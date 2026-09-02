@@ -1,0 +1,33 @@
+-- rendered by scripts/render_deploy.py; do not install this file directly --
+[Unit]
+Description=Devvy Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@DEVVY_ROOT@
+Environment=PATH=@SERVICE_PATH@
+EnvironmentFile=@DEVVY_ROOT@/.env
+ExecStart=@POETRY_BIN@ run python -m src.main
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=@SERVICE_NAME@
+
+# Memory safety net: agent-spawned tool commands (bash/python children) share
+# this cgroup. A runaway command gets throttled at MemoryHigh and OOM-killed
+# inside the cgroup at MemoryMax instead of freezing the whole host
+# (2026-07-31 incident: unbounded iterparse over a 1.6GB XML thrashed the box).
+# Tune these to the box: the defaults below assume ~4G RAM and leave headroom
+# for the system's own services.
+MemoryAccounting=yes
+MemoryHigh=@MEMORY_HIGH@
+MemoryMax=@MEMORY_MAX@
+MemorySwapMax=@MEMORY_SWAP_MAX@
+
+[Install]
+WantedBy=multi-user.target

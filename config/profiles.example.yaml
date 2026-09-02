@@ -1,0 +1,175 @@
+# Profile registry — REFERENCE. Every key is documented here.
+#
+# You normally do not copy this file: ./install.sh writes config/profiles.yaml
+# for you from the templates in data/templates/profiles/, and
+#
+#   python3 scripts/install_profiles.py --list
+#   python3 scripts/install_profiles.py --add coach
+#
+# add the rest later. Copy this one only if you want to write the registry by
+# hand; then set PROFILES_CONFIG_PATH to wherever you put it.
+#
+# Each profile is an isolated session: own working_dir, memory, persona.
+#
+# Optional per-profile `sandbox:` overrides the global SANDBOX_ENABLED default.
+#   false = full access (bash network + cross-filesystem writes) — for a trusted
+#           admin profile like devops.
+#   true  = jailed (bash confined to cwd, no network) — do real work via tools.
+#   unset = inherit the global SANDBOX_ENABLED setting.
+#
+# Optional per-profile `permission_policy:` gates which roles (owner / guest,
+# see GUEST_USERS) may route into the profile. Absent = owner-only. Hard
+# invariant enforced at load time: a profile that resolves to sandbox=false
+# can never allow guests. Example (guest-visible sandboxed profile):
+#
+#   - slug: general
+#     name: General Assistant
+#     ...
+#     permission_policy:
+#       allowed_roles: [owner, guest]
+#
+# Optional per-profile `family_memory: false` (default true) locks every
+# family member's facts to their own private scope ON THIS PROFILE ONLY —
+# no family-shared writes or reads, even if the user explicitly says
+# "remember this for the family". Other profiles keep sharing normally.
+# Use for personal/sensitive topics (e.g. a health coach) where facts
+# should never cross between family members regardless of framing.
+#
+# Workspace/memory sharing: PER-USER IS THE DEFAULT (dv-0fbb). On a profile
+# without a `shared:`/`personal_memory:` key, EVERY user — including
+# "owner"-role family members — gets their own workspace
+# (<working_dir>/users/<user_id>) and their own private memory scope
+# ({slug}#u{user_id}). `shared: true` opts a profile out: owner-role users
+# then share the profile root and one private fact store (guests stay
+# isolated in guests/<user_id> either way). Use it for genuinely communal
+# profiles (a household recipe box, a joint project board) and for any
+# profile whose working_dir is a real repo checkout that must not be split.
+# `personal_memory: true|false` is the explicit spelling of the same bit
+# (true = per-user, false = shared); setting both keys is a load error.
+# `family_memory: false` + per-user together give strict per-person
+# isolation regardless of role, e.g.:
+#
+#   - slug: chef
+#     name: Personal Chef
+#     ...
+#     shared: true            # one communal workspace + fact store for owners
+#
+#   - slug: coach
+#     name: Health & Training Coach
+#     ...
+#     family_memory: false
+#     personal_memory: true   # explicit; same as leaving both keys unset
+#
+# Optional per-profile `max_turns:` (integer >= 1) raises or lowers the global
+# CLAUDE_MAX_TURNS for this profile — devops runs long multi-file tasks that
+# exceed the conservative default.
+#
+# Optional per-profile `max_cost_per_request:` (USD, >= 0) is the per-turn SDK
+# budget ceiling. Unset = inherit CLAUDE_MAX_COST_PER_REQUEST, which owners are
+# exempt from; an explicit value here applies to EVERY role on the profile,
+# owner included, so a cheap agent can be bounded without bounding devops.
+# 0 = explicitly uncapped. When a turn hits this cap the run is ABORTED (not
+# truncated) and the bot says so — see docs/FINDINGS.md 2026-08-03.
+#
+#   - slug: coach
+#     ...
+#     max_cost_per_request: 1.50
+# PATHS
+#
+# `working_dir`, `memory_dir`, `persona` and `mcp` accept, in this order:
+#   ${VAR}          — any environment variable. Undefined is an ERROR, not an
+#                     empty string, so ${TYPO}/coach can never become /coach.
+#   ${DEVVY_ROOT}   — always defined. Defaults to this file's grandparent
+#                     (<root>/config/profiles.yaml -> <root>), so the paths
+#                     below work in any checkout with nothing exported.
+#                     Export DEVVY_ROOT to override.
+#   ~/…             — the service user's home.
+#   relative/path   — resolved against THIS FILE's directory, never the
+#                     process CWD.
+#   /absolute/path  — used as-is.
+#
+# Resolution is lexical (normpath), so a symlinked working_dir keeps the name
+# you configured — routing matches on the configured path, not its target.
+#
+# FIRST RUN
+#
+# On boot, every profile's `working_dir` and `memory_dir` are created if
+# missing, and `persona` is seeded from a committed template when the file is
+# not there yet. Existing files are NEVER overwritten, so re-running an install
+# loses nothing. The template is, in order:
+#
+#   1. an explicit `persona_template:` on the profile (same path rules as
+#      above) — used when a persona is shared with another bootstrap path;
+#   2. `data/templates/profiles/<slug>/persona.md` by convention — this is the
+#      normal case, so adding a profile means adding one template file, no
+#      extra key. It sits next to the `profile.yaml` fragment the installer
+#      instantiates that profile from; see data/templates/profiles/README.md.
+#   3. `data/templates/personas/<slug>.md` — the older flat layout, still
+#      honoured for checkouts that carry one.
+#
+# Only then are the paths checked: a missing persona with no template, or an
+# unwritable working_dir, aborts startup naming the profile and the path,
+# instead of failing later on the first turn that touches the profile.
+profiles:
+  - slug: devops              # default — preserves single-profile behavior
+    name: Server / DevOps
+    working_dir: ${DEVVY_ROOT}
+    memory_dir: ${DEVVY_ROOT}/data/memory
+    persona: ${DEVVY_ROOT}/data/agent.md
+    # devops reuses the single-profile agent persona, so it names its template
+    # explicitly rather than getting a second, drifting copy under personas/.
+    persona_template: ${DEVVY_ROOT}/data/templates/agent.md
+    default: true
+    sandbox: false            # trusted admin: full bash network + cross-FS access
+    shared: true              # working_dir is a repo checkout; never split per-user
+    max_turns: 100            # complex multi-file work exceeds the global default
+
+  - slug: general
+    name: General Assistant
+    working_dir: ${DEVVY_ROOT}/workspaces/general
+    memory_dir: ${DEVVY_ROOT}/workspaces/general/memory
+    persona: ${DEVVY_ROOT}/workspaces/general/persona.md
+    permission_policy:
+      allowed_roles: [owner, guest]
+
+  # --- optional profiles -------------------------------------------------
+  # `devops` and `general` are the two that ship active. The rest are examples
+  # of the shape; delete what you do not want, or scaffold them from templates.
+
+  - slug: chef
+    name: Personal Chef
+    working_dir: ${DEVVY_ROOT}/workspaces/chef
+    memory_dir: ${DEVVY_ROOT}/workspaces/chef/memory
+    persona: ${DEVVY_ROOT}/workspaces/chef/persona.md
+    permission_policy:
+      allowed_roles: [owner, guest]
+    shared: true              # household recipes are shared, not per-person
+
+  - slug: coach
+    name: Health & Training Coach
+    working_dir: ${DEVVY_ROOT}/workspaces/coach
+    memory_dir: ${DEVVY_ROOT}/workspaces/coach/memory
+    persona: ${DEVVY_ROOT}/workspaces/coach/persona.md
+    permission_policy:
+      allowed_roles: [owner, guest]
+    family_memory: false      # health data never joins the family-shared scope
+    personal_memory: true     # …and every user gets their own private scope
+
+  - slug: pm
+    name: Project Manager
+    working_dir: ${DEVVY_ROOT}/workspaces/pm
+    memory_dir: ${DEVVY_ROOT}/workspaces/pm/memory
+    persona: ${DEVVY_ROOT}/workspaces/pm/persona.md
+    permission_policy:
+      allowed_roles: [owner, guest]
+    shared: true
+
+  # `channel` is bound to one Telegram channel and the channel-intel MCP
+  # daemon, so it is not a useful starting point — shown only for the `mcp:`
+  # key. It needs src/channel_intel running; see src/channel_intel/README.md.
+  # - slug: channel
+  #   name: TG Channel Editor
+  #   working_dir: ${DEVVY_ROOT}/workspaces/channel
+  #   memory_dir: ${DEVVY_ROOT}/workspaces/channel/memory
+  #   persona: ${DEVVY_ROOT}/workspaces/channel/persona.md
+  #   mcp: ${DEVVY_ROOT}/config/mcp/channel-intel.json

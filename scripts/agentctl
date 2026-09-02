@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""agentctl — agent-facing CLI for the bot's internal API.
+
+Lets any profile (or the user, from a shell) send Telegram messages,
+schedule cron/one-shot jobs, and manage the shared task board.
+Talks to the bot's FastAPI /internal/* endpoints; auth and port are read
+from the bot's .env (WEBHOOK_API_SECRET, API_SERVER_PORT).
+
+Usage:
+  agentctl notify "text"                          Send a Telegram message now
+  agentctl prompt "text" --profile P              Run one agent turn now (resumed session)
+  agentctl schedule add --name N --cron "0 7 * * *" [--profile P] "prompt"
+  agentctl schedule add --name N --at 2026-07-09T08:00 [--profile P] "prompt"
+  agentctl schedule list
+  agentctl schedule rm JOB_ID
+  agentctl task add "title" [--body TEXT] [--by PROFILE] [--assignee P] [--due ISO]
+  agentctl task list [--status open|done|all]
+  agentctl task done TASK_ID
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+
+
+def _load_env() -> dict:
+    env = {}
+    if ENV_PATH.exists():
+        for line in ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, val = line.partition("=")
+                env[key.strip()] = val.strip().strip("\"'")
+    return env
+
+
+def _request(method: str, path: str, body: dict = None, query: str = "") -> dict:
+    env = _load_env()
+    secret = os.environ.get("WEBHOOK_API_SECRET") or env.get("WEBHOOK_API_SECRET")
+    port = os.environ.get("API_SERVER_PORT") or env.get("API_SERVER_PORT") or "8080"
+    host = (
+        os.environ.get("API_SERVER_HOST") or env.get("API_SERVER_HOST") or "127.0.0.1"
+    )
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    if not secret:
+        sys.exit("error: WEBHOOK_API_SECRET not set (in env or bot .env)")
+
+    url = f"http://{host}:{port}{path}{query}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {secret}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        sys.exit(f"error {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        sys.exit(
+            f"error: cannot reach bot API at {url} ({e.reason}). Is the bot running with ENABLE_API_SERVER=true?"
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="agentctl", description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_notify = sub.add_parser("notify", help="send a Telegram message now")
+    p_notify.add_argument("text")
+    p_notify.add_argument("--chat-id", type=int, default=None)
+    p_notify.add_argument("--pin-as", default=None,
+                          help="maintain a single pinned status post under this key")
+
+    p_prompt = sub.add_parser(
+        "prompt",
+        help="run one agent turn in a profile's conversation now "
+        "(resumes the profile's current session)",
+    )
+    p_prompt.add_argument("text")
+    p_prompt.add_argument("--profile", required=True)
+    p_prompt.add_argument("--name", default="prompt")
+    p_prompt.add_argument("--chat-id", type=int, default=None)
+
+    p_sched = sub.add_parser("schedule", help="manage scheduled jobs")
+    ssub = p_sched.add_subparsers(dest="subcmd", required=True)
+
+    p_add = ssub.add_parser("add")
+    p_add.add_argument("prompt")
+    p_add.add_argument("--name", required=True)
+    p_add.add_argument("--cron", help='crontab expression, e.g. "0 7 * * *"')
+    p_add.add_argument("--at", help="one-shot ISO time, e.g. 2026-07-09T08:00")
+    p_add.add_argument("--profile", help="run as this profile (coach, chef, ...)")
+    ssub.add_parser("list")
+    p_rm = ssub.add_parser("rm")
+    p_rm.add_argument("job_id")
+
+    p_task = sub.add_parser("task", help="shared task board")
+    tsub = p_task.add_subparsers(dest="subcmd", required=True)
+
+    t_add = tsub.add_parser("add")
+    t_add.add_argument("title")
+    t_add.add_argument("--body", default=None)
+    t_add.add_argument("--by", default="user", help="creator profile slug")
+    t_add.add_argument("--assignee", default=None)
+    t_add.add_argument("--due", default=None, help="ISO datetime")
+    t_list = tsub.add_parser("list")
+    t_list.add_argument("--status", default="open", choices=["open", "done", "all"])
+    t_done = tsub.add_parser("done")
+    t_done.add_argument("task_id", help="board id, e.g. dv-3f21")
+
+    args = parser.parse_args()
+
+    if args.cmd == "notify":
+        out = _request(
+            "POST",
+            "/internal/notify",
+            {"text": args.text, "chat_id": args.chat_id, "pin_as": args.pin_as},
+        )
+    elif args.cmd == "prompt":
+        out = _request(
+            "POST",
+            "/internal/prompt",
+            {
+                "prompt": args.text,
+                "profile": args.profile,
+                "name": args.name,
+                "chat_id": args.chat_id,
+            },
+        )
+    elif args.cmd == "schedule" and args.subcmd == "add":
+        if bool(args.cron) == bool(args.at):
+            sys.exit("error: provide exactly one of --cron / --at")
+        out = _request(
+            "POST",
+            "/internal/schedule",
+            {
+                "name": args.name,
+                "prompt": args.prompt,
+                "cron": args.cron,
+                "at": args.at,
+                "profile": args.profile,
+            },
+        )
+    elif args.cmd == "schedule" and args.subcmd == "list":
+        out = _request("GET", "/internal/schedule")
+    elif args.cmd == "schedule" and args.subcmd == "rm":
+        out = _request("DELETE", f"/internal/schedule/{args.job_id}")
+    elif args.cmd == "task" and args.subcmd == "add":
+        out = _request(
+            "POST",
+            "/internal/tasks",
+            {
+                "title": args.title,
+                "body": args.body,
+                "created_by": args.by,
+                "assignee": args.assignee,
+                "due_at": args.due,
+            },
+        )
+    elif args.cmd == "task" and args.subcmd == "list":
+        out = _request("GET", "/internal/tasks", query=f"?status={args.status}")
+    elif args.cmd == "task" and args.subcmd == "done":
+        out = _request("PATCH", f"/internal/tasks/{args.task_id}", {"status": "done"})
+    else:
+        parser.error("unknown command")
+        return
+
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+# Personal Chef -- the household recipe box.
+#
+# Not installed by default. Add it with:
+#   python3 scripts/install_profiles.py --add chef
+# then restart the bot (PROFILES_CONFIG_PATH is read once, at boot).
+#
+# `shared: true` is the point of this profile: one communal workspace and one
+# fact store for every owner-role user, so a recipe saved by one person is
+# there for the others. Guests stay isolated in guests/<id> regardless.
+- slug: "@SLUG@"
+  name: Personal Chef
+  working_dir: ${DEVVY_ROOT}/workspaces/@SLUG@
+  memory_dir: ${DEVVY_ROOT}/workspaces/@SLUG@/memory
+  persona: ${DEVVY_ROOT}/workspaces/@SLUG@/persona.md
+  permission_policy:
+    allowed_roles: [owner, guest]
+  shared: true
+  user_data_tools: [products]   # shared nutrition lookups

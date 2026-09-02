@@ -1,0 +1,16 @@
+# Project Manager -- plans, decisions and a shared task board.
+#
+# Not installed by default. Add it with:
+#   python3 scripts/install_profiles.py --add pm
+# then restart the bot (PROFILES_CONFIG_PATH is read once, at boot).
+#
+# `shared: true` because a project board that is per-user is not a project
+# board. Everyone with the owner role sees the same workspace and facts.
+- slug: "@SLUG@"
+  name: Project Manager
+  working_dir: ${DEVVY_ROOT}/workspaces/@SLUG@
+  memory_dir: ${DEVVY_ROOT}/workspaces/@SLUG@/memory
+  persona: ${DEVVY_ROOT}/workspaces/@SLUG@/persona.md
+  permission_policy:
+    allowed_roles: [owner, guest]
+  shared: true

@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""Detached background jobs for work that outlives a bot turn.
+
+The bot runs ONE CLI process per turn and unconditionally disconnects when the
+reply is sent (src/claude/sdk_integration.py, `finally: client.disconnect()`),
+so a backgrounded sub-agent is always killed mid-flight. Blocking sub-agents
+work fine but the whole turn is capped at CLAUDE_TIMEOUT_SECONDS (300s).
+
+This runs the work OUTSIDE the turn instead: `systemd-run --user` starts a
+transient unit that is not a child of the bot, so it survives both the end of
+the turn and a bot restart (the user manager has Linger=yes). Completion pings
+Telegram via `scripts/agentctl notify`.
+
+NOTE on output: `claude --output-format text` buffers the whole reply and only
+writes it when the run ends, so `output.md` stays 0 bytes while the job works
+and a crash loses it entirely. Progress is therefore reported from the cgroup
+(CPU/memory/elapsed), and any job that must survive a crash has to be told, in
+its prompt, to write its findings to files incrementally.
+
+Usage:
+  bgjob run "<prompt>" [--profile general] [--name research]
+  bgjob list
+  bgjob status <id>
+  bgjob output <id> [--tail N]
+  bgjob cancel <id>
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+JOBS_ROOT = Path(os.environ.get("BGJOB_ROOT", REPO.parent / "jobs"))
+PROFILES_YAML = REPO / "config" / "profiles.yaml"
+AGENTCTL = REPO / "scripts" / "agentctl"
+
+# Host has ~3.8G RAM and has already had an OOM reboot from parallel claude
+# processes; the bot itself is capped at MemoryMax=2.5G. Keep detached jobs
+# well inside what is left.
+MAX_CONCURRENT = int(os.environ.get("BGJOB_MAX_CONCURRENT", "2"))
+JOB_MEMORY_MAX = os.environ.get("BGJOB_MEMORY_MAX", "1G")
+
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+
+
+def _env() -> dict:
+    """systemd --user needs XDG_RUNTIME_DIR; the bot's environment lacks it."""
+    env = dict(os.environ)
+    env["XDG_RUNTIME_DIR"] = RUNTIME_DIR
+    return env
+
+
+def load_profiles() -> dict:
+    """slug -> working_dir, parsed from config/profiles.yaml."""
+    text = PROFILES_YAML.read_text(encoding="utf-8") if PROFILES_YAML.exists() else ""
+    try:
+        import yaml  # type: ignore
+
+        data = yaml.safe_load(text) or {}
+        return {
+            p["slug"]: p["working_dir"]
+            for p in data.get("profiles", [])
+            if p.get("slug") and p.get("working_dir")
+        }
+    except Exception:
+        # Dependency-free fallback: the file is a flat list of simple scalars.
+        out, slug = {}, None
+        for line in text.splitlines():
+            m = re.match(r"\s*-?\s*slug:\s*(\S+)", line)
+            if m:
+                slug = m.group(1)
+                continue
+            m = re.match(r"\s*working_dir:\s*(\S+)", line)
+            if m and slug:
+                out[slug] = m.group(1)
+                slug = None
+        return out
+
+
+def job_dir(job_id: str) -> Path:
+    return JOBS_ROOT / job_id
+
+
+def read_meta(job_id: str) -> dict:
+    try:
+        return json.loads((job_dir(job_id) / "meta.json").read_text())
+    except Exception:
+        return {}
+
+
+def unit_active(unit: str) -> bool:
+    r = subprocess.run(
+        ["systemctl", "--user", "is-active", unit],
+        capture_output=True,
+        text=True,
+        env=_env(),
+    )
+    return r.stdout.strip() in {"active", "activating"}
+
+
+def all_jobs() -> list:
+    if not JOBS_ROOT.exists():
+        return []
+    return sorted((p.name for p in JOBS_ROOT.iterdir() if p.is_dir()), reverse=True)
+
+
+def job_progress(unit: str) -> str:
+    """Human-readable proof a running job is actually doing work.
+
+    output.md is useless as a progress signal (claude buffers it to the end),
+    so read CPU time and memory straight from the job's cgroup: a job burning
+    CPU is working, a job at 0s CPU for minutes is stuck.
+    """
+    base = (
+        Path("/sys/fs/cgroup/user.slice")
+        / f"user-{os.getuid()}.slice"
+        / f"user@{os.getuid()}.service"
+        / "app.slice"
+        / f"{unit}.service"
+    )
+    try:
+        cpu_us = 0
+        for line in (base / "cpu.stat").read_text().splitlines():
+            if line.startswith("usage_usec"):
+                cpu_us = int(line.split()[1])
+                break
+        mem = int((base / "memory.current").read_text().strip())
+        return f"cpu {cpu_us // 1_000_000}s, mem {mem // 1048576}MB"
+    except Exception:
+        return ""
+
+
+def live_jobs() -> list:
+    out = []
+    for jid in all_jobs():
+        meta = read_meta(jid)
+        if meta.get("unit") and unit_active(meta["unit"]):
+            out.append(jid)
+    return out
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    profiles = load_profiles()
+    cwd = profiles.get(args.profile)
+    if not cwd:
+        sys.exit(
+            f"error: unknown profile '{args.profile}'. "
+            f"Known: {', '.join(sorted(profiles)) or '(none)'}"
+        )
+    if not Path(cwd).is_dir():
+        sys.exit(f"error: working dir does not exist: {cwd}")
+
+    # --cwd overrides where the job runs AND what it may write; the profile is
+    # still resolved above because the digest turn has to be delivered into
+    # some profile's conversation.
+    if getattr(args, "cwd", None):
+        override = Path(args.cwd).expanduser().resolve()
+        if not override.is_dir():
+            sys.exit(f"error: --cwd does not exist: {override}")
+        cwd = str(override)
+
+    running = live_jobs()
+    if len(running) >= MAX_CONCURRENT:
+        sys.exit(
+            f"error: {len(running)} job(s) already running "
+            f"(cap {MAX_CONCURRENT}, host has ~3.8G RAM). "
+            f"Wait or `bgjob cancel {running[0]}`."
+        )
+
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    safe = re.sub(r"[^a-zA-Z0-9_-]+", "-", args.name).strip("-") or "job"
+    job_id = f"{stamp}-{safe}"
+    d = job_dir(job_id)
+    d.mkdir(parents=True, exist_ok=True)
+
+    (d / "prompt.txt").write_text(args.prompt, encoding="utf-8")
+    output = d / "output.md"
+    output.touch()
+
+    unit = f"bgjob-{job_id}"
+    meta = {
+        "id": job_id,
+        "name": args.name,
+        "profile": args.profile,
+        "cwd": cwd,
+        "unit": unit,
+        "created": datetime.now(UTC).isoformat(),
+        "model": args.model,
+        "prompt": args.prompt[:2000],
+    }
+    (d / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    # systemd --user units get a minimal PATH without ~/.local/bin, so the
+    # wrapper must call claude by absolute path or it dies with rc=127.
+    claude_bin = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
+    if not Path(claude_bin).exists():
+        sys.exit(f"error: claude CLI not found (looked at {claude_bin})")
+
+    # Filesystem confinement is enforced by bubblewrap, NOT by systemd.
+    # systemd --user accepts ProtectSystem=strict / ReadWritePaths / ProtectHome
+    # and reports Result=success, but silently does not enforce them (the user
+    # manager lacks the privileges for the mount namespace) -- verified: a job
+    # with those properties still wrote outside its workspace. bwrap does
+    # enforce: everything is read-only except the paths bound rw below.
+    bwrap_bin = shutil.which("bwrap")
+    if not bwrap_bin:
+        sys.exit("error: bwrap not found; refusing to run a job unconfined")
+
+    write_paths = [str(d), cwd, str(Path.home() / ".claude")]
+    for extra in args.allow_dir or []:
+        p = Path(extra).expanduser().resolve()
+        if not p.is_dir():
+            sys.exit(f"error: --allow-dir does not exist: {p}")
+        write_paths.append(str(p))
+
+    binds = " ".join(f"--bind {shlex.quote(w)} {shlex.quote(w)}" for w in write_paths)
+    bwrap_prefix = (
+        f"{shlex.quote(bwrap_bin)} --ro-bind / / {binds} "
+        f"--bind /tmp /tmp --dev /dev --proc /proc --die-with-parent"
+    )
+
+    # Everything after the claude call is reporting, and --quiet drops all of
+    # it: taskpump-launched jobs write a structured report their caller renders
+    # into one short message, and the raw-tail ping would be a second, worse
+    # copy of the same news.
+    notify_tail = (
+        "d=$(( $(date +%s) - t0 ))\n"
+        'dur=$(printf "%dm%02ds" $((d/60)) $((d%60)))\n'
+        'if [ $rc -eq 0 ]; then icon="✅"; s="finished"; '
+        'else icon="❌"; s="FAILED (rc=$rc)"; fi\n'
+        f'msg="$icon {args.profile} · job \\"{args.name}\\" $s\n'
+        f"started $started_h · ran $dur\n"
+        f"id: {job_id}\n"
+        f'output: {str(output)}"\n'
+        # The ping must carry the ANSWER, not just say "there is a file". Tail
+        # capped so _split_message doesn't chunk the notification; the header
+        # above already names the full output path for the truncated case.
+        f"out_bytes=$(wc -c < {str(output)!r} 2>/dev/null || echo 0)\n"
+        f'if [ "$out_bytes" -gt 0 ]; then\n'
+        f"  body=$(tail -c 1500 {str(output)!r})\n"
+        f'  if [ "$out_bytes" -gt 1500 ]; then body="…$body"; fi\n'
+        f'  msg="$msg\n'
+        f"\n"
+        f'$body"\n'
+        f"fi\n"
+        # The bot may be down exactly when we finish -- a restart is the whole
+        # reason this runner exists. A single fire-and-forget notify would be
+        # swallowed by `|| true` and the user would never learn the job ended.
+        # Retry for ~5 min, then leave a PENDING_NOTIFY marker so the result is
+        # still discoverable instead of silently lost.
+        f"sent=0\n"
+        f"for i in $(seq 1 30); do\n"
+        f'  if {str(AGENTCTL)!r} notify "$msg" >>{str(d / "notify.log")!r} 2>&1; then\n'
+        f"    sent=1; break\n"
+        f"  fi\n"
+        f"  sleep 10\n"
+        f"done\n"
+        f'if [ "$sent" != "1" ]; then echo "$msg" > {str(d / "PENDING_NOTIFY")!r}; fi\n'
+        # Agentic digest: run one resumed turn in the owning profile's
+        # conversation so the transcript itself records the finish (kills the
+        # "still running" hallucination class) and the user gets a digested
+        # result, not just a raw tail. Best-effort on top of the ✅ ping above,
+        # which stays as the guaranteed/bot-down-fallback delivery.
+        f'if [ "$sent" = "1" ]; then\n'
+        f"  {str(AGENTCTL)!r} prompt "
+        f'"[Background job \\"{args.name}\\" (id: {job_id}) finished with '
+        f"exit code $rc. Read its output at {str(output)} (job_output tool "
+        f"or the file directly) and report the outcome to the user. The "
+        f"user already saw a raw tail of it -- give the digested result, "
+        f'not a re-dump.]" '
+        f"--profile {args.profile} --name job-finish "
+        f">>{str(d / 'notify.log')!r} 2>&1 || true\n"
+        f"fi\n"
+        # Retire/refresh the pinned status: this job is no longer running, and
+        # a pin still listing it is worse than no pin. --exclude because this
+        # very unit is still `active` while run.sh executes this line, so an
+        # unfiltered render would list the finished job as running forever.
+        f'{str(REPO / "scripts" / "bgjob")!r} pin --exclude {job_id} '
+        f">/dev/null 2>&1 || true\n"
+    )
+    if getattr(args, "quiet", False):
+        notify_tail = ""
+
+    # The wrapper keeps claude's stdout streaming into output.md so partial
+    # work survives a crash, records the exit code, then pings Telegram.
+    runner = d / "run.sh"
+    runner.write_text(
+        "#!/bin/bash\n"
+        # Timestamps captured here, not at completion: the finish notification
+        # has to say when the job STARTED and how long it ran, otherwise the
+        # user cannot tell which request it belongs to.
+        "t0=$(date +%s)\n"
+        "started_h=$(date -u '+%H:%M UTC')\n"
+        # Any nested Task-tool subagents the job spawns stay on sonnet even if
+        # the job itself was started with a bigger --model.
+        "export CLAUDE_CODE_SUBAGENT_MODEL=sonnet\n"
+        f"cd {cwd!r} || exit 1\n"
+        f"{bwrap_prefix} {claude_bin!r} "
+        f'-p "$(cat {str(d / "prompt.txt")!r})" '
+        f"--model {shlex.quote(args.model)} "
+        f"--permission-mode bypassPermissions "
+        f"--output-format text "
+        f">> {str(output)!r} 2>&1\n"
+        "rc=$?\n"
+        f'echo "$rc" > {str(d / "exit_code")!r}\n' + notify_tail,
+        encoding="utf-8",
+    )
+    runner.chmod(0o755)
+
+    cmd = [
+        "systemd-run",
+        "--user",
+        "--quiet",
+        f"--unit={unit}",
+        "--collect",
+        f"--property=MemoryMax={JOB_MEMORY_MAX}",
+        "--property=CPUWeight=50",
+        "--property=NoNewPrivileges=yes",
+        "/bin/bash",
+        str(runner),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, env=_env())
+    if r.returncode != 0:
+        sys.exit(f"error: systemd-run failed: {r.stderr.strip()}")
+
+    # Announce the start HERE, not in the MCP wrapper. The finish ping already
+    # lives in this script, and having the two on different layers meant a job
+    # launched any way other than the job_start tool (a shell, another agent,
+    # cron) silently produced no start message at all -- which is exactly the
+    # "did it actually start?" ambiguity this whole mechanism exists to kill.
+    started_at = datetime.now(UTC).strftime("%H:%M UTC")
+    if not getattr(args, "quiet", False):
+        subprocess.run(
+            [
+                str(AGENTCTL),
+                "notify",
+                f'🚀 {args.profile} · job "{args.name}" started\n'
+                f"at {started_at}\nid: {job_id}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [str(AGENTCTL), "notify", render_jobs_status(), "--pin-as", "jobs"],
+            capture_output=True,
+            text=True,
+        )
+
+    print(f"started {job_id}  (unit {unit})")
+    print(f"  output: {output}")
+    print(f"  status: bgjob status {job_id}")
+    return 0
+
+
+def cmd_list(_args: argparse.Namespace) -> int:
+    jobs = all_jobs()
+    if not jobs:
+        print("no jobs")
+        return 0
+    for jid in jobs:
+        meta = read_meta(jid)
+        unit = meta.get("unit", "")
+        if unit and unit_active(unit):
+            prog = job_progress(unit)
+            state = f"RUNNING ({prog})" if prog else "RUNNING"
+        else:
+            rc = (
+                (job_dir(jid) / "exit_code").read_text().strip()
+                if (job_dir(jid) / "exit_code").exists()
+                else "?"
+            )
+            state = "done" if rc == "0" else f"failed(rc={rc})"
+        size = (
+            (job_dir(jid) / "output.md").stat().st_size
+            if (job_dir(jid) / "output.md").exists()
+            else 0
+        )
+        profile = meta.get("profile", "?")
+        print(f"{jid:<34} {state:<32} {size:>7}B  {profile}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    meta = read_meta(args.id)
+    if not meta:
+        sys.exit(f"error: no such job: {args.id}")
+    d = job_dir(args.id)
+    running = unit_active(meta.get("unit", ""))
+    print(json.dumps(meta, indent=2))
+    print(f"running: {running}")
+    if (d / "exit_code").exists():
+        print(f"exit_code: {(d / 'exit_code').read_text().strip()}")
+    if (d / "output.md").exists():
+        print(f"output_bytes: {(d / 'output.md').stat().st_size}")
+    return 0
+
+
+def cmd_output(args: argparse.Namespace) -> int:
+    p = job_dir(args.id) / "output.md"
+    if not p.exists():
+        sys.exit(f"error: no output for {args.id}")
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines[-args.tail :] if args.tail else lines:
+        print(line)
+    return 0
+
+
+def render_jobs_status(exclude: str | None = None) -> str:
+    """Text for the pinned 'what is running now' post ('' when nothing is).
+
+    `exclude` drops one job id from the render: the pin refresh at the end of
+    run.sh executes INSIDE the finishing job's own unit, which is still
+    `active` at that moment, so without the exclusion the just-finished job
+    re-appears as running on every single finish.
+    """
+    lines = []
+    for jid in all_jobs():
+        if jid == exclude:
+            continue
+        meta = read_meta(jid)
+        unit = meta.get("unit", "")
+        if unit and unit_active(unit):
+            prog = job_progress(unit)
+            tail = f" ({prog})" if prog else ""
+            prof = meta.get("profile", "?")
+            lines.append(f"• {prof} · {meta.get('name', jid)}{tail}")
+    if not lines:
+        return ""
+    return f"⏳ Background jobs running ({len(lines)})\n" + "\n".join(lines)
+
+
+def cmd_pin(args: argparse.Namespace) -> int:
+    """Push the current status into the pinned post (empty retires it)."""
+    r = subprocess.run(
+        [
+            str(AGENTCTL),
+            "notify",
+            render_jobs_status(exclude=args.exclude),
+            "--pin-as",
+            "jobs",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    print(r.stdout.strip() or r.stderr.strip())
+    return 0 if r.returncode == 0 else 1
+
+
+def cmd_flush(_args: argparse.Namespace) -> int:
+    """Deliver notifications that failed while the bot was down.
+
+    A job that finishes during a bot restart cannot reach the HTTP API, so it
+    leaves a PENDING_NOTIFY marker. This drains those, so a completed job is
+    never silently lost -- run it after a restart (or from the agent when it
+    notices jobs finished while it was away).
+    """
+    pending = [j for j in all_jobs() if (job_dir(j) / "PENDING_NOTIFY").exists()]
+    if not pending:
+        print("no pending notifications")
+        return 0
+    for jid in pending:
+        marker = job_dir(jid) / "PENDING_NOTIFY"
+        msg = marker.read_text(encoding="utf-8").strip()
+        r = subprocess.run(
+            [str(AGENTCTL), "notify", msg], capture_output=True, text=True
+        )
+        if r.returncode == 0:
+            marker.unlink()
+            print(f"delivered {jid}")
+        else:
+            print(f"still failing {jid}: {r.stderr.strip()[:120]}")
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    meta = read_meta(args.id)
+    if not meta:
+        sys.exit(f"error: no such job: {args.id}")
+    subprocess.run(
+        ["systemctl", "--user", "stop", meta["unit"]],
+        capture_output=True,
+        env=_env(),
+    )
+    print(f"cancelled {args.id}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="bgjob", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("run", help="start a detached job")
+    p.add_argument("prompt")
+    p.add_argument("--profile", default="general")
+    p.add_argument("--name", default="job")
+    p.add_argument(
+        "--model",
+        default="sonnet",
+        help="model for the detached claude run (default: sonnet). Without an "
+        "explicit flag jobs would silently inherit the CLI's global default "
+        "(opus) — sonnet is the deliberate cost floor for background work.",
+    )
+    p.add_argument(
+        "--allow-dir",
+        action="append",
+        metavar="DIR",
+        help="extra directory the job may WRITE to (repeatable). The job dir "
+        "and the profile working dir are always writable; everything else on "
+        "the filesystem is read-only.",
+    )
+    p.add_argument(
+        "--cwd",
+        metavar="DIR",
+        help="run in this directory instead of the profile's working_dir, and "
+        "make it the writable root. Used by taskpump to run a job in a git "
+        "worktree so an unattended agent never edits the tree the live bot "
+        "imports from.",
+    )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="send no Telegram start/finish/pin messages and skip the digest "
+        "turn. For jobs whose caller does its own reporting (taskpump); a "
+        "job that pings twice from two layers is worse than one that pings "
+        "once from the layer that knows what the message should say.",
+    )
+    p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("list", help="list jobs")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("status", help="show one job")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("output", help="print job output")
+    p.add_argument("id")
+    p.add_argument("--tail", type=int, default=0)
+    p.set_defaults(fn=cmd_output)
+
+    p = sub.add_parser("pin", help="refresh the pinned running-jobs status post")
+    p.add_argument(
+        "--exclude",
+        metavar="JOB_ID",
+        default=None,
+        help="treat this job as not-running (used by a finishing job whose "
+        "unit is still active while it refreshes the pin)",
+    )
+    p.set_defaults(fn=cmd_pin)
+
+    p = sub.add_parser("flush", help="deliver notifications missed while bot was down")
+    p.set_defaults(fn=cmd_flush)
+
+    p = sub.add_parser("cancel", help="stop a running job")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_cancel)
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

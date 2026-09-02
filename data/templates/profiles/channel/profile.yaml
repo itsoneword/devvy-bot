@@ -1,0 +1,17 @@
+# TG Channel Editor.
+#
+# NOT a useful starting point and not installed by default: it is bound to one
+# specific Telegram channel and to the channel-intel MCP daemon, which is a
+# separate service with its own database and token
+# (see src/channel_intel/README.md). It is kept here for the shape of an
+# MCP-backed profile -- the `mcp:` key -- not as something to switch on.
+#
+# If you do want it: start the channel-intel daemon, write
+# config/mcp/channel-intel.json, then
+#   python3 scripts/install_profiles.py --add channel
+- slug: "@SLUG@"
+  name: TG Channel Editor
+  working_dir: ${DEVVY_ROOT}/workspaces/@SLUG@
+  memory_dir: ${DEVVY_ROOT}/workspaces/@SLUG@/memory
+  persona: ${DEVVY_ROOT}/workspaces/@SLUG@/persona.md
+  mcp: ${DEVVY_ROOT}/config/mcp/channel-intel.json

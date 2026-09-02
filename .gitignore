@@ -1,0 +1,211 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+#   install all needed dependencies.
+#Pipfile.lock
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+# Match every .env variant (.env.bak-*, .env.local, .env.prod ...) but keep the
+# tracked template. A bare ".env" left backups like .env.bak-144858 -- which hold
+# live bot tokens and API keys -- one `git add -A` away from being staged (dv-2f70).
+.env
+.env.*
+!.env.example
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Project-specific
+# `data/*` not `data/`: excluding the directory itself makes git prune it, and
+# a pruned parent can never be re-included — `!data/templates/` then silently
+# fails to un-ignore anything in a NEW subdirectory (dv-3b41: personas/).
+data/*
+!data/templates/
+# Loaded by PromptComposer at runtime; must ship (it is tracked, but a plain
+# `git add -A` on a fresh export silently drops it without this line).
+!data/shared-capabilities.md
+*.db
+*.db-journal
+
+# Codex CLI backend: generated persona + per-turn output file (written into
+# each profile's working_dir, which for the devops profile is this repo).
+/AGENTS.md
+.codex_last_message.txt
+*.log
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Bot-specific
+sessions/
+!data/templates/memory/sessions/
+backups/
+uploads/
+config/mcp.json
+# Personal deployment config, not source. Ship config/profiles.example.yaml instead (dv-2f70).
+config/profiles.yaml
+
+# gg derived graph
+docs/planning/items/.graph.json
+# BPC: telegram-image attachments saved into working dirs
+tg_image_*
+
+# Archived/retired tooling and superseded docs (preserved on disk, out of git)
+.archive/
+
+# taskpump job reports — per-worktree scratch, never committed
+.pump/
+
+# Per-user uploads (dv-9ebe). devops' working_dir is this repo, so inbound
+# photos/documents land in users/<id>/uploads/ rather than the repo root.
+/users/
+MagicMock/
+deploy/rendered/
+
+# Personal machine state that happens to live in this working tree (dv-9ebe).
+# The repo root is the devops profile's working_dir, so shell rc files, agent
+# harness state and editor config land here. None of it is source; none of it
+# ships. `.deviz/` and `.archive/` are deliberately NOT here -- they are the
+# private repo's changelog and archive and stay tracked/on disk.
+/.bashrc
+/.bash_profile
+/.zshrc
+/.zprofile
+/.profile
+/.gitconfig
+/.ripgreprc
+/.codex/
+/.agents/
+/agents/
+/.gsd/
+/.bg-shell/
+/.claude/projects/
+/.claude/hooks/
+/.mcp.json
+/skills-lock.json
+/smoke-test-report.md
+.idea
+.vscode

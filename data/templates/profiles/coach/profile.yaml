@@ -1,0 +1,20 @@
+# Health & Training Coach.
+#
+# Not installed by default. Add it with:
+#   python3 scripts/install_profiles.py --add coach
+# then restart the bot (PROFILES_CONFIG_PATH is read once, at boot).
+#
+# The two memory keys below are the whole reason this profile is separate:
+# health facts stay strictly per-person and never join the family-shared scope,
+# no matter how the user phrases the request.
+- slug: "@SLUG@"
+  name: Health & Training Coach
+  working_dir: ${DEVVY_ROOT}/workspaces/@SLUG@
+  memory_dir: ${DEVVY_ROOT}/workspaces/@SLUG@/memory
+  persona: ${DEVVY_ROOT}/workspaces/@SLUG@/persona.md
+  permission_policy:
+    allowed_roles: [owner, guest]
+  family_memory: false      # never shared with the family scope
+  personal_memory: true     # explicit; matches the per-user default
+  user_data_tools: [logs, products, portions, export]
+  today_digest: true        # per-turn <today_state> block

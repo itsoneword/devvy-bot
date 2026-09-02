@@ -1,0 +1,26 @@
+# rendered by scripts/render_deploy.py; do not install this file directly
+#
+# Scoped passwordless commands for bot maintenance.
+# Lets the bot's /restart AND a non-interactive maintenance session run these
+# without a TTY/password. Kept deliberately tight: root *actions* only.
+#
+# The renderer validates the OUTPUT with `visudo -cf` before it is ever copied
+# into /etc/sudoers.d. Never install a hand-edited copy without doing the same:
+# a malformed file in /etc/sudoers.d can lock you out of the box entirely.
+#
+# Log READING is intentionally NOT granted here. Use group membership instead
+# (read-only, scoped, far safer than sudo cat/journalctl which read anything):
+#   sudo usermod -aG adm,systemd-journal @SERVICE_USER@
+#   sudo systemctl restart @SERVICE_NAME@
+# (a normal login shell picks up the groups on next login.)
+
+Cmnd_Alias DEVVY_BOT_CTL = \
+    @SYSTEMCTL@ start @SERVICE_NAME@, @SYSTEMCTL@ start @SERVICE_NAME@.service, \
+    @SYSTEMCTL@ stop @SERVICE_NAME@, @SYSTEMCTL@ stop @SERVICE_NAME@.service, \
+    @SYSTEMCTL@ restart @SERVICE_NAME@, @SYSTEMCTL@ restart @SERVICE_NAME@.service, \
+    @SYSTEMCTL@ status @SERVICE_NAME@, @SYSTEMCTL@ status @SERVICE_NAME@.service, \
+    @SYSTEMCTL@ is-active @SERVICE_NAME@, @SYSTEMCTL@ is-enabled @SERVICE_NAME@
+
+Cmnd_Alias DEVVY_SYSTEMD_RELOAD = @SYSTEMCTL@ daemon-reload
+
+@SERVICE_USER@ ALL=(root) NOPASSWD: DEVVY_BOT_CTL, DEVVY_SYSTEMD_RELOAD

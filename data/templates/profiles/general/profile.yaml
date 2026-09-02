@@ -1,0 +1,16 @@
+# General Assistant -- the everyday profile, and the one guests land in.
+#
+# Sandboxed (it inherits the global SANDBOX_ENABLED default of true), so the
+# guest-allowed permission_policy below is legal: the registry refuses at load
+# time any profile that allows guests and resolves to sandbox=false.
+#
+# Per-user by default: every user gets their own <working_dir>/users/<id> and
+# their own private memory scope. Do not add `shared: true` unless you mean one
+# common workspace for every owner-role user.
+- slug: "@SLUG@"
+  name: General Assistant
+  working_dir: ${DEVVY_ROOT}/workspaces/@SLUG@
+  memory_dir: ${DEVVY_ROOT}/workspaces/@SLUG@/memory
+  persona: ${DEVVY_ROOT}/workspaces/@SLUG@/persona.md
+  permission_policy:
+    allowed_roles: [owner, guest]

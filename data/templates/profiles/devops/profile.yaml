@@ -1,0 +1,24 @@
+# Server / DevOps -- the default profile.
+#
+# This is the one profile whose working_dir is the bot's own checkout, so it is
+# the only one that sees CLAUDE.md and can edit the bot's source. It is trusted
+# admin: sandbox is off and guests can never reach it.
+#
+# The slug placeholder is filled in by scripts/install_profiles.py (default:
+# the template directory name). ${DEVVY_ROOT} is resolved by the profile
+# registry at boot and defaults to the repo root, so nothing here is
+# machine-specific.
+- slug: "@SLUG@"
+  name: Server / DevOps
+  working_dir: ${DEVVY_ROOT}
+  memory_dir: ${DEVVY_ROOT}/data/memory
+  persona: ${DEVVY_ROOT}/data/agent.md
+  # devops reuses the single-profile agent persona rather than getting a second,
+  # drifting copy -- so it names its template explicitly instead of relying on
+  # the <templates>/profiles/<slug>/persona.md convention. This template
+  # directory therefore has no persona.md of its own; that is deliberate.
+  persona_template: ${DEVVY_ROOT}/data/templates/agent.md
+  default: true
+  sandbox: false            # trusted admin: full bash network + cross-FS access
+  shared: true              # working_dir is a repo checkout; never split per-user
+  max_turns: 100            # multi-file work exceeds the global CLAUDE_MAX_TURNS
