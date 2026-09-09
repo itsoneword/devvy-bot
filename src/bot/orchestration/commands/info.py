@@ -8,10 +8,12 @@ import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from ....agent_backends.protocol import BackendSession
 from ....profiles.registry import family_agent_id_for_agent, guest_agent_id
 from ....projects import PrivateTopicsUnavailableError
 from ...utils.html_format import escape_html
-from ..base import OrchestratorBase
+from ..agents_menu import build_agents_picker
+from ..base import OrchestratorBase, policy_for
 from ..formatting import format_diag, format_sessions_summary, format_usage_table
 from ..windowing import apply_window_tokens, reset_window, window_conversation_text
 
@@ -62,9 +64,10 @@ class InfoCommandsMixin(OrchestratorBase):
                     return
                 except Exception:
                     sync_line = "\n\n🧵 Topic sync failed. Run /sync_threads to retry."
-        current_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory or Path.home()
-        )
+        # Routed like text turns (dv-c07a): the greeting must name the
+        # workspace the next message will actually run in. Reading
+        # current_directory showed the home-dir fallback on a cold process.
+        current_dir = self._routed_working_dir(context, user.id if user else None)
         dir_display = f"<code>{current_dir}/</code>"
 
         safe_name = escape_html(user.first_name)
@@ -142,6 +145,11 @@ class InfoCommandsMixin(OrchestratorBase):
                 cost_usage = user_status.get("cost_usage", {})
                 current_cost = cost_usage.get("current", 0.0)
                 cost_str = f" · Cost: ${current_cost:.2f}"
+                # Unpriced-backend tokens (dv-0722): a Codex day is not $0.
+                token_usage = user_status.get("token_usage") or {}
+                used_tokens = int(token_usage.get("current", 0) or 0)
+                if used_tokens:
+                    cost_str += f" + {used_tokens:,} tok"
             except Exception:
                 pass
 
@@ -225,6 +233,23 @@ class InfoCommandsMixin(OrchestratorBase):
                         f" / ${cap:.2f}"
                         f" — ${max(0.0, cap - cost['current']):.2f} left"
                     )
+                # Unpriced backends (Codex on a subscription, dv-0722) are
+                # budgeted in tokens; without this line a day on Codex reads
+                # as $0.00, i.e. free. Shown whenever any were spent or a cap
+                # is enforced, so a capped guest sees their allowance early.
+                tokens = status.get("token_usage") or {}
+                used_tokens = int(tokens.get("current", 0) or 0)
+                token_cap = rate_limiter.effective_daily_token_cap(user_id, role)
+                if token_cap is None:
+                    if used_tokens:
+                        lines.append(
+                            f"Unmetered tokens (24h): {used_tokens:,} (no cap)"
+                        )
+                else:
+                    lines.append(
+                        f"Unmetered tokens (24h): {used_tokens:,} / {token_cap:,}"
+                        f" — {max(0, token_cap - used_tokens):,} left"
+                    )
             except Exception as e:
                 logger.warning("usage: rate limiter status unavailable", error=str(e))
 
@@ -234,7 +259,9 @@ class InfoCommandsMixin(OrchestratorBase):
             None if role == "owner" else self.settings.claude_max_cost_per_request
         )
         registry = context.bot_data.get("profile_registry")
-        current_dir = context.user_data.get("current_directory")
+        # Routed, not current_directory (dv-c07a): unset on a cold process,
+        # which silently reported "no per-request cap" for a capped profile.
+        current_dir = self._routed_working_dir(context, user_id) if registry else None
         if registry and current_dir:
             profile = registry.get_by_working_dir(Path(str(current_dir)))
             if profile is not None and profile.max_cost_per_request is not None:
@@ -311,6 +338,32 @@ class InfoCommandsMixin(OrchestratorBase):
             parse_mode="HTML",
         )
 
+    async def _codex_model_rows(self) -> List[List[InlineKeyboardButton]]:
+        """Keyboard rows for the Codex backend, built from the live catalog.
+
+        `codex debug models` is the source of truth (dv-0c01): the entitled
+        set is a property of the subscription and the vendor renames slugs,
+        so the previous two hardcoded buttons drifted into offering models the
+        CLI would reject. Cached per process with a TTL and invalidated on a
+        successful `/auth` Codex login; a failed read falls back to the two
+        historical constants rather than rendering an empty section.
+        """
+        from ....agent_backends.codex_catalog import CODEX_CATALOG
+
+        models = await CODEX_CATALOG.get()
+        rows: List[List[InlineKeyboardButton]] = []
+        for i in range(0, len(models), 2):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"Codex {m.display_name}",
+                        callback_data=f"model:codex:{m.slug}",
+                    )
+                    for m in models[i : i + 2]
+                ]
+            )
+        return rows
+
     async def agentic_model(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -322,36 +375,26 @@ class InfoCommandsMixin(OrchestratorBase):
             if (Path.home() / ".codex" / "auth.json").exists()
             else "not authenticated"
         )
-        keyboard = InlineKeyboardMarkup(
+        rows = [
             [
-                [
-                    InlineKeyboardButton(
-                        "Claude Sonnet", callback_data="model:claude:sonnet"
-                    ),
-                    InlineKeyboardButton(
-                        "Claude Opus", callback_data="model:claude:opus"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Codex gpt-5.5",
-                        callback_data="model:codex:gpt-5.5",
-                    ),
-                    InlineKeyboardButton(
-                        "Codex gpt-5.4-mini",
-                        callback_data="model:codex:gpt-5.4-mini",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Login OpenAI Codex", callback_data="model:codex_login"
-                    ),
-                    InlineKeyboardButton(
-                        "Logout Codex", callback_data="model:codex_logout"
-                    ),
-                ],
+                InlineKeyboardButton(
+                    "Claude Sonnet", callback_data="model:claude:sonnet"
+                ),
+                InlineKeyboardButton("Claude Opus", callback_data="model:claude:opus"),
+            ]
+        ]
+        rows += await self._codex_model_rows()
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Login OpenAI Codex", callback_data="model:codex_login"
+                ),
+                InlineKeyboardButton(
+                    "Logout Codex", callback_data="model:codex_logout"
+                ),
             ]
         )
+        keyboard = InlineKeyboardMarkup(rows)
         await update.message.reply_text(
             "<b>Model backend</b>\n\n"
             f"Current: <code>{escape_html(backend)}</code> "
@@ -440,20 +483,21 @@ class InfoCommandsMixin(OrchestratorBase):
         # Session token tracking. Read from the conversation window, which is
         # the number the thresholds actually gate on — ClaudeSession's own
         # cumulative counter sums uncached input only and reads ~2.5x low on a
-        # cache-hitting deployment (dv-9f31).
-        claude_integration = context.bot_data.get("claude_integration")
-        session = None
-        if claude_integration and claude_integration.session_manager:
-            session_id = context.user_data.get("claude_session_id")
-            if session_id:
-                session = claude_integration.session_manager.active_sessions.get(
-                    session_id
-                )
-
+        # cache-hitting deployment (dv-9f31). The evaluator lookup below keys
+        # on the selected backend's session id straight from user_data
+        # (dv-5368): no reach into a backend's session manager, so a
+        # Codex-only deployment answers the same way.
+        session_id = context.user_data.get(
+            self._session_key(self._selected_backend(context))
+        )
         window_repo = context.bot_data.get("window_repo")
+        # The window the conversation actually accounts against (dv-c07a):
+        # profile.working_dir is the profile ROOT, but personal_memory profiles
+        # run in <root>/users/<id>, so reading the root here reported the wrong
+        # window and get_or_create() minted a phantom row for it.
         window_dir = (
-            profile.working_dir
-            if profile
+            self._routed_working_dir(context, user_id)
+            if registry
             else context.user_data.get("current_directory")
         )
         w_state = None
@@ -477,9 +521,9 @@ class InfoCommandsMixin(OrchestratorBase):
 
         # Evaluator status via token_tracker
         token_tracker = context.bot_data.get("token_tracker")
-        if token_tracker is not None and session:
+        if token_tracker is not None and session_id:
             try:
-                extraction = await token_tracker.get_last_extraction(session.session_id)
+                extraction = await token_tracker.get_last_extraction(session_id)
                 if extraction and extraction.timestamp:
                     lines.append(f"Last evaluator: {extraction.timestamp}")
                 else:
@@ -500,22 +544,9 @@ class InfoCommandsMixin(OrchestratorBase):
             await update.message.reply_text("Profiles are not configured.")
             return
         active = context.user_data.get("active_profile") or registry.get_default().slug
-        rows = []
-        for p in registry.profiles:
-            mark = "✅ " if p.slug == active else ""
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        f"{mark}{p.name} ({p.slug})",
-                        callback_data=f"agent:{p.slug}",
-                    )
-                ]
-            )
-        await update.message.reply_text(
-            f"<b>Active agent:</b> <code>{escape_html(active)}</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
+        role = self._resolve_role(update.effective_user.id, context)
+        text, markup = build_agents_picker(registry, active=active, role=role)
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
     async def agentic_tasks(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -627,37 +658,37 @@ class InfoCommandsMixin(OrchestratorBase):
         if not registry:
             await update.message.reply_text("Profiles are not configured.")
             return
-        claude_integration = context.bot_data.get("claude_integration")
-        manager = claude_integration.session_manager if claude_integration else None
         user_id = update.effective_user.id
-        sessions = await manager._get_user_sessions(user_id) if manager else []
-        last_by_dir: Dict[Path, Optional[Dict[str, Any]]] = {}
-        for p in registry.profiles:
-            match = [s for s in sessions if Path(str(s.project_path)) == p.working_dir]
-            if match:
-                newest = max(match, key=lambda s: s.last_used)
-                last_by_dir[p.working_dir] = {
-                    "cumulative_tokens": newest.cumulative_tokens,
-                    "updated_at": newest.last_used.isoformat(),
-                }
-            else:
-                last_by_dir[p.working_dir] = None
-
-        codex_integration = context.bot_data.get("codex_integration")
-        codex_sessions = (
-            codex_integration.store.sessions_for_user(user_id)
-            if codex_integration and hasattr(codex_integration, "store")
-            else []
-        )
-        codex_by_dir = {Path(s["working_dir"]): s for s in codex_sessions}
-        for p in registry.profiles:
-            cx = codex_by_dir.get(p.working_dir)
-            if cx and last_by_dir.get(p.working_dir) is None:
-                last_by_dir[p.working_dir] = {
-                    "cumulative_tokens": cx.get("cumulative_tokens", 0),
-                    "updated_at": cx.get("updated_at", "?"),
-                    "backend": "codex",
-                }
+        last_by_dir: Dict[Path, Optional[Dict[str, Any]]] = {
+            p.working_dir: None for p in registry.profiles
+        }
+        # Registry order decides who reports a directory (dv-5368): the first
+        # backend with a session there wins, later ones only fill gaps. With
+        # the default wiring that is Claude first, Codex as overlay — the
+        # same precedence as the pre-registry code.
+        for backend in self._backends(context).values():
+            try:
+                sessions = await backend.sessions_for_user(user_id)
+            except Exception:
+                logger.warning(
+                    "sessions_backend_lookup_failed",
+                    backend=getattr(backend, "backend_id", "?"),
+                    exc_info=True,
+                )
+                continue
+            newest_by_dir: Dict[Path, BackendSession] = {}
+            for s in sessions:
+                cur = newest_by_dir.get(s.working_dir)
+                if cur is None or s.last_used > cur.last_used:
+                    newest_by_dir[s.working_dir] = s
+            for p in registry.profiles:
+                newest = newest_by_dir.get(p.working_dir)
+                if newest is not None and last_by_dir.get(p.working_dir) is None:
+                    last_by_dir[p.working_dir] = {
+                        "cumulative_tokens": newest.cumulative_tokens,
+                        "updated_at": newest.last_used.isoformat(),
+                        "backend": policy_for(newest.backend_id).label,
+                    }
 
         # Overlay authoritative token counts from conversation_windows: session
         # records stay at 0 for Claude sessions; WindowRepository holds the
@@ -792,16 +823,10 @@ class InfoCommandsMixin(OrchestratorBase):
 
             context.user_data["current_directory"] = target_path
 
-            # Try to find a resumable session
-            claude_integration = context.bot_data.get("claude_integration")
-            session_id = None
-            if claude_integration:
-                existing = await claude_integration._find_resumable_session(
-                    update.effective_user.id, target_path
-                )
-                if existing:
-                    session_id = existing.session_id
-            context.user_data["claude_session_id"] = session_id
+            # Try to find a resumable session on every registered backend
+            session_id = await self._refresh_resumable_sessions(
+                context, update.effective_user.id, target_path
+            )
 
             is_git = (target_path / ".git").is_dir()
             git_badge = " (git)" if is_git else ""

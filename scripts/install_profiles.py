@@ -32,6 +32,10 @@ from typing import List, Optional, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = REPO_ROOT / "data" / "templates" / "profiles"
+# Owner-created templates (new-agent interview, dv-0e1e). Same layout, kept
+# apart from the shipped set because they carry this machine's paths: the
+# public export never includes them and the template tests never scan them.
+LOCAL_TEMPLATES_DIR = REPO_ROOT / "data" / "templates" / "local"
 DEFAULT_CONFIG = REPO_ROOT / "config" / "profiles.yaml"
 
 # The two that ship active (dv-1a55 D4). Everything else is a template only.
@@ -79,11 +83,33 @@ def available_templates(templates_dir: Path = TEMPLATES_DIR) -> List[str]:
 
 
 def read_template(name: str, templates_dir: Path = TEMPLATES_DIR) -> str:
-    path = templates_dir / name / "profile.yaml"
-    if not path.is_file():
-        known = ", ".join(available_templates(templates_dir)) or "none"
-        raise TemplateError(f"no such profile template: {name!r} (have: {known})")
-    return path.read_text(encoding="utf-8")
+    """The fragment for ``name``: a local template shadows a shipped one."""
+    for root in _template_roots(templates_dir):
+        path = root / name / "profile.yaml"
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+    known = (
+        ", ".join(
+            sorted(
+                {
+                    n
+                    for r in _template_roots(templates_dir)
+                    for n in available_templates(r)
+                }
+            )
+        )
+        or "none"
+    )
+    raise TemplateError(f"no such profile template: {name!r} (have: {known})")
+
+
+def _template_roots(templates_dir: Path) -> List[Path]:
+    """Local first, then the given (shipped) root. Only the default shipped
+    root gets the local sibling: an explicit ``--templates`` means exactly
+    that directory."""
+    if templates_dir == TEMPLATES_DIR:
+        return [LOCAL_TEMPLATES_DIR, templates_dir]
+    return [templates_dir]
 
 
 # --- rendering ----------------------------------------------------------
@@ -124,6 +150,14 @@ def assert_installable(fragment: str, slug: str) -> None:
             f"profile {slug!r} would allow guests with sandbox: false -- full"
             " bash network and cross-filesystem access for a guest. The"
             " registry refuses this at boot; refusing to write it now."
+        )
+    # Same shape for extra_dirs (dv-3103): extra write roots are an owner-only
+    # grant, and the registry refuses them on a guest-allowed profile.
+    if guest_allowed and re.search(r"^\s*extra_dirs:", fragment, re.MULTILINE):
+        raise TemplateError(
+            f"profile {slug!r} would allow guests AND grant extra_dirs -- a"
+            " write path into the owner's files for every guest. The registry"
+            " refuses this at boot; refusing to write it now."
         )
 
 
@@ -186,7 +220,17 @@ def _print_list(config_path: Path, templates_dir: Path) -> int:
         state = "installed" if name in existing else "template only"
         default = " (installed by default)" if name in DEFAULT_PROFILES else ""
         print(f"  {name:<{width}}  {state}{default}")
-    extra = [s for s in existing if s not in names]
+    local = (
+        available_templates(LOCAL_TEMPLATES_DIR)
+        if templates_dir == TEMPLATES_DIR
+        else []
+    )
+    if local:
+        print(f"\nLocal templates ({LOCAL_TEMPLATES_DIR}):")
+        for name in local:
+            state = "installed" if name in existing else "template only"
+            print(f"  {name:<{width}}  {state}")
+    extra = [s for s in existing if s not in names and s not in local]
     if extra:
         print("\n  In the config but not from a template: " + ", ".join(extra))
     return 0

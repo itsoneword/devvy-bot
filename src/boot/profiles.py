@@ -13,10 +13,13 @@ Template lookup per profile, in order:
 
 1. the profile's explicit ``persona_template:`` (already resolved by the
    registry through the same ``${VAR}``/relative rules as every other path);
-2. ``<templates_dir>/profiles/<slug>/persona.md`` -- the profile-template
-   layout (dv-4e29), where the persona sits next to the ``profile.yaml``
-   fragment the installer instantiated the profile from;
-3. ``<templates_dir>/personas/<slug>.md`` -- the older flat layout, still
+2. ``<templates_dir>/local/<slug>/persona.md`` -- profiles the owner created
+   through the new-agent interview (dv-0e1e). Same layout as 3, kept apart
+   because these carry personal paths and never ship;
+3. ``<templates_dir>/profiles/<slug>/persona.md`` -- the shipped
+   profile-template layout (dv-4e29), where the persona sits next to the
+   ``profile.yaml`` fragment the installer instantiated the profile from;
+4. ``<templates_dir>/personas/<slug>.md`` -- the older flat layout, still
    honoured so an existing checkout that carries one keeps working.
 
 A profile with neither a persona nor a template is *not* an error here -- it is
@@ -37,11 +40,13 @@ logger = structlog.get_logger()
 
 PERSONAS_SUBDIR = "personas"
 PROFILES_SUBDIR = "profiles"
+LOCAL_SUBDIR = "local"
 
 
 def _persona_candidates(slug: str, templates_dir: Path) -> list[Path]:
     """Conventional persona-template paths for ``slug``, best first."""
     return [
+        templates_dir / LOCAL_SUBDIR / slug / "persona.md",
         templates_dir / PROFILES_SUBDIR / slug / "persona.md",
         templates_dir / PERSONAS_SUBDIR / f"{slug}.md",
     ]
@@ -134,7 +139,8 @@ async def bootstrap_profiles(
             # Left for validate_registry_paths to report -- see module docstring.
             logger.warning(
                 "No persona template for profile; expected one of"
-                " persona_template:, <templates>/profiles/<slug>/persona.md"
+                " persona_template:, <templates>/local/<slug>/persona.md,"
+                " <templates>/profiles/<slug>/persona.md"
                 " or <templates>/personas/<slug>.md",
                 profile=profile.slug,
                 persona=str(profile.persona),

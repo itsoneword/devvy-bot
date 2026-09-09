@@ -27,7 +27,8 @@ class WatchdogAlert:
     """One hourly threshold crossed for one user (dv-8bb5)."""
 
     user_id: int
-    metric: str  # "cost_per_hour" | "messages_per_hour" | "turns_per_hour"
+    # "cost_per_hour" | "messages_per_hour" | "turns_per_hour" | "tokens_per_hour"
+    metric: str
     value: float
     threshold: float
 
@@ -84,6 +85,13 @@ class RateLimiter:
         self.request_buckets: Dict[int, RateLimitBucket] = {}
         self.cost_tracker: Dict[int, float] = defaultdict(float)
         self.cost_reset_time: Dict[int, datetime] = {}
+        # Unmetered-backend ledger (dv-0722): tokens spent on turns that
+        # carry no USD price (ClaudeResponse.cost is None -- Codex on a
+        # ChatGPT subscription). Same daily window and reset anchor as
+        # cost_tracker; a user is blocked when EITHER ledger is exhausted.
+        # NOT seeded from SQLite at startup (nothing persists these tokens
+        # per day yet), so a restart zeroes it.
+        self.token_tracker: Dict[int, int] = defaultdict(int)
         self.locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # Session watchdog (dv-8bb5): a second, independent hourly window per
@@ -95,6 +103,7 @@ class RateLimiter:
         self.watchdog_hour_cost: Dict[int, float] = defaultdict(float)
         self.watchdog_hour_messages: Dict[int, int] = defaultdict(int)
         self.watchdog_hour_turns: Dict[int, int] = defaultdict(int)
+        self.watchdog_hour_tokens: Dict[int, int] = defaultdict(int)
         self.watchdog_hour_reset_time: Dict[int, datetime] = {}
         # Metrics already alerted on in the current window, so a sustained
         # overage fires once per metric per hour instead of on every turn.
@@ -197,6 +206,30 @@ class RateLimiter:
             return None
         return self._cost_cap_for(role, user_id)
 
+    def _token_cap_for(self, role: str) -> int:
+        """Daily unmetered-token cap for the role tier (dv-0722)."""
+        if role == "guest":
+            return int(self.config.unmetered_max_tokens_per_user_guest)
+        return int(self.config.unmetered_max_tokens_per_user)
+
+    def _budget_exempt(self, user_id: int, role: str) -> bool:
+        """Owners are uncapped unless a per-user USD override names them.
+
+        One rule for both ledgers: an override is the operator saying "this
+        person is budgeted", so it also switches on the token cap for them.
+        """
+        overrides = getattr(self.config, "claude_cost_limit_overrides", {}) or {}
+        return role == "owner" and user_id not in overrides
+
+    def effective_daily_token_cap(self, user_id: int, role: str) -> Optional[int]:
+        """The unmetered-token cap enforced for this user, or None if uncapped.
+
+        Mirrors ``effective_daily_cap`` so /usage and the gate agree.
+        """
+        if self._budget_exempt(user_id, role):
+            return None
+        return self._token_cap_for(role)
+
     def _check_cost_limit(
         self, user_id: int, cost: float, role: str = "owner"
     ) -> Tuple[bool, Optional[str]]:
@@ -226,9 +259,7 @@ class RateLimiter:
         # CLAUDE_COST_LIMIT_OVERRIDES exists (e.g. primary owner $100/day,
         # spouse $50/day). Short-circuiting on role first silently voided
         # every override set on an owner.
-        overrides = getattr(self.config, "claude_cost_limit_overrides", {}) or {}
-        has_override = user_id in overrides
-        if role == "owner" and not has_override:
+        if self._budget_exempt(user_id, role):
             return True, None
 
         cap = self._cost_cap_for(role, user_id)
@@ -239,6 +270,20 @@ class RateLimiter:
                 f"Cost limit exceeded. Remaining budget: ${remaining:.2f}. "
                 f"Current usage: ${current_cost:.2f}/"
                 f"${cap:.2f}"
+            )
+            return False, message
+
+        # Unmetered ledger (dv-0722). There is no pre-turn token estimate
+        # worth having (the USD one is a ~$0.001 placeholder anyway), so the
+        # gate is "already exhausted", trued up after each turn by
+        # record_tokens. Checked regardless of which backend the coming turn
+        # will use: the budget is per person, not per backend.
+        token_cap = self._token_cap_for(role)
+        used_tokens = self.token_tracker[user_id]
+        if used_tokens >= token_cap:
+            message = (
+                "Token budget exceeded (unmetered backend). "
+                f"Current usage: {used_tokens:,}/{token_cap:,} tokens"
             )
             return False, message
 
@@ -282,14 +327,17 @@ class RateLimiter:
         reset_interval = timedelta(hours=24)
         if now - last_reset >= reset_interval:
             old_cost = self.cost_tracker[user_id]
+            old_tokens = self.token_tracker[user_id]
             self.cost_tracker[user_id] = 0
+            self.token_tracker[user_id] = 0
             self.cost_reset_time[user_id] = now
 
-            if old_cost > 0:
+            if old_cost > 0 or old_tokens > 0:
                 logger.info(
                     "Cost tracker reset",
                     user_id=user_id,
                     old_cost=old_cost,
+                    old_tokens=old_tokens,
                     reset_time=now.isoformat(),
                 )
 
@@ -307,8 +355,27 @@ class RateLimiter:
             self._maybe_reset_cost_tracker(user_id)
             self._track_cost(user_id, cost)
 
+    async def record_tokens(self, user_id: int, tokens: int) -> None:
+        """Record a turn that has NO USD price (dv-0722).
+
+        The unmetered counterpart of ``record_cost``: call it with
+        ``input_tokens + output_tokens`` when ``ClaudeResponse.cost`` is
+        None. Shares the daily window with the USD ledger.
+        """
+        if tokens <= 0:
+            return
+        async with self.locks[user_id]:
+            self._maybe_reset_cost_tracker(user_id)
+            self.token_tracker[user_id] += int(tokens)
+            logger.debug(
+                "Unmetered tokens tracked",
+                user_id=user_id,
+                tokens=tokens,
+                total_tokens=self.token_tracker[user_id],
+            )
+
     def record_watchdog_turn(
-        self, user_id: int, cost: float, turns: int
+        self, user_id: int, cost: Optional[float], turns: int, tokens: int = 0
     ) -> List[WatchdogAlert]:
         """Track one completed turn against the hourly watchdog thresholds.
 
@@ -316,9 +383,16 @@ class RateLimiter:
         thresholds (if any) were newly crossed this window so the caller can
         alert the admin. Call once per completed turn with the REAL cost
         (post-turn, same as ``record_cost``) and ``ClaudeResponse.num_turns``.
+        A turn with no USD price (``cost is None``, dv-0722) contributes its
+        ``tokens`` to the ``tokens_per_hour`` metric instead of
+        ``cost_per_hour``; a priced turn's tokens are ignored here because
+        its dollars already cover it.
         """
         self._maybe_reset_watchdog_window(user_id)
-        self.watchdog_hour_cost[user_id] += max(cost, 0.0)
+        if cost is None:
+            self.watchdog_hour_tokens[user_id] += max(int(tokens), 0)
+        else:
+            self.watchdog_hour_cost[user_id] += max(cost, 0.0)
         self.watchdog_hour_messages[user_id] += 1
         self.watchdog_hour_turns[user_id] += max(turns, 0)
 
@@ -327,6 +401,11 @@ class RateLimiter:
                 "cost_per_hour",
                 self.watchdog_hour_cost[user_id],
                 self.config.watchdog_max_cost_per_hour,
+            ),
+            (
+                "tokens_per_hour",
+                float(self.watchdog_hour_tokens[user_id]),
+                float(self.config.watchdog_max_tokens_per_hour),
             ),
             (
                 "messages_per_hour",
@@ -369,6 +448,7 @@ class RateLimiter:
             self.watchdog_hour_cost[user_id] = 0.0
             self.watchdog_hour_messages[user_id] = 0
             self.watchdog_hour_turns[user_id] = 0
+            self.watchdog_hour_tokens[user_id] = 0
             self.watchdog_hour_reset_time[user_id] = now
             self._watchdog_alerted[user_id] = set()
 
@@ -393,9 +473,10 @@ class RateLimiter:
     async def reset_user_limits(self, user_id: int) -> None:
         """Reset all limits for a user (admin function)."""
         async with self.locks[user_id]:
-            # Reset cost tracking
+            # Reset cost tracking (both ledgers)
             old_cost = self.cost_tracker[user_id]
             self.cost_tracker[user_id] = 0
+            self.token_tracker[user_id] = 0
             self.cost_reset_time[user_id] = datetime.now(UTC)
 
             # Reset request bucket
@@ -418,6 +499,8 @@ class RateLimiter:
         cap = self._cost_cap_for(role, user_id)
         current_cost = self.cost_tracker[user_id]
         cost_remaining = max(0, cap - current_cost)
+        token_cap = self._token_cap_for(role)
+        current_tokens = self.token_tracker[user_id]
 
         return {
             "request_bucket": bucket_status,
@@ -426,6 +509,13 @@ class RateLimiter:
                 "limit": cap,
                 "remaining": cost_remaining,
                 "utilization": current_cost / cap,
+            },
+            # Unmetered-backend tokens in the same daily window (dv-0722).
+            "token_usage": {
+                "current": current_tokens,
+                "limit": token_cap,
+                "remaining": max(0, token_cap - current_tokens),
+                "utilization": (current_tokens / token_cap) if token_cap else 0.0,
             },
             "last_reset": self.cost_reset_time.get(
                 user_id, datetime.now(UTC)

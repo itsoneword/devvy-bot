@@ -31,9 +31,12 @@ from src.utils.constants import (
     DEFAULT_RATE_LIMIT_WINDOW,
     DEFAULT_SESSION_TIMEOUT_HOURS,
     DEFAULT_SOUL_MD_PATH,
+    DEFAULT_UNMETERED_MAX_TOKENS_PER_USER,
+    DEFAULT_UNMETERED_MAX_TOKENS_PER_USER_GUEST,
     DEFAULT_USER_DATABASE_URL,
     DEFAULT_WATCHDOG_MAX_COST_PER_HOUR,
     DEFAULT_WATCHDOG_MAX_MESSAGES_PER_HOUR,
+    DEFAULT_WATCHDOG_MAX_TOKENS_PER_HOUR,
     DEFAULT_WATCHDOG_MAX_TURNS_PER_HOUR,
 )
 
@@ -160,6 +163,27 @@ class Settings(BaseSettings):
         description="Alert admin if a user's summed SDK turns in a rolling hour exceed this",
     )
 
+    # Unmetered-backend token budget (dv-0722). A Codex turn on a ChatGPT
+    # subscription reports no USD price (ClaudeResponse.cost is None), so
+    # the daily budget and the watchdog count its tokens instead. Same role
+    # tiers, owner exemption and per-user-override precedence as the USD
+    # caps above; a user is refused when EITHER ledger is exhausted.
+    unmetered_max_tokens_per_user: int = Field(
+        DEFAULT_UNMETERED_MAX_TOKENS_PER_USER,
+        description="Max daily tokens on unmetered (no-USD-price) backends per user",
+    )
+    unmetered_max_tokens_per_user_guest: int = Field(
+        DEFAULT_UNMETERED_MAX_TOKENS_PER_USER_GUEST,
+        description="Max daily tokens on unmetered backends for guest-role users",
+    )
+    watchdog_max_tokens_per_hour: int = Field(
+        DEFAULT_WATCHDOG_MAX_TOKENS_PER_HOUR,
+        description=(
+            "Alert admin if a user's unmetered-backend tokens in a rolling hour "
+            "exceed this"
+        ),
+    )
+
     # Agent backend selection. ``claude`` preserves the current Claude Code path;
     # ``openai_codex`` uses the local ChatGPT/Codex device-code auth backend.
     agent_backend: Literal["claude", "openai_codex"] = Field(
@@ -170,6 +194,33 @@ class Settings(BaseSettings):
     )
     agent_timeout_seconds: int = Field(
         600, description="Timeout for non-Claude agent backend requests", ge=10
+    )
+    # Agent-tools bridge (dv-ffcb). A subprocess backend (Codex) cannot reach
+    # the in-process SDK MCP server, so the same tools are served over
+    # loopback HTTP with a per-turn bearer token. The bind address is NOT
+    # configurable: it is always 127.0.0.1.
+    enable_agent_bridge: bool = Field(
+        True,
+        description=(
+            "Serve the agent tools (memory, user data) to subprocess backends "
+            "over a loopback HTTP MCP endpoint. Off = a Codex turn has no bot "
+            "tools at all."
+        ),
+    )
+    agent_bridge_port: int = Field(
+        8770,
+        description="Loopback port for the agent-tools MCP bridge",
+        ge=1,
+        le=65535,
+    )
+    agent_bridge_token_ttl_seconds: int = Field(
+        1800,
+        description=(
+            "Backstop expiry for a per-turn agent-bridge token. Tokens are "
+            "normally revoked when the turn returns; this only bounds one "
+            "that never did. Keep above AGENT_TIMEOUT_SECONDS."
+        ),
+        ge=60,
     )
     # Memory evaluator (fact extraction). A setting rather than a literal so
     # the model can move without a deploy. The Codex path picks its own model

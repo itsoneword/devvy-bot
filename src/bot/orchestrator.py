@@ -214,7 +214,7 @@ class MessageOrchestrator(
         # the live registry, never the table. /help reads the same source.
         registry = self.deps.get("profile_registry")
         if registry:
-            for profile in registry.profiles:
+            for profile in registry.enabled_profiles:
                 app.add_handler(
                     CommandHandler(
                         profile.slug,
@@ -267,7 +267,7 @@ class MessageOrchestrator(
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
-                pattern=r"^(cd:|model:|agent:|auth:)",
+                pattern=r"^(cd:|model:|agent:|agents:|auth:)",
             )
         )
 
@@ -345,7 +345,7 @@ class MessageOrchestrator(
             "profile_registry"
         )
         if registry:
-            switches = [p for p in registry.profiles if p.allows_role(role)]
+            switches = [p for p in registry.enabled_profiles if p.allows_role(role)]
             if switches:
                 active = context.user_data.get("active_profile")
                 lines.append("")
@@ -366,7 +366,7 @@ class MessageOrchestrator(
 
         async def _switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             registry = context.bot_data.get("profile_registry")
-            profile = registry.get_by_slug(slug) if registry else None
+            profile = registry.get_enabled_by_slug(slug) if registry else None
             if not profile:
                 await update.message.reply_text(f"Unknown profile: {slug}")
                 return

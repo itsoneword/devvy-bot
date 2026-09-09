@@ -24,6 +24,16 @@ DEFAULT_WATCHDOG_MAX_COST_PER_HOUR = 20.0
 DEFAULT_WATCHDOG_MAX_MESSAGES_PER_HOUR = 60
 DEFAULT_WATCHDOG_MAX_TURNS_PER_HOUR = 100
 
+# Unmetered backends (dv-0722): a Codex turn on a ChatGPT subscription has no
+# knowable USD price, so those turns are budgeted in tokens. The defaults are
+# the USD caps above converted at a blended ~$4/Mtok (mostly-input turn at
+# Sonnet-class rates), so a user on Codex gets roughly the same allowance as
+# the same user on Claude. Per-turn input is the full context re-sent, so a
+# 100k-context conversation burns ~100k per turn.
+DEFAULT_UNMETERED_MAX_TOKENS_PER_USER = 2_500_000
+DEFAULT_UNMETERED_MAX_TOKENS_PER_USER_GUEST = 500_000
+DEFAULT_WATCHDOG_MAX_TOKENS_PER_HOUR = 5_000_000
+
 DEFAULT_SESSION_TIMEOUT_HOURS = 24
 DEFAULT_MAX_SESSIONS_PER_USER = 5
 

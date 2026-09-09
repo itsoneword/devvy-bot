@@ -38,9 +38,9 @@ def _context_tokens_of(response: Any) -> Optional[int]:
 
     Returning None on an all-zero response matters: a failed/aborted turn
     reports no usage, and writing 0 as the level would make the window look
-    empty and silently reset the rotation clock. Codex has no prompt cache, so
-    its ``context_tokens`` degrades to ``input_tokens`` — which for an
-    uncached backend is the real context anyway.
+    empty and silently reset the rotation clock. Both backends report a real
+    level (Claude from per-call usage, Codex from its rollout file); when one
+    cannot this turn, None tells the repository to hold the last value.
     """
     tokens = getattr(response, "context_tokens", None)
     if tokens is None:

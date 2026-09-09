@@ -134,6 +134,12 @@ sudo systemctl restart claude-bot                   # profiles load at boot
 Each arrives already isolated and already prompted. See
 [`data/templates/profiles/README.md`](data/templates/profiles/README.md) to write your own.
 
+Or do it from Telegram: `/agents → ➕ New agent` hands you to `devops`, which
+interviews you (purpose, who may use it, which folders outside its workspace it
+may write to) and creates the profile. `/agents → ⚙ Manage` turns profiles on
+and off without deleting anything. A profile that needs to write to a notes
+vault or another checkout gets `extra_dirs:` — the sandbox stays on.
+
 ## Beyond chat
 
 Optional and off by default:

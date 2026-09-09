@@ -75,14 +75,29 @@ async def test_thresholds_are_configurable(repo):
 
 
 async def test_context_tokens_none_falls_back_to_flow_sum(repo):
-    """Codex reports no cache split; the level must still advance rather than
-    freezing at 0 and disabling rotation entirely for that backend."""
+    """A backend that can never measure a level (none shipped today) gets
+    the flow sum, so rotation still eventually fires for it."""
     await repo.get_or_create(7, "/p")
-    st = await repo.record_turn(7, "/p", backend="openai_codex", added_tokens=80_000)
+    st = await repo.record_turn(7, "/p", backend="other", added_tokens=80_000)
     assert st.last_context_tokens == 80_000
-    st = await repo.record_turn(7, "/p", backend="openai_codex", added_tokens=130_000)
+    st = await repo.record_turn(7, "/p", backend="other", added_tokens=130_000)
     assert st.last_context_tokens == 210_000
     assert repo.should_refresh(st) is True
+
+
+async def test_codex_holds_the_level_when_a_turn_cannot_measure_it(repo):
+    """Codex reports a level from its rollout file (2026-09-05). A turn whose
+    rollout could not be read must NOT fall back to the flow sum: that sum is
+    the thread's cumulative prompt total and is exactly what rolled the
+    window on every turn."""
+    await repo.get_or_create(7, "/p")
+    st = await repo.record_turn(
+        7, "/p", backend="openai_codex", added_tokens=170_000, context_tokens=36_000
+    )
+    assert st.last_context_tokens == 36_000
+    st = await repo.record_turn(7, "/p", backend="openai_codex", added_tokens=180_000)
+    assert st.last_context_tokens == 36_000
+    assert repo.should_refresh(st) is False
 
 
 async def test_mark_evaluator_run_advances_checkpoint(repo):

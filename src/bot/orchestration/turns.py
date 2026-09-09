@@ -51,7 +51,7 @@ from .windowing import (
 )
 
 if TYPE_CHECKING:
-    from ...claude.sdk_integration import StreamUpdate
+    from ...claude.sdk_integration import ClaudeResponse, StreamUpdate
 
 logger = structlog.get_logger()
 
@@ -127,6 +127,52 @@ class TurnRequest:
     # Byte-identical log strings per path.
     interaction_log_error: str = "Failed to log media interaction"
     accounting_log_error: str = "Media window accounting failed"
+
+
+@dataclass
+class TurnState:
+    """Shared locals of one ``_run_turn`` invocation.
+
+    Built once the route is resolved and threaded through the extracted
+    stages (``_prepare_window_transition``, ``_true_up_budget``,
+    ``_store_interaction``, ``_run_save_honesty``, ``_account_window``,
+    ``_render_footer``, ``_deliver_reply``) so each reads exactly the values
+    ``_run_turn`` used to hold as locals. The mutable fields are the few
+    results one stage leaves for a later one.
+    """
+
+    request: TurnRequest
+    context: ContextTypes.DEFAULT_TYPE
+    user_id: int
+    current_dir: Any
+    storage_prompt: str
+    selected_backend: str
+    verbose_level: int
+    # Family memory scope for this turn (None = no family, no change).
+    family_id: Optional[int]
+    # ``bot_data["window_repo"]`` regardless of ``use_window_transitions``.
+    # Assigned right before the interaction store — the point where the old
+    # local was re-read from bot_data — and read by every later stage.
+    window_repo: Any = None
+    # Set by ``_store_interaction``; joins the save-honesty telemetry and the
+    # sent-messages ledger to the ``messages`` row.
+    saved_message_id: Optional[int] = None
+    # Set by ``_account_window``; read by ``_render_footer``.
+    window_state_for_footer: Any = None
+    window_rotated_for_footer: bool = False
+
+    @property
+    def trigger_text(self) -> str:
+        """Text the «запомни» force-eval trigger matches on.
+
+        The user's raw text before any reply envelope, falling back to
+        ``storage_prompt`` on the media path (dv-7783, msg-766).
+        """
+        return (
+            self.request.trigger_text
+            if self.request.trigger_text is not None
+            else self.storage_prompt
+        )
 
 
 class TurnsMixin(OrchestratorBase):
@@ -507,6 +553,491 @@ class TurnsMixin(OrchestratorBase):
             context,
         )
 
+    async def _prepare_window_transition(
+        self,
+        state: TurnState,
+        *,
+        window_repo: Any,
+        force_new: bool,
+        prompt_text: str,
+    ) -> Tuple[bool, str]:
+        """BPC seed, row-level force_new and the over-threshold backstop.
+
+        Text path only (``window_repo`` is None otherwise and this is never
+        called). Returns the possibly-raised ``force_new`` and the prompt
+        with the armed seed prepended.
+        """
+        context = state.context
+        user_id = state.user_id
+        current_dir = state.current_dir
+        # The transition also set force_new_session=True. Read it from the
+        # window row, not just user_data, so a restart between the roll
+        # and this turn cannot cancel the rotation (dv-9f31).
+        _wstate = await window_repo.get_or_create(user_id, current_dir)
+        force_new = (
+            force_new
+            or _wstate.force_new_session
+            or bool(context.user_data.get("force_new_session"))
+        )
+        if not force_new and window_repo.should_refresh(_wstate):
+            # Backstop: the window is already over the roll threshold and
+            # nothing armed a transition (older build, lost flag, threshold
+            # lowered under a running window, manual DB edit). Run the SAME
+            # transition a normal turn-end crossing would — final
+            # extraction over the outgoing slice, window roll (so the
+            # bundle re-materializes for the new window_id), armed seed —
+            # then let THIS turn consume it via consume_pending_seed
+            # below, so the user's message still goes out with continuity.
+            # The previous bare force_new dropped ~164k tokens of context
+            # with no seed, no extraction, and a stale frozen bundle
+            # (dv-d9e2, live incident 2026-08-08 10:21:08Z).
+            logger.warning(
+                "Window over refresh threshold with no armed transition; "
+                "forcing a fresh session",
+                user_id=user_id,
+                working_dir=str(current_dir),
+                context_tokens=_wstate.last_context_tokens,
+            )
+            await refresh_window(
+                window_repo,
+                context.bot_data.get("evaluator_service"),
+                context.user_data,
+                user_id=user_id,
+                working_dir=current_dir,
+                backend=state.selected_backend,
+                conversation_text=await self._window_conversation_text(
+                    context, user_id, current_dir, _wstate
+                ),
+                agent_id=self._agent_id_for(context, current_dir, user_id),
+                family_id=self._family_id_for(context, user_id, current_dir),
+            )
+            force_new = True
+        _storage = context.bot_data.get("storage")
+        prompt_text = await consume_pending_seed(
+            window_repo,
+            context.user_data,
+            user_id=user_id,
+            working_dir=current_dir,
+            user_message=prompt_text,
+            memory_repo=getattr(_storage, "memory_repository", None),
+            agent_id=self._agent_id_for(context, current_dir, user_id),
+        )
+        return force_new, prompt_text
+
+    async def _true_up_budget(
+        self, state: TurnState, claude_response: "ClaudeResponse"
+    ) -> None:
+        """Charge the REAL turn cost to the per-user budget and watchdog.
+
+        The pre-check only consumed a ~$0.001 estimate, which is why the
+        per-user cap never actually triggered on spend.
+        """
+        context = state.context
+        user_id = state.user_id
+        rate_limiter = context.bot_data.get("rate_limiter")
+        if not rate_limiter:
+            return
+        turn_tokens = claude_response.input_tokens + claude_response.output_tokens
+        if claude_response.cost is None:
+            # Unpriced backend (Codex on a subscription, dv-0722):
+            # budget the token delta so the turn is not free.
+            await rate_limiter.record_tokens(user_id, turn_tokens)
+        elif claude_response.cost > 0:
+            await rate_limiter.record_cost(user_id, claude_response.cost)
+
+        # Session watchdog (dv-8bb5): soft hourly thresholds, checked
+        # against the same real cost plus this turn's SDK turn count.
+        # Never blocks — a crossed threshold just alerts the admin.
+        watchdog_manager = context.bot_data.get("watchdog_manager")
+        if watchdog_manager:
+            for alert in rate_limiter.record_watchdog_turn(
+                user_id,
+                claude_response.cost,
+                claude_response.num_turns,
+                tokens=turn_tokens,
+            ):
+                await watchdog_manager.trigger(
+                    alert.user_id, alert.metric, alert.value, alert.threshold
+                )
+
+    async def _store_interaction(
+        self, state: TurnState, claude_response: "ClaudeResponse"
+    ) -> None:
+        """Persist the interaction, stamped with the active window.
+
+        Leaves the ``messages`` row id on ``state.saved_message_id`` (None
+        when there is no storage or the save failed).
+        """
+        context = state.context
+        user_id = state.user_id
+        storage = context.bot_data.get("storage")
+        state_before = None
+        if state.window_repo:
+            state_before = await state.window_repo.get_or_create(
+                user_id, state.current_dir
+            )
+        if storage:
+            try:
+                state.saved_message_id = await storage.save_claude_interaction(
+                    user_id=user_id,
+                    session_id=claude_response.session_id,
+                    prompt=state.storage_prompt,
+                    response=claude_response,
+                    ip_address=None,
+                    window_id=state_before.window_id if state_before else None,
+                )
+            except Exception as e:
+                logger.warning(state.request.interaction_log_error, error=str(e))
+
+    async def _run_save_honesty(
+        self, state: TurnState, claude_response: "ClaudeResponse"
+    ) -> None:
+        """Save-honesty check (dv-7783): did the reply claim a durable write
+        that no tool call backs?
+
+        Telemetry only — log + owner inform, no retry/annotation. Sits at
+        the one choke point both text and media turns share, joinable to
+        ``messages`` via the id ``_store_interaction`` just left on the
+        state. Never raises.
+        """
+        context = state.context
+        user_id = state.user_id
+        storage = context.bot_data.get("storage")
+        if not (storage and self.settings.save_claim_check_enabled):
+            return
+        saved_message_id = state.saved_message_id
+        try:
+            from ...events.types import AgentResponseEvent
+            from .save_honesty import check_turn
+
+            trigger_fired = mentions_remember_trigger(state.trigger_text)
+            honesty = check_turn(
+                claude_response.content,
+                [t["name"] for t in claude_response.tools_used],
+                trigger_fired=trigger_fired,
+                force_eval_scheduled=(
+                    trigger_fired
+                    and context.bot_data.get("evaluator_service") is not None
+                ),
+            )
+            profile_slug = self._agent_id_for(context, state.current_dir, user_id)
+            if honesty.claim is not None or trigger_fired:
+                # Every detected claim is logged, not only mismatches:
+                # the FP/miss rates are recomputable only with a
+                # denominator (plan decision 3).
+                await storage.log_bot_event(
+                    user_id,
+                    "save_claim_detected",
+                    {
+                        "message_id": saved_message_id,
+                        "profile": profile_slug,
+                        "matched_pattern": (
+                            honesty.claim.family if honesty.claim else None
+                        ),
+                        "satisfied_by": honesty.satisfied_by,
+                        "trigger_fired": trigger_fired,
+                    },
+                )
+            if honesty.mismatch_kind:
+                excerpt = honesty.claim.excerpt if honesty.claim else ""
+                await storage.log_bot_event(
+                    user_id,
+                    "save_claim_mismatch",
+                    {
+                        "message_id": saved_message_id,
+                        "profile": profile_slug,
+                        "mismatch_kind": honesty.mismatch_kind,
+                        "matched_pattern": (
+                            honesty.claim.family if honesty.claim else None
+                        ),
+                        "claim_excerpt": excerpt,
+                        "tools_used": [t["name"] for t in claude_response.tools_used],
+                        "trigger_fired": trigger_fired,
+                    },
+                    success=False,
+                )
+                event_bus = context.bot_data.get("event_bus")
+                if event_bus:
+                    claim_line = (
+                        f"«{' '.join(excerpt.split())[:160]}»"
+                        if excerpt
+                        else "(no claim text — trigger without write)"
+                    )
+                    await event_bus.publish(
+                        AgentResponseEvent(
+                            chat_id=0,  # broadcast to owner chats
+                            text=(
+                                "⚠️ save-claim mismatch "
+                                f"[{honesty.mismatch_kind}] "
+                                f"{profile_slug} msg={saved_message_id}: "
+                                f"{claim_line}"
+                            ),
+                            parse_mode=None,
+                            source="save_honesty",
+                        )
+                    )
+        except Exception as e:
+            logger.warning("Save-honesty check failed", error=str(e))
+
+    async def _account_window(
+        self, state: TurnState, claude_response: "ClaudeResponse"
+    ) -> None:
+        """Backend-agnostic token accounting + 50k evaluator checkpoint,
+        then the 150k compaction roll on the SAME backend.
+
+        Leaves ``window_state_for_footer`` / ``window_rotated_for_footer``
+        on the state for ``_render_footer``. Never raises.
+        """
+        window_repo = state.window_repo
+        if not window_repo:
+            return
+        context = state.context
+        user_id = state.user_id
+        current_dir = state.current_dir
+        try:
+            evaluator = context.bot_data.get("evaluator_service")
+            # Resolve the active profile slug so facts are scoped to
+            # *this* agent's memory, not the global default.
+            agent_id = self._agent_id_for(context, current_dir, user_id)
+            wstate = await window_repo.get_or_create(user_id, current_dir)
+            convo = await self._window_conversation_text(
+                context, user_id, current_dir, wstate
+            )
+            await account_turn_and_maybe_eval(
+                window_repo=window_repo,
+                evaluator=evaluator,
+                user_id=user_id,
+                working_dir=current_dir,
+                backend=state.selected_backend,
+                added_tokens=(
+                    claude_response.input_tokens + claude_response.output_tokens
+                ),
+                context_tokens=_context_tokens_of(claude_response),
+                conversation_text=convo,
+                max_message_id=await self._max_message_id(
+                    context, user_id, current_dir
+                ),
+                agent_id=agent_id,
+                family_id=state.family_id,
+                # Trigger runs on the user's raw text only — a quoted
+                # «запомнил» in the reply envelope cannot force an
+                # eval (dv-7783, msg-766).
+                force_eval=mentions_remember_trigger(state.trigger_text),
+            )
+            # 150k compaction: roll the window on the SAME backend and
+            # arm the seed so the next turn continues fresh.
+            state_after = await window_repo.get_or_create(user_id, current_dir)
+            state.window_state_for_footer = state_after
+            if window_repo.should_refresh(state_after):
+                state.window_rotated_for_footer = True
+                await refresh_window(
+                    window_repo,
+                    evaluator,
+                    context.user_data,
+                    user_id=user_id,
+                    working_dir=current_dir,
+                    backend=state.selected_backend,
+                    conversation_text=await self._window_conversation_text(
+                        context, user_id, current_dir, state_after
+                    ),
+                    agent_id=agent_id,
+                    family_id=state.family_id,
+                )
+        except Exception as e:
+            logger.warning(state.request.accounting_log_error, error=str(e))
+
+    def _render_footer(
+        self,
+        state: TurnState,
+        claude_response: "ClaudeResponse",
+        formatted_messages: List[FormattedMessage],
+    ) -> None:
+        """Append the window/token footer to ``formatted_messages`` in place.
+
+        Compact window diagnostic at verbose >= 1 (so rotation is visible by
+        default without cranking verbosity), full input/output token + cost
+        breakdown layered on at verbose >= 2. Rendered on both the text and
+        media paths (dv-2f19).
+        """
+        if not (state.request.show_footer and state.verbose_level >= 1):
+            return
+        # Model first: on 2026-09-05 a user debugged a Codex-only
+        # rotation bug believing they were on Claude. The provider
+        # prefix ("openai-codex/") is noise here.
+        footer_parts = [self._selected_model(state.context).rsplit("/", 1)[-1]]
+        if state.verbose_level >= 2:
+            input_t = claude_response.input_tokens
+            output_t = claude_response.output_tokens
+            # Fall back to estimation if SDK didn't provide real counts
+            if input_t == 0 and output_t == 0:
+                input_t = len(state.storage_prompt) // 4
+                output_t = len(claude_response.content) // 4
+                prefix = "~"
+            else:
+                prefix = ""
+            total_t = input_t + output_t
+            # None = unpriced (Codex, dv-0722): the token counts
+            # above are the whole story, no misleading "$0".
+            cost_str = (
+                f"${claude_response.cost:.4f}"
+                if claude_response.cost is not None and claude_response.cost > 0
+                else ""
+            )
+            footer_parts += [
+                f"{prefix}{input_t} in",
+                f"{prefix}{output_t} out",
+                f"{prefix}{total_t} total",
+            ]
+            if cost_str:
+                footer_parts.append(cost_str)
+        if getattr(claude_response, "session_restarted", False):
+            footer_parts.append("↻ session restarted (resume failed)")
+        if state.window_rotated_for_footer:
+            footer_parts.append("🔄 window rotated")
+        elif state.window_state_for_footer is not None:
+            # Real context vs the roll threshold. Was cumulative_tokens
+            # (a flow sum measured on uncached input only), which read
+            # ~2.5x low and made the gauge agree with the bug rather
+            # than with reality (dv-9f31).
+            footer_parts.append(
+                f"win {state.window_state_for_footer.last_context_tokens // 1000}k/"
+                f"{state.window_repo.refresh_threshold_tokens // 1000}k"
+            )
+
+        if footer_parts:
+            footer = "\n\n---\n" + " | ".join(footer_parts)
+
+            # Append to last message, checking Telegram limit
+            last_msg = formatted_messages[-1]
+            if len(last_msg.text) + len(footer) <= 4000:
+                formatted_messages[-1] = FormattedMessage(
+                    text=last_msg.text + footer,
+                    parse_mode=last_msg.parse_mode,
+                )
+            else:
+                # Footer as separate message if it would exceed limit
+                formatted_messages.append(
+                    FormattedMessage(text=footer.strip(), parse_mode=None)
+                )
+
+    async def _deliver_reply(
+        self,
+        state: TurnState,
+        update: Update,
+        formatted_messages: List[FormattedMessage],
+        images: List[ImageAttachment],
+    ) -> None:
+        """Send the reply: text (+ images), ledgering every outgoing message.
+
+        Text path (``resilient_send``): HTML send -> plain retry -> failure
+        notice. Media path: no fallback (preserved drift) — a send error
+        propagates to the media entry point.
+        """
+        context = state.context
+        request = state.request
+
+        # Try to combine text + images in one message when possible
+        caption_sent = False
+        if images and len(formatted_messages) == 1:
+            msg = formatted_messages[0]
+            if msg.text and len(msg.text) <= 1024:
+                try:
+                    caption_sent = await self._send_images(
+                        update,
+                        images,
+                        reply_to_message_id=update.message.message_id,
+                        caption=msg.text,
+                        caption_parse_mode=msg.parse_mode,
+                    )
+                except Exception as img_err:
+                    logger.warning("Image+caption send failed", error=str(img_err))
+
+        # Ledger every outgoing reply (dv-7783): the reply-context builder
+        # resolves user replies to our messages here. Never raises; a failed
+        # ledger write only degrades the NEXT reply's origin attribution.
+        _ledger_storage = context.bot_data.get("storage")
+
+        async def _ledger_sent(sent: Any) -> None:
+            if _ledger_storage is None or sent is None:
+                return
+            try:
+                await _ledger_storage.sent_messages.record(
+                    telegram_chat_id=sent.chat.id,
+                    telegram_message_id=sent.message_id,
+                    kind="turn_reply",
+                    messages_message_id=state.saved_message_id,
+                    profile_slug=self._agent_id_for(
+                        context, state.current_dir, state.user_id
+                    ),
+                )
+            except Exception as ledger_err:
+                logger.warning("sent_messages ledger failed", error=str(ledger_err))
+
+        # Send text messages (skip if caption was already embedded in photos)
+        if caption_sent:
+            return
+        for i, message in enumerate(formatted_messages):
+            if not message.text or not message.text.strip():
+                continue
+            if not request.resilient_send:
+                # Media path: no HTML→plain fallback (preserved drift) —
+                # a send error propagates to the media entry point.
+                sent_msg = await update.message.reply_text(
+                    message.text,
+                    parse_mode=message.parse_mode,
+                    reply_markup=None,
+                    reply_to_message_id=(update.message.message_id if i == 0 else None),
+                )
+                await _ledger_sent(sent_msg)
+                if i < len(formatted_messages) - 1:
+                    await asyncio.sleep(0.5)
+                continue
+            try:
+                sent_msg = await update.message.reply_text(
+                    message.text,
+                    parse_mode=message.parse_mode,
+                    reply_markup=None,  # No keyboards in agentic mode
+                    reply_to_message_id=(update.message.message_id if i == 0 else None),
+                )
+                await _ledger_sent(sent_msg)
+                if i < len(formatted_messages) - 1:
+                    await asyncio.sleep(0.5)
+            except Exception as send_err:
+                logger.warning(
+                    "Failed to send HTML response, retrying as plain text",
+                    error=str(send_err),
+                    message_index=i,
+                )
+                try:
+                    sent_msg = await update.message.reply_text(
+                        message.text,
+                        reply_markup=None,
+                        reply_to_message_id=(
+                            update.message.message_id if i == 0 else None
+                        ),
+                    )
+                    await _ledger_sent(sent_msg)
+                except Exception as plain_err:
+                    await update.message.reply_text(
+                        f"Failed to deliver response "
+                        f"(Telegram error: {str(plain_err)[:150]}). "
+                        f"Please try again.",
+                        reply_to_message_id=(
+                            update.message.message_id if i == 0 else None
+                        ),
+                    )
+
+        # Send images separately if caption wasn't used
+        if images:
+            try:
+                await self._send_images(
+                    update,
+                    images,
+                    reply_to_message_id=update.message.message_id,
+                )
+            except Exception as img_err:
+                logger.warning("Image send failed", error=str(img_err))
+
     async def _run_turn(
         self,
         request: TurnRequest,
@@ -522,6 +1053,11 @@ class TurnsMixin(OrchestratorBase):
         the previously duplicated ``_agentic_text_turn`` /
         ``_run_agentic_media_turn`` bodies.
 
+        The stages after the run are the ``_true_up_budget`` ..
+        ``_deliver_reply`` helpers above, sharing their locals through a
+        ``TurnState``; this method keeps the ordering, the try/finally and
+        the per-path error policy.
+
         With ``catch_run_errors`` unset (media path), exceptions from the
         run and post-run bookkeeping propagate to the caller after the
         typing heartbeat is cancelled — the media entry points surface them
@@ -533,13 +1069,9 @@ class TurnsMixin(OrchestratorBase):
         role = request.role
 
         selected_backend = self._selected_backend(context)
-        claude_integration = context.bot_data.get("claude_integration")
-        codex_integration = context.bot_data.get("codex_integration")
-        active_integration = (
-            codex_integration
-            if selected_backend == "openai_codex"
-            else claude_integration
-        )
+        # Registry lookup (dv-5368): the user's backend pick is the key into
+        # bot_data["backends"]; no per-backend branching here.
+        active_integration = self._active_backend(context)
         if not active_integration:
             await progress_msg.edit_text(
                 f"{selected_backend} integration not available. Check configuration."
@@ -560,6 +1092,17 @@ class TurnsMixin(OrchestratorBase):
             route.storage_prompt
             if route.storage_prompt is not None
             else request.storage_prompt
+        )
+        state = TurnState(
+            request=request,
+            context=context,
+            user_id=user_id,
+            current_dir=current_dir,
+            storage_prompt=storage_prompt,
+            selected_backend=selected_backend,
+            verbose_level=self._get_verbose_level(context),
+            # Family memory scope for this turn (None = no family, no change).
+            family_id=self._family_id_for(context, user_id, current_dir),
         )
 
         session_key = self._session_key(selected_backend)
@@ -584,57 +1127,11 @@ class TurnsMixin(OrchestratorBase):
             else None
         )
         if window_repo:
-            # The transition also set force_new_session=True. Read it from the
-            # window row, not just user_data, so a restart between the roll
-            # and this turn cannot cancel the rotation (dv-9f31).
-            _wstate = await window_repo.get_or_create(user_id, current_dir)
-            force_new = (
-                force_new
-                or _wstate.force_new_session
-                or bool(context.user_data.get("force_new_session"))
-            )
-            if not force_new and window_repo.should_refresh(_wstate):
-                # Backstop: the window is already over the roll threshold and
-                # nothing armed a transition (older build, lost flag, threshold
-                # lowered under a running window, manual DB edit). Run the SAME
-                # transition a normal turn-end crossing would — final
-                # extraction over the outgoing slice, window roll (so the
-                # bundle re-materializes for the new window_id), armed seed —
-                # then let THIS turn consume it via consume_pending_seed
-                # below, so the user's message still goes out with continuity.
-                # The previous bare force_new dropped ~164k tokens of context
-                # with no seed, no extraction, and a stale frozen bundle
-                # (dv-d9e2, live incident 2026-08-08 10:21:08Z).
-                logger.warning(
-                    "Window over refresh threshold with no armed transition; "
-                    "forcing a fresh session",
-                    user_id=user_id,
-                    working_dir=str(current_dir),
-                    context_tokens=_wstate.last_context_tokens,
-                )
-                await refresh_window(
-                    window_repo,
-                    context.bot_data.get("evaluator_service"),
-                    context.user_data,
-                    user_id=user_id,
-                    working_dir=current_dir,
-                    backend=selected_backend,
-                    conversation_text=await self._window_conversation_text(
-                        context, user_id, current_dir, _wstate
-                    ),
-                    agent_id=self._agent_id_for(context, current_dir, user_id),
-                    family_id=self._family_id_for(context, user_id, current_dir),
-                )
-                force_new = True
-            _storage = context.bot_data.get("storage")
-            prompt_text = await consume_pending_seed(
-                window_repo,
-                context.user_data,
-                user_id=user_id,
-                working_dir=current_dir,
-                user_message=prompt_text,
-                memory_repo=getattr(_storage, "memory_repository", None),
-                agent_id=self._agent_id_for(context, current_dir, user_id),
+            force_new, prompt_text = await self._prepare_window_transition(
+                state,
+                window_repo=window_repo,
+                force_new=force_new,
+                prompt_text=prompt_text,
             )
 
         # One-shot pending notes for this workspace (e.g. a verbatim
@@ -652,7 +1149,6 @@ class TurnsMixin(OrchestratorBase):
                 prompt_text = "\n".join(notes) + "\n\n" + prompt_text
 
         # --- Verbose progress tracking via stream callback ---
-        verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
         mcp_images: List[ImageAttachment] = []
@@ -673,7 +1169,7 @@ class TurnsMixin(OrchestratorBase):
             )
 
         on_stream = self._make_stream_callback(
-            verbose_level,
+            state.verbose_level,
             progress_msg,
             tool_log,
             start_time,
@@ -690,14 +1186,8 @@ class TurnsMixin(OrchestratorBase):
         # Independent typing heartbeat — stays alive even with no stream events
         heartbeat = self._start_typing_heartbeat(chat)
 
-        # Family memory scope for this turn (None = no family, no change).
-        family_id = self._family_id_for(context, user_id, current_dir)
-
         success = True
-        saved_message_id: Optional[int] = None
         try:
-            if selected_backend == "openai_codex" and codex_integration:
-                codex_integration.set_user_model(user_id, self._selected_model(context))
             # Media always passes images= (even None for doc/voice); text
             # never passes the kwarg at all. The splat keeps each path's
             # call shape byte-identical to the pre-refactor code.
@@ -712,9 +1202,9 @@ class TurnsMixin(OrchestratorBase):
                 on_stream=on_stream,
                 force_new=force_new,
                 **extra_kwargs,
-                model=self._claude_model_override(context),
+                model=self._model_override(context),
                 requester_chat_id=chat.id,
-                family_id=family_id,
+                family_id=state.family_id,
                 role=role,
             )
 
@@ -733,25 +1223,7 @@ class TurnsMixin(OrchestratorBase):
 
             context.user_data[session_key] = claude_response.session_id
 
-            # True-up the budget with the REAL turn cost — the pre-check only
-            # consumed a ~$0.001 estimate, which is why the per-user cap never
-            # actually triggered on spend.
-            rate_limiter = context.bot_data.get("rate_limiter")
-            if rate_limiter:
-                if claude_response.cost > 0:
-                    await rate_limiter.record_cost(user_id, claude_response.cost)
-
-                # Session watchdog (dv-8bb5): soft hourly thresholds, checked
-                # against the same real cost plus this turn's SDK turn count.
-                # Never blocks — a crossed threshold just alerts the admin.
-                watchdog_manager = context.bot_data.get("watchdog_manager")
-                if watchdog_manager:
-                    for alert in rate_limiter.record_watchdog_turn(
-                        user_id, claude_response.cost, claude_response.num_turns
-                    ):
-                        await watchdog_manager.trigger(
-                            alert.user_id, alert.metric, alert.value, alert.threshold
-                        )
+            await self._true_up_budget(state, claude_response)
 
             # NOTE: no prose-based cwd tracking here (dv-b4f1). Classic mode
             # regex-scanned the reply for `cd <path>` and moved the user's
@@ -764,169 +1236,12 @@ class TurnsMixin(OrchestratorBase):
             if restore_dir is not None:
                 context.user_data["current_directory"] = restore_dir
 
-            # Store interaction (stamped with the active conversation window)
-            storage = context.bot_data.get("storage")
-            window_repo = context.bot_data.get("window_repo")
-            state_before = None
-            if window_repo:
-                state_before = await window_repo.get_or_create(user_id, current_dir)
-            if storage:
-                try:
-                    saved_message_id = await storage.save_claude_interaction(
-                        user_id=user_id,
-                        session_id=claude_response.session_id,
-                        prompt=storage_prompt,
-                        response=claude_response,
-                        ip_address=None,
-                        window_id=state_before.window_id if state_before else None,
-                    )
-                except Exception as e:
-                    logger.warning(request.interaction_log_error, error=str(e))
-
-            # Save-honesty check (dv-7783): did the reply claim a durable
-            # write that no tool call backs? Telemetry only — log + owner
-            # inform, no retry/annotation. Sits at the one choke point both
-            # text and media turns share, joinable to `messages` via the id
-            # save_claude_interaction just returned.
-            if storage and self.settings.save_claim_check_enabled:
-                try:
-                    from ...events.types import AgentResponseEvent
-                    from .save_honesty import check_turn
-
-                    trigger_fired = mentions_remember_trigger(
-                        request.trigger_text
-                        if request.trigger_text is not None
-                        else storage_prompt
-                    )
-                    honesty = check_turn(
-                        claude_response.content,
-                        [t["name"] for t in claude_response.tools_used],
-                        trigger_fired=trigger_fired,
-                        force_eval_scheduled=(
-                            trigger_fired
-                            and context.bot_data.get("evaluator_service") is not None
-                        ),
-                    )
-                    profile_slug = self._agent_id_for(context, current_dir, user_id)
-                    if honesty.claim is not None or trigger_fired:
-                        # Every detected claim is logged, not only mismatches:
-                        # the FP/miss rates are recomputable only with a
-                        # denominator (plan decision 3).
-                        await storage.log_bot_event(
-                            user_id,
-                            "save_claim_detected",
-                            {
-                                "message_id": saved_message_id,
-                                "profile": profile_slug,
-                                "matched_pattern": (
-                                    honesty.claim.family if honesty.claim else None
-                                ),
-                                "satisfied_by": honesty.satisfied_by,
-                                "trigger_fired": trigger_fired,
-                            },
-                        )
-                    if honesty.mismatch_kind:
-                        excerpt = honesty.claim.excerpt if honesty.claim else ""
-                        await storage.log_bot_event(
-                            user_id,
-                            "save_claim_mismatch",
-                            {
-                                "message_id": saved_message_id,
-                                "profile": profile_slug,
-                                "mismatch_kind": honesty.mismatch_kind,
-                                "matched_pattern": (
-                                    honesty.claim.family if honesty.claim else None
-                                ),
-                                "claim_excerpt": excerpt,
-                                "tools_used": [
-                                    t["name"] for t in claude_response.tools_used
-                                ],
-                                "trigger_fired": trigger_fired,
-                            },
-                            success=False,
-                        )
-                        event_bus = context.bot_data.get("event_bus")
-                        if event_bus:
-                            claim_line = (
-                                f"«{' '.join(excerpt.split())[:160]}»"
-                                if excerpt
-                                else "(no claim text — trigger without write)"
-                            )
-                            await event_bus.publish(
-                                AgentResponseEvent(
-                                    chat_id=0,  # broadcast to owner chats
-                                    text=(
-                                        "⚠️ save-claim mismatch "
-                                        f"[{honesty.mismatch_kind}] "
-                                        f"{profile_slug} msg={saved_message_id}: "
-                                        f"{claim_line}"
-                                    ),
-                                    parse_mode=None,
-                                    source="save_honesty",
-                                )
-                            )
-                except Exception as e:
-                    logger.warning("Save-honesty check failed", error=str(e))
-
-            # Backend-agnostic token accounting + 50k evaluator checkpoint.
-            window_state_for_footer = None
-            window_rotated_for_footer = False
-            if window_repo:
-                try:
-                    evaluator = context.bot_data.get("evaluator_service")
-                    # Resolve the active profile slug so facts are scoped to
-                    # *this* agent's memory, not the global default.
-                    agent_id = self._agent_id_for(context, current_dir, user_id)
-                    state = await window_repo.get_or_create(user_id, current_dir)
-                    convo = await self._window_conversation_text(
-                        context, user_id, current_dir, state
-                    )
-                    await account_turn_and_maybe_eval(
-                        window_repo=window_repo,
-                        evaluator=evaluator,
-                        user_id=user_id,
-                        working_dir=current_dir,
-                        backend=selected_backend,
-                        added_tokens=(
-                            claude_response.input_tokens + claude_response.output_tokens
-                        ),
-                        context_tokens=_context_tokens_of(claude_response),
-                        conversation_text=convo,
-                        max_message_id=await self._max_message_id(
-                            context, user_id, current_dir
-                        ),
-                        agent_id=agent_id,
-                        family_id=family_id,
-                        # Trigger runs on the user's raw text only — a quoted
-                        # «запомнил» in the reply envelope cannot force an
-                        # eval (dv-7783, msg-766).
-                        force_eval=mentions_remember_trigger(
-                            request.trigger_text
-                            if request.trigger_text is not None
-                            else storage_prompt
-                        ),
-                    )
-                    # 150k compaction: roll the window on the SAME backend and
-                    # arm the seed so the next turn continues fresh.
-                    state_after = await window_repo.get_or_create(user_id, current_dir)
-                    window_state_for_footer = state_after
-                    if window_repo.should_refresh(state_after):
-                        window_rotated_for_footer = True
-                        await refresh_window(
-                            window_repo,
-                            evaluator,
-                            context.user_data,
-                            user_id=user_id,
-                            working_dir=current_dir,
-                            backend=selected_backend,
-                            conversation_text=await self._window_conversation_text(
-                                context, user_id, current_dir, state_after
-                            ),
-                            agent_id=agent_id,
-                            family_id=family_id,
-                        )
-                except Exception as e:
-                    logger.warning(request.accounting_log_error, error=str(e))
+            # From here on every stage sees bot_data's window repo, whether
+            # or not this path opted into window transitions (preserved).
+            state.window_repo = context.bot_data.get("window_repo")
+            await self._store_interaction(state, claude_response)
+            await self._run_save_honesty(state, claude_response)
+            await self._account_window(state, claude_response)
 
             # Format response (no reply_markup — strip keyboards)
             from ..utils.formatting import ResponseFormatter
@@ -935,65 +1250,7 @@ class TurnsMixin(OrchestratorBase):
             formatted_messages = formatter.format_claude_response(
                 claude_response.content
             )
-
-            # Footer: compact window diagnostic at verbose >= 1 (so rotation
-            # is visible by default without cranking verbosity), full
-            # input/output token + cost breakdown layered on at verbose >= 2.
-            # Rendered on both the text and media paths (dv-2f19).
-            if request.show_footer and verbose_level >= 1:
-                footer_parts = []
-                if verbose_level >= 2:
-                    input_t = claude_response.input_tokens
-                    output_t = claude_response.output_tokens
-                    # Fall back to estimation if SDK didn't provide real counts
-                    if input_t == 0 and output_t == 0:
-                        input_t = len(storage_prompt) // 4
-                        output_t = len(claude_response.content) // 4
-                        prefix = "~"
-                    else:
-                        prefix = ""
-                    total_t = input_t + output_t
-                    cost_str = (
-                        f"${claude_response.cost:.4f}"
-                        if claude_response.cost > 0
-                        else ""
-                    )
-                    footer_parts += [
-                        f"{prefix}{input_t} in",
-                        f"{prefix}{output_t} out",
-                        f"{prefix}{total_t} total",
-                    ]
-                    if cost_str:
-                        footer_parts.append(cost_str)
-                if getattr(claude_response, "session_restarted", False):
-                    footer_parts.append("↻ session restarted (resume failed)")
-                if window_rotated_for_footer:
-                    footer_parts.append("🔄 window rotated")
-                elif window_state_for_footer is not None:
-                    # Real context vs the roll threshold. Was cumulative_tokens
-                    # (a flow sum measured on uncached input only), which read
-                    # ~2.5x low and made the gauge agree with the bug rather
-                    # than with reality (dv-9f31).
-                    footer_parts.append(
-                        f"win {window_state_for_footer.last_context_tokens // 1000}k/"
-                        f"{window_repo.refresh_threshold_tokens // 1000}k"
-                    )
-
-                if footer_parts:
-                    footer = "\n\n---\n" + " | ".join(footer_parts)
-
-                    # Append to last message, checking Telegram limit
-                    last_msg = formatted_messages[-1]
-                    if len(last_msg.text) + len(footer) <= 4000:
-                        formatted_messages[-1] = FormattedMessage(
-                            text=last_msg.text + footer,
-                            parse_mode=last_msg.parse_mode,
-                        )
-                    else:
-                        # Footer as separate message if it would exceed limit
-                        formatted_messages.append(
-                            FormattedMessage(text=footer.strip(), parse_mode=None)
-                        )
+            self._render_footer(state, claude_response, formatted_messages)
 
             # Aborted run: the "response" above is just mid-task narration (no
             # final result exists). Tell the user instead of passing it off as
@@ -1043,110 +1300,7 @@ class TurnsMixin(OrchestratorBase):
             )
 
         # Use MCP-collected images (from send_image_to_user tool calls)
-        images: List[ImageAttachment] = mcp_images
-
-        # Try to combine text + images in one message when possible
-        caption_sent = False
-        if images and len(formatted_messages) == 1:
-            msg = formatted_messages[0]
-            if msg.text and len(msg.text) <= 1024:
-                try:
-                    caption_sent = await self._send_images(
-                        update,
-                        images,
-                        reply_to_message_id=update.message.message_id,
-                        caption=msg.text,
-                        caption_parse_mode=msg.parse_mode,
-                    )
-                except Exception as img_err:
-                    logger.warning("Image+caption send failed", error=str(img_err))
-
-        # Ledger every outgoing reply (dv-7783): the reply-context builder
-        # resolves user replies to our messages here. Never raises; a failed
-        # ledger write only degrades the NEXT reply's origin attribution.
-        _ledger_storage = context.bot_data.get("storage")
-
-        async def _ledger_sent(sent: Any) -> None:
-            if _ledger_storage is None or sent is None:
-                return
-            try:
-                await _ledger_storage.sent_messages.record(
-                    telegram_chat_id=sent.chat.id,
-                    telegram_message_id=sent.message_id,
-                    kind="turn_reply",
-                    messages_message_id=saved_message_id,
-                    profile_slug=self._agent_id_for(context, current_dir, user_id),
-                )
-            except Exception as ledger_err:
-                logger.warning("sent_messages ledger failed", error=str(ledger_err))
-
-        # Send text messages (skip if caption was already embedded in photos)
-        if not caption_sent:
-            for i, message in enumerate(formatted_messages):
-                if not message.text or not message.text.strip():
-                    continue
-                if not request.resilient_send:
-                    # Media path: no HTML→plain fallback (preserved drift) —
-                    # a send error propagates to the media entry point.
-                    sent_msg = await update.message.reply_text(
-                        message.text,
-                        parse_mode=message.parse_mode,
-                        reply_markup=None,
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
-                    )
-                    await _ledger_sent(sent_msg)
-                    if i < len(formatted_messages) - 1:
-                        await asyncio.sleep(0.5)
-                    continue
-                try:
-                    sent_msg = await update.message.reply_text(
-                        message.text,
-                        parse_mode=message.parse_mode,
-                        reply_markup=None,  # No keyboards in agentic mode
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
-                    )
-                    await _ledger_sent(sent_msg)
-                    if i < len(formatted_messages) - 1:
-                        await asyncio.sleep(0.5)
-                except Exception as send_err:
-                    logger.warning(
-                        "Failed to send HTML response, retrying as plain text",
-                        error=str(send_err),
-                        message_index=i,
-                    )
-                    try:
-                        sent_msg = await update.message.reply_text(
-                            message.text,
-                            reply_markup=None,
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
-                        )
-                        await _ledger_sent(sent_msg)
-                    except Exception as plain_err:
-                        await update.message.reply_text(
-                            f"Failed to deliver response "
-                            f"(Telegram error: {str(plain_err)[:150]}). "
-                            f"Please try again.",
-                            reply_to_message_id=(
-                                update.message.message_id if i == 0 else None
-                            ),
-                        )
-
-            # Send images separately if caption wasn't used
-            if images:
-                try:
-                    await self._send_images(
-                        update,
-                        images,
-                        reply_to_message_id=update.message.message_id,
-                    )
-                except Exception as img_err:
-                    logger.warning("Image send failed", error=str(img_err))
+        await self._deliver_reply(state, update, formatted_messages, mcp_images)
 
         # Audit log (text path only — media turns never logged one).
         if request.audit_command is not None:

@@ -184,6 +184,12 @@ async def _finish(
         pending.pop(chat_id, None)
     text = result.detail
     if result.ok:
+        if backend == "codex":
+            # The entitled model set belongs to the account that just changed,
+            # so the /model catalog cache is stale by definition (dv-0c01).
+            from ....agent_backends.codex_catalog import CODEX_CATALOG
+
+            CODEX_CATALOG.invalidate()
         # Re-probe rather than claim success from an exit code: for Codex the
         # exit code is the only signal and it has been wrong before.
         await asyncio.sleep(0.5)

@@ -30,8 +30,9 @@ REFRESH_THRESHOLD_TOKENS = 200_000
 
 # Backends that can report the conversation's real size per turn, so a missing
 # number from them means "not measurable this turn", not "no such thing".
-# See record_turn.
-_LEVEL_REPORTING_BACKENDS = frozenset({"claude"})
+# See record_turn. Codex joined on 2026-09-05: its level is read from the
+# CLI's rollout file (agent_backends.codex_cli.read_rollout_token_info).
+_LEVEL_REPORTING_BACKENDS = frozenset({"claude", "openai_codex"})
 
 PathLike = Union[str, Path]
 

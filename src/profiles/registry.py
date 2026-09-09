@@ -91,6 +91,19 @@ class ProfileDefinition:
     # (meals, sleep, sessions) and meaningless outside a tracking profile.
     # Turning it off is the revert path — no code change, just YAML.
     today_digest: bool = False
+    # Extra directories a *sandboxed* profile may write to, beyond its own
+    # workspace (dv-3103): an Obsidian vault, another project checkout. Wired
+    # to the CLI ``--add-dir`` (bash inside the bwrap jail) and to the
+    # in-process write boundary, so the two agree. The alternative — flipping
+    # ``sandbox: false`` — grants the whole filesystem plus network for one
+    # extra folder; this is the narrow grant. Owner-only profiles only: the
+    # loader refuses the key on a guest-allowed profile.
+    extra_dirs: Tuple[Path, ...] = ()
+    # Disabled profiles (dv-ffb4) stay in the YAML — persona, memory, and
+    # workspace intact — but are invisible: no ``/slug`` command, no keyboard
+    # button, no routing target. Toggled from the /agents Manage menu; the
+    # registry is boot-only, so a toggle takes effect on restart.
+    enabled: bool = True
 
     def allows_role(self, role: str) -> bool:
         """Owners always pass; other roles must be explicitly allowed."""
@@ -109,10 +122,25 @@ class ProfileRegistry:
 
     @property
     def profiles(self) -> List[ProfileDefinition]:
+        """Every profile, disabled ones included.
+
+        For anything user-facing (keyboards, ``/slug`` commands, routing) use
+        ``enabled_profiles`` — a disabled profile must stay reachable here so
+        its memory scopes and workspaces still resolve for existing state.
+        """
         return list(self._profiles)
+
+    @property
+    def enabled_profiles(self) -> List[ProfileDefinition]:
+        return [p for p in self._profiles if p.enabled]
 
     def get_by_slug(self, slug: str) -> Optional[ProfileDefinition]:
         return self._by_slug.get(slug)
+
+    def get_enabled_by_slug(self, slug: str) -> Optional[ProfileDefinition]:
+        """``get_by_slug`` for switch targets: a disabled slug is unknown."""
+        p = self._by_slug.get(slug)
+        return p if p is not None and p.enabled else None
 
     def get_by_working_dir(self, path: Path) -> Optional[ProfileDefinition]:
         """Profile owning ``path`` — a profile root or a guest workspace."""
@@ -155,10 +183,10 @@ class ProfileRegistry:
         """
         if role == "owner":
             return self.get_default()
-        general = self.get_by_slug(GUEST_DEFAULT_SLUG)
+        general = self.get_enabled_by_slug(GUEST_DEFAULT_SLUG)
         if general is not None and general.allows_role(role):
             return general
-        for p in self._profiles:
+        for p in self.enabled_profiles:
             if p.allows_role(role):
                 return p
         return None
@@ -441,6 +469,15 @@ def _validate_profile_paths(defn: "ProfileDefinition") -> None:
     if defn.mcp is not None and not defn.mcp.exists():
         errors.append(f"mcp config does not exist: {defn.mcp}")
 
+    # Extra write roots are never created for the profile: an extra dir is
+    # someone else's tree (a vault, another checkout), so a typo must fail
+    # here rather than quietly create an empty folder somewhere.
+    for extra in defn.extra_dirs:
+        if not extra.is_dir():
+            errors.append(f"extra_dirs entry is not a directory: {extra}")
+        elif not os.access(extra, os.W_OK | os.X_OK):
+            errors.append(f"extra_dirs entry is not writable: {extra}")
+
     if errors:
         raise ValueError(f"Profile '{defn.slug}': " + "; ".join(errors))
 
@@ -555,6 +592,28 @@ def load_profile_registry(
                 " and can never be guest-allowed"
             )
 
+        extra_dirs = _parse_extra_dirs(item, slug, _resolve)
+        # Extra write roots widen a sandboxed profile's reach beyond its own
+        # workspace. On a guest-reachable profile that hands every guest a
+        # write path into the owner's files, so the grant is owner-only —
+        # the same fail-closed shape as the sandbox invariant above.
+        if extra_dirs and "guest" in allowed_roles:
+            raise ValueError(
+                f"Profile '{slug}': extra_dirs is not allowed on a"
+                " guest-allowed profile"
+            )
+        if extra_dirs and not resolved_sandbox:
+            logger.warning(
+                "extra_dirs has no effect on a full-access profile",
+                profile=slug,
+            )
+
+        enabled = item.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"Profile '{slug}': enabled must be true or false")
+        if is_default and not enabled:
+            raise ValueError(f"Profile '{slug}' is the default and cannot be disabled")
+
         family_memory = bool(item.get("family_memory", True))
         # Per-user is the default (dv-0fbb). `shared: true` is the readable
         # opt-out spelling; `personal_memory` remains accepted for explicit
@@ -607,6 +666,8 @@ def load_profile_registry(
             personal_memory=personal_memory,
             user_data_tools=_parse_user_data_tools(item, slug),
             today_digest=bool(item.get("today_digest", False)),
+            extra_dirs=extra_dirs,
+            enabled=enabled,
         )
         if validate_paths:
             _validate_profile_paths(definition)
@@ -617,5 +678,57 @@ def load_profile_registry(
             f"Profiles config must mark exactly one default (found {default_count})"
         )
 
-    logger.info("Loaded profile registry", count=len(profiles))
+    _validate_extra_dirs_disjoint(profiles)
+
+    logger.info(
+        "Loaded profile registry",
+        count=len(profiles),
+        disabled=[p.slug for p in profiles if not p.enabled],
+    )
     return ProfileRegistry(profiles)
+
+
+def _parse_extra_dirs(
+    item: Dict[str, Any], slug: str, resolve: Any
+) -> Tuple[Path, ...]:
+    """Parse `extra_dirs: [/path, ...]` for one profile (dv-3103)."""
+    raw = item.get("extra_dirs")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(x, str) and x for x in raw):
+        raise ValueError(f"Profile '{slug}': extra_dirs must be a list of paths")
+    resolved: List[Path] = []
+    for entry in raw:
+        path = resolve(entry, "extra_dirs").resolve()
+        if path == Path("/") or path == Path.home():
+            raise ValueError(
+                f"Profile '{slug}': extra_dirs entry '{entry}' is too broad"
+            )
+        if path not in resolved:
+            resolved.append(path)
+    return tuple(resolved)
+
+
+def _validate_extra_dirs_disjoint(profiles: List[ProfileDefinition]) -> None:
+    """An extra dir may not contain or sit inside another profile's tree.
+
+    Otherwise ``extra_dirs: [<repo>]`` on a sandboxed profile is
+    ``sandbox: false`` through the back door (it could edit the bot's own
+    source), and an extra dir under another profile's workspace reads that
+    profile's private memory. Resolve both sides so symlinks cannot dodge it.
+    """
+    for p in profiles:
+        for extra in p.extra_dirs:
+            for other in profiles:
+                if other.slug == p.slug:
+                    continue
+                for label, tree in (
+                    ("working_dir", other.working_dir),
+                    ("memory_dir", other.memory_dir),
+                ):
+                    tree = tree.resolve()
+                    if extra == tree or extra in tree.parents or tree in extra.parents:
+                        raise ValueError(
+                            f"Profile '{p.slug}': extra_dirs entry {extra} overlaps"
+                            f" profile '{other.slug}' {label} {tree}"
+                        )

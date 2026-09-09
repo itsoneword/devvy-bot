@@ -5,7 +5,6 @@ switch-message pinning. Code is moved verbatim from src/bot/orchestrator.py.
 """
 
 import asyncio
-from pathlib import Path
 from typing import Any
 
 import structlog
@@ -14,8 +13,15 @@ from telegram.ext import ContextTypes
 
 from ...profiles.registry import ensure_workspace_for
 from ..utils.html_format import escape_html
-from .base import _CODEX_DEFAULT_MODEL, _CODEX_SUPPORTED_MODELS, OrchestratorBase
+from .agents_menu import (
+    CREATOR_SLUG,
+    NEW_AGENT_INTAKE,
+    build_agents_manage,
+    build_agents_picker,
+)
+from .base import CLAUDE_BACKEND, CODEX_BACKEND, OrchestratorBase, policy_for
 from .routing import _PROFILE_BADGES
+from .windowing import refresh_window, window_conversation_text
 
 logger = structlog.get_logger()
 
@@ -72,40 +78,71 @@ class CallbacksMixin(OrchestratorBase):
         new_backend: str,
         prev_backend: str,
     ) -> None:
-        """On a real backend change, roll the window and arm the seed so the
-        next turn continues the conversation on the new backend."""
+        """On a real backend change, run the SAME transition as a 150k
+        compaction (``refresh_window``): final extraction over the outgoing
+        window's un-extracted tail, roll, and arm the seed durably in the DB
+        so the next turn continues the conversation on the new backend.
+
+        This used to roll and write the seed to ``user_data`` only. That is
+        in-memory: a restart between the switch and the next message dropped
+        both the seed and ``force_new_session``, so the turn resumed the
+        retired session with no continuity — the dv-9f31 failure, which had
+        only been fixed on the compaction path (dv-a826).
+        """
         if new_backend == prev_backend:
             return
         window_repo = context.bot_data.get("window_repo")
         if not window_repo:
             return
-        working_dir = context.user_data.get(
-            "current_directory", self.settings.approved_directory or Path.home()
+        # Same resolver as text turns and /new (dv-c07a): rolling on the
+        # current_directory/home fallback rotated a phantom window while the
+        # conversation kept running in the profile workspace.
+        user_id = query.from_user.id if query.from_user else None
+        if user_id is None or context.user_data is None:
+            return
+        working_dir = self._routed_working_dir(context, user_id)
+        state = await window_repo.get_or_create(user_id, working_dir)
+        # The extraction runs on the backend just selected: prefs are already
+        # persisted at this point, so it is the active one — same rule as the
+        # compaction path, which evaluates on ``selected_backend``.
+        await refresh_window(
+            window_repo,
+            context.bot_data.get("evaluator_service"),
+            context.user_data,
+            user_id=user_id,
+            working_dir=working_dir,
+            backend=new_backend,
+            conversation_text=await window_conversation_text(
+                context.bot_data.get("storage"), user_id, working_dir, state
+            ),
+            agent_id=self._agent_id_for(context, working_dir, user_id),
+            family_id=self._family_id_for(context, user_id, working_dir),
         )
-        old, _new = await window_repo.roll_window(
-            query.from_user.id, working_dir, new_backend=new_backend
-        )
-        context.user_data["pending_seed_window"] = old
-        context.user_data["force_new_session"] = True
 
     async def _handle_model_callback(
         self, query: Any, context: ContextTypes.DEFAULT_TYPE, data: str
     ) -> None:
-        prev_backend = context.user_data.get("agent_backend", "claude")
+        # The picker's callback keys are UI routes ("model:claude:<tier>",
+        # "model:codex:<name>"), one block per backend the keyboard offers;
+        # a third backend adds a keyboard row and a block here. Validation
+        # and the ids written to prefs come from the backend's policy
+        # (src/agent_backends/protocol.py), not from inline literals.
+        prev_backend = context.user_data.get("agent_backend", CLAUDE_BACKEND)
         if data == "model:claude" or data.startswith("model:claude:"):
             tier = data.split(":", 2)[2] if data.count(":") >= 2 else ""
-            model = tier if tier in self._CLAUDE_TIERS else "claude"
-            context.user_data["agent_backend"] = "claude"
+            # "claude" is the stored sentinel for "no tier: config default".
+            model = policy_for(CLAUDE_BACKEND).resolve_model(tier) or "claude"
+            context.user_data["agent_backend"] = CLAUDE_BACKEND
             context.user_data["agent_model"] = model
             if query.from_user:
                 await self._save_user_prefs(
                     context,
                     query.from_user.id,
-                    agent_backend="claude",
+                    agent_backend=CLAUDE_BACKEND,
                     agent_model=model,
                 )
             await self._maybe_roll_on_switch(
-                context, query, new_backend="claude", prev_backend=prev_backend
+                context, query, new_backend=CLAUDE_BACKEND, prev_backend=prev_backend
             )
             label = model if model in self._CLAUDE_TIERS else "default model"
             await query.edit_message_text(
@@ -133,27 +170,25 @@ class CallbacksMixin(OrchestratorBase):
         if data.startswith("model:codex:"):
             model = data.split(":", 2)[2]
             model_ref = f"openai-codex/{model}"
-            if model_ref not in _CODEX_SUPPORTED_MODELS:
+            resolved = policy_for(CODEX_BACKEND).resolve_model(model_ref)
+            if resolved != model_ref:
                 await query.edit_message_text(
                     "That OpenAI Codex model is not available for ChatGPT auth. "
-                    f"Using <code>{escape_html(_CODEX_DEFAULT_MODEL)}</code> instead.",
+                    f"Using <code>{escape_html(str(resolved))}</code> instead.",
                     parse_mode="HTML",
                 )
-                model_ref = _CODEX_DEFAULT_MODEL
-            context.user_data["agent_backend"] = "openai_codex"
+                model_ref = str(resolved)
+            context.user_data["agent_backend"] = CODEX_BACKEND
             context.user_data["agent_model"] = model_ref
-            codex_integration = context.bot_data.get("codex_integration")
-            if codex_integration and query.from_user:
-                codex_integration.set_user_model(query.from_user.id, model_ref)
             if query.from_user:
                 await self._save_user_prefs(
                     context,
                     query.from_user.id,
-                    agent_backend="openai_codex",
+                    agent_backend=CODEX_BACKEND,
                     agent_model=model_ref,
                 )
             await self._maybe_roll_on_switch(
-                context, query, new_backend="openai_codex", prev_backend=prev_backend
+                context, query, new_backend=CODEX_BACKEND, prev_backend=prev_backend
             )
             await query.edit_message_text(
                 "Model backend set to OpenAI Codex: "
@@ -169,7 +204,7 @@ class CallbacksMixin(OrchestratorBase):
         """Handle agent:<slug> callbacks — switch the active profile + persist."""
         slug = data.split(":", 1)[1]
         registry = context.bot_data.get("profile_registry")
-        profile = registry.get_by_slug(slug) if registry else None
+        profile = registry.get_enabled_by_slug(slug) if registry else None
         if not profile:
             await query.edit_message_text(f"Unknown profile: {slug}")
             return
@@ -208,6 +243,120 @@ class CallbacksMixin(OrchestratorBase):
                 success=True,
             )
 
+    async def _handle_agents_menu_callback(
+        self, query: Any, context: ContextTypes.DEFAULT_TYPE, data: str
+    ) -> None:
+        """agents:* callbacks — the /agents Manage view (dv-ffb4), owner-only.
+
+        Toggles edit ``profiles.yaml`` (comment-preserving splice, validated
+        before write); the running registry is boot-only, so the view is
+        rendered from a fresh parse of the file and offers a restart once the
+        two disagree.
+        """
+        import os
+        import signal
+
+        from ...profiles.config_edit import set_profile_enabled
+        from ...profiles.registry import load_profile_registry
+
+        user_id = query.from_user.id if query.from_user else None
+        role = self._resolve_role(user_id, context)
+        registry = context.bot_data.get("profile_registry")
+        if not registry:
+            await query.edit_message_text("Profiles are not configured.")
+            return
+        action = data.split(":", 2)[1]
+        active = context.user_data.get("active_profile") or registry.get_default().slug
+
+        if action == "back":
+            text, markup = build_agents_picker(registry, active=active, role=role)
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            return
+
+        if role != "owner":
+            await query.edit_message_text("🚫 Managing agents is owner-only.")
+            return
+
+        config_path = self.settings.profiles_config_path
+        audit_logger = context.bot_data.get("audit_logger")
+
+        if action == "new":
+            creator = registry.get_enabled_by_slug(CREATOR_SLUG)
+            if creator is None:
+                await query.edit_message_text(
+                    f"The '{CREATOR_SLUG}' agent is not available; " "enable it first."
+                )
+                return
+            working_dir = ensure_workspace_for(creator, role, user_id)
+            context.user_data["active_profile"] = creator.slug
+            context.user_data["current_directory"] = working_dir
+            if user_id is not None:
+                await self._save_user_prefs(
+                    context, user_id, active_profile=creator.slug
+                )
+            edited = await query.edit_message_text(
+                NEW_AGENT_INTAKE.format(creator=escape_html(creator.name)),
+                parse_mode="HTML",
+            )
+            if user_id is not None and hasattr(edited, "message_id"):
+                await self._pin_switch_message(context, user_id, edited)
+            if audit_logger and user_id is not None:
+                await audit_logger.log_command(user_id, "agents", ["new"], True)
+            return
+
+        if action == "restart":
+            await query.edit_message_text(
+                "🔄 <b>Restarting bot…</b>", parse_mode="HTML"
+            )
+            if audit_logger and user_id is not None:
+                await audit_logger.log_command(user_id, "restart", ["agents"], True)
+            logger.info("Restart requested via /agents manage", user_id=user_id)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+
+        if action == "toggle":
+            slug = data.split(":", 2)[2]
+            if not config_path:
+                await query.edit_message_text("Profiles config path is not set.")
+                return
+            current = load_profile_registry(
+                config_path, sandbox_default=self.settings.sandbox_enabled
+            ).get_by_slug(slug)
+            if current is None:
+                await query.edit_message_text(f"Unknown profile: {slug}")
+                return
+            try:
+                set_profile_enabled(
+                    config_path,
+                    slug,
+                    not current.enabled,
+                    sandbox_default=self.settings.sandbox_enabled,
+                )
+            except ValueError as exc:
+                await query.edit_message_text(f"⚠️ Not changed: {escape_html(str(exc))}")
+                return
+            if audit_logger and user_id is not None:
+                await audit_logger.log_command(
+                    user_id,
+                    "agents",
+                    ["enable" if not current.enabled else "disable", slug],
+                    True,
+                )
+            # fall through to re-render the manage view
+
+        if action in ("manage", "toggle"):
+            if not config_path:
+                await query.edit_message_text("Profiles config path is not set.")
+                return
+            file_registry = load_profile_registry(
+                config_path, sandbox_default=self.settings.sandbox_enabled
+            )
+            text, markup = build_agents_manage(file_registry, registry)
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            return
+
+        await query.edit_message_text("Unknown agents action.")
+
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -222,6 +371,10 @@ class CallbacksMixin(OrchestratorBase):
 
         if data.startswith("agent:"):
             await self._handle_agent_callback(query, context, data)
+            return
+
+        if data.startswith("agents:"):
+            await self._handle_agents_menu_callback(query, context, data)
             return
 
         if data.startswith("auth:"):
@@ -244,16 +397,11 @@ class CallbacksMixin(OrchestratorBase):
 
         context.user_data["current_directory"] = new_path
 
-        # Look for a resumable session instead of always clearing
-        claude_integration = context.bot_data.get("claude_integration")
-        session_id = None
-        if claude_integration:
-            existing = await claude_integration._find_resumable_session(
-                query.from_user.id, new_path
-            )
-            if existing:
-                session_id = existing.session_id
-        context.user_data["claude_session_id"] = session_id
+        # Look for a resumable session instead of always clearing: every
+        # registered backend re-points its session key (dv-5368).
+        session_id = await self._refresh_resumable_sessions(
+            context, query.from_user.id, new_path
+        )
 
         is_git = (new_path / ".git").is_dir()
         git_badge = " (git)" if is_git else ""

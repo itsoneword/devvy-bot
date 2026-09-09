@@ -50,7 +50,12 @@ def test_codex_output_schema_is_object_wrapping_array(service):
     ]
     # Nullable: the metadata-only ops (invalidate/flag_conflict) carry no tier.
     assert items["properties"]["tier"]["enum"] == ["pinned", "general", None]
-    assert set(items["required"]) == {"op", "tier", "content"}
+    # OpenAI strict mode also requires EVERY property to be listed in
+    # `required`; optionality is expressed by the "null" type member alone.
+    # Listing only {op, tier, content} made the server answer 400
+    # invalid_json_schema ("Missing 'label'") and every Codex evaluator run
+    # died with `Codex CLI failed (exit 1):` and an empty stderr (dv-0c01).
+    assert set(items["required"]) == set(items["properties"])
 
 
 def test_unwrap_codex_output_extracts_array(service):
@@ -137,3 +142,80 @@ async def test_invoke_codex_cli_pipes_prompt_via_stdin_not_argv(service, monkeyp
     assert captured["args"][-1] == "-"  # stdin sentinel, not the prompt
     assert captured["kwargs"]["stdin"] == asyncio.subprocess.PIPE
     assert json.loads(result) == []  # _unwrap_codex_output strips the wrapper
+
+
+def test_codex_schema_every_op_field_is_nullable_except_op(service):
+    """Strict mode forces every field into `required`, so every field that a
+    metadata-only op does not carry MUST accept null — otherwise requiring
+    them would make `invalidate`/`flag_conflict` unrepresentable."""
+    items = service._codex_output_schema()["properties"]["extractions"]["items"]
+    for name, spec in items["properties"].items():
+        if name == "op":
+            assert spec["type"] == "string"
+            continue
+        assert "null" in spec["type"], name
+
+
+async def test_invoke_codex_cli_reports_the_error_it_finds_on_stdout(
+    service, monkeypatch
+):
+    """`codex exec --json` puts API failures on STDOUT as `error`/`turn.failed`
+    events and leaves stderr empty. Reporting stderr alone produced the
+    useless live line `Evaluator failed: Codex CLI failed (exit 1): `."""
+    stdout = b"\n".join(
+        [
+            b'{"type":"thread.started","thread_id":"th-1"}',
+            b'{"type":"error","message":"400 invalid_json_schema: Missing \'label\'."}',
+            b'{"type":"turn.failed","error":'
+            b'{"message":"400 invalid_json_schema: Missing \'label\'."}}',
+        ]
+    )
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProcess(stdout=stdout, stderr=b"", returncode=1)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await service._invoke_codex_cli("PROMPT")
+    message = str(excinfo.value)
+    assert "exit 1" in message
+    assert "invalid_json_schema" in message
+    # turn.failed restates the error event; say it once.
+    assert message.count("invalid_json_schema") == 1
+
+
+async def test_invoke_codex_cli_never_reports_an_empty_reason(service, monkeypatch):
+    async def fake_exec(*args, **kwargs):
+        return _FakeProcess(stdout=b"", stderr=b"", returncode=1)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(RuntimeError, match=r"exit 1\): \(no output\)"):
+        await service._invoke_codex_cli("PROMPT")
+
+
+async def test_invoke_codex_cli_runs_read_only_outside_the_bot_cwd(
+    service, monkeypatch
+):
+    """This call reads a prompt and emits JSON. It used to ask for
+    danger-full-access in the bot's own working directory, which bought
+    nothing and pointed a shell-capable agent at the repository."""
+    from pathlib import Path
+
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        Path(args[args.index("-o") + 1]).write_text('{"extractions": []}')
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await service._invoke_codex_cli("PROMPT")
+
+    args = captured["args"]
+    assert args[args.index("-s") + 1] == "read-only"
+    assert "danger-full-access" not in args
+    # -C points at the same throwaway temp dir the schema/out files live in.
+    workdir = Path(args[args.index("-C") + 1])
+    assert workdir == Path(args[args.index("-o") + 1]).parent

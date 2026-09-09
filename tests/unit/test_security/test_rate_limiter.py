@@ -575,3 +575,131 @@ class TestSessionWatchdogThresholds:
         alerts_2 = rate_limiter.record_watchdog_turn(2, cost=0.1, turns=1)
         assert [a.metric for a in alerts_1] == ["cost_per_hour"]
         assert alerts_2 == []
+
+
+class TestUnmeteredTokenBudget:
+    """dv-0722: turns with no USD price are budgeted in tokens, not as free."""
+
+    @pytest.fixture
+    def config(self):
+        return create_test_config(
+            claude_max_cost_per_user=10.0,
+            claude_max_cost_per_user_guest=2.0,
+            unmetered_max_tokens_per_user=1_000,
+            unmetered_max_tokens_per_user_guest=100,
+            watchdog_max_cost_per_hour=1.0,
+            watchdog_max_tokens_per_hour=500,
+            watchdog_max_messages_per_hour=1000,
+            watchdog_max_turns_per_hour=1000,
+        )
+
+    @pytest.fixture
+    def rate_limiter(self, config):
+        return RateLimiter(config)
+
+    async def test_record_tokens_accumulates(self, rate_limiter):
+        await rate_limiter.record_tokens(1, 40)
+        await rate_limiter.record_tokens(1, 20)
+        assert rate_limiter.token_tracker[1] == 60
+        # Dollars untouched: the two ledgers are independent.
+        assert rate_limiter.cost_tracker[1] == 0.0
+
+    async def test_record_tokens_ignores_non_positive(self, rate_limiter):
+        await rate_limiter.record_tokens(1, 0)
+        await rate_limiter.record_tokens(1, -5)
+        assert rate_limiter.token_tracker[1] == 0
+
+    async def test_guest_blocked_when_token_budget_exhausted(self, rate_limiter):
+        await rate_limiter.record_tokens(1, 100)
+        allowed, message = await rate_limiter.check_rate_limit(
+            1, cost=0.001, role="guest"
+        )
+        assert allowed is False
+        assert "Token budget exceeded" in message
+        assert "100/100" in message
+
+    async def test_guest_allowed_under_token_budget(self, rate_limiter):
+        await rate_limiter.record_tokens(1, 99)
+        allowed, _ = await rate_limiter.check_rate_limit(1, cost=0.001, role="guest")
+        assert allowed is True
+
+    async def test_owner_exempt_from_token_budget(self, rate_limiter):
+        await rate_limiter.record_tokens(1, 5_000)
+        allowed, _ = await rate_limiter.check_rate_limit(1, cost=0.001, role="owner")
+        assert allowed is True
+        assert rate_limiter.effective_daily_token_cap(1, "owner") is None
+
+    async def test_usd_override_switches_on_token_cap_for_owner(self):
+        # An override says "this owner is budgeted" -- for both ledgers.
+        config = create_test_config(
+            claude_cost_limit_overrides={1: 50.0},
+            unmetered_max_tokens_per_user=1_000,
+        )
+        limiter = RateLimiter(config)
+        assert limiter.effective_daily_token_cap(1, "owner") == 1_000
+        await limiter.record_tokens(1, 1_000)
+        allowed, message = await limiter.check_rate_limit(1, cost=0.001, role="owner")
+        assert allowed is False
+        assert "Token budget exceeded" in message
+
+    async def test_free_updates_skip_the_token_gate(self, rate_limiter):
+        # cost=0 = command/button press: must not be locked out by tokens.
+        await rate_limiter.record_tokens(1, 100)
+        allowed, _ = await rate_limiter.check_rate_limit(1, cost=0.0, role="guest")
+        assert allowed is True
+
+    async def test_daily_reset_clears_both_ledgers(self, rate_limiter):
+        await rate_limiter.record_cost(1, 1.0)
+        await rate_limiter.record_tokens(1, 100)
+        rate_limiter.cost_reset_time[1] = datetime.now(UTC) - timedelta(hours=25)
+        rate_limiter._maybe_reset_cost_tracker(1)
+        assert rate_limiter.cost_tracker[1] == 0
+        assert rate_limiter.token_tracker[1] == 0
+
+    async def test_admin_reset_clears_tokens(self, rate_limiter):
+        await rate_limiter.record_tokens(1, 100)
+        await rate_limiter.reset_user_limits(1)
+        assert rate_limiter.token_tracker[1] == 0
+
+    async def test_status_reports_token_usage(self, rate_limiter):
+        await rate_limiter.record_tokens(1, 60)
+        status = rate_limiter.get_user_status(1, role="guest")
+        assert status["token_usage"] == {
+            "current": 60,
+            "limit": 100,
+            "remaining": 40,
+            "utilization": pytest.approx(0.6),
+        }
+
+    def test_effective_token_cap_by_role(self, rate_limiter):
+        assert rate_limiter.effective_daily_token_cap(1, "guest") == 100
+        assert rate_limiter.effective_daily_token_cap(1, "owner") is None
+
+    # -- watchdog: tokens_per_hour --------------------------------------
+
+    def test_unpriced_turn_feeds_tokens_not_cost(self, rate_limiter):
+        alerts = rate_limiter.record_watchdog_turn(1, cost=None, turns=1, tokens=600)
+        assert [a.metric for a in alerts] == ["tokens_per_hour"]
+        assert alerts[0].value == 600
+        assert alerts[0].threshold == 500
+        assert rate_limiter.watchdog_hour_cost[1] == 0.0
+
+    def test_priced_turn_ignores_tokens(self, rate_limiter):
+        alerts = rate_limiter.record_watchdog_turn(1, cost=0.5, turns=1, tokens=9_999)
+        assert alerts == []
+        assert rate_limiter.watchdog_hour_tokens[1] == 0
+        assert rate_limiter.watchdog_hour_cost[1] == pytest.approx(0.5)
+
+    def test_token_alert_fires_once_per_window(self, rate_limiter):
+        first = rate_limiter.record_watchdog_turn(1, cost=None, turns=1, tokens=600)
+        second = rate_limiter.record_watchdog_turn(1, cost=None, turns=1, tokens=600)
+        assert [a.metric for a in first] == ["tokens_per_hour"]
+        assert second == []
+
+    def test_watchdog_window_reset_clears_tokens(self, rate_limiter):
+        rate_limiter.record_watchdog_turn(1, cost=None, turns=1, tokens=400)
+        rate_limiter.watchdog_hour_reset_time[1] = datetime.now(UTC) - timedelta(
+            hours=2
+        )
+        rate_limiter.record_watchdog_turn(1, cost=None, turns=1, tokens=1)
+        assert rate_limiter.watchdog_hour_tokens[1] == 1

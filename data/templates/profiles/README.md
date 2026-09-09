@@ -30,6 +30,15 @@ boot — restart the bot (`/restart` in Telegram, or
 
 ## Adding your own
 
+From Telegram: `/agents → ➕ New agent` switches you to `devops`, which runs
+the `new-agent` skill (`.claude/skills/new-agent/SKILL.md`) — a short
+interview that writes a template directory under **`../local/<slug>/`** (same
+layout, but machine-specific paths are allowed there and it never ships),
+runs `--add`, validates with `scripts/check_install.py --skip-db`, and offers
+the restart. `--add` looks in `local/` first, then here.
+
+By hand:
+
 Make a directory, drop in `profile.yaml` and `persona.md`, and it is offered by
 `--list` immediately. Two rules the loader enforces, so get them right here:
 

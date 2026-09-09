@@ -245,6 +245,7 @@ class TestWriteTools:
             "log_food",
             "food_edit",
             "log_sleep",
+            "sleep_edit",
             "log_train",
             "log_activity",
             "train_edit",
@@ -253,10 +254,15 @@ class TestWriteTools:
             "product_save",
             "product_delete",
             "portion_save",
+            "portion_delete",
         }
         assert set(self._tools(repo, {"products"})) == {
             "product_save",
             "product_delete",
+        }
+        assert set(self._tools(repo, {"portions"})) == {
+            "portion_save",
+            "portion_delete",
         }
 
     async def test_log_food_returns_day_totals(self, repo) -> None:
@@ -555,6 +561,113 @@ class TestFoodEditTool:
         result = await self._tools(repo)["food_edit"].handler(
             {"edits": [{"kcal": 100}]}
         )
+        assert result.get("is_error")
+
+
+class TestSleepEditTool:
+    """dv-4e81: log_sleep's COALESCE upsert cannot write NULL, so before this
+    tool a wrong sleep number could be replaced but never taken back — and
+    the domain most likely to hold invented zeros was the one with no way to
+    remove them."""
+
+    def _tools(self, repo, groups=("logs",)):
+        built = build_user_data_write_tools(repo, USER_A, frozenset(groups))
+        return {t.name: t for t in built}
+
+    async def test_clear_blanks_a_field_log_sleep_cannot(self, repo) -> None:
+        tools = self._tools(repo)
+        await tools["log_sleep"].handler(
+            {"nights": [{"date": "2026-08-15", "weight_kg": 82.4, "hrv": 0}]}
+        )
+
+        # log_sleep alone can never blank it — the omitted field is kept.
+        kept = await tools["log_sleep"].handler(
+            {"nights": [{"date": "2026-08-15", "weight_kg": 82.4}]}
+        )
+        assert _payload(kept)["nights"][0]["row"]["hrv"] == 0
+
+        result = await tools["sleep_edit"].handler(
+            {"edits": [{"date": "2026-08-15", "clear": "hrv"}]}
+        )
+        row = _payload(result)["nights"][0]["row"]
+        assert row["hrv"] is None
+        assert row["weight_kg"] == 82.4
+
+    async def test_addresses_by_date_and_needs_no_entry_id(self, repo) -> None:
+        schema = self._tools(repo)["sleep_edit"].input_schema
+        item = schema["properties"]["edits"]["items"]
+        assert item["required"] == ["date"]
+        assert "entry_id" not in item["properties"]
+
+    async def test_a_date_with_no_night_is_rejected(self, repo) -> None:
+        result = await self._tools(repo)["sleep_edit"].handler(
+            {"edits": [{"date": "2026-08-15", "score": 80}]}
+        )
+        assert result.get("is_error")
+        assert await repo.sleep_last(USER_A) == []
+
+    async def test_cannot_edit_another_users_night(self, repo) -> None:
+        await repo.log_sleep(USER_B, "2026-08-15", hrv=44)
+
+        result = await self._tools(repo)["sleep_edit"].handler(
+            {"edits": [{"date": "2026-08-15", "clear": "hrv"}], "user_id": USER_B}
+        )
+
+        assert result.get("is_error")
+        assert (await repo.sleep_last(USER_B))[0]["hrv"] == 44
+
+    async def test_bad_date_rejects_the_whole_batch(self, repo) -> None:
+        await repo.log_sleep(USER_A, "2026-08-15", hrv=0)
+
+        result = await self._tools(repo)["sleep_edit"].handler(
+            {
+                "edits": [
+                    {"date": "2026-08-15", "clear": "hrv"},
+                    {"date": "2026-08-16", "score": 80},
+                ]
+            }
+        )
+
+        assert result.get("is_error")
+        assert "NOTHING WAS WRITTEN" in result["content"][0]["text"]
+        assert (await repo.sleep_last(USER_A))[0]["hrv"] == 0
+
+    async def test_malformed_date_is_rejected(self, repo) -> None:
+        result = await self._tools(repo)["sleep_edit"].handler(
+            {"edits": [{"date": "вчера", "clear": "hrv"}]}
+        )
+        assert result.get("is_error")
+
+
+class TestPortionDeleteTool:
+    """dv-4e81: a phrase saved by mistake used to be permanent."""
+
+    def _tools(self, repo):
+        built = build_user_data_write_tools(repo, USER_A, frozenset({"portions"}))
+        return {t.name: t for t in built}
+
+    async def test_deletes_own_phrase(self, repo) -> None:
+        mine = (await repo.portion_find(USER_A, "пицца"))[0]
+
+        result = await self._tools(repo)["portion_delete"].handler(
+            {"portion_id": mine["id"]}
+        )
+
+        assert _payload(result)["deleted"] is True
+        assert await repo.portion_find(USER_A, "пицца") == []
+
+    async def test_cannot_delete_another_users_phrase(self, repo) -> None:
+        theirs = (await repo.portion_find(USER_B, "пицца"))[0]
+
+        result = await self._tools(repo)["portion_delete"].handler(
+            {"portion_id": theirs["id"], "user_id": USER_B}
+        )
+
+        assert result.get("is_error")
+        assert len(await repo.portion_find(USER_B, "пицца")) == 1
+
+    async def test_missing_id_is_rejected(self, repo) -> None:
+        result = await self._tools(repo)["portion_delete"].handler({})
         assert result.get("is_error")
 
 

@@ -215,9 +215,16 @@ place filtered by `profile.allows_role(role)`.
 The bot runs one or more isolated profiles (`config/profiles.yaml`; unset
 `PROFILES_CONFIG_PATH` = single-profile mode). Each has its own `working_dir`,
 `memory_dir` and `persona` file, and therefore its own auto-resuming session.
-`config/profiles.example.yaml` is the shipped starting point, and
-`data/templates/` holds the persona/memory scaffolding a new profile is seeded
-from.
+`config/profiles.example.yaml` documents every key, and
+`data/templates/profiles/` holds the shipped profile templates a new profile
+is instantiated from (`scripts/install_profiles.py --add <name>`).
+
+Profiles are toggled (`enabled:`) from `/agents → ⚙ Manage` and created via
+the `new-agent` skill (`.claude/skills/new-agent/`) — an interview run by the
+`devops` profile that writes a template under `data/templates/local/<slug>/`,
+runs `install_profiles.py --add`, validates with `scripts/check_install.py`,
+and offers the restart. A sandboxed profile that must write outside its
+workspace gets `extra_dirs:`, never `sandbox: false`.
 
 Configuration reference: `docs/configuration.md`.
 

@@ -88,10 +88,12 @@ def test_context_tokens_prefers_the_peak_over_result_totals():
     assert r.context_tokens == 66_706
 
 
-def test_context_tokens_degrades_to_input_for_uncached_backends():
-    """Codex reports no cache split — there input_tokens IS the context."""
+def test_context_tokens_never_falls_back_to_input_tokens():
+    """Used to degrade to input_tokens "for uncached backends (Codex)". Codex
+    is not uncached, and its input_tokens is the thread's running total --
+    the flow, which rolled the window every turn (2026-09-05). Unknown is 0."""
     r = _resp(input_tokens=54_000, output_tokens=800)
-    assert r.context_tokens == 54_000
+    assert r.context_tokens == 0
 
 
 def test_context_tokens_is_zero_when_cached_but_peak_unknown():

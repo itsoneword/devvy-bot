@@ -53,12 +53,14 @@ WRITE_TOOLS = {
     "mcp__agent__log_train",
     "mcp__agent__log_activity",
     "mcp__agent__food_edit",
+    "mcp__agent__sleep_edit",
     "mcp__agent__train_edit",
     "mcp__agent__activity_edit",
     "mcp__agent__log_delete",
     "mcp__agent__product_save",
     "mcp__agent__product_delete",
     "mcp__agent__portion_save",
+    "mcp__agent__portion_delete",
 }
 
 # Claim families (ru/en, case-insensitive). Perfective past + performative

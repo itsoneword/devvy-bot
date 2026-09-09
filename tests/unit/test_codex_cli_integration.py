@@ -51,7 +51,16 @@ def _fake_codex(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def settings():
-    return Settings(telegram_bot_token="x", telegram_bot_username="x")
+    # enable_mcp pinned: Settings reads the developer's real .env, where
+    # ENABLE_MCP=true, and the stdio seam (config/mcp.json ->
+    # send_image_to_user) would then be mounted in tests that are about the
+    # profile seam. Its own coverage lives in test_agent_bridge/.
+    return Settings(
+        telegram_bot_token="x",
+        telegram_bot_username="x",
+        enable_mcp=False,
+        mcp_config_path=None,
+    )
 
 
 async def test_run_command_streams_tools_and_returns_answer(tmp_path, settings):
@@ -103,6 +112,65 @@ async def test_run_command_resumes_from_store(tmp_path, settings):
         force_new=False,
     )
     assert "resume" in captured["argv"] and "th-prev" in captured["argv"]
+
+
+def _m_flag(argv):
+    return argv[argv.index("-m") + 1]
+
+
+async def test_run_command_model_kwarg_drives_the_m_argv(tmp_path, settings):
+    """The model comes in on `run_command(model=)`, exactly as it does for
+    Claude — not from a per-user dict on the integration (dv-4207): that was
+    per-process, lost on restart, and raced when two chats shared a user."""
+    fake = _fake_codex(tmp_path)
+    integ = CodexCliIntegration(
+        config=settings,
+        codex_bin=str(fake),
+        session_store=CodexSessionStore(tmp_path / "s.json"),
+    )
+    captured = []
+    orig = integ._build_argv
+    integ._build_argv = lambda **kw: (captured.append(orig(**kw)) or captured[-1])  # type: ignore
+
+    await integ.run_command(
+        prompt="hi",
+        working_directory=tmp_path,
+        user_id=7,
+        force_new=True,
+        model="openai-codex/gpt-5.5",
+    )
+    # Same user, different chat, a different pick: nothing on the object
+    # remembers the previous call.
+    await integ.run_command(
+        prompt="hi",
+        working_directory=tmp_path,
+        user_id=7,
+        force_new=True,
+        model="openai-codex/gpt-5.4-mini",
+    )
+
+    assert [_m_flag(a) for a in captured] == ["gpt-5.5", "gpt-5.4-mini"]
+    assert not hasattr(integ, "set_user_model")
+    assert not hasattr(integ, "_models_by_user")
+
+
+async def test_run_command_without_model_uses_the_config_default(tmp_path, settings):
+    fake = _fake_codex(tmp_path)
+    integ = CodexCliIntegration(
+        config=settings,
+        codex_bin=str(fake),
+        session_store=CodexSessionStore(tmp_path / "s.json"),
+    )
+    captured = {}
+    orig = integ._build_argv
+    integ._build_argv = lambda **kw: captured.setdefault("argv", orig(**kw))  # type: ignore
+
+    await integ.run_command(
+        prompt="hi", working_directory=tmp_path, user_id=7, force_new=True
+    )
+
+    expected = settings.agent_model or "openai-codex/gpt-5.4-mini"
+    assert _m_flag(captured["argv"]) == expected.split("/", 1)[-1]
 
 
 async def test_run_command_does_not_overwrite_agents_md(tmp_path, settings):
@@ -193,3 +261,40 @@ def test_no_mcp_overrides_for_profile_without_seam(tmp_path, settings):
         resume_id=None,
     )
     assert not any("mcp_servers" in a for a in argv)
+
+
+def _failing_codex(tmp_path: Path) -> Path:
+    """A `codex` that fails the way the real one does: the reason on STDOUT
+    as an `error`/`turn.failed` event, and an empty stderr."""
+    script = tmp_path / "codex_fail"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo \'{"type":"thread.started","thread_id":"th-1"}\'\n'
+        'echo \'{"type":"error","message":"400 invalid_request_error"}\'\n'
+        'echo \'{"type":"turn.failed","error":'
+        '{"message":"400 invalid_request_error"}}\'\n'
+        "exit 1\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
+    return script
+
+
+async def test_failed_turn_reports_the_reason_from_stdout(tmp_path, settings):
+    """Regression: the stderr drainer consumes the whole stream, so the old
+    `await proc.stderr.read()` in the failure path always came back empty and
+    the operator saw `Codex CLI failed (exit 1): ` with nothing after it."""
+    integ = CodexCliIntegration(
+        config=settings,
+        codex_bin=str(_failing_codex(tmp_path)),
+        session_store=CodexSessionStore(tmp_path / "s.json"),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await integ.run_command(
+            prompt="hi", working_directory=tmp_path, user_id=1, force_new=True
+        )
+
+    message = str(excinfo.value)
+    assert "exit 1" in message
+    assert "invalid_request_error" in message
+    assert message.count("invalid_request_error") == 1  # turn.failed dedup

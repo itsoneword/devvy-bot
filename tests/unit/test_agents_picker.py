@@ -67,6 +67,13 @@ class _FakeRegistry:
     def get_by_slug(self, slug):
         return self._by.get(slug)
 
+    def get_enabled_by_slug(self, slug):
+        return self._by.get(slug)
+
+    @property
+    def enabled_profiles(self):
+        return list(self.profiles)
+
 
 def _orchestrator():
     settings = SimpleNamespace(

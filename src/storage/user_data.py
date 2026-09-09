@@ -228,6 +228,44 @@ CLEARABLE_SQL: Dict[str, Dict[str, str]] = {
     },
 }
 
+# Sleep is the one domain keyed on (user_id, date) rather than a row id
+# (dv-4e81), so its clear statements bind the date, not an entry_id, and it
+# gets its own map instead of a fourth entry in CLEARABLE_SQL — one dict whose
+# values take different parameters is exactly the kind of thing that gets
+# called with the wrong tuple. `imported_from` is deliberately absent: it
+# records where a row came from, and an import's provenance is not the agent's
+# to erase.
+CLEARABLE_SLEEP_SQL: Dict[str, str] = {
+    "bed": "UPDATE logs_sleep SET bed = NULL WHERE user_id = ? AND date = ?",
+    "wake": "UPDATE logs_sleep SET wake = NULL WHERE user_id = ? AND date = ?",
+    "sleep_min": (
+        "UPDATE logs_sleep SET sleep_min = NULL WHERE user_id = ? AND date = ?"
+    ),
+    "onset_min": (
+        "UPDATE logs_sleep SET onset_min = NULL WHERE user_id = ? AND date = ?"
+    ),
+    "score": "UPDATE logs_sleep SET score = NULL WHERE user_id = ? AND date = ?",
+    "hrv": "UPDATE logs_sleep SET hrv = NULL WHERE user_id = ? AND date = ?",
+    "rhr": "UPDATE logs_sleep SET rhr = NULL WHERE user_id = ? AND date = ?",
+    "weight_kg": (
+        "UPDATE logs_sleep SET weight_kg = NULL WHERE user_id = ? AND date = ?"
+    ),
+    "wellbeing": (
+        "UPDATE logs_sleep SET wellbeing = NULL WHERE user_id = ? AND date = ?"
+    ),
+    "alcohol_u": (
+        "UPDATE logs_sleep SET alcohol_u = NULL WHERE user_id = ? AND date = ?"
+    ),
+    "thc": "UPDATE logs_sleep SET thc = NULL WHERE user_id = ? AND date = ?",
+    "room_temp": (
+        "UPDATE logs_sleep SET room_temp = NULL WHERE user_id = ? AND date = ?"
+    ),
+    "out_night": (
+        "UPDATE logs_sleep SET out_night = NULL WHERE user_id = ? AND date = ?"
+    ),
+    "out_day": "UPDATE logs_sleep SET out_day = NULL WHERE user_id = ? AND date = ?",
+}
+
 # Deleting a row: one literal statement per domain, every one user-scoped so
 # an id belonging to somebody else matches nothing.
 DELETE_SQL: Dict[str, str] = {
@@ -297,6 +335,30 @@ UPSERT_SLEEP_SQL = (
     "imported_from = COALESCE(excluded.imported_from, "
     "logs_sleep.imported_from), "
     "updated_at = excluded.updated_at"
+)
+
+# dv-4e81. Same COALESCE-per-column shape as the upsert, minus the INSERT:
+# `sleep_edit` corrects a night that already exists and must NOT create one.
+# Writing a night is `log_sleep`; a typo'd date here has to fail, not silently
+# open a new row that then looks like real data.
+UPDATE_SLEEP_SQL = (
+    "UPDATE logs_sleep SET "
+    "bed = COALESCE(?, bed), "
+    "wake = COALESCE(?, wake), "
+    "sleep_min = COALESCE(?, sleep_min), "
+    "onset_min = COALESCE(?, onset_min), "
+    "score = COALESCE(?, score), "
+    "hrv = COALESCE(?, hrv), "
+    "rhr = COALESCE(?, rhr), "
+    "weight_kg = COALESCE(?, weight_kg), "
+    "wellbeing = COALESCE(?, wellbeing), "
+    "alcohol_u = COALESCE(?, alcohol_u), "
+    "thc = COALESCE(?, thc), "
+    "room_temp = COALESCE(?, room_temp), "
+    "out_night = COALESCE(?, out_night), "
+    "out_day = COALESCE(?, out_day), "
+    "updated_at = ? "
+    "WHERE user_id = ? AND date = ?"
 )
 
 SELECT_SLEEP_DAY_SQL = "SELECT * FROM logs_sleep WHERE user_id = ? AND date = ?"
@@ -1110,6 +1172,132 @@ class UserDataRepository:
                 )
         return {"written": len(written), "nights": written}
 
+    async def edit_sleep_day(
+        self,
+        user_id: int,
+        date: str,
+        bed: Optional[str] = None,
+        wake: Optional[str] = None,
+        sleep_min: Optional[float] = None,
+        onset_min: Optional[float] = None,
+        score: Optional[float] = None,
+        hrv: Optional[float] = None,
+        rhr: Optional[float] = None,
+        weight_kg: Optional[float] = None,
+        wellbeing: Optional[str] = None,
+        alcohol_u: Optional[float] = None,
+        thc: Optional[str] = None,
+        room_temp: Optional[float] = None,
+        out_night: Optional[float] = None,
+        out_day: Optional[float] = None,
+        clear: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Correct one night in place, keyed on DATE (dv-4e81).
+
+        Same contract as ``edit_food`` with one difference that follows from
+        the table: ``logs_sleep`` is UNIQUE(user_id, date), so the address is
+        the date rather than an entry_id — which is also how the agent thinks
+        about a night, and it saves a ``day_summary`` round-trip just to learn
+        an id.
+
+        Why this exists at all: ``log_sleep`` upserts through
+        COALESCE(excluded.col, existing.col), so passing NULL *keeps* the old
+        value. That is right for "send only what you learned this turn", and
+        it means a wrong number can be replaced but never blanked. The
+        2026-08-19 repair had to null invented zeros out of score/hrv/rhr by
+        hand; ``clear`` is the tool version of that, and the alternative the
+        agent had — ``log_delete`` on the whole night — would have thrown away
+        the real values sitting in the same row.
+        """
+        now = _now()
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(SELECT_SLEEP_DAY_SQL, (user_id, date))
+            before = await cur.fetchone()
+            if before is None:
+                return {"edited": False, "reason": "no sleep entry for that date"}
+            await conn.execute(
+                UPDATE_SLEEP_SQL,
+                (
+                    bed,
+                    wake,
+                    sleep_min,
+                    onset_min,
+                    score,
+                    hrv,
+                    rhr,
+                    weight_kg,
+                    wellbeing,
+                    alcohol_u,
+                    thc,
+                    room_temp,
+                    out_night,
+                    out_day,
+                    now,
+                    user_id,
+                    date,
+                ),
+            )
+            cleared: List[str] = []
+            for name in clear or []:
+                sql = CLEARABLE_SLEEP_SQL.get(str(name).strip().lower())
+                if sql:
+                    await conn.execute(sql, (user_id, date))
+                    cleared.append(str(name).strip().lower())
+            await conn.commit()
+            cur = await conn.execute(SELECT_SLEEP_DAY_SQL, (user_id, date))
+            after = await cur.fetchone()
+            cur = await conn.execute(SELECT_SLEEP_AVG_SQL, (user_id, date, date))
+            avgs = await cur.fetchone()
+        logger.info(
+            "Sleep entry edited",
+            user_id=user_id,
+            date=date,
+            before=dict(before),
+            after=dict(after) if after else None,
+            cleared=cleared,
+        )
+        return {
+            "edited": True,
+            "date": date,
+            "row": dict(after) if after else None,
+            "avg_7d": dict(avgs) if avgs else None,
+            "cleared": cleared,
+        }
+
+    async def missing_sleep_date_index(
+        self, user_id: int, dates: List[str]
+    ) -> Optional[int]:
+        """Index of the first date with no night stored, or None if all exist.
+
+        The dv-b042 pre-flight, dates instead of ids: a batch whose third
+        date is a typo must not leave the first two applied, because the model
+        would assume the whole batch landed.
+        """
+        async with self._db.get_connection() as conn:
+            for index, date in enumerate(dates):
+                cur = await conn.execute(SELECT_SLEEP_DAY_SQL, (user_id, date))
+                if await cur.fetchone() is None:
+                    return index
+        return None
+
+    async def edit_sleep_days(
+        self, user_id: int, edits: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Apply several night corrections, dates pre-flighted as a set.
+
+        NOT deduped by date (unlike ``log_sleep_nights``): edits are applied
+        in the order given, so ``bad_index`` names the row the caller sent
+        rather than a position in a rewritten list. Two edits addressing one
+        night therefore stack in order, which is at least predictable.
+        """
+        missing = await self.missing_sleep_date_index(
+            user_id, [str(e.get("date") or "") for e in edits]
+        )
+        if missing is not None:
+            return {"edited": 0, "bad_index": missing}
+        nights = [await self.edit_sleep_day(user_id, **edit) for edit in edits]
+        return {"edited": len(nights), "nights": nights}
+
     async def sleep_last(self, user_id: int, n: int = 7) -> List[Dict[str, Any]]:
         limit = max(1, min(int(n), 60))
         async with self._db.get_connection() as conn:
@@ -1661,6 +1849,34 @@ class UserDataRepository:
             )
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    async def delete_portion(self, user_id: int, portion_id: int) -> Dict[str, Any]:
+        """Remove one of THIS user's portion phrases (dv-4e81).
+
+        User-scoped, unlike ``delete_product``: portions are per-user, so the
+        ``AND user_id = ?`` means another user's id simply matches nothing.
+        ``save_portion`` can already overwrite a phrase's grams, so this is
+        only for a phrase that should never have been learned — a mis-heard
+        phrase, or grams attributed to the wrong food.
+        """
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(
+                "SELECT * FROM portions WHERE id = ? AND user_id = ?",
+                (portion_id, user_id),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return {"deleted": False, "reason": "no such portion for this user"}
+            await conn.execute(
+                "DELETE FROM portions WHERE id = ? AND user_id = ?",
+                (portion_id, user_id),
+            )
+            await conn.commit()
+        removed = dict(row)
+        logger.info(
+            "Portion deleted", user_id=user_id, portion_id=portion_id, row=removed
+        )
+        return {"deleted": True, "row": removed}
 
     # -- issues (consumers: dv-b9c7) ----------------------------------------
 

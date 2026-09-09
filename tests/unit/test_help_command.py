@@ -33,9 +33,14 @@ def _registry() -> SimpleNamespace:
         _profile("devops", "DevOps", {"owner"}),
         _profile("general", "General", {"owner", "guest"}),
     ]
+    by_slug = lambda slug: next(
+        (p for p in profiles if p.slug == slug), None
+    )  # noqa: E731
     return SimpleNamespace(
         profiles=profiles,
-        get_by_slug=lambda slug: next((p for p in profiles if p.slug == slug), None),
+        enabled_profiles=profiles,
+        get_by_slug=by_slug,
+        get_enabled_by_slug=by_slug,
         get_default=lambda: profiles[0],
     )
 

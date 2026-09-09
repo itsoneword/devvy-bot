@@ -1,11 +1,14 @@
 """data.db read-lane MCP tools (dv-5f3a: lane 3 shaped reads + lane 2 export).
 
-Built per turn by ``build_agent_mcp_server`` when the profile's YAML declares
-``user_data_tools`` groups. ``user_id`` comes exclusively from server
-context, baked into each tool's closure — no tool takes a user or scope
-parameter, so a model cannot address another user's rows (the dv-6dbc rule).
-Mounting is capability-config driven (dv-5f3a decision 1): no profile slug
-is ever hardcoded here.
+Mounted for the profiles whose YAML declares ``user_data_tools`` groups.
+``ctx.user_id`` comes exclusively from server context — no tool takes a user
+or scope parameter, so a model cannot address another user's rows (the
+dv-6dbc rule). Mounting is capability-config driven (dv-5f3a decision 1): no
+profile slug is ever hardcoded here.
+
+Each tool is a :class:`ToolSpec` (dv-ffcb): one implementation, reached by
+the in-process SDK server and by the loopback HTTP bridge alike, both of
+which pass the turn's :class:`TurnContext` explicitly.
 
 ``export_my_data`` is the universal read path: the DB file itself is
 denylisted for sandboxed profiles, so when no shaped tool fits a question
@@ -23,9 +26,15 @@ from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import structlog
-from claude_agent_sdk import tool
 
 from ..events.types import AgentResponseEvent
+from .tool_context import (
+    AgentServices,
+    ToolPredicate,
+    ToolSpec,
+    TurnContext,
+    sdk_tool,
+)
 
 logger = structlog.get_logger()
 
@@ -195,118 +204,6 @@ def _write_export_csv(path: Path, rows: List[Dict[str, Any]]) -> int:
     return len(rows)
 
 
-def build_user_data_read_tools(
-    repo: Any,
-    user_id: int,
-    groups: FrozenSet[str],
-    working_directory: Optional[Path] = None,
-) -> List[Any]:
-    """Read tools for the mounted groups, scoped to ``user_id`` by closure.
-
-    ``working_directory`` is where ``export_my_data`` materializes files;
-    the export tool is only mounted when it is provided.
-    """
-    tools: List[Any] = []
-
-    if "logs" in groups:
-
-        @tool(
-            "day_summary",
-            "Everything logged for one day: meals with computed kcal/macro "
-            "totals, training sets, activities, and the sleep row. This is "
-            "the data store of record — use it instead of reading CSV files "
-            "or recomputing totals yourself.",
-            _schema({"date": str}, "date"),
-        )
-        async def day_summary(args: Dict[str, Any]) -> Dict[str, Any]:
-            date = _date_arg(args, "date")
-            if not date:
-                return _err("date must be YYYY-MM-DD")
-            return _text(await repo.day_summary(user_id, date), drop_nulls=True)
-
-        @tool(
-            "sleep_last",
-            "The last N sleep/recovery rows (sleep, HRV, RHR, weight, "
-            "wellbeing), newest first.",
-            _schema({"n": int}),
-        )
-        async def sleep_last(args: Dict[str, Any]) -> Dict[str, Any]:
-            try:
-                n = int(args.get("n") or 7)
-            except (TypeError, ValueError):
-                n = 7
-            return _text(await repo.sleep_last(user_id, n), drop_nulls=True)
-
-        @tool(
-            "lift_history",
-            "Set-by-set history for one exercise over its most recent "
-            "training dates. Ground every progression suggestion in this — "
-            "never quote weights or reps from memory.",
-            _schema({"exercise": str, "limit": int}, "exercise"),
-        )
-        async def lift_history(args: Dict[str, Any]) -> Dict[str, Any]:
-            exercise = (args.get("exercise") or "").strip()
-            if not exercise:
-                return _err("exercise is required")
-            try:
-                limit = int(args.get("limit") or 5)
-            except (TypeError, ValueError):
-                limit = 5
-            return _text(
-                await repo.lift_history(user_id, exercise, limit), drop_nulls=True
-            )
-
-        @tool(
-            "week_summary",
-            "Last 7 days at a glance: per-day meal counts and kcal/protein "
-            "totals, training volume, activity minutes. Activity minutes "
-            "exclude 'estimated' rows — see activity_estimated_excluded for "
-            "what was left out and say so if you quote a total.",
-            _schema({}),
-        )
-        async def week_summary(args: Dict[str, Any]) -> Dict[str, Any]:
-            return _text(await repo.week_summary(user_id), drop_nulls=True)
-
-        tools += [day_summary, sleep_last, lift_history, week_summary]
-
-    if "products" in groups:
-
-        @tool(
-            "product_find",
-            "Look up a food product or dish by name/brand substring. Returns "
-            "kcal/macros per 100g WITH provenance: 'label_photo'/'official' "
-            "values are authoritative; 'estimate' values are guesses — say so "
-            "when you use one, and never present an estimate as label data.",
-            _schema({"query": str}, "query"),
-        )
-        async def product_find(args: Dict[str, Any]) -> Dict[str, Any]:
-            query = (args.get("query") or "").strip()
-            if not query:
-                return _err("query is required")
-            return _text(await repo.product_find(query), drop_nulls=True)
-
-        tools.append(product_find)
-
-    if "portions" in groups:
-
-        @tool(
-            "portion_find",
-            "This user's learned portion sizes for a phrase (e.g. what "
-            "'нормальная пицца' weighs for THEM). Personal, not universal.",
-            _schema({"phrase": str}, "phrase"),
-        )
-        async def portion_find(args: Dict[str, Any]) -> Dict[str, Any]:
-            phrase = (args.get("phrase") or "").strip()
-            if not phrase:
-                return _err("phrase is required")
-            return _text(await repo.portion_find(user_id, phrase), drop_nulls=True)
-
-        tools.append(portion_find)
-
-    _append_export_tool(tools, repo, user_id, groups, working_directory)
-    return tools
-
-
 def _entry_id(args: Dict[str, Any]) -> int:
     """Row id to act on. Anything unusable becomes 0, which every caller
     rejects — a bad id must never fall through to a statement."""
@@ -381,6 +278,1115 @@ def _str(args: Dict[str, Any], key: str) -> Optional[str]:
     return value.strip()
 
 
+# --------------------------------------------------------------------------
+# Spec registry. Order is the mount order, and it is the order the model sees
+# the tools in; it mirrors the lists the old builders appended.
+# --------------------------------------------------------------------------
+
+USER_DATA_READ_SPECS: List[ToolSpec] = []
+USER_DATA_WRITE_SPECS: List[ToolSpec] = []
+
+
+def data_groups_for(services: AgentServices, ctx: TurnContext) -> FrozenSet[str]:
+    """The data.db capability groups this turn may use — fail closed.
+
+    Needs the repo, a resolved user_id, and a profile whose config declares
+    groups. ``profile_slug`` may carry a per-user suffix ("coach#u123");
+    capabilities live on the base profile.
+    """
+    if services.user_data is None or ctx.user_id is None:
+        return frozenset()
+    if not services.profile_registry:
+        return frozenset()
+    base = services.profile_registry.get_by_slug(ctx.profile_slug.split("#", 1)[0])
+    return (
+        frozenset(getattr(base, "user_data_tools", None) or ()) if base else frozenset()
+    )
+
+
+def _group_available(group: str) -> ToolPredicate:
+    """Mount predicate for one capability group."""
+
+    def _available(services: AgentServices, ctx: TurnContext) -> bool:
+        if group not in data_groups_for(services, ctx):
+            return False
+        # export_my_data materializes files, so it needs a workspace to
+        # write into; without one it is not offered at all.
+        return not (group == "export" and ctx.working_dir is None)
+
+    return _available
+
+
+def _register(
+    bucket: List[ToolSpec],
+    name: str,
+    description: str,
+    schema: Dict[str, Any],
+    group: str,
+) -> Any:
+    def decorator(handler: Any) -> Any:
+        bucket.append(
+            ToolSpec(
+                name=name,
+                description=description,
+                schema=schema,
+                handler=handler,
+                available=_group_available(group),
+                group=group,
+            )
+        )
+        return handler
+
+    return decorator
+
+
+def _read_spec(
+    name: str, description: str, schema: Dict[str, Any], *, group: str
+) -> Any:
+    return _register(USER_DATA_READ_SPECS, name, description, schema, group)
+
+
+def _write_spec(
+    name: str, description: str, schema: Dict[str, Any], *, group: str
+) -> Any:
+    return _register(USER_DATA_WRITE_SPECS, name, description, schema, group)
+
+
+# --- read tools (lane 3: shaped reads) ---
+
+
+@_read_spec(
+    "day_summary",
+    "Everything logged for one day: meals with computed kcal/macro "
+    "totals, training sets, activities, and the sleep row. This is "
+    "the data store of record — use it instead of reading CSV files "
+    "or recomputing totals yourself.",
+    _schema({"date": str}, "date"),
+    group="logs",
+)
+async def day_summary(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    date = _date_arg(args, "date")
+    if not date:
+        return _err("date must be YYYY-MM-DD")
+    return _text(
+        await services.user_data.day_summary(ctx.user_id, date), drop_nulls=True
+    )
+
+
+@_read_spec(
+    "sleep_last",
+    "The last N sleep/recovery rows (sleep, HRV, RHR, weight, "
+    "wellbeing), newest first.",
+    _schema({"n": int}),
+    group="logs",
+)
+async def sleep_last(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    try:
+        n = int(args.get("n") or 7)
+    except (TypeError, ValueError):
+        n = 7
+    return _text(await services.user_data.sleep_last(ctx.user_id, n), drop_nulls=True)
+
+
+@_read_spec(
+    "lift_history",
+    "Set-by-set history for one exercise over its most recent "
+    "training dates. Ground every progression suggestion in this — "
+    "never quote weights or reps from memory.",
+    _schema({"exercise": str, "limit": int}, "exercise"),
+    group="logs",
+)
+async def lift_history(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    exercise = (args.get("exercise") or "").strip()
+    if not exercise:
+        return _err("exercise is required")
+    try:
+        limit = int(args.get("limit") or 5)
+    except (TypeError, ValueError):
+        limit = 5
+    return _text(
+        await services.user_data.lift_history(ctx.user_id, exercise, limit),
+        drop_nulls=True,
+    )
+
+
+@_read_spec(
+    "week_summary",
+    "Last 7 days at a glance: per-day meal counts and kcal/protein "
+    "totals, training volume, activity minutes. Activity minutes "
+    "exclude 'estimated' rows — see activity_estimated_excluded for "
+    "what was left out and say so if you quote a total.",
+    _schema({}),
+    group="logs",
+)
+async def week_summary(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    return _text(await services.user_data.week_summary(ctx.user_id), drop_nulls=True)
+
+
+@_read_spec(
+    "product_find",
+    "Look up a food product or dish by name/brand substring. Returns "
+    "kcal/macros per 100g WITH provenance: 'label_photo'/'official' "
+    "values are authoritative; 'estimate' values are guesses — say so "
+    "when you use one, and never present an estimate as label data.",
+    _schema({"query": str}, "query"),
+    group="products",
+)
+async def product_find(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    query = (args.get("query") or "").strip()
+    if not query:
+        return _err("query is required")
+    return _text(await services.user_data.product_find(query), drop_nulls=True)
+
+
+@_read_spec(
+    "portion_find",
+    "This user's learned portion sizes for a phrase (e.g. what "
+    "'нормальная пицца' weighs for THEM). Personal, not universal.",
+    _schema({"phrase": str}, "phrase"),
+    group="portions",
+)
+async def portion_find(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    phrase = (args.get("phrase") or "").strip()
+    if not phrase:
+        return _err("phrase is required")
+    return _text(
+        await services.user_data.portion_find(ctx.user_id, phrase), drop_nulls=True
+    )
+
+
+@_read_spec(
+    "export_my_data",
+    "Export raw data rows as CSV files (docs as .md) into "
+    "exports/ in your working directory, then analyze them with "
+    "code. THIS IS YOUR UNIVERSAL READ PATH: whenever no other data "
+    "tool answers the question, export the relevant domain and "
+    "compute over the files — never tell the user data is "
+    "unreachable, and never guess. domain: sleep | food | train | "
+    "activity | portions | issues | docs | products | all. Optional "
+    "date_from/date_to (YYYY-MM-DD) bound the dated log domains. "
+    "Files are overwritten on each call.",
+    _schema({"domain": str, "date_from": str, "date_to": str}),
+    group="export",
+)
+async def export_my_data(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    # Guarded at mount time too (_group_available); kept so a mis-wire fails
+    # loudly instead of writing the export somewhere nobody asked for.
+    if ctx.working_dir is None:
+        return _err("no workspace to export into in this session")
+    domain = (args.get("domain") or "").strip().lower()
+    valid = set(services.user_data.EXPORT_DOMAINS)
+    domains = sorted(valid) if domain == "all" else [domain]
+    if not set(domains) <= valid:
+        return _err(f"domain must be one of: {', '.join(sorted(valid))}, all")
+    date_from = _date_arg(args, "date_from") or None
+    date_to = _date_arg(args, "date_to") or None
+
+    export_dir = ctx.working_dir / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    report: Dict[str, Any] = {}
+    for name in domains:
+        rows = await services.user_data.export_rows(
+            ctx.user_id, name, date_from=date_from, date_to=date_to
+        )
+        if name == "docs":
+            docs_dir = export_dir / "docs"
+            docs_dir.mkdir(exist_ok=True)
+            paths = []
+            for row in rows:
+                stem = row.get("period") or str(row.get("id"))
+                doc_path = docs_dir / f"{row.get('kind')}-{stem}.md"
+                doc_path.write_text(str(row.get("content") or ""), encoding="utf-8")
+                paths.append(str(doc_path))
+            report[name] = {"rows": len(rows), "paths": paths}
+        else:
+            csv_path = export_dir / f"{name}.csv"
+            count = _write_export_csv(csv_path, rows)
+            report[name] = {"rows": count, "path": str(csv_path)}
+    logger.info(
+        "agent tool export_my_data",
+        user_id=ctx.user_id,
+        domains=domains,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return _text(report)
+
+
+# --- write tools (lane 1) ---
+
+
+@_write_spec(
+    "log_food",
+    "Record meals for ONE date. 'items' is always an array, one "
+    "object per meal or component: a whole day, a three-part dinner "
+    "and a single snack are each ONE call — never one call per "
+    "component. Returns the day's computed totals ONCE, after every "
+    "row is in — quote THOSE numbers back to the user, never your "
+    "own arithmetic. Omit unknown numbers entirely: an absent field "
+    "is stored as empty, but a 0 you supplied is a real zero and "
+    "will drag every average that touches it. confidence: 'high' "
+    "only with label/known-product data, else 'est'. source: "
+    "'photo' or 'text'.",
+    _batch_schema(
+        "items",
+        {
+            "meal": str,
+            "time": str,
+            "kcal": float,
+            "protein": float,
+            "fat": float,
+            "carb": float,
+            "confidence": str,
+            "source": str,
+        },
+        ("meal",),
+        {"date": str},
+        ("date",),
+    ),
+    group="logs",
+)
+async def log_food(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    date = _date_arg(args, "date")
+    if not date:
+        return _err("date (YYYY-MM-DD) is required")
+    items, error = _rows(args, "items")
+    if error:
+        return _err(error)
+    if _cap(items, "items"):
+        return _err(_cap(items, "items"))
+    payload: List[Dict[str, Any]] = []
+    for index, item in enumerate(items):
+        meal = _str(item, "meal")
+        if not meal:
+            return _reject("items", index, "meal is required")
+        payload.append(
+            {
+                "meal": meal,
+                "time": _str(item, "time"),
+                "kcal": _num(item, "kcal"),
+                "protein": _num(item, "protein"),
+                "fat": _num(item, "fat"),
+                "carb": _num(item, "carb"),
+                "confidence": _str(item, "confidence"),
+                "source": _str(item, "source"),
+            }
+        )
+    return _text(await services.user_data.log_food_items(ctx.user_id, date, payload))
+
+
+@_write_spec(
+    "food_edit",
+    "Correct meals ALREADY logged, in place. 'edits' is always an "
+    "array, one object per row being corrected. Use this whenever "
+    "the user revises something you logged (wrong weight, wrong "
+    "estimate, forgot an ingredient) — never log a second "
+    "'correction' row with a negative number. Take entry_id from "
+    "day_summary. Send only the fields that change; the rest are "
+    "kept. To take back a number you invented, name it in 'clear' "
+    "(e.g. 'kcal,protein') — that blanks it to empty, which is "
+    "honest, whereas setting it to 0 is a false measurement. "
+    "Returns the corrected rows plus each day's recomputed totals — "
+    "quote THOSE.",
+    _batch_schema(
+        "edits",
+        {
+            "entry_id": int,
+            "meal": str,
+            "time": str,
+            "kcal": float,
+            "protein": float,
+            "fat": float,
+            "carb": float,
+            "confidence": str,
+            "source": str,
+            "clear": str,
+        },
+        ("entry_id",),
+    ),
+    group="logs",
+)
+async def food_edit(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    edits, error = _rows(args, "edits")
+    if error:
+        return _err(error)
+    if _cap(edits, "edits"):
+        return _err(_cap(edits, "edits"))
+    payload: List[Dict[str, Any]] = []
+    for index, item in enumerate(edits):
+        entry_id = _entry_id(item)
+        if entry_id <= 0:
+            return _reject("edits", index, "entry_id is required (from day_summary)")
+        payload.append(
+            {
+                "entry_id": entry_id,
+                "meal": _str(item, "meal"),
+                "time": _str(item, "time"),
+                "kcal": _num(item, "kcal"),
+                "protein": _num(item, "protein"),
+                "fat": _num(item, "fat"),
+                "carb": _num(item, "carb"),
+                "confidence": _str(item, "confidence"),
+                "source": _str(item, "source"),
+                "clear": _clear_list(item),
+            }
+        )
+    result = await services.user_data.edit_food_many(ctx.user_id, payload)
+    if result.get("bad_index") is not None:
+        index = int(result["bad_index"])
+        return _reject(
+            "edits",
+            index,
+            f"no meal with id {payload[index]['entry_id']} in this "
+            "user's log — re-read day_summary for the right ids",
+        )
+    return _text(result)
+
+
+@_write_spec(
+    "train_edit",
+    "Correct training sets ALREADY logged, in place (wrong weight, "
+    "reps, or exercise name). 'edits' is always an array, one object "
+    "per set — re-weighting all four sets of an exercise is ONE "
+    "call. entry_id comes from day_summary. Send only what changes; "
+    "'clear' blanks fields by name (e.g. 'rpe,weight_kg'), which is "
+    "how you take back a number you should not have written — never "
+    "overwrite it with 0.",
+    _batch_schema(
+        "edits",
+        {
+            "entry_id": int,
+            "exercise": str,
+            "session": str,
+            "set_n": str,
+            "weight_kg": str,
+            "reps": str,
+            "rpe": float,
+            "clear": str,
+        },
+        ("entry_id",),
+    ),
+    group="logs",
+)
+async def train_edit(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    edits, error = _rows(args, "edits")
+    if error:
+        return _err(error)
+    if _cap(edits, "edits"):
+        return _err(_cap(edits, "edits"))
+    payload: List[Dict[str, Any]] = []
+    for index, item in enumerate(edits):
+        entry_id = _entry_id(item)
+        if entry_id <= 0:
+            return _reject("edits", index, "entry_id is required (from day_summary)")
+        payload.append(
+            {
+                "entry_id": entry_id,
+                "exercise": _str(item, "exercise"),
+                "session": _str(item, "session"),
+                "set_n": _str(item, "set_n"),
+                "weight_kg": _str(item, "weight_kg"),
+                "reps": _str(item, "reps"),
+                "rpe": _num(item, "rpe"),
+                "clear": _clear_list(item),
+            }
+        )
+    result = await services.user_data.edit_train_many(ctx.user_id, payload)
+    if result.get("bad_index") is not None:
+        index = int(result["bad_index"])
+        return _reject(
+            "edits",
+            index,
+            f"no training set with id {payload[index]['entry_id']} in "
+            "this user's log — re-read day_summary for the right ids",
+        )
+    return _text(result)
+
+
+@_write_spec(
+    "activity_edit",
+    "Correct an activity ALREADY logged, in place. entry_id comes "
+    "from day_summary. Send only what changes; 'clear' blanks fields "
+    "by name (e.g. 'duration_min'). kcal_active/kcal_total/"
+    "exercise_min/stand_h/steps/distance_km are Apple-Watch-style "
+    "ring/step numbers, distinct from duration_min/intensity. "
+    "source lets you upgrade a 'user_reported' placeholder to "
+    "'measured' once real data arrives — never use this to change a "
+    "value just because the user pushed back; that needs real data, "
+    "not a revision.",
+    _batch_schema(
+        "edits",
+        {
+            "entry_id": int,
+            "type": str,
+            "duration_min": float,
+            "intensity": str,
+            "kcal_active": float,
+            "kcal_total": float,
+            "exercise_min": float,
+            "stand_h": float,
+            "steps": float,
+            "distance_km": float,
+            "source": str,
+            "clear": str,
+        },
+        ("entry_id",),
+    ),
+    group="logs",
+)
+async def activity_edit(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    edits, error = _rows(args, "edits")
+    if error:
+        return _err(error)
+    if _cap(edits, "edits"):
+        return _err(_cap(edits, "edits"))
+    payload: List[Dict[str, Any]] = []
+    for index, item in enumerate(edits):
+        entry_id = _entry_id(item)
+        if entry_id <= 0:
+            return _reject("edits", index, "entry_id is required (from day_summary)")
+        source = _str(item, "source")
+        if source is not None and source not in _ACTIVITY_SOURCES:
+            return _reject(
+                "edits",
+                index,
+                "source must be one of " + ", ".join(_ACTIVITY_SOURCES),
+            )
+        payload.append(
+            {
+                "entry_id": entry_id,
+                "type_": _str(item, "type"),
+                "duration_min": _num(item, "duration_min"),
+                "intensity": _str(item, "intensity"),
+                "kcal_active": _num(item, "kcal_active"),
+                "kcal_total": _num(item, "kcal_total"),
+                "exercise_min": _num(item, "exercise_min"),
+                "stand_h": _num(item, "stand_h"),
+                "steps": _num(item, "steps"),
+                "distance_km": _num(item, "distance_km"),
+                "source": source,
+                "clear": _clear_list(item),
+            }
+        )
+    result = await services.user_data.edit_activity_many(ctx.user_id, payload)
+    if result.get("bad_index") is not None:
+        index = int(result["bad_index"])
+        return _reject(
+            "edits",
+            index,
+            f"no activity with id {payload[index]['entry_id']} in this "
+            "user's log — re-read day_summary for the right ids",
+        )
+    return _text(result)
+
+
+@_write_spec(
+    "log_delete",
+    "Remove log rows that should not exist at all — logged twice, "
+    "logged on the wrong day, or something the user says never "
+    "happened. 'entries' is always an array, one object per row, so "
+    "undoing a whole mis-logged session is ONE call. Prefer editing "
+    "when the entry is merely WRONG: deletion loses the record. "
+    "domain is food/sleep/train/activity; entry_id comes from "
+    "day_summary. Every id is checked before anything is removed — "
+    "one bad id and nothing is deleted. Tell the user exactly what "
+    "you removed.",
+    _batch_schema("entries", {"domain": str, "entry_id": int}, ("domain", "entry_id")),
+    group="logs",
+)
+async def log_delete(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    entries, error = _rows(args, "entries")
+    if error:
+        return _err(error)
+    if _cap(entries, "entries"):
+        return _err(_cap(entries, "entries"))
+    payload: List[Dict[str, Any]] = []
+    for index, item in enumerate(entries):
+        domain = str(item.get("domain") or "").strip().lower()
+        entry_id = _entry_id(item)
+        if domain not in ("food", "sleep", "train", "activity"):
+            return _reject(
+                "entries",
+                index,
+                "domain must be one of food, sleep, train, activity",
+            )
+        if entry_id <= 0:
+            return _reject("entries", index, "entry_id is required (from day_summary)")
+        payload.append({"domain": domain, "entry_id": entry_id})
+    result = await services.user_data.delete_log_entries(ctx.user_id, payload)
+    if result.get("bad_index") is not None:
+        index = int(result["bad_index"])
+        bad = payload[index]
+        return _reject(
+            "entries",
+            index,
+            f"no {bad['domain']} entry with id {bad['entry_id']} in "
+            "this user's log — re-read day_summary for the right ids",
+        )
+    return _text(result)
+
+
+@_write_spec(
+    "log_sleep",
+    "Record sleep/recovery fields. 'nights' is always an array, one "
+    "object per DATE — each night carries its own 'date', so a week "
+    "read off a watch export is ONE call. Upserts: provide only what "
+    "you learned this turn, existing fields for that date are kept, "
+    "not erased. Never fill a field you were not told: a night "
+    "without an hrv reading must LEAVE HRV OUT, because a 0 written "
+    "for two nights corrupts every average afterwards while an empty "
+    "cell is simply skipped. Returns the merged row plus 7-day "
+    "averages per date.",
+    _batch_schema(
+        "nights",
+        {
+            "date": str,
+            "bed": str,
+            "wake": str,
+            "sleep_min": float,
+            "onset_min": float,
+            "score": float,
+            "hrv": float,
+            "rhr": float,
+            "weight_kg": float,
+            "wellbeing": str,
+            "alcohol_u": float,
+            "thc": str,
+            "room_temp": float,
+            "out_night": float,
+            "out_day": float,
+        },
+        ("date",),
+    ),
+    group="logs",
+)
+async def log_sleep(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    nights, error = _rows(args, "nights")
+    if error:
+        return _err(error)
+    if _cap(nights, "nights"):
+        return _err(_cap(nights, "nights"))
+    payload: List[Dict[str, Any]] = []
+    for index, item in enumerate(nights):
+        date = _date_arg(item, "date")
+        if not date:
+            return _reject("nights", index, "date must be YYYY-MM-DD")
+        payload.append(
+            {
+                "date": date,
+                "bed": _str(item, "bed"),
+                "wake": _str(item, "wake"),
+                "sleep_min": _num(item, "sleep_min"),
+                "onset_min": _num(item, "onset_min"),
+                "score": _num(item, "score"),
+                "hrv": _num(item, "hrv"),
+                "rhr": _num(item, "rhr"),
+                "weight_kg": _num(item, "weight_kg"),
+                "wellbeing": _str(item, "wellbeing"),
+                "alcohol_u": _num(item, "alcohol_u"),
+                "thc": _str(item, "thc"),
+                "room_temp": _num(item, "room_temp"),
+                "out_night": _num(item, "out_night"),
+                "out_day": _num(item, "out_day"),
+            }
+        )
+    return _text(await services.user_data.log_sleep_nights(ctx.user_id, payload))
+
+
+@_write_spec(
+    "sleep_edit",
+    "Correct nights ALREADY logged. 'edits' is always an array, one "
+    "object per DATE — sleep rows are addressed by 'date', not by "
+    "entry_id, so you do not need day_summary first. Only for a date "
+    "that already has a row; use log_sleep to create one. Send only "
+    "the fields that change; the rest are kept. THIS IS THE ONLY WAY "
+    "TO BLANK A SLEEP FIELD: name it in 'clear' (e.g. 'hrv,score') "
+    "and it goes back to empty. log_sleep cannot do this — it keeps "
+    "the stored value for anything you omit. Use clear whenever a "
+    "number turns out to be unknown rather than wrong; writing 0 "
+    "instead is a false measurement that drags every average. "
+    "Returns the merged row plus 7-day averages per date.",
+    _batch_schema(
+        "edits",
+        {
+            "date": str,
+            "bed": str,
+            "wake": str,
+            "sleep_min": float,
+            "onset_min": float,
+            "score": float,
+            "hrv": float,
+            "rhr": float,
+            "weight_kg": float,
+            "wellbeing": str,
+            "alcohol_u": float,
+            "thc": str,
+            "room_temp": float,
+            "out_night": float,
+            "out_day": float,
+            "clear": str,
+        },
+        ("date",),
+    ),
+    group="logs",
+)
+async def sleep_edit(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    edits, error = _rows(args, "edits")
+    if error:
+        return _err(error)
+    if _cap(edits, "edits"):
+        return _err(_cap(edits, "edits"))
+    payload: List[Dict[str, Any]] = []
+    for index, item in enumerate(edits):
+        date = _date_arg(item, "date")
+        if not date:
+            return _reject("edits", index, "date must be YYYY-MM-DD")
+        payload.append(
+            {
+                "date": date,
+                "bed": _str(item, "bed"),
+                "wake": _str(item, "wake"),
+                "sleep_min": _num(item, "sleep_min"),
+                "onset_min": _num(item, "onset_min"),
+                "score": _num(item, "score"),
+                "hrv": _num(item, "hrv"),
+                "rhr": _num(item, "rhr"),
+                "weight_kg": _num(item, "weight_kg"),
+                "wellbeing": _str(item, "wellbeing"),
+                "alcohol_u": _num(item, "alcohol_u"),
+                "thc": _str(item, "thc"),
+                "room_temp": _num(item, "room_temp"),
+                "out_night": _num(item, "out_night"),
+                "out_day": _num(item, "out_day"),
+                "clear": _clear_list(item),
+            }
+        )
+    result = await services.user_data.edit_sleep_days(ctx.user_id, payload)
+    if result.get("bad_index") is not None:
+        index = int(result["bad_index"])
+        return _reject(
+            "edits",
+            index,
+            f"no sleep entry for {payload[index]['date']} — check the "
+            "date, or use log_sleep to create the night first",
+        )
+    return _text(result)
+
+
+@_write_spec(
+    "log_train",
+    "Record training sets for ONE date. 'sets' is always an array, "
+    "one object per SET: a whole workout is ONE call with every set "
+    "in the array, and adding a single set later is the same call "
+    "with a one-element array. Never one call per set. 'session' is "
+    "the workout label (e.g. 'pull_chest'), given once for the "
+    "batch. weight_kg and reps are TEXT — record what was said "
+    "('10-12', 'bodyweight'), never invent per-set numbers, and "
+    "leave set_n out rather than numbering sets yourself. Returns "
+    "today's sets and the previous session's sets ONCE PER "
+    "EXERCISE — ground progression advice in that.",
+    _batch_schema(
+        "sets",
+        {
+            "exercise": str,
+            "set_n": str,
+            "weight_kg": str,
+            "reps": str,
+            "rpe": float,
+        },
+        ("exercise",),
+        {"date": str, "session": str},
+        ("date",),
+    ),
+    group="logs",
+)
+async def log_train(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    date = _date_arg(args, "date")
+    if not date:
+        return _err("date (YYYY-MM-DD) is required")
+    sets, error = _rows(args, "sets")
+    if error:
+        return _err(error)
+    if _cap(sets, "sets"):
+        return _err(_cap(sets, "sets"))
+    payload: List[Dict[str, Any]] = []
+    for index, item in enumerate(sets):
+        exercise = _str(item, "exercise")
+        if not exercise:
+            return _reject("sets", index, "exercise is required")
+        payload.append(
+            {
+                "exercise": exercise,
+                "set_n": _str(item, "set_n"),
+                "weight_kg": _str(item, "weight_kg"),
+                "reps": _str(item, "reps"),
+                "rpe": _num(item, "rpe"),
+            }
+        )
+    return _text(
+        await services.user_data.log_train_sets(
+            ctx.user_id, date, payload, session=_str(args, "session")
+        )
+    )
+
+
+@_write_spec(
+    "log_activity",
+    "Record activities (padel, climbing, walk...) for ONE date. "
+    "'activities' is always an array, one object per activity — a "
+    "day with a walk and a padel session is ONE call. "
+    "kcal_active/kcal_total/exercise_min/stand_h/steps/distance_km "
+    "are optional Apple-Watch-style ring/step numbers (e.g. "
+    "'Move 393/600 ккал, Exercise 24/40 мин, шаги 8266') — omit "
+    "whatever wasn't reported, empty stays empty, never 0. source is "
+    "REQUIRED PER ACTIVITY, and stays that way in a batch: "
+    "'user_reported' (the user told you), 'measured' (device/Watch "
+    "data), or 'estimated' (you inferred or guessed it) — never "
+    "write an estimate as 'user_reported' or 'measured', and never "
+    "let one row inherit another row's source. Any date more than 1 "
+    "day in the past needs a non-empty backfill_reason. Never write "
+    "a row for a date the user has already said had nothing on it, "
+    "and never change the number because the user pushed back — that "
+    "calls for asking for real data, not a bigger guess. Returns the "
+    "day's full activity list ONCE.",
+    _batch_schema(
+        "activities",
+        {
+            "type": str,
+            "source": str,
+            "duration_min": float,
+            "intensity": str,
+            "kcal_active": float,
+            "kcal_total": float,
+            "exercise_min": float,
+            "stand_h": float,
+            "steps": float,
+            "distance_km": float,
+        },
+        ("type", "source"),
+        {"date": str, "backfill_reason": str},
+        ("date",),
+    ),
+    group="logs",
+)
+async def log_activity(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    log_date = _date_arg(args, "date")
+    if not log_date:
+        return _err("date (YYYY-MM-DD) is required")
+    activities, error = _rows(args, "activities")
+    if error:
+        return _err(error)
+    if _cap(activities, "activities"):
+        return _err(_cap(activities, "activities"))
+    backfill_reason = _str(args, "backfill_reason")
+    retroactive = _is_retroactive(log_date)
+    if retroactive and not backfill_reason:
+        return _err(
+            "date is more than 1 day in the past — backfill_reason "
+            "is required for a retroactive write"
+        )
+    # Validate every row BEFORE the first insert: in a batch, an
+    # unlabelled row must not ride in behind a labelled one (dv-c388).
+    payload: List[Dict[str, Any]] = []
+    for index, item in enumerate(activities):
+        activity_type = _str(item, "type")
+        source = _str(item, "source")
+        if not activity_type:
+            return _reject("activities", index, "type is required")
+        if source not in _ACTIVITY_SOURCES:
+            return _reject(
+                "activities",
+                index,
+                "source is required: one of " + ", ".join(_ACTIVITY_SOURCES),
+            )
+        payload.append(
+            {
+                "type": activity_type,
+                "source": source,
+                "duration_min": _num(item, "duration_min"),
+                "intensity": _str(item, "intensity"),
+                "kcal_active": _num(item, "kcal_active"),
+                "kcal_total": _num(item, "kcal_total"),
+                "exercise_min": _num(item, "exercise_min"),
+                "stand_h": _num(item, "stand_h"),
+                "steps": _num(item, "steps"),
+                "distance_km": _num(item, "distance_km"),
+            }
+        )
+    result = await services.user_data.log_activities(ctx.user_id, log_date, payload)
+    estimated = [r["type"] for r in payload if r["source"] == "estimated"]
+    if retroactive and estimated:
+        logger.warning(
+            "Estimated activity backfilled",
+            user_id=ctx.user_id,
+            date=log_date,
+            types=estimated,
+            backfill_reason=backfill_reason,
+        )
+        if services.event_bus is not None:
+            await services.event_bus.publish(
+                AgentResponseEvent(
+                    chat_id=0,  # broadcast to owner chats
+                    text=(
+                        "⚠️ estimated backfill "
+                        f"[{ctx.profile_slug or 'coach'}] user={ctx.user_id} "
+                        f"date={log_date} types={estimated!r}: "
+                        f"{backfill_reason}"
+                    ),
+                    parse_mode=None,
+                    source="log_activity_backfill",
+                )
+            )
+    return _text(result)
+
+
+@_write_spec(
+    "product_save",
+    "Save or update food products/dishes (per 100g). 'products' is "
+    "always an array, one object per product — a label photo or a "
+    "menu that yields five products is ONE call. provenance is "
+    "REQUIRED PER PRODUCT and never guessed: 'label_photo' only when "
+    "reading an actual label, 'official' for verified official data, "
+    "otherwise 'estimate' — one row's provenance never carries over "
+    "to the next. An estimate can NEVER overwrite label/official "
+    "values: that product is refused individually and the "
+    "authoritative row is returned, while the rest of the batch is "
+    "still saved. Omit a macro you do not know rather than sending "
+    "0 — a 0 here is 'this food has no protein', not 'unknown'.",
+    _batch_schema(
+        "products",
+        {
+            "name": str,
+            "brand": str,
+            "kind": str,
+            "kcal_100g": float,
+            "protein": float,
+            "fat": float,
+            "carb": float,
+            "salt": float,
+            "provenance": str,
+            "confirmed_on": str,
+        },
+        ("name", "kind", "provenance"),
+    ),
+    group="products",
+)
+async def product_save(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    products, error = _rows(args, "products")
+    if error:
+        return _err(error)
+    if _cap(products, "products"):
+        return _err(_cap(products, "products"))
+    payload: List[Dict[str, Any]] = []
+    for index, item in enumerate(products):
+        name = _str(item, "name")
+        kind = _str(item, "kind")
+        provenance = _str(item, "provenance")
+        if not name or kind not in ("product", "dish"):
+            return _reject(
+                "products",
+                index,
+                "name and kind ('product'|'dish') are required",
+            )
+        if provenance not in ("label_photo", "official", "estimate"):
+            return _reject(
+                "products",
+                index,
+                "provenance must be label_photo, official, or estimate",
+            )
+        payload.append(
+            {
+                "name": name,
+                "kind": kind,
+                "provenance": provenance,
+                "brand": _str(item, "brand") or "",
+                "kcal_100g": _num(item, "kcal_100g"),
+                "protein": _num(item, "protein"),
+                "fat": _num(item, "fat"),
+                "carb": _num(item, "carb"),
+                "salt": _num(item, "salt"),
+                "confirmed_on": _date_arg(item, "confirmed_on") or None,
+                "created_by": ctx.user_id,
+            }
+        )
+    return _text(await services.user_data.save_products(payload))
+
+
+@_write_spec(
+    "product_delete",
+    "Remove a product from the shared store — use it when a product "
+    "is a duplicate or was never real. To fix WRONG numbers, call "
+    "product_save instead: correcting keeps the history, deleting "
+    "loses it. Products are SHARED, so this affects every user; "
+    "confirm with the user first and say what you removed. "
+    "product_id comes from product_find.",
+    _schema({"product_id": int}, "product_id"),
+    group="products",
+)
+async def product_delete(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    try:
+        product_id = int(args.get("product_id") or 0)
+    except (TypeError, ValueError):
+        product_id = 0
+    if product_id <= 0:
+        return _err("product_id is required (get it from product_find)")
+    result = await services.user_data.delete_product(product_id)
+    if not result.get("deleted"):
+        return _err(f"no product with id {product_id}")
+    return _text(result)
+
+
+@_write_spec(
+    "portion_save",
+    "Save THIS user's portion sizes for phrases (e.g. 'нормальная "
+    "пицца' = 350g for them). 'portions' is always an array, one "
+    "object per phrase. Upserts on the phrase. grams must be a real "
+    "number the user gave or agreed to — if you do not know it, ask, "
+    "do not send a placeholder.",
+    _batch_schema(
+        "portions",
+        {"phrase": str, "grams": float, "learned_from": str},
+        ("phrase", "grams"),
+    ),
+    group="portions",
+)
+async def portion_save(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    portions, error = _rows(args, "portions")
+    if error:
+        return _err(error)
+    if _cap(portions, "portions"):
+        return _err(_cap(portions, "portions"))
+    payload: List[Dict[str, Any]] = []
+    for index, item in enumerate(portions):
+        phrase = _str(item, "phrase")
+        grams = _num(item, "grams")
+        if not phrase or grams is None or grams <= 0:
+            return _reject("portions", index, "phrase and positive grams are required")
+        payload.append(
+            {
+                "phrase": phrase,
+                "grams": grams,
+                "learned_from": _str(item, "learned_from"),
+            }
+        )
+    return _text(await services.user_data.save_portions(ctx.user_id, payload))
+
+
+@_write_spec(
+    "portion_delete",
+    "Forget one of this user's portion phrases — use it when the "
+    "phrase itself was never real (mis-heard, or the grams belong to "
+    "a different food). To fix WRONG grams, call portion_save "
+    "instead: it overwrites the phrase and keeps it usable. "
+    "portion_id comes from portion_find. Say which phrase you "
+    "removed.",
+    _schema({"portion_id": int}, "portion_id"),
+    group="portions",
+)
+async def portion_delete(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    try:
+        portion_id = int(args.get("portion_id") or 0)
+    except (TypeError, ValueError):
+        portion_id = 0
+    if portion_id <= 0:
+        return _err("portion_id is required (get it from portion_find)")
+    result = await services.user_data.delete_portion(ctx.user_id, portion_id)
+    if not result.get("deleted"):
+        return _err(f"no portion with id {portion_id} for this user")
+    return _text(result)
+
+
+# --------------------------------------------------------------------------
+# Legacy builders. The SDK transport reaches these tools through
+# ``build_agent_mcp_server`` -> the spec registry above; these two functions
+# stay for callers that hand in a repo + user id + an explicit group set.
+# --------------------------------------------------------------------------
+
+
+def _legacy_tools(
+    specs: List[ToolSpec],
+    repo: Any,
+    user_id: int,
+    groups: FrozenSet[str],
+    working_directory: Optional[Path] = None,
+    event_bus: Any = None,
+    profile_slug: Optional[str] = None,
+) -> List[Any]:
+    """Bind the specs for ``groups`` to one explicit context."""
+    services = AgentServices(event_bus=event_bus, task_repo=None, user_data=repo)
+    ctx = TurnContext(
+        profile_slug=profile_slug or "",
+        working_dir=working_directory,
+        user_id=user_id,
+    )
+    return [
+        sdk_tool(spec, services, ctx)
+        for spec in specs
+        if spec.group in groups
+        and not (spec.group == "export" and working_directory is None)
+    ]
+
+
+def build_user_data_read_tools(
+    repo: Any,
+    user_id: int,
+    groups: FrozenSet[str],
+    working_directory: Optional[Path] = None,
+) -> List[Any]:
+    """Read tools for the mounted groups, scoped to ``user_id``.
+
+    ``working_directory`` is where ``export_my_data`` materializes files;
+    the export tool is only mounted when it is provided.
+    """
+    return _legacy_tools(
+        USER_DATA_READ_SPECS,
+        repo,
+        user_id,
+        groups,
+        working_directory=working_directory,
+    )
+
+
 def build_user_data_write_tools(
     repo: Any,
     user_id: int,
@@ -388,7 +1394,7 @@ def build_user_data_write_tools(
     event_bus: Any = None,
     profile_slug: Optional[str] = None,
 ) -> List[Any]:
-    """Write tools (lane 1) for the mounted groups, user-scoped by closure.
+    """Write tools (lane 1) for the mounted groups, user-scoped.
 
     Every write returns computed aggregates — the model quotes them instead
     of doing its own arithmetic (dv-7a3c failure class).
@@ -398,763 +1404,11 @@ def build_user_data_write_tools(
     way the save-honesty check does, so a fabrication surfaces within a
     minute instead of after a user complaint.
     """
-    tools: List[Any] = []
-
-    if "logs" in groups:
-
-        @tool(
-            "log_food",
-            "Record meals for ONE date. 'items' is always an array, one "
-            "object per meal or component: a whole day, a three-part dinner "
-            "and a single snack are each ONE call — never one call per "
-            "component. Returns the day's computed totals ONCE, after every "
-            "row is in — quote THOSE numbers back to the user, never your "
-            "own arithmetic. Omit unknown numbers entirely: an absent field "
-            "is stored as empty, but a 0 you supplied is a real zero and "
-            "will drag every average that touches it. confidence: 'high' "
-            "only with label/known-product data, else 'est'. source: "
-            "'photo' or 'text'.",
-            _batch_schema(
-                "items",
-                {
-                    "meal": str,
-                    "time": str,
-                    "kcal": float,
-                    "protein": float,
-                    "fat": float,
-                    "carb": float,
-                    "confidence": str,
-                    "source": str,
-                },
-                ("meal",),
-                {"date": str},
-                ("date",),
-            ),
-        )
-        async def log_food(args: Dict[str, Any]) -> Dict[str, Any]:
-            date = _date_arg(args, "date")
-            if not date:
-                return _err("date (YYYY-MM-DD) is required")
-            items, error = _rows(args, "items")
-            if error:
-                return _err(error)
-            if _cap(items, "items"):
-                return _err(_cap(items, "items"))
-            payload: List[Dict[str, Any]] = []
-            for index, item in enumerate(items):
-                meal = _str(item, "meal")
-                if not meal:
-                    return _reject("items", index, "meal is required")
-                payload.append(
-                    {
-                        "meal": meal,
-                        "time": _str(item, "time"),
-                        "kcal": _num(item, "kcal"),
-                        "protein": _num(item, "protein"),
-                        "fat": _num(item, "fat"),
-                        "carb": _num(item, "carb"),
-                        "confidence": _str(item, "confidence"),
-                        "source": _str(item, "source"),
-                    }
-                )
-            return _text(await repo.log_food_items(user_id, date, payload))
-
-        @tool(
-            "food_edit",
-            "Correct meals ALREADY logged, in place. 'edits' is always an "
-            "array, one object per row being corrected. Use this whenever "
-            "the user revises something you logged (wrong weight, wrong "
-            "estimate, forgot an ingredient) — never log a second "
-            "'correction' row with a negative number. Take entry_id from "
-            "day_summary. Send only the fields that change; the rest are "
-            "kept. To take back a number you invented, name it in 'clear' "
-            "(e.g. 'kcal,protein') — that blanks it to empty, which is "
-            "honest, whereas setting it to 0 is a false measurement. "
-            "Returns the corrected rows plus each day's recomputed totals — "
-            "quote THOSE.",
-            _batch_schema(
-                "edits",
-                {
-                    "entry_id": int,
-                    "meal": str,
-                    "time": str,
-                    "kcal": float,
-                    "protein": float,
-                    "fat": float,
-                    "carb": float,
-                    "confidence": str,
-                    "source": str,
-                    "clear": str,
-                },
-                ("entry_id",),
-            ),
-        )
-        async def food_edit(args: Dict[str, Any]) -> Dict[str, Any]:
-            edits, error = _rows(args, "edits")
-            if error:
-                return _err(error)
-            if _cap(edits, "edits"):
-                return _err(_cap(edits, "edits"))
-            payload: List[Dict[str, Any]] = []
-            for index, item in enumerate(edits):
-                entry_id = _entry_id(item)
-                if entry_id <= 0:
-                    return _reject(
-                        "edits", index, "entry_id is required (from day_summary)"
-                    )
-                payload.append(
-                    {
-                        "entry_id": entry_id,
-                        "meal": _str(item, "meal"),
-                        "time": _str(item, "time"),
-                        "kcal": _num(item, "kcal"),
-                        "protein": _num(item, "protein"),
-                        "fat": _num(item, "fat"),
-                        "carb": _num(item, "carb"),
-                        "confidence": _str(item, "confidence"),
-                        "source": _str(item, "source"),
-                        "clear": _clear_list(item),
-                    }
-                )
-            result = await repo.edit_food_many(user_id, payload)
-            if result.get("bad_index") is not None:
-                index = int(result["bad_index"])
-                return _reject(
-                    "edits",
-                    index,
-                    f"no meal with id {payload[index]['entry_id']} in this "
-                    "user's log — re-read day_summary for the right ids",
-                )
-            return _text(result)
-
-        @tool(
-            "train_edit",
-            "Correct training sets ALREADY logged, in place (wrong weight, "
-            "reps, or exercise name). 'edits' is always an array, one object "
-            "per set — re-weighting all four sets of an exercise is ONE "
-            "call. entry_id comes from day_summary. Send only what changes; "
-            "'clear' blanks fields by name (e.g. 'rpe,weight_kg'), which is "
-            "how you take back a number you should not have written — never "
-            "overwrite it with 0.",
-            _batch_schema(
-                "edits",
-                {
-                    "entry_id": int,
-                    "exercise": str,
-                    "session": str,
-                    "set_n": str,
-                    "weight_kg": str,
-                    "reps": str,
-                    "rpe": float,
-                    "clear": str,
-                },
-                ("entry_id",),
-            ),
-        )
-        async def train_edit(args: Dict[str, Any]) -> Dict[str, Any]:
-            edits, error = _rows(args, "edits")
-            if error:
-                return _err(error)
-            if _cap(edits, "edits"):
-                return _err(_cap(edits, "edits"))
-            payload: List[Dict[str, Any]] = []
-            for index, item in enumerate(edits):
-                entry_id = _entry_id(item)
-                if entry_id <= 0:
-                    return _reject(
-                        "edits", index, "entry_id is required (from day_summary)"
-                    )
-                payload.append(
-                    {
-                        "entry_id": entry_id,
-                        "exercise": _str(item, "exercise"),
-                        "session": _str(item, "session"),
-                        "set_n": _str(item, "set_n"),
-                        "weight_kg": _str(item, "weight_kg"),
-                        "reps": _str(item, "reps"),
-                        "rpe": _num(item, "rpe"),
-                        "clear": _clear_list(item),
-                    }
-                )
-            result = await repo.edit_train_many(user_id, payload)
-            if result.get("bad_index") is not None:
-                index = int(result["bad_index"])
-                return _reject(
-                    "edits",
-                    index,
-                    f"no training set with id {payload[index]['entry_id']} in "
-                    "this user's log — re-read day_summary for the right ids",
-                )
-            return _text(result)
-
-        @tool(
-            "activity_edit",
-            "Correct an activity ALREADY logged, in place. entry_id comes "
-            "from day_summary. Send only what changes; 'clear' blanks fields "
-            "by name (e.g. 'duration_min'). kcal_active/kcal_total/"
-            "exercise_min/stand_h/steps/distance_km are Apple-Watch-style "
-            "ring/step numbers, distinct from duration_min/intensity. "
-            "source lets you upgrade a 'user_reported' placeholder to "
-            "'measured' once real data arrives — never use this to change a "
-            "value just because the user pushed back; that needs real data, "
-            "not a revision.",
-            _batch_schema(
-                "edits",
-                {
-                    "entry_id": int,
-                    "type": str,
-                    "duration_min": float,
-                    "intensity": str,
-                    "kcal_active": float,
-                    "kcal_total": float,
-                    "exercise_min": float,
-                    "stand_h": float,
-                    "steps": float,
-                    "distance_km": float,
-                    "source": str,
-                    "clear": str,
-                },
-                ("entry_id",),
-            ),
-        )
-        async def activity_edit(args: Dict[str, Any]) -> Dict[str, Any]:
-            edits, error = _rows(args, "edits")
-            if error:
-                return _err(error)
-            if _cap(edits, "edits"):
-                return _err(_cap(edits, "edits"))
-            payload: List[Dict[str, Any]] = []
-            for index, item in enumerate(edits):
-                entry_id = _entry_id(item)
-                if entry_id <= 0:
-                    return _reject(
-                        "edits", index, "entry_id is required (from day_summary)"
-                    )
-                source = _str(item, "source")
-                if source is not None and source not in _ACTIVITY_SOURCES:
-                    return _reject(
-                        "edits",
-                        index,
-                        "source must be one of " + ", ".join(_ACTIVITY_SOURCES),
-                    )
-                payload.append(
-                    {
-                        "entry_id": entry_id,
-                        "type_": _str(item, "type"),
-                        "duration_min": _num(item, "duration_min"),
-                        "intensity": _str(item, "intensity"),
-                        "kcal_active": _num(item, "kcal_active"),
-                        "kcal_total": _num(item, "kcal_total"),
-                        "exercise_min": _num(item, "exercise_min"),
-                        "stand_h": _num(item, "stand_h"),
-                        "steps": _num(item, "steps"),
-                        "distance_km": _num(item, "distance_km"),
-                        "source": source,
-                        "clear": _clear_list(item),
-                    }
-                )
-            result = await repo.edit_activity_many(user_id, payload)
-            if result.get("bad_index") is not None:
-                index = int(result["bad_index"])
-                return _reject(
-                    "edits",
-                    index,
-                    f"no activity with id {payload[index]['entry_id']} in this "
-                    "user's log — re-read day_summary for the right ids",
-                )
-            return _text(result)
-
-        @tool(
-            "log_delete",
-            "Remove log rows that should not exist at all — logged twice, "
-            "logged on the wrong day, or something the user says never "
-            "happened. 'entries' is always an array, one object per row, so "
-            "undoing a whole mis-logged session is ONE call. Prefer editing "
-            "when the entry is merely WRONG: deletion loses the record. "
-            "domain is food/sleep/train/activity; entry_id comes from "
-            "day_summary. Every id is checked before anything is removed — "
-            "one bad id and nothing is deleted. Tell the user exactly what "
-            "you removed.",
-            _batch_schema(
-                "entries", {"domain": str, "entry_id": int}, ("domain", "entry_id")
-            ),
-        )
-        async def log_delete(args: Dict[str, Any]) -> Dict[str, Any]:
-            entries, error = _rows(args, "entries")
-            if error:
-                return _err(error)
-            if _cap(entries, "entries"):
-                return _err(_cap(entries, "entries"))
-            payload: List[Dict[str, Any]] = []
-            for index, item in enumerate(entries):
-                domain = str(item.get("domain") or "").strip().lower()
-                entry_id = _entry_id(item)
-                if domain not in ("food", "sleep", "train", "activity"):
-                    return _reject(
-                        "entries",
-                        index,
-                        "domain must be one of food, sleep, train, activity",
-                    )
-                if entry_id <= 0:
-                    return _reject(
-                        "entries", index, "entry_id is required (from day_summary)"
-                    )
-                payload.append({"domain": domain, "entry_id": entry_id})
-            result = await repo.delete_log_entries(user_id, payload)
-            if result.get("bad_index") is not None:
-                index = int(result["bad_index"])
-                bad = payload[index]
-                return _reject(
-                    "entries",
-                    index,
-                    f"no {bad['domain']} entry with id {bad['entry_id']} in "
-                    "this user's log — re-read day_summary for the right ids",
-                )
-            return _text(result)
-
-        @tool(
-            "log_sleep",
-            "Record sleep/recovery fields. 'nights' is always an array, one "
-            "object per DATE — each night carries its own 'date', so a week "
-            "read off a watch export is ONE call. Upserts: provide only what "
-            "you learned this turn, existing fields for that date are kept, "
-            "not erased. Never fill a field you were not told: a night "
-            "without an hrv reading must LEAVE HRV OUT, because a 0 written "
-            "for two nights corrupts every average afterwards while an empty "
-            "cell is simply skipped. Returns the merged row plus 7-day "
-            "averages per date.",
-            _batch_schema(
-                "nights",
-                {
-                    "date": str,
-                    "bed": str,
-                    "wake": str,
-                    "sleep_min": float,
-                    "onset_min": float,
-                    "score": float,
-                    "hrv": float,
-                    "rhr": float,
-                    "weight_kg": float,
-                    "wellbeing": str,
-                    "alcohol_u": float,
-                    "thc": str,
-                    "room_temp": float,
-                    "out_night": float,
-                    "out_day": float,
-                },
-                ("date",),
-            ),
-        )
-        async def log_sleep(args: Dict[str, Any]) -> Dict[str, Any]:
-            nights, error = _rows(args, "nights")
-            if error:
-                return _err(error)
-            if _cap(nights, "nights"):
-                return _err(_cap(nights, "nights"))
-            payload: List[Dict[str, Any]] = []
-            for index, item in enumerate(nights):
-                date = _date_arg(item, "date")
-                if not date:
-                    return _reject("nights", index, "date must be YYYY-MM-DD")
-                payload.append(
-                    {
-                        "date": date,
-                        "bed": _str(item, "bed"),
-                        "wake": _str(item, "wake"),
-                        "sleep_min": _num(item, "sleep_min"),
-                        "onset_min": _num(item, "onset_min"),
-                        "score": _num(item, "score"),
-                        "hrv": _num(item, "hrv"),
-                        "rhr": _num(item, "rhr"),
-                        "weight_kg": _num(item, "weight_kg"),
-                        "wellbeing": _str(item, "wellbeing"),
-                        "alcohol_u": _num(item, "alcohol_u"),
-                        "thc": _str(item, "thc"),
-                        "room_temp": _num(item, "room_temp"),
-                        "out_night": _num(item, "out_night"),
-                        "out_day": _num(item, "out_day"),
-                    }
-                )
-            return _text(await repo.log_sleep_nights(user_id, payload))
-
-        @tool(
-            "log_train",
-            "Record training sets for ONE date. 'sets' is always an array, "
-            "one object per SET: a whole workout is ONE call with every set "
-            "in the array, and adding a single set later is the same call "
-            "with a one-element array. Never one call per set. 'session' is "
-            "the workout label (e.g. 'pull_chest'), given once for the "
-            "batch. weight_kg and reps are TEXT — record what was said "
-            "('10-12', 'bodyweight'), never invent per-set numbers, and "
-            "leave set_n out rather than numbering sets yourself. Returns "
-            "today's sets and the previous session's sets ONCE PER "
-            "EXERCISE — ground progression advice in that.",
-            _batch_schema(
-                "sets",
-                {
-                    "exercise": str,
-                    "set_n": str,
-                    "weight_kg": str,
-                    "reps": str,
-                    "rpe": float,
-                },
-                ("exercise",),
-                {"date": str, "session": str},
-                ("date",),
-            ),
-        )
-        async def log_train(args: Dict[str, Any]) -> Dict[str, Any]:
-            date = _date_arg(args, "date")
-            if not date:
-                return _err("date (YYYY-MM-DD) is required")
-            sets, error = _rows(args, "sets")
-            if error:
-                return _err(error)
-            if _cap(sets, "sets"):
-                return _err(_cap(sets, "sets"))
-            payload: List[Dict[str, Any]] = []
-            for index, item in enumerate(sets):
-                exercise = _str(item, "exercise")
-                if not exercise:
-                    return _reject("sets", index, "exercise is required")
-                payload.append(
-                    {
-                        "exercise": exercise,
-                        "set_n": _str(item, "set_n"),
-                        "weight_kg": _str(item, "weight_kg"),
-                        "reps": _str(item, "reps"),
-                        "rpe": _num(item, "rpe"),
-                    }
-                )
-            return _text(
-                await repo.log_train_sets(
-                    user_id, date, payload, session=_str(args, "session")
-                )
-            )
-
-        @tool(
-            "log_activity",
-            "Record activities (padel, climbing, walk...) for ONE date. "
-            "'activities' is always an array, one object per activity — a "
-            "day with a walk and a padel session is ONE call. "
-            "kcal_active/kcal_total/exercise_min/stand_h/steps/distance_km "
-            "are optional Apple-Watch-style ring/step numbers (e.g. "
-            "'Move 393/600 ккал, Exercise 24/40 мин, шаги 8266') — omit "
-            "whatever wasn't reported, empty stays empty, never 0. source is "
-            "REQUIRED PER ACTIVITY, and stays that way in a batch: "
-            "'user_reported' (the user told you), 'measured' (device/Watch "
-            "data), or 'estimated' (you inferred or guessed it) — never "
-            "write an estimate as 'user_reported' or 'measured', and never "
-            "let one row inherit another row's source. Any date more than 1 "
-            "day in the past needs a non-empty backfill_reason. Never write "
-            "a row for a date the user has already said had nothing on it, "
-            "and never change the number because the user pushed back — that "
-            "calls for asking for real data, not a bigger guess. Returns the "
-            "day's full activity list ONCE.",
-            _batch_schema(
-                "activities",
-                {
-                    "type": str,
-                    "source": str,
-                    "duration_min": float,
-                    "intensity": str,
-                    "kcal_active": float,
-                    "kcal_total": float,
-                    "exercise_min": float,
-                    "stand_h": float,
-                    "steps": float,
-                    "distance_km": float,
-                },
-                ("type", "source"),
-                {"date": str, "backfill_reason": str},
-                ("date",),
-            ),
-        )
-        async def log_activity(args: Dict[str, Any]) -> Dict[str, Any]:
-            log_date = _date_arg(args, "date")
-            if not log_date:
-                return _err("date (YYYY-MM-DD) is required")
-            activities, error = _rows(args, "activities")
-            if error:
-                return _err(error)
-            if _cap(activities, "activities"):
-                return _err(_cap(activities, "activities"))
-            backfill_reason = _str(args, "backfill_reason")
-            retroactive = _is_retroactive(log_date)
-            if retroactive and not backfill_reason:
-                return _err(
-                    "date is more than 1 day in the past — backfill_reason "
-                    "is required for a retroactive write"
-                )
-            # Validate every row BEFORE the first insert: in a batch, an
-            # unlabelled row must not ride in behind a labelled one (dv-c388).
-            payload: List[Dict[str, Any]] = []
-            for index, item in enumerate(activities):
-                activity_type = _str(item, "type")
-                source = _str(item, "source")
-                if not activity_type:
-                    return _reject("activities", index, "type is required")
-                if source not in _ACTIVITY_SOURCES:
-                    return _reject(
-                        "activities",
-                        index,
-                        "source is required: one of " + ", ".join(_ACTIVITY_SOURCES),
-                    )
-                payload.append(
-                    {
-                        "type": activity_type,
-                        "source": source,
-                        "duration_min": _num(item, "duration_min"),
-                        "intensity": _str(item, "intensity"),
-                        "kcal_active": _num(item, "kcal_active"),
-                        "kcal_total": _num(item, "kcal_total"),
-                        "exercise_min": _num(item, "exercise_min"),
-                        "stand_h": _num(item, "stand_h"),
-                        "steps": _num(item, "steps"),
-                        "distance_km": _num(item, "distance_km"),
-                    }
-                )
-            result = await repo.log_activities(user_id, log_date, payload)
-            estimated = [r["type"] for r in payload if r["source"] == "estimated"]
-            if retroactive and estimated:
-                logger.warning(
-                    "Estimated activity backfilled",
-                    user_id=user_id,
-                    date=log_date,
-                    types=estimated,
-                    backfill_reason=backfill_reason,
-                )
-                if event_bus is not None:
-                    await event_bus.publish(
-                        AgentResponseEvent(
-                            chat_id=0,  # broadcast to owner chats
-                            text=(
-                                "⚠️ estimated backfill "
-                                f"[{profile_slug or 'coach'}] user={user_id} "
-                                f"date={log_date} types={estimated!r}: "
-                                f"{backfill_reason}"
-                            ),
-                            parse_mode=None,
-                            source="log_activity_backfill",
-                        )
-                    )
-            return _text(result)
-
-        tools += [
-            log_food,
-            food_edit,
-            log_sleep,
-            log_train,
-            log_activity,
-            train_edit,
-            activity_edit,
-            log_delete,
-        ]
-
-    if "products" in groups:
-
-        @tool(
-            "product_save",
-            "Save or update food products/dishes (per 100g). 'products' is "
-            "always an array, one object per product — a label photo or a "
-            "menu that yields five products is ONE call. provenance is "
-            "REQUIRED PER PRODUCT and never guessed: 'label_photo' only when "
-            "reading an actual label, 'official' for verified official data, "
-            "otherwise 'estimate' — one row's provenance never carries over "
-            "to the next. An estimate can NEVER overwrite label/official "
-            "values: that product is refused individually and the "
-            "authoritative row is returned, while the rest of the batch is "
-            "still saved. Omit a macro you do not know rather than sending "
-            "0 — a 0 here is 'this food has no protein', not 'unknown'.",
-            _batch_schema(
-                "products",
-                {
-                    "name": str,
-                    "brand": str,
-                    "kind": str,
-                    "kcal_100g": float,
-                    "protein": float,
-                    "fat": float,
-                    "carb": float,
-                    "salt": float,
-                    "provenance": str,
-                    "confirmed_on": str,
-                },
-                ("name", "kind", "provenance"),
-            ),
-        )
-        async def product_save(args: Dict[str, Any]) -> Dict[str, Any]:
-            products, error = _rows(args, "products")
-            if error:
-                return _err(error)
-            if _cap(products, "products"):
-                return _err(_cap(products, "products"))
-            payload: List[Dict[str, Any]] = []
-            for index, item in enumerate(products):
-                name = _str(item, "name")
-                kind = _str(item, "kind")
-                provenance = _str(item, "provenance")
-                if not name or kind not in ("product", "dish"):
-                    return _reject(
-                        "products",
-                        index,
-                        "name and kind ('product'|'dish') are required",
-                    )
-                if provenance not in ("label_photo", "official", "estimate"):
-                    return _reject(
-                        "products",
-                        index,
-                        "provenance must be label_photo, official, or estimate",
-                    )
-                payload.append(
-                    {
-                        "name": name,
-                        "kind": kind,
-                        "provenance": provenance,
-                        "brand": _str(item, "brand") or "",
-                        "kcal_100g": _num(item, "kcal_100g"),
-                        "protein": _num(item, "protein"),
-                        "fat": _num(item, "fat"),
-                        "carb": _num(item, "carb"),
-                        "salt": _num(item, "salt"),
-                        "confirmed_on": _date_arg(item, "confirmed_on") or None,
-                        "created_by": user_id,
-                    }
-                )
-            return _text(await repo.save_products(payload))
-
-        @tool(
-            "product_delete",
-            "Remove a product from the shared store — use it when a product "
-            "is a duplicate or was never real. To fix WRONG numbers, call "
-            "product_save instead: correcting keeps the history, deleting "
-            "loses it. Products are SHARED, so this affects every user; "
-            "confirm with the user first and say what you removed. "
-            "product_id comes from product_find.",
-            _schema({"product_id": int}, "product_id"),
-        )
-        async def product_delete(args: Dict[str, Any]) -> Dict[str, Any]:
-            try:
-                product_id = int(args.get("product_id") or 0)
-            except (TypeError, ValueError):
-                product_id = 0
-            if product_id <= 0:
-                return _err("product_id is required (get it from product_find)")
-            result = await repo.delete_product(product_id)
-            if not result.get("deleted"):
-                return _err(f"no product with id {product_id}")
-            return _text(result)
-
-        tools += [product_save, product_delete]
-
-    if "portions" in groups:
-
-        @tool(
-            "portion_save",
-            "Save THIS user's portion sizes for phrases (e.g. 'нормальная "
-            "пицца' = 350g for them). 'portions' is always an array, one "
-            "object per phrase. Upserts on the phrase. grams must be a real "
-            "number the user gave or agreed to — if you do not know it, ask, "
-            "do not send a placeholder.",
-            _batch_schema(
-                "portions",
-                {"phrase": str, "grams": float, "learned_from": str},
-                ("phrase", "grams"),
-            ),
-        )
-        async def portion_save(args: Dict[str, Any]) -> Dict[str, Any]:
-            portions, error = _rows(args, "portions")
-            if error:
-                return _err(error)
-            if _cap(portions, "portions"):
-                return _err(_cap(portions, "portions"))
-            payload: List[Dict[str, Any]] = []
-            for index, item in enumerate(portions):
-                phrase = _str(item, "phrase")
-                grams = _num(item, "grams")
-                if not phrase or grams is None or grams <= 0:
-                    return _reject(
-                        "portions", index, "phrase and positive grams are required"
-                    )
-                payload.append(
-                    {
-                        "phrase": phrase,
-                        "grams": grams,
-                        "learned_from": _str(item, "learned_from"),
-                    }
-                )
-            return _text(await repo.save_portions(user_id, payload))
-
-        tools.append(portion_save)
-
-    return tools
-
-
-def _append_export_tool(
-    tools: List[Any],
-    repo: Any,
-    user_id: int,
-    groups: FrozenSet[str],
-    working_directory: Optional[Path],
-) -> List[Any]:
-    """Mount export_my_data (lane 2) when the group is declared and a
-    workspace exists to write into."""
-    if "export" in groups and working_directory is not None:
-
-        @tool(
-            "export_my_data",
-            "Export raw data rows as CSV files (docs as .md) into "
-            "exports/ in your working directory, then analyze them with "
-            "code. THIS IS YOUR UNIVERSAL READ PATH: whenever no other data "
-            "tool answers the question, export the relevant domain and "
-            "compute over the files — never tell the user data is "
-            "unreachable, and never guess. domain: sleep | food | train | "
-            "activity | portions | issues | docs | products | all. Optional "
-            "date_from/date_to (YYYY-MM-DD) bound the dated log domains. "
-            "Files are overwritten on each call.",
-            _schema({"domain": str, "date_from": str, "date_to": str}),
-        )
-        async def export_my_data(args: Dict[str, Any]) -> Dict[str, Any]:
-            domain = (args.get("domain") or "").strip().lower()
-            valid = set(repo.EXPORT_DOMAINS)
-            domains = sorted(valid) if domain == "all" else [domain]
-            if not set(domains) <= valid:
-                return _err(f"domain must be one of: {', '.join(sorted(valid))}, all")
-            date_from = _date_arg(args, "date_from") or None
-            date_to = _date_arg(args, "date_to") or None
-
-            export_dir = working_directory / "exports"
-            export_dir.mkdir(parents=True, exist_ok=True)
-            report: Dict[str, Any] = {}
-            for name in domains:
-                rows = await repo.export_rows(
-                    user_id, name, date_from=date_from, date_to=date_to
-                )
-                if name == "docs":
-                    docs_dir = export_dir / "docs"
-                    docs_dir.mkdir(exist_ok=True)
-                    paths = []
-                    for row in rows:
-                        stem = row.get("period") or str(row.get("id"))
-                        doc_path = docs_dir / f"{row.get('kind')}-{stem}.md"
-                        doc_path.write_text(
-                            str(row.get("content") or ""), encoding="utf-8"
-                        )
-                        paths.append(str(doc_path))
-                    report[name] = {"rows": len(rows), "paths": paths}
-                else:
-                    csv_path = export_dir / f"{name}.csv"
-                    count = _write_export_csv(csv_path, rows)
-                    report[name] = {"rows": count, "path": str(csv_path)}
-            logger.info(
-                "agent tool export_my_data",
-                user_id=user_id,
-                domains=domains,
-                date_from=date_from,
-                date_to=date_to,
-            )
-            return _text(report)
-
-        tools.append(export_my_data)
-
-    return tools
+    return _legacy_tools(
+        USER_DATA_WRITE_SPECS,
+        repo,
+        user_id,
+        groups,
+        event_bus=event_bus,
+        profile_slug=profile_slug,
+    )

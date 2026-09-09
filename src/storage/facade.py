@@ -135,7 +135,7 @@ class Storage:
             timestamp=datetime.now(UTC),
             prompt=prompt,
             response=response.content,
-            cost=response.cost,
+            cost=response.cost_usd,
             duration_ms=response.duration_ms,
             error=response.error_type if response.is_error else None,
             window_id=window_id,
@@ -159,12 +159,14 @@ class Storage:
                 await self.tools.save_tool_usage(tool_usage)
 
         # Update cost tracking
-        await self.costs.update_daily_cost(user_id, response.cost)
+        # None (unpriced turn, dv-0722) is written as 0.0: these are
+        # dollars-spent ledgers with no "unknown" state.
+        await self.costs.update_daily_cost(user_id, response.cost_usd)
 
         # Update user stats
         user = await self.users.get_user(user_id)
         if user:
-            user.total_cost += response.cost
+            user.total_cost += response.cost_usd
             user.message_count += 1
             user.last_active = datetime.now(UTC)
             await self.users.update_user(user)
@@ -172,7 +174,7 @@ class Storage:
         # Update session stats
         session = await self.sessions.get_session(session_id)
         if session:
-            session.total_cost += response.cost
+            session.total_cost += response.cost_usd
             session.total_turns += response.num_turns
             session.message_count += 1
             session.last_used = datetime.now(UTC)

@@ -20,6 +20,7 @@ from .exceptions import ClaudeStoppedError
 
 if TYPE_CHECKING:
     from ..activity.logger import ActivityLogger
+    from ..agent_backends.protocol import BackendSession
     from ..daystate.source import TodayStateSource
     from ..evaluator.refresh import ContextRefreshService
     from ..evaluator.service import EvaluatorService
@@ -47,7 +48,13 @@ def augment_prompt_with_images(prompt: str, images: Any) -> str:
 
 
 class ClaudeIntegration:
-    """Main integration point for Claude Code."""
+    """Main integration point for Claude Code.
+
+    Satisfies ``src.agent_backends.protocol.AgentBackend`` (dv-5368): the
+    orchestrator and the info commands only call that surface.
+    """
+
+    backend_id = "claude"
 
     def __init__(
         self,
@@ -368,7 +375,7 @@ class ClaudeIntegration:
                         input_tokens=response.input_tokens,
                         output_tokens=response.output_tokens,
                         cumulative_tokens=session.cumulative_tokens,
-                        cost=response.cost,
+                        cost=response.cost_usd,
                     )
                 except Exception as e:
                     logger.warning("Failed to record token usage", error=str(e))
@@ -470,6 +477,41 @@ class ClaudeIntegration:
             return None
 
         return max(matching_sessions, key=lambda s: s.last_used)
+
+    # --- AgentBackend surface (src/agent_backends/protocol.py) ---
+
+    def default_model(self) -> str:
+        """Model a turn runs on with ``model=None``: config, else the CLI's."""
+        return str(self.config.claude_model or "CLI default")
+
+    async def resumable_session_for(
+        self, user_id: int, working_directory: Path
+    ) -> Optional[str]:
+        """Public form of :meth:`_find_resumable_session`: the id only."""
+        existing = await self._find_resumable_session(user_id, working_directory)
+        return existing.session_id if existing else None
+
+    async def sessions_for_user(self, user_id: int) -> List["BackendSession"]:
+        """Every session row for ``user_id`` as backend-neutral records."""
+        from ..agent_backends.protocol import BackendSession
+
+        if self.session_manager is None:
+            return []
+        sessions = await self.session_manager._get_user_sessions(user_id)
+        return [
+            BackendSession(
+                session_id=s.session_id,
+                working_dir=Path(str(s.project_path)),
+                last_used=s.last_used,
+                cumulative_tokens=s.cumulative_tokens,
+                backend_id=self.backend_id,
+            )
+            for s in sessions
+        ]
+
+    def attach_tools(self, services: Any, bridge: Any = None) -> None:
+        """In-process MCP tools; the HTTP bridge is for out-of-process backends."""
+        self.sdk_manager.attach_agent_services(services)
 
     # Cap for the heal recap prepended on a lossy resume (~few k tokens).
     _HEAL_MAX_CHARS = 24_000

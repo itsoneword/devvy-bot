@@ -5,7 +5,17 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import structlog
 from claude_agent_sdk import (
@@ -55,6 +65,13 @@ if TYPE_CHECKING:
     from .confirmation import ConfirmationManager
     from .window_bundle import WindowBundleProvider
 from .prompt_composer import PromptComposer
+from .tool_context import TurnContext
+from .turn_setup import (
+    compose_persona,
+    composer_for,
+    image_roots_env,
+    resolve_turn_context,
+)
 
 logger = structlog.get_logger()
 
@@ -319,7 +336,15 @@ class ClaudeResponse:
 
     content: str
     session_id: str
-    cost: float
+    # USD spent by this turn as the backend reports it. Three states, and the
+    # difference matters to the budget (dv-0722):
+    #   float > 0  -- priced (Claude's total_cost_usd; an estimate on OAuth)
+    #   0.0        -- priced and free (nothing was spent)
+    #   None       -- UNPRICED: the backend has no USD figure for this turn
+    #                 (Codex on a ChatGPT subscription). The limiter and the
+    #                 watchdog then budget input_tokens + output_tokens via
+    #                 RateLimiter.record_tokens instead of pretending $0.
+    cost: Optional[float]
     duration_ms: int
     num_turns: int
     is_error: bool = False
@@ -345,25 +370,32 @@ class ClaudeResponse:
     session_restarted: bool = False
 
     @property
+    def cost_usd(self) -> float:
+        """Dollars to write into the USD ledgers: ``cost`` with None as 0.0.
+
+        For the SQLite cost rows and session/user totals, which are "money
+        spent" and have no way to say "unknown". Budget enforcement must NOT
+        use this -- it hides the unpriced case; use ``cost`` and branch on
+        None (see turns.py, the record_cost/record_tokens split).
+        """
+        return self.cost or 0.0
+
+    @property
     def context_tokens(self) -> int:
         """The conversation's real size as of this turn, or 0 if unknown.
 
-        Prefers `peak_context_tokens` (a level). Falls back to `input_tokens`
-        ONLY for a backend that reported no cache split at all (Codex), where
-        there is no cache to hide the context in.
-
-        Returns 0 — not the ResultMessage sum — when caching was active but no
-        per-call usage came through. 0 means "unknown"; callers key off the
-        falsy value and leave the window's last known level alone. Returning
-        the sum instead is what made rotation fire on every turn: an ordinary
-        agentic turn of 20 tool round-trips at ~55k context sums to over 1M
-        (dv-9f31, evidence in the task file).
+        `peak_context_tokens` is the only level. 0 means "unknown"; callers
+        key off the falsy value and leave the window's last known level
+        alone. Returning any of the flow fields instead is what made rotation
+        fire on every turn -- twice: the Claude ResultMessage sum (dv-9f31,
+        a 20-round-trip turn at ~55k context sums past 1M) and then Codex's
+        `turn.completed.usage.input_tokens`, which is the thread's running
+        total and tripped the 150k roll on the first tool-using turn of every
+        fresh window (2026-09-05, docs/FINDINGS.md). The old "Codex has no
+        cache, so input_tokens is the context" fallback was wrong on both
+        counts; Codex now reads its level from the rollout file.
         """
-        if self.peak_context_tokens:
-            return self.peak_context_tokens
-        if not self.cache_read_tokens and not self.cache_creation_tokens:
-            return self.input_tokens
-        return 0
+        return self.peak_context_tokens
 
 
 @dataclass
@@ -496,6 +528,7 @@ def _make_can_use_tool_callback(
     full_access: bool = False,
     confirmation_manager: Optional["ConfirmationManager"] = None,
     read_scope: Optional[ReadScope] = None,
+    extra_write_roots: Sequence[Path] = (),
 ) -> Any:
     """Create a can_use_tool callback for SDK-level tool permission validation.
 
@@ -504,6 +537,10 @@ def _make_can_use_tool_callback(
 
     On **full-access** profiles (sandbox off) it additionally routes destructive
     ops through ``confirmation_manager`` for an owner approve/deny prompt.
+
+    ``extra_write_roots`` are the profile's ``extra_dirs`` (dv-3103): the same
+    paths handed to the CLI as ``--add-dir``, so the in-process write boundary
+    and the bwrap jail agree on where a sandboxed profile may write.
     """
     # Every tool that names a path. MultiEdit/NotebookEdit were missing and are
     # both in the default allowed_tools, so they bypassed path validation
@@ -560,7 +597,11 @@ def _make_can_use_tool_callback(
         except (ValueError, OSError):
             return False, f"Could not resolve write target: {path}"
 
-        roots = [working_directory.resolve(), *session_scratch_roots()]
+        roots = [
+            working_directory.resolve(),
+            *session_scratch_roots(),
+            *extra_write_roots,
+        ]
         for root in roots:
             try:
                 resolved.relative_to(root)
@@ -571,7 +612,13 @@ def _make_can_use_tool_callback(
         return False, (
             f"Access denied: writing to '{path}' is outside this agent's "
             f"workspace ({working_directory}). Reads outside are fine; writes "
-            f"must stay in the workspace or the session scratch dir."
+            f"must stay in the workspace, the session scratch dir"
+            + (
+                f", or one of: {', '.join(str(r) for r in extra_write_roots)}"
+                if extra_write_roots
+                else ""
+            )
+            + "."
         )
 
     async def can_use_tool(
@@ -743,7 +790,9 @@ def _make_can_use_tool_callback(
                     from ..bot.utils.image_extractor import session_scratch_roots
 
                     valid, error = check_bash_workspace_writes(
-                        command, working_directory, session_scratch_roots()
+                        command,
+                        working_directory,
+                        [*session_scratch_roots(), *extra_write_roots],
                     )
                     if not valid:
                         logger.warning(
@@ -879,10 +928,10 @@ class ClaudeSDKManager:
 
         ``user_id`` / ``family_id`` are used HERE, server-side, to resolve the
         memory scopes the ``remember``/``recall`` tools read/write — the same
-        ``_agent_id_for`` / ``_family_agent_id_for`` calls prompt composition
-        already uses, so the tools operate exactly where this turn reads. The
-        resolved strings are baked into the tools' closures; the model never
-        supplies a scope (dv-6dbc). ``user_id`` is also passed through raw for
+        :meth:`_turn_context_for` resolution prompt composition uses, so the
+        tools operate exactly where this turn reads. The resolved strings are
+        baked into the tools' closures; the model never supplies a scope
+        (dv-6dbc). ``user_id`` is also passed through raw for
         ``recall_conversation``, which scopes by (user_id, working_directory)
         rather than by memory agent_id (dv-r3c1).
 
@@ -895,24 +944,87 @@ class ClaudeSDKManager:
             return {}
         from .agent_tools import build_agent_mcp_server
 
-        profile_slug = self._agent_id_for(working_directory)
-        memory_agent_id = self._agent_id_for(working_directory, user_id)
-        memory_family_agent_id = (
-            self._family_agent_id_for(working_directory, family_id, user_id)
-            if family_id is not None
-            else None
+        ctx = self._turn_context_for(
+            working_directory,
+            user_id=user_id,
+            requester_chat_id=requester_chat_id,
+            family_id=family_id,
+            role=role,
         )
         server = build_agent_mcp_server(
             self._agent_services,
-            profile_slug,
+            ctx.profile_slug,
             working_directory,
-            requester_chat_id=requester_chat_id,
-            memory_agent_id=memory_agent_id,
-            memory_family_agent_id=memory_family_agent_id,
-            user_id=user_id,
-            role=role,
+            requester_chat_id=ctx.requester_chat_id,
+            memory_agent_id=ctx.memory_agent_id,
+            memory_family_agent_id=ctx.family_agent_id,
+            user_id=ctx.user_id,
+            role=ctx.role,
         )
         return {"agent": server}
+
+    def _turn_context_for(
+        self,
+        working_directory: Path,
+        *,
+        user_id: Optional[int] = None,
+        requester_chat_id: Optional[int] = None,
+        family_id: Optional[int] = None,
+        role: Optional[str] = None,
+    ) -> TurnContext:
+        """This turn's identity — the same resolution the Codex backend makes.
+
+        Shared with ``CodexCliIntegration._turn_context`` through
+        :func:`turn_setup.resolve_turn_context` (dv-a342), so a tool reached
+        over either transport operates on precisely the scope this turn
+        reads from.
+        """
+        return resolve_turn_context(
+            self.profile_registry,
+            working_directory,
+            user_id=user_id,
+            requester_chat_id=requester_chat_id,
+            family_id=family_id,
+            role=role,
+        )
+
+    async def _persona_text(
+        self,
+        working_directory: Path,
+        prompt: str,
+        *,
+        user_id: Optional[int] = None,
+        family_id: Optional[int] = None,
+        full_access: bool = False,
+    ) -> Optional[str]:
+        """The composed persona for this turn, or None without a composer.
+
+        Frozen bundle first, live compose second (see
+        :func:`turn_setup.compose_persona`, shared with the Codex backend).
+        The SDK path passes the result as ``system_prompt``.
+        """
+        return await compose_persona(
+            self._turn_context_for(
+                working_directory, user_id=user_id, family_id=family_id
+            ),
+            prompt=prompt,
+            composer=self._composer_for(working_directory),
+            memory_retriever=self.memory_retriever,
+            bundle_provider=self.bundle_provider,
+            family_id=family_id,
+            full_access=full_access,
+        )
+
+    def _extra_dirs_for(self, working_directory: Path) -> Tuple[Path, ...]:
+        """The profile's extra write roots (dv-3103); empty outside profiles.
+
+        Resolved via the owning profile so a per-user workspace
+        (``<root>/users/<uid>``) inherits the profile's grant.
+        """
+        if self.profile_registry is None:
+            return ()
+        profile = self.profile_registry.get_by_working_dir(working_directory)
+        return profile.extra_dirs if profile is not None else ()
 
     def _sandbox_enabled_for(self, working_directory: Path) -> bool:
         """Resolve the bash-sandbox flag for the profile at this working dir.
@@ -1000,19 +1112,12 @@ class ClaudeSDKManager:
 
     def _composer_for(self, working_directory: Path) -> Optional[PromptComposer]:
         """Pick the per-profile composer for a working dir, else the default."""
-        if not self.profile_registry:
-            return self.prompt_composer
-        profile = self.profile_registry.get_by_working_dir(working_directory)
-        if not profile:
-            return self.prompt_composer
-        cached = self._profile_composers.get(profile.slug)
-        if cached is None:
-            cached = PromptComposer(
-                memory_path=profile.memory_dir,
-                agent_md_path=profile.persona,
-            )
-            self._profile_composers[profile.slug] = cached
-        return cached
+        return composer_for(
+            self.profile_registry,
+            self.prompt_composer,
+            self._profile_composers,
+            working_directory,
+        )
 
     def _agent_id_for(
         self, working_directory: Path, user_id: Optional[int] = None
@@ -1154,6 +1259,7 @@ class ClaudeSDKManager:
             # prompt's cwd confinement is relaxed to match.
             sandbox_enabled = self._sandbox_enabled_for(Path(working_directory))
             full_access = not sandbox_enabled
+            extra_dirs = self._extra_dirs_for(Path(working_directory))
 
             # Per-session read scope (dv-7de7): guest sessions get a read
             # allowlist + cross-user tree denial; owner sessions build a
@@ -1178,51 +1284,19 @@ class ClaudeSDKManager:
             # files"). Injecting it here too put the whole file in context
             # twice; for the devops profile that was ~3.9k duplicated tokens
             # on every turn. See docs/FINDINGS.md 2026-08-04.
-            # Frozen per-window bundle (dv-5e2a): one composition per window,
-            # byte-identical on every turn until the next roll or /new. The
-            # live compose below survives only as a fallback for callers with
-            # no user_id (no window to key) or deployments without the
-            # provider.
-            bundle = None
-            if self.bundle_provider is not None and user_id is not None:
-                bundle = await self.bundle_provider.get_or_materialize(
-                    working_directory=Path(working_directory),
-                    user_id=user_id,
-                    family_id=family_id,
-                    full_access=full_access,
-                )
-            composer = self._composer_for(Path(working_directory))
-            if bundle is not None:
-                base_prompt = bundle.text
-            elif composer:
-                pinned_facts: List[str] = []
-                general_facts: List[str] = []
-                family_facts: List[str] = []
-                result_pointers: List[str] = []
-                if self.memory_retriever:
-                    (
-                        pinned_facts,
-                        general_facts,
-                        result_pointers,
-                    ) = await self.memory_retriever.select(
-                        self._agent_id_for(Path(working_directory), user_id),
-                        query=prompt,
-                    )
-                    if family_id is not None:
-                        family_facts = await self.memory_retriever.select_family(
-                            self._family_agent_id_for(
-                                Path(working_directory), family_id, user_id
-                            ),
-                            query=prompt,
-                        )
-                base_prompt = composer.compose(
-                    working_directory=Path(working_directory),
-                    pinned_facts=pinned_facts,
-                    general_facts=general_facts,
-                    family_facts=family_facts or None,
-                    result_pointers=result_pointers or None,
-                    full_access=full_access,
-                )
+            # Frozen per-window bundle (dv-5e2a) first, live compose as the
+            # fallback for callers with no user_id (no window to key) or
+            # deployments without the provider — the same shared path the
+            # Codex backend takes (turn_setup.compose_persona, dv-a342).
+            persona = await self._persona_text(
+                Path(working_directory),
+                prompt,
+                user_id=user_id,
+                family_id=family_id,
+                full_access=full_access,
+            )
+            if persona is not None:
+                base_prompt = persona
             else:
                 # Fallback: original inline construction. CLAUDE.md is left to
                 # the CLI here too -- see the note above.
@@ -1288,6 +1362,11 @@ class ClaudeSDKManager:
                 model=model or self.config.claude_model or None,
                 max_budget_usd=max_budget_usd,
                 cwd=str(working_directory),
+                # Profile extra_dirs (dv-3103): `--add-dir` is what makes a path
+                # writable for bash *inside* the bwrap jail (verified live,
+                # docs/agent-capabilities-sandbox-plan.md). Full-access
+                # profiles already see everything, so it is a no-op there.
+                add_dirs=[str(d) for d in extra_dirs],
                 allowed_tools=sdk_allowed_tools,
                 disallowed_tools=sdk_disallowed_tools,
                 cli_path=self.config.claude_cli_path or None,
@@ -1371,6 +1450,7 @@ class ClaudeSDKManager:
                     full_access=full_access,
                     confirmation_manager=self._confirmation_manager,
                     read_scope=read_scope,
+                    extra_write_roots=extra_dirs,
                 )
 
             # Resume previous session if we have a session_id
@@ -1795,26 +1875,22 @@ class ClaudeSDKManager:
     def _inject_image_roots(self, servers: Any, working_directory: Path) -> None:
         """Set TELEGRAM_IMAGE_ROOTS on the telegram MCP server config.
 
-        The roots are the profile's working dir plus the session scratch dir
-        (sandboxed profiles write throwaway charts to /tmp, which is legitimate
-        and must stay deliverable).
+        The value comes from :func:`turn_setup.image_roots_env`, shared with
+        the Codex backend's ``-c mcp_servers.telegram.env`` override so both
+        transports tell the tool the same deliverable roots.
         """
-        import os as _os
-
-        from src.bot.utils.image_extractor import (
-            IMAGE_ROOTS_ENV,
-            allowed_image_roots,
-        )
+        from src.bot.utils.image_extractor import IMAGE_ROOTS_ENV
 
         if not isinstance(servers, dict):
             return
         cfg = servers.get("telegram")
         if not isinstance(cfg, dict):
             return
-        roots = allowed_image_roots(self.config.approved_directory or working_directory)
         env = cfg.setdefault("env", {})
         if isinstance(env, dict):
-            env[IMAGE_ROOTS_ENV] = _os.pathsep.join(str(r) for r in roots)
+            env[IMAGE_ROOTS_ENV] = image_roots_env(
+                self.config.approved_directory, working_directory
+            )
 
     def _load_mcp_config(self, config_path: Path) -> Dict[str, Any]:
         """Load MCP server configuration from a JSON file.

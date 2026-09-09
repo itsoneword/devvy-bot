@@ -618,7 +618,45 @@ class EvaluatorService:
         (the root must be an object), so the op list is wrapped under
         ``extractions`` and unwrapped again in :meth:`_unwrap_codex_output`.
         Every object node sets ``additionalProperties: False`` (OpenAI rule).
+
+        Every property of the op object is also listed in ``required`` — that
+        is the OTHER OpenAI strict-mode rule, and violating it is what made
+        every Codex evaluator run fail (dv-0c01). The server answered 400
+        ``invalid_json_schema``: "'required' is required to be supplied and to
+        be an array including every key in properties. Missing 'label'."
+        Optionality is expressed by the ``"null"`` member of each type union,
+        never by omitting the key from ``required``; ``validate_evaluator_output``
+        already treats an explicit null exactly like an absent field.
         """
+        op_properties: dict = {
+            "op": {
+                "type": "string",
+                "enum": ["add", "supersede", "invalidate", "flag_conflict"],
+            },
+            # tier/content are nullable: the metadata-only ops
+            # (invalidate/flag_conflict) carry neither.
+            "tier": {
+                "type": ["string", "null"],
+                "enum": ["pinned", "general", None],
+            },
+            "content": {"type": ["string", "null"]},
+            "label": {"type": ["string", "null"]},
+            "supersedes_id": {"type": ["integer", "null"]},
+            "kind": {
+                "type": ["string", "null"],
+                "enum": ["user_fact", "conversation_result", None],
+            },
+            "source_ref": {"type": ["string", "null"]},
+            "target_id": {"type": ["integer", "null"]},
+            "ids": {
+                "type": ["array", "null"],
+                "items": {"type": "integer"},
+            },
+            "scope": {
+                "type": ["string", "null"],
+                "enum": ["private", "family", None],
+            },
+        }
         return {
             "type": "object",
             "additionalProperties": False,
@@ -629,41 +667,8 @@ class EvaluatorService:
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
-                        "required": ["op", "tier", "content"],
-                        "properties": {
-                            "op": {
-                                "type": "string",
-                                "enum": [
-                                    "add",
-                                    "supersede",
-                                    "invalidate",
-                                    "flag_conflict",
-                                ],
-                            },
-                            # tier/content are nullable: the metadata-only ops
-                            # (invalidate/flag_conflict) carry neither.
-                            "tier": {
-                                "type": ["string", "null"],
-                                "enum": ["pinned", "general", None],
-                            },
-                            "content": {"type": ["string", "null"]},
-                            "label": {"type": ["string", "null"]},
-                            "supersedes_id": {"type": ["integer", "null"]},
-                            "kind": {
-                                "type": ["string", "null"],
-                                "enum": ["user_fact", "conversation_result", None],
-                            },
-                            "source_ref": {"type": ["string", "null"]},
-                            "target_id": {"type": ["integer", "null"]},
-                            "ids": {
-                                "type": ["array", "null"],
-                                "items": {"type": "integer"},
-                            },
-                            "scope": {
-                                "type": ["string", "null"],
-                                "enum": ["private", "family", None],
-                            },
-                        },
+                        "required": list(op_properties),
+                        "properties": op_properties,
                     },
                 }
             },
@@ -682,12 +687,51 @@ class EvaluatorService:
             return json.dumps(parsed["extractions"])
         return text
 
+    @staticmethod
+    def _codex_stdout_error(stdout: bytes) -> str:
+        """Pull the failure reason out of a `codex exec --json` stdout stream.
+
+        `codex exec` reports API and turn failures as JSONL `error` /
+        `turn.failed` events on STDOUT and leaves stderr completely empty, so
+        the obvious "report stderr" error path produced
+        `Codex CLI failed (exit 1): ` with nothing after the colon — the exact
+        journal line that made this bug undiagnosable from the logs (dv-0c01).
+        """
+        messages: List[str] = []
+        for raw in stdout.decode("utf-8", errors="replace").splitlines():
+            raw = raw.strip()
+            if not raw.startswith("{"):
+                continue
+            try:
+                event = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "error":
+                messages.append(str(event.get("message", "")))
+            elif event.get("type") == "turn.failed":
+                err = event.get("error") or {}
+                if isinstance(err, dict):
+                    messages.append(str(err.get("message", "")))
+        # turn.failed usually restates the preceding error event verbatim.
+        deduped: List[str] = []
+        for msg in messages:
+            if msg and msg not in deduped:
+                deduped.append(msg)
+        return " | ".join(deduped)
+
     async def _invoke_codex_cli(self, prompt: str) -> str:
         """Invoke `codex exec` constrained to the evaluator JSON schema.
 
         Prompt goes via stdin (positional arg `-`), not argv — same ARG_MAX
         reasoning as `_invoke_claude_cli`; `codex exec` reads stdin when the
         prompt argument is `-`.
+
+        Runs read-only, rooted at the throwaway temp dir rather than the bot's
+        cwd: this call reads a prompt and emits JSON, so the full-access
+        sandbox it used to request bought nothing and pointed a shell-capable
+        agent at the repository.
         """
         import tempfile
 
@@ -699,8 +743,10 @@ class EvaluatorService:
                 "codex",
                 "exec",
                 "--json",
+                "-C",
+                td,
                 "-s",
-                "danger-full-access",
+                "read-only",
                 "--skip-git-repo-check",
                 "--output-schema",
                 str(schema_path),
@@ -712,7 +758,7 @@ class EvaluatorService:
                 stderr=asyncio.subprocess.PIPE,
             )
             try:
-                _, stderr = await asyncio.wait_for(
+                stdout, stderr = await asyncio.wait_for(
                     process.communicate(input=prompt.encode("utf-8")),
                     timeout=self._timeout,
                 )
@@ -722,6 +768,7 @@ class EvaluatorService:
                 raise RuntimeError(f"timeout after {self._timeout}s (codex cli)")
             if process.returncode != 0:
                 err = stderr.decode("utf-8", errors="replace").strip()
+                err = err or self._codex_stdout_error(stdout) or "(no output)"
                 raise RuntimeError(
                     f"Codex CLI failed (exit {process.returncode}): {err[-500:]}"
                 )

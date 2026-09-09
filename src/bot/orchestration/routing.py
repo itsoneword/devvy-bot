@@ -77,17 +77,19 @@ def apply_route(
     if role != "owner":
         # Guard the persisted active profile: if it is missing or no longer
         # guest-allowed, fall back to the role's default profile.
-        active_profile = registry.get_by_slug(active)
+        # A disabled profile (dv-ffb4) falls back like an unknown one: the
+        # user's persisted active_profile may name a slug the owner turned off.
+        active_profile = registry.get_enabled_by_slug(active)
         if active_profile is None or not active_profile.allows_role(role):
             fallback = registry.get_default_for_role(role)
             if fallback is None:
                 raise ProfileAccessDenied(active, role)
             active = fallback.slug
             user_data["active_profile"] = active
-    valid = {p.slug for p in registry.profiles}
+    valid = {p.slug for p in registry.enabled_profiles}
     r = resolve_route(text, active=active, valid_slugs=valid)
 
-    target = registry.get_by_slug(r.target) or registry.get_default()
+    target = registry.get_enabled_by_slug(r.target) or registry.get_default()
     if not target.allows_role(role):
         raise ProfileAccessDenied(target.slug, role)
     badge = _PROFILE_BADGES.get(target.slug, target.slug)

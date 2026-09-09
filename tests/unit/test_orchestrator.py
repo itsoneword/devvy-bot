@@ -200,6 +200,9 @@ def test_callback_pattern_covers_every_prefix(agentic_settings, deps):
         "model:claude",
         "model:codex_login",
         "agent:coach",
+        "agents:manage",
+        "agents:toggle:pm",
+        "agents:new",
         "auth:refresh",
         "auth:login:codex",
         "auth:login:claude",
@@ -543,10 +546,12 @@ async def test_agentic_usage_reports_costs_and_caps(agentic_settings, deps):
 
     rate_limiter = MagicMock()
     rate_limiter.get_user_status.return_value = {
-        "cost_usage": {"current": 1.25, "limit": 10.0, "remaining": 8.75}
+        "cost_usage": {"current": 1.25, "limit": 10.0, "remaining": 8.75},
+        "token_usage": {"current": 0, "limit": 2_500_000, "remaining": 2_500_000},
     }
     # /usage asks the limiter what it will actually enforce; None = uncapped.
     rate_limiter.effective_daily_cap.return_value = None
+    rate_limiter.effective_daily_token_cap.return_value = None
 
     update = MagicMock()
     update.effective_user.id = 123
@@ -571,6 +576,8 @@ async def test_agentic_usage_reports_costs_and_caps(agentic_settings, deps):
     # a number that would misleadingly imply enforcement.
     assert "Budget window (24h): $1.25 (no cap)" in text
     assert "Per-request cap: none" in text
+    # No unmetered tokens spent and no cap: the token line stays out of the way.
+    assert "Unmetered tokens" not in text
 
 
 async def test_agentic_usage_shows_caps_for_guest_role(agentic_settings, deps):
@@ -588,9 +595,11 @@ async def test_agentic_usage_shows_caps_for_guest_role(agentic_settings, deps):
 
     rate_limiter = MagicMock()
     rate_limiter.get_user_status.return_value = {
-        "cost_usage": {"current": 1.25, "limit": 10.0, "remaining": 8.75}
+        "cost_usage": {"current": 1.25, "limit": 10.0, "remaining": 8.75},
+        "token_usage": {"current": 0, "limit": 500_000, "remaining": 500_000},
     }
     rate_limiter.effective_daily_cap.return_value = 10.0
+    rate_limiter.effective_daily_token_cap.return_value = 500_000
 
     update = MagicMock()
     update.effective_user.id = 456
@@ -608,7 +617,52 @@ async def test_agentic_usage_shows_caps_for_guest_role(agentic_settings, deps):
 
     text = update.message.reply_text.call_args.args[0]
     assert "$1.25 / $10.00" in text
+    # A capped guest sees the token allowance even before spending any.
+    assert "Unmetered tokens (24h): 0 / 500,000 — 500,000 left" in text
     assert "Per-request cap: $" in text
+
+
+async def test_agentic_usage_does_not_show_a_codex_day_as_free(agentic_settings, deps):
+    """dv-0722: a day spent on an unpriced backend reads as tokens, not $0."""
+    from datetime import UTC, datetime
+
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    storage = MagicMock()
+    # The SQLite dollar ledger is honestly $0.00 -- nothing was billed.
+    storage.costs.get_user_daily_costs = AsyncMock(
+        return_value=[SimpleNamespace(date=today, daily_cost=0.0, request_count=9)]
+    )
+    storage.log_bot_event = AsyncMock()
+
+    rate_limiter = MagicMock()
+    rate_limiter.get_user_status.return_value = {
+        "cost_usage": {"current": 0.0, "limit": 10.0, "remaining": 10.0},
+        "token_usage": {"current": 480_000, "limit": 2_500_000},
+    }
+    rate_limiter.effective_daily_cap.return_value = None
+    rate_limiter.effective_daily_token_cap.return_value = None
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.reply_text = AsyncMock()
+
+    context = MagicMock()
+    context.user_data = {"role": "owner"}
+    context.bot_data = {
+        "storage": storage,
+        "rate_limiter": rate_limiter,
+        "auth_manager": None,
+    }
+
+    await orchestrator.agentic_usage(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "Today: $0.00 (9 requests)" in text
+    assert "Budget window (24h): $0.00 (no cap)" in text
+    assert "Unmetered tokens (24h): 480,000 (no cap)" in text
+    rate_limiter.effective_daily_token_cap.assert_called_once_with(123, "owner")
 
 
 async def test_agentic_usage_survives_missing_deps(agentic_settings, deps):
@@ -1419,29 +1473,37 @@ def _ctx_with(user_data):
     return ctx
 
 
-def test_claude_model_override_default_none(agentic_settings, deps):
+def test_model_override_default_none(agentic_settings, deps):
     """No user pick and no AGENT_MODEL -> None (config/CLI default applies)."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
-    assert orchestrator._claude_model_override(_ctx_with({})) is None
+    assert orchestrator._model_override(_ctx_with({})) is None
 
 
-def test_claude_model_override_user_tier(agentic_settings, deps):
+def test_model_override_user_tier(agentic_settings, deps):
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     ctx = _ctx_with({"agent_model": "opus"})
-    assert orchestrator._claude_model_override(ctx) == "opus"
+    assert orchestrator._model_override(ctx) == "opus"
 
 
-def test_claude_model_override_ignored_for_codex(agentic_settings, deps):
+def test_model_override_for_codex_is_the_validated_codex_ref(agentic_settings, deps):
+    """Codex gets its model through the same kwarg (dv-4207): a Claude tier
+    left in user_data is not a Codex model, so the catalog default wins."""
+    from src.bot.orchestration.base import _CODEX_DEFAULT_MODEL
+
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     ctx = _ctx_with({"agent_backend": "openai_codex", "agent_model": "sonnet"})
-    assert orchestrator._claude_model_override(ctx) is None
+    assert orchestrator._model_override(ctx) == _CODEX_DEFAULT_MODEL
+    ctx = _ctx_with(
+        {"agent_backend": "openai_codex", "agent_model": "openai-codex/gpt-5.5"}
+    )
+    assert orchestrator._model_override(ctx) == "openai-codex/gpt-5.5"
 
 
-def test_claude_model_override_ignores_placeholder(agentic_settings, deps):
+def test_model_override_ignores_placeholder(agentic_settings, deps):
     """Legacy 'claude' placeholder in user_data must not become the model."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     ctx = _ctx_with({"agent_model": "claude"})
-    assert orchestrator._claude_model_override(ctx) is None
+    assert orchestrator._model_override(ctx) is None
 
 
 class TestThinkingProgressRendering:

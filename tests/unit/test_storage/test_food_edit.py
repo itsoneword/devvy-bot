@@ -229,3 +229,140 @@ class TestDeleteProduct:
     async def test_unknown_product_is_a_no_op(self, repo) -> None:
         result = await repo.delete_product(999999)
         assert result["deleted"] is False
+
+
+class TestEditSleepDay:
+    """dv-4e81: sleep was the one domain where a value could be replaced but
+    never blanked, because log_sleep's COALESCE upsert keeps whatever you
+    omit. The rows the 2026-08-19 repair had to fix by hand are the shape of
+    every test here."""
+
+    async def test_replays_the_2026_08_19_repair(self, repo) -> None:
+        # A real weight plus an invented hrv, exactly like logs_sleep 82.
+        await repo.log_sleep(USER_A, DAY, weight_kg=82.4, hrv=0, sleep_min=460)
+
+        result = await repo.edit_sleep_day(USER_A, DAY, clear=["hrv"])
+
+        assert result["edited"] is True
+        assert result["row"]["hrv"] is None
+        # The whole reason log_delete was not an acceptable substitute:
+        # the real values in the same row survive.
+        assert result["row"]["weight_kg"] == 82.4
+        assert result["row"]["sleep_min"] == 460
+        assert result["cleared"] == ["hrv"]
+
+    async def test_clears_several_fields_at_once(self, repo) -> None:
+        await repo.log_sleep(
+            USER_A, DAY, score=0, hrv=0, rhr=0, wellbeing="7", room_temp=20.9
+        )
+
+        result = await repo.edit_sleep_day(USER_A, DAY, clear=["score", "hrv", "rhr"])
+
+        assert result["row"]["score"] is None
+        assert result["row"]["hrv"] is None
+        assert result["row"]["rhr"] is None
+        assert result["row"]["wellbeing"] == "7"
+        assert result["row"]["room_temp"] == 20.9
+
+    async def test_sets_and_clears_in_one_call(self, repo) -> None:
+        await repo.log_sleep(USER_A, DAY, sleep_min=400, score=0)
+
+        result = await repo.edit_sleep_day(USER_A, DAY, sleep_min=460, clear=["score"])
+
+        assert result["row"]["sleep_min"] == 460
+        assert result["row"]["score"] is None
+
+    async def test_omitted_fields_are_kept(self, repo) -> None:
+        await repo.log_sleep(USER_A, DAY, sleep_min=460, weight_kg=82.4)
+
+        result = await repo.edit_sleep_day(USER_A, DAY, sleep_min=430)
+
+        assert result["row"]["weight_kg"] == 82.4
+
+    async def test_unknown_field_name_clears_nothing(self, repo) -> None:
+        await repo.log_sleep(USER_A, DAY, hrv=44)
+
+        result = await repo.edit_sleep_day(USER_A, DAY, clear=["hrv_", "id", "date"])
+
+        assert result["cleared"] == []
+        assert result["row"]["hrv"] == 44
+        assert result["row"]["date"] == DAY
+
+    async def test_a_date_with_no_row_is_refused_not_created(self, repo) -> None:
+        result = await repo.edit_sleep_day(USER_A, "2026-08-18", score=80)
+
+        assert result["edited"] is False
+        assert await repo.sleep_last(USER_A) == []
+
+    async def test_another_users_night_is_untouchable(self, repo) -> None:
+        await repo.log_sleep(USER_B, DAY, hrv=44)
+
+        result = await repo.edit_sleep_day(USER_A, DAY, clear=["hrv"])
+
+        assert result["edited"] is False
+        theirs = await repo.sleep_last(USER_B)
+        assert theirs[0]["hrv"] == 44
+
+    async def test_returns_seven_day_averages(self, repo) -> None:
+        await repo.log_sleep(USER_A, DAY, sleep_min=400)
+
+        result = await repo.edit_sleep_day(USER_A, DAY, sleep_min=460)
+
+        assert result["avg_7d"]["sleep_min"] == 460
+
+    async def test_batch_is_all_or_nothing_on_a_bad_date(self, repo) -> None:
+        await repo.log_sleep(USER_A, DAY, hrv=0)
+
+        result = await repo.edit_sleep_days(
+            USER_A,
+            [{"date": DAY, "clear": ["hrv"]}, {"date": "2026-08-19", "score": 80}],
+        )
+
+        assert result["bad_index"] == 1
+        assert result["edited"] == 0
+        # Row one must not have been touched: the model would otherwise be
+        # told "row 1 is bad" and assume row 0 landed.
+        assert (await repo.sleep_last(USER_A))[0]["hrv"] == 0
+
+    async def test_batch_edits_several_nights(self, repo) -> None:
+        await repo.log_sleep(USER_A, "2026-08-17", hrv=0)
+        await repo.log_sleep(USER_A, "2026-08-18", score=0)
+
+        result = await repo.edit_sleep_days(
+            USER_A,
+            [
+                {"date": "2026-08-17", "clear": ["hrv"]},
+                {"date": "2026-08-18", "clear": ["score"], "sleep_min": 500},
+            ],
+        )
+
+        assert result["edited"] == 2
+        assert result["nights"][0]["row"]["hrv"] is None
+        assert result["nights"][1]["row"]["score"] is None
+        assert result["nights"][1]["row"]["sleep_min"] == 500
+
+
+class TestDeletePortion:
+    """dv-4e81: portion_save could overwrite a phrase's grams but a phrase
+    saved by mistake was permanent."""
+
+    async def test_removes_the_users_phrase(self, repo) -> None:
+        saved = await repo.save_portion(USER_A, "нормальная пицца", 350)
+
+        result = await repo.delete_portion(USER_A, saved["id"])
+
+        assert result["deleted"] is True
+        assert result["row"]["phrase"] == "нормальная пицца"
+        assert await repo.portion_find(USER_A, "пицца") == []
+
+    async def test_cannot_delete_another_users_phrase(self, repo) -> None:
+        theirs = await repo.save_portion(USER_B, "нормальная пицца", 150)
+
+        result = await repo.delete_portion(USER_A, theirs["id"])
+
+        assert result["deleted"] is False
+        assert len(await repo.portion_find(USER_B, "пицца")) == 1
+
+    async def test_unknown_id_is_a_no_op(self, repo) -> None:
+        result = await repo.delete_portion(USER_A, 999999)
+        assert result["deleted"] is False

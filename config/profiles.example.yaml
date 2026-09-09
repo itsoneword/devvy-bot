@@ -74,9 +74,32 @@
 #   - slug: coach
 #     ...
 #     max_cost_per_request: 1.50
+#
+# Optional per-profile `extra_dirs:` (list of paths) lets a SANDBOXED profile
+# write to directories beyond its own workspace — an Obsidian vault, another
+# project checkout — without flipping `sandbox: false` (which grants the whole
+# filesystem plus network). Wired to the CLI `--add-dir` for bash inside the
+# jail and to the in-process write boundary for Write/Edit. Rules enforced
+# at load: owner-only profiles only (never with `allowed_roles: [guest]`),
+# never `/` or `~`, never overlapping another profile's working_dir or
+# memory_dir (that would be `sandbox: false` through the back door), and the
+# directory must already exist — it is someone else's tree, never created.
+#
+#   - slug: study
+#     ...
+#     extra_dirs:
+#       - ~/notes                       # Obsidian vault
+#       - ${DEVVY_ROOT}/../my-project   # another checkout on this host
+#
+# Optional per-profile `enabled: false` hides a profile without deleting it:
+# no /slug command, no /agents button, no routing target — persona, memory
+# and workspace stay on disk. The default profile cannot be disabled. The
+# /agents Manage menu flips this key; restart afterwards, the registry is
+# read once at boot.
+#
 # PATHS
 #
-# `working_dir`, `memory_dir`, `persona` and `mcp` accept, in this order:
+# `working_dir`, `memory_dir`, `persona`, `mcp` and `extra_dirs` accept, in this order:
 #   ${VAR}          — any environment variable. Undefined is an ERROR, not an
 #                     empty string, so ${TYPO}/coach can never become /coach.
 #   ${DEVVY_ROOT}   — always defined. Defaults to this file's grandparent

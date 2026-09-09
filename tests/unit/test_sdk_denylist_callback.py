@@ -552,3 +552,54 @@ class TestGuestReadScope:
             assert not self._hook_denied(decision), tool_input
             result = await callback(tool, tool_input, MagicMock())
             assert result.__class__.__name__ == "PermissionResultAllow", tool_input
+
+
+class TestExtraWriteRoots:
+    """dv-3103: profile extra_dirs widen the write boundary, nothing else."""
+
+    def setup_method(self) -> None:
+        self.workspace = Path("/home/testuser/Devvybot/workspaces/study")
+        self.vault = Path("/home/testuser/notes")
+        self.project = Path("/home/testuser/other-project")
+        self.callback = _make_can_use_tool_callback(
+            security_validator=SecurityValidator(approved_directory=None),
+            working_directory=self.workspace,
+            approved_directory=None,
+            full_access=False,
+            extra_write_roots=(self.vault, self.project),
+        )
+
+    @pytest.mark.asyncio
+    async def test_file_write_into_extra_dir_allowed(self) -> None:
+        for target in (self.vault / "study/topic.md", self.project / "src/x.py"):
+            result = await self.callback(
+                "Write", {"file_path": str(target)}, MagicMock()
+            )
+            assert result.__class__.__name__ == "PermissionResultAllow", target
+
+    @pytest.mark.asyncio
+    async def test_file_write_elsewhere_still_denied(self) -> None:
+        for target in (
+            "/home/testuser/PROBE.txt",
+            "/home/testuser/notes-other/x.md",  # prefix, not a subtree
+            "/home/testuser/Devvybot/devvy_bot/src/x.py",
+        ):
+            result = await self.callback("Write", {"file_path": target}, MagicMock())
+            assert result.__class__.__name__ == "PermissionResultDeny", target
+        assert str(self.vault) in result.message
+
+    @pytest.mark.asyncio
+    async def test_bash_write_into_extra_dir_allowed(self) -> None:
+        result = await self.callback(
+            "Bash",
+            {"command": f"python3 build.py > {self.project}/out.log"},
+            MagicMock(),
+        )
+        assert result.__class__.__name__ == "PermissionResultAllow"
+
+    @pytest.mark.asyncio
+    async def test_bash_write_elsewhere_still_denied(self) -> None:
+        result = await self.callback(
+            "Bash", {"command": "echo hi > /home/testuser/PROBE.txt"}, MagicMock()
+        )
+        assert result.__class__.__name__ == "PermissionResultDeny"

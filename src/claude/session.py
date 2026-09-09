@@ -49,7 +49,7 @@ class ClaudeSession:
     def update_usage(self, response: ClaudeResponse) -> None:
         """Update session with usage from response."""
         self.last_used = _to_utc(datetime.now(UTC))
-        self.total_cost += response.cost
+        self.total_cost += response.cost_usd
         self.total_turns += response.num_turns
         self.message_count += 1
         self.cumulative_tokens += response.input_tokens + response.output_tokens

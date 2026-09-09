@@ -100,6 +100,7 @@ async def test_evaluator_triggers_at_50k_on_active_backend(window_repo):
         working_dir="/p",
         backend="openai_codex",
         added_tokens=49_000,
+        context_tokens=49_000,
         conversation_text="...",
         max_message_id=10,
     )
@@ -112,6 +113,9 @@ async def test_evaluator_triggers_at_50k_on_active_backend(window_repo):
         working_dir="/p",
         backend="openai_codex",
         added_tokens=2_000,
+        # Codex reports a real level since 2026-09-05 (rollout file); the
+        # flow sum is no longer its fallback, so the level is passed.
+        context_tokens=51_000,
         conversation_text="convo",
         max_message_id=11,
     )

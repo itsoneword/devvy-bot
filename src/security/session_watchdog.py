@@ -26,6 +26,9 @@ _METRIC_LABELS = {
     "cost_per_hour": ("💰 Cost/hour", "${:.2f}", "${:.2f}"),
     "messages_per_hour": ("💬 Messages/hour", "{:.0f}", "{:.0f}"),
     "turns_per_hour": ("🔁 Turns/hour", "{:.0f}", "{:.0f}"),
+    # Unpriced backends (Codex on a subscription, dv-0722) are metered in
+    # tokens because there is no USD figure to add to cost_per_hour.
+    "tokens_per_hour": ("🪙 Unmetered tokens/hour", "{:,.0f}", "{:,.0f}"),
 }
 
 

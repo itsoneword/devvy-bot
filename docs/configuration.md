@@ -84,6 +84,11 @@ CLAUDE_MAX_COST_PER_USER=10.0
 # Maximum cost per individual request in USD (SDK-level hard cap)
 CLAUDE_MAX_COST_PER_REQUEST=5.0
 
+# Daily token budget for turns with no USD price (Codex on a subscription);
+# same role tiers and owner exemption as the USD caps (see Cost Limits)
+UNMETERED_MAX_TOKENS_PER_USER=2500000
+UNMETERED_MAX_TOKENS_PER_USER_GUEST=500000
+
 # Allowed Claude tools (comma-separated list; see docs/tools.md for descriptions)
 CLAUDE_ALLOWED_TOOLS=Read,Write,Edit,Bash,Glob,Grep,LS,Task,TaskOutput,MultiEdit,NotebookRead,NotebookEdit,WebFetch,TodoRead,TodoWrite,WebSearch
 ```
@@ -103,6 +108,35 @@ AGENT_TIMEOUT_SECONDS=600
 
 # Local OAuth token store used by /model -> Login OpenAI Codex
 OPENAI_CODEX_CREDENTIALS_PATH=data/model_auth/openai_codex.json
+```
+
+#### Agent Tools Bridge (Codex)
+
+The Claude path mounts the bot's own tools in-process; a subprocess backend
+cannot reach a Python object, so the same tools are served over a loopback
+HTTP MCP endpoint (dv-ffcb). The bind address is always `127.0.0.1` and is
+deliberately not configurable. Each turn gets its own bearer token, minted
+into that child's environment and revoked when the turn returns — there is no
+token to configure, and there must never be one (`docs/DECISIONS.md`
+2026-09-04).
+
+Which tools the bridge serves is not configured either: it is every tool the
+Claude path mounts (`available_tool_specs`, the same per-user filter on both
+transports) minus the `NOT_EXPORTED` denylist in `src/agent_bridge/server.py`
+— one entry per withheld tool, with its reason. A new tool reaches Codex
+without any change to the bridge; only a declared exception keeps one off.
+
+```bash
+# Serve the agent tools to subprocess backends. Off = a Codex turn has no
+# bot tools at all (memory, food/training log).
+ENABLE_AGENT_BRIDGE=true
+
+# Loopback port for the bridge
+AGENT_BRIDGE_PORT=8770
+
+# Backstop expiry for a per-turn token that was never revoked (a killed
+# turn). Keep above AGENT_TIMEOUT_SECONDS.
+AGENT_BRIDGE_TOKEN_TTL_SECONDS=1800
 ```
 
 #### Memory Evaluator
@@ -223,6 +257,10 @@ WATCHDOG_MAX_MESSAGES_PER_HOUR=60
 
 # Alert if a user's summed SDK turns in a rolling hour exceed this
 WATCHDOG_MAX_TURNS_PER_HOUR=100
+
+# Alert if a user's tokens on an unpriced backend (Codex) in a rolling hour
+# exceed this -- those turns have no USD figure to add to the cost metric
+WATCHDOG_MAX_TOKENS_PER_HOUR=5000000
 ```
 
 #### Storage & Database
@@ -375,8 +413,17 @@ a strict subset of `/agents`.)
 Profiles work under both denylist (systemd) and allowlist (container) modes;
 each profile's `working_dir` must be reachable in whichever mode is active.
 Per-profile keys include `sandbox`, `max_turns`, `max_cost_per_request`,
-`permission_policy.allowed_roles`, `family_memory`, `personal_memory` and
-`mcp`. See `config/profiles.example.yaml`.
+`permission_policy.allowed_roles`, `family_memory`, `personal_memory`, `mcp`,
+`extra_dirs` (extra write roots for a sandboxed profile — a notes vault, another
+checkout — instead of `sandbox: false`) and `enabled` (`false` hides a profile
+without deleting it). See `config/profiles.example.yaml`.
+
+Owners manage profiles from Telegram: `/agents → ⚙ Manage` toggles `enabled:`
+in the YAML and offers the restart (the registry is read once at boot);
+`/agents → ➕ New agent` hands you to the `devops` profile, which runs the
+`new-agent` skill — a short interview that writes a template under
+`data/templates/local/<slug>/`, runs `scripts/install_profiles.py --add`,
+validates with `scripts/check_install.py --skip-db`, and offers the restart.
 
 Note that a profile's persona comes from its `persona` file, injected by
 `PromptComposer`. A `CLAUDE.md` in the profile's `working_dir` is loaded
@@ -441,14 +488,22 @@ Three separate mechanisms, easily confused:
 | Daily rolling budget | `CLAUDE_MAX_COST_PER_USER` / `_GUEST`, per-user `CLAUDE_COST_LIMIT_OVERRIDES` (`id:usd,...`) | per user, 24h in-memory window | request refused before the model runs |
 | Per-request SDK cap | `CLAUDE_MAX_COST_PER_REQUEST`, or per-profile `max_cost_per_request` | per turn | **turn aborted mid-run**, partial output labelled as such |
 | Turn limit | `CLAUDE_MAX_TURNS`, or per-profile `max_turns` | per turn | turn stopped, labelled |
+| Daily unmetered-token budget | `UNMETERED_MAX_TOKENS_PER_USER` / `_GUEST` | per user, same 24h window as the USD budget | request refused when exhausted |
 
 Owners are exempt from the daily budget and the global per-request cap
 **unless** an explicit per-user override (daily) or per-profile
 `max_cost_per_request` (per-request) names them — the specific setting always
 beats the role exemption.
 
-`/usage` reads the enforced number from `RateLimiter.effective_daily_cap`, so
-the readout and the gate cannot drift apart. An aborted turn always produces a
+Turns on a backend with no USD price (Codex on a ChatGPT subscription —
+`ClaudeResponse.cost is None`, dv-0722) are not free: their
+`input_tokens + output_tokens` go to the token budget instead of the USD one,
+with the same owner exemption and override precedence. A user is refused when
+either ledger is exhausted. The SQLite cost rows record `$0.00` for such turns
+(nothing was billed); `/usage` shows the token ledger next to the dollar one.
+
+`/usage` reads the enforced numbers from `RateLimiter.effective_daily_cap` and
+`effective_daily_token_cap`, so the readout and the gate cannot drift apart. An aborted turn always produces a
 user-visible notice; see `_ABORT_SUBTYPES` in `src/claude/sdk_integration.py`
 and `docs/FINDINGS.md` 2026-08-03 for why silence there was a bug.
 

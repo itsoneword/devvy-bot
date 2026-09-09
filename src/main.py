@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 import structlog
 
 from src import __version__
-from src.agent_backends import CodexCliIntegration, CodexSessionStore
+from src.agent_backends import AgentBackend, CodexCliIntegration, CodexSessionStore
 from src.bot.core import ClaudeCodeBot
 from src.bot.features.self_modify import SelfModificationGuard
 from src.claude import (
@@ -371,6 +371,9 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         profile_registry=profile_registry,
         memory_retriever=memory_retriever,
         bundle_provider=bundle_provider,
+        # Same session manager as the Claude path: a Codex thread has to exist
+        # in `sessions` before its `messages` row is written (dv-0c01).
+        session_manager=session_manager,
     )
 
     # Wire refresh service (needs claude_integration for conversation helper)
@@ -425,12 +428,24 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         bot_root=Path(__file__).resolve().parent.parent,
     )
 
+    # Backend registry (dv-5368): user_data["agent_backend"] is the key the
+    # orchestrator looks up; each value satisfies AgentBackend
+    # (src/agent_backends/protocol.py). A third backend registers its
+    # instance here and its BackendPolicy in protocol.BACKEND_POLICIES.
+    backends: Dict[str, AgentBackend] = {
+        claude_integration.backend_id: claude_integration,
+        codex_integration.backend_id: codex_integration,
+    }
+
     # Create bot with all dependencies
     dependencies = {
         "auth_manager": auth_manager,
         "security_validator": security_validator,
         "rate_limiter": rate_limiter,
         "audit_logger": audit_logger,
+        "backends": backends,
+        # Pre-registry keys, kept for the dv-5368 transition; orchestration
+        # reads bot_data["backends"] and only falls back to these.
         "claude_integration": claude_integration,
         "codex_integration": codex_integration,
         "storage": storage,
@@ -459,6 +474,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
 
     return {
         "bot": bot,
+        "backends": backends,
         "claude_integration": claude_integration,
         "storage": storage,
         "config": config,
@@ -497,6 +513,7 @@ async def run_application(app: Dict[str, Any]) -> None:
     notification_service: Optional[NotificationService] = None
     scheduler: Optional[JobScheduler] = None
     project_threads_manager: Optional[ProjectThreadManager] = None
+    agent_bridge: Optional[Any] = None
 
     # Set up signal handlers for graceful shutdown
     shutdown_event = asyncio.Event()
@@ -718,25 +735,59 @@ async def run_application(app: Dict[str, Any]) -> None:
         # not at SDK-manager construction — because the scheduler is created
         # now. These tools run outside the Bash sandbox, so agents no longer
         # need the network-blocked HTTP agentctl path.
+        agent_services = None
         try:
             from src.claude.agent_tools import AgentServices
 
-            claude_integration.sdk_manager.attach_agent_services(
-                AgentServices(
-                    event_bus=event_bus,
-                    task_repo=storage.tasks,
-                    scheduler=scheduler,
-                    profile_registry=bot.deps.get("profile_registry"),
-                    default_chat_ids=config.notification_chat_ids or [],
-                    memory_writer=app.get("agent_memory_writer"),
-                    memory_repo=storage.memory_repository,
-                    message_repo=storage.messages,
-                    audit_memory_writer=app.get("audit_memory_writer"),
-                    user_data=storage.user_data,
-                )
+            agent_services = AgentServices(
+                event_bus=event_bus,
+                task_repo=storage.tasks,
+                scheduler=scheduler,
+                profile_registry=bot.deps.get("profile_registry"),
+                default_chat_ids=config.notification_chat_ids or [],
+                memory_writer=app.get("agent_memory_writer"),
+                memory_repo=storage.memory_repository,
+                message_repo=storage.messages,
+                audit_memory_writer=app.get("audit_memory_writer"),
+                user_data=storage.user_data,
             )
         except Exception as e:  # pragma: no cover - defensive wiring guard
-            logger.warning("Failed to attach agent MCP services", error=str(e))
+            logger.warning("Failed to build agent MCP services", error=str(e))
+
+        # The same tools, second transport (dv-ffcb): a loopback HTTP MCP
+        # endpoint so the out-of-process Codex backend can reach them. Started
+        # unconditionally, not only when AGENT_BACKEND is codex: the backend is
+        # a per-user runtime choice (/model writes user_data["agent_backend"]),
+        # so gating on the process-wide default would leave the tools missing
+        # for exactly the user who just switched to Codex from Telegram.
+        if config.enable_agent_bridge and agent_services is not None:
+            try:
+                from src.agent_bridge import AgentBridge
+
+                agent_bridge = AgentBridge(
+                    services=agent_services,
+                    port=config.agent_bridge_port,
+                    token_ttl_seconds=config.agent_bridge_token_ttl_seconds,
+                )
+                await agent_bridge.start()
+                app["agent_bridge"] = agent_bridge
+            except Exception as e:  # pragma: no cover - defensive wiring guard
+                agent_bridge = None
+                logger.warning("Failed to start agent bridge", error=str(e))
+
+        # Every registered backend gets both transports and keeps what it can
+        # use (dv-5368): Claude mounts the in-process services, Codex takes
+        # the bridge. One failure must not cost the other backend its tools.
+        if agent_services is not None:
+            for backend in app.get("backends", {}).values():
+                try:
+                    backend.attach_tools(agent_services, agent_bridge)
+                except Exception as e:  # pragma: no cover - defensive wiring guard
+                    logger.warning(
+                        "Failed to attach agent tools",
+                        backend=getattr(backend, "backend_id", "?"),
+                        error=str(e),
+                    )
 
         # Destructive-op confirmation gate (full-access profiles). Needs the
         # Telegram bot, so it's wired here. Prompts go to the owner chat(s).
@@ -895,12 +946,15 @@ async def run_application(app: Dict[str, Any]) -> None:
         logger.error("Application error", error=str(e))
         raise
     finally:
-        # Ordered shutdown: scheduler -> API -> notification -> bot -> claude -> storage
+        # Ordered shutdown: scheduler -> bridge -> API -> notification -> bot
+        # -> claude -> storage
         logger.info("Shutting down application")
 
         try:
             if scheduler:
                 await scheduler.stop()
+            if agent_bridge:
+                await agent_bridge.stop()
             if notification_service:
                 await notification_service.stop()
             await event_bus.stop()

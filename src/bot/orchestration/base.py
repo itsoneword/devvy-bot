@@ -14,6 +14,18 @@ import structlog
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from ...agent_backends.protocol import (  # noqa: F401 — re-exported
+    _CLAUDE_TIERS,
+    _CODEX_DEFAULT_MODEL,
+    _CODEX_HARD_MODEL,
+    _CODEX_PINNED_MODELS,
+    CLAUDE_BACKEND,
+    CODEX_BACKEND,
+    AgentBackend,
+    BackendPolicy,
+    codex_supported_models,
+    policy_for,
+)
 from ...config.settings import Settings
 from ...profiles.registry import agent_id_for_working_dir
 from ...security.auth import fallback_role
@@ -22,12 +34,13 @@ from .routing import seed_prefs_into_user_data
 logger = structlog.get_logger()
 
 
-_CODEX_DEFAULT_MODEL = "openai-codex/gpt-5.4-mini"
-_CODEX_HARD_MODEL = "openai-codex/gpt-5.5"
-_CODEX_SUPPORTED_MODELS = {
-    _CODEX_HARD_MODEL,
-    _CODEX_DEFAULT_MODEL,
-}
+# Pre-registry bot_data keys (dv-5368 transition). ``bot_data["backends"]`` is
+# the registry; these are read only when it is absent, which today means a
+# unit test that wired a single mock integration the old way.
+_LEGACY_BACKEND_KEYS = (
+    (CLAUDE_BACKEND, "claude_integration"),
+    (CODEX_BACKEND, "codex_integration"),
+)
 
 
 class OrchestratorBase:
@@ -76,13 +89,18 @@ class OrchestratorBase:
         return Path(current) if current else Path.home()
 
     def _routed_working_dir(
-        self, context: ContextTypes.DEFAULT_TYPE, user_id: int
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int]
     ) -> Path:
         """Working dir resolved through the SAME profile router as text turns.
 
-        Commands that operate on "the current conversation" (/new, /status)
-        must resolve the workspace exactly like the message pipeline does, or
-        they act on a different window than the one the user is talking in.
+        This is the ONE resolver for "the directory this conversation is in".
+        Commands that operate on the current conversation (/new, /status,
+        /start, /usage, /memory) and the model/backend callbacks must all use
+        it, or they act on a different window than the one the user is talking
+        in. Never re-derive the dir from ``current_directory`` with a
+        ``Path.home()`` fallback: ``user_data`` is in-memory only, so on a cold
+        process that fallback silently targets the service user's home dir
+        (dv-c07a / dv-9eb0).
         Live failure (dv-5f3a, 2026-08-15): /new read ``current_directory``
         (unset -> home-dir fallback) and rolled the window for the service
         user's home directory while the user's coach conversation kept running
@@ -359,34 +377,88 @@ class OrchestratorBase:
 
     def _selected_backend(self, context: ContextTypes.DEFAULT_TYPE) -> str:
         return str(
-            context.user_data.get("agent_backend") or self.settings.agent_backend
+            context.user_data.get("agent_backend")
+            or getattr(self.settings, "agent_backend", CLAUDE_BACKEND)
         )
 
-    def _selected_model(self, context: ContextTypes.DEFAULT_TYPE) -> str:
-        backend = self._selected_backend(context)
-        configured = context.user_data.get("agent_model") or self.settings.agent_model
-        if backend == "openai_codex":
-            model = str(configured or _CODEX_DEFAULT_MODEL)
-            if model not in _CODEX_SUPPORTED_MODELS:
-                context.user_data["agent_model"] = _CODEX_DEFAULT_MODEL
-                return _CODEX_DEFAULT_MODEL
-            return model
-        if configured in self._CLAUDE_TIERS:
-            return str(configured)
-        return str(self.settings.claude_model or "CLI default")
+    def _backend_policy(self, context: ContextTypes.DEFAULT_TYPE) -> BackendPolicy:
+        """Static policy (session key, model validation) for the selected backend."""
+        return policy_for(self._selected_backend(context))
 
-    _CLAUDE_TIERS = ("sonnet", "opus")
+    def _backends(self, context: ContextTypes.DEFAULT_TYPE) -> Dict[str, AgentBackend]:
+        """Live backend registry: ``bot_data["backends"]`` (dv-5368).
 
-    def _claude_model_override(
+        Falls back to the pre-registry ``claude_integration`` /
+        ``codex_integration`` keys so older test fixtures keep working.
+        """
+        registry: Optional[Dict[str, AgentBackend]] = context.bot_data.get("backends")
+        if registry:
+            return registry
+        legacy: Dict[str, AgentBackend] = {}
+        for backend_id, key in _LEGACY_BACKEND_KEYS:
+            instance = context.bot_data.get(key)
+            if instance is not None:
+                legacy[backend_id] = instance
+        return legacy
+
+    def _active_backend(
         self, context: ContextTypes.DEFAULT_TYPE
+    ) -> Optional[AgentBackend]:
+        """The registered backend the user's turns run on, or None if unwired."""
+        return self._backends(context).get(self._selected_backend(context))
+
+    async def _refresh_resumable_sessions(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: int, working_dir: Path
     ) -> Optional[str]:
-        """User-selected Claude tier ('sonnet'/'opus'), or None for the config default."""
-        if self._selected_backend(context) == "openai_codex":
-            return None
-        m = context.user_data.get("agent_model") or self.settings.agent_model
-        if m in self._CLAUDE_TIERS:
-            return str(m)
-        return None
+        """After a directory switch, re-point every registered backend's
+        ``user_data`` session key at the session it would resume in
+        ``working_dir`` (None when there is nothing to resume).
+
+        Returns the selected backend's resumable id — what the "session
+        resumed" badge reports.
+        """
+        selected = self._selected_backend(context)
+        user_data = context.user_data if context.user_data is not None else {}
+        backends = self._backends(context)
+        resumed: Optional[str] = None
+        for backend_id, backend in backends.items():
+            session_id = await backend.resumable_session_for(user_id, working_dir)
+            user_data[policy_for(backend_id).session_key] = session_id
+            if backend_id == selected:
+                resumed = session_id
+        if selected not in backends:
+            # Unwired backend: nothing to resume, and the key must not keep
+            # pointing at the previous directory's session.
+            user_data[policy_for(selected).session_key] = None
+        return resumed
+
+    def _selected_model(self, context: ContextTypes.DEFAULT_TYPE) -> str:
+        """What ``/status`` and ``/model`` print for the user's current pick."""
+        resolved = self._model_override(context)
+        if resolved is not None:
+            return resolved
+        configured = context.user_data.get("agent_model") or self.settings.agent_model
+        return self._backend_policy(context).display_model(configured, self.settings)
+
+    _CLAUDE_TIERS = _CLAUDE_TIERS
+
+    def _model_override(self, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+        """The ``model=`` kwarg for this turn's ``run_command``, any backend.
+
+        ``BackendPolicy.resolve_model`` decides: Codex returns the
+        catalog-validated ref, always set; Claude returns the user's tier
+        ('sonnet'/'opus') or None so the facade applies the config/CLI
+        default. ``user_data["agent_model"]`` (seeded from the DB prefs row on
+        first contact) is the only source of the user's pick; there is no
+        per-backend side channel (dv-4207). A stored pick the policy rejects
+        is repaired in place so the next read is stable.
+        """
+        policy = self._backend_policy(context)
+        configured = context.user_data.get("agent_model") or self.settings.agent_model
+        resolved = policy.resolve_model(configured)
+        if configured and resolved is not None and resolved != configured:
+            context.user_data["agent_model"] = resolved
+        return resolved
 
     async def _save_user_prefs(
         self, context: ContextTypes.DEFAULT_TYPE, user_id: int, **fields: Any
@@ -402,7 +474,8 @@ class OrchestratorBase:
 
     @staticmethod
     def _session_key(backend: str) -> str:
-        return "codex_session_id" if backend == "openai_codex" else "claude_session_id"
+        """``user_data`` key holding ``backend``'s resumable session id."""
+        return policy_for(backend).session_key
 
     def _agent_id_for(
         self,
