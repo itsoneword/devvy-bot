@@ -1,26 +1,19 @@
 """Records profile/session lifecycle events to SQLite; surfaced via /diag.
 
-Built against DatabaseManager.get_connection() (async context manager). Never
-raises — observability must never break a response.
+Thin wrapper over LifecycleRepository (dv-5e4f Phase 0): the
+``lifecycle_events`` table's DDL now lives in bot.db migration v26
+(src/storage/database.py), owned once, instead of this class creating it
+itself on every boot. Never raises -- observability must never break a
+response.
 """
 
-import json
-from datetime import UTC, datetime
 from typing import Any, Dict, List
 
 import structlog
 
-logger = structlog.get_logger()
+from ..storage.lifecycle_repository import LifecycleRepository
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS lifecycle_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts TEXT NOT NULL,
-    profile TEXT NOT NULL,
-    event TEXT NOT NULL,
-    detail TEXT NOT NULL
-)
-"""
+logger = structlog.get_logger()
 
 
 class LifecycleLogger:
@@ -28,29 +21,22 @@ class LifecycleLogger:
 
     def __init__(self, db: Any) -> None:
         self._db = db
+        self._repo = LifecycleRepository(db)
 
     async def ensure_schema(self) -> None:
+        """Idempotent against a real bot.db -- migration v26
+        (src/storage/database.py) already created the table before this
+        class is ever constructed in production. Still delegates to the
+        repository (not a pure no-op) so a caller handing in a bare
+        db-like stub of its own still gets a working table, e.g. tests."""
         try:
-            async with self._db.get_connection() as conn:
-                await conn.execute(_SCHEMA)
-                await conn.commit()
+            await self._repo.ensure_schema()
         except Exception as e:  # noqa: BLE001
             logger.warning("lifecycle schema init failed", error=str(e))
 
     async def record(self, profile: str, event: str, detail: Dict[str, Any]) -> None:
         try:
-            async with self._db.get_connection() as conn:
-                await conn.execute(
-                    "INSERT INTO lifecycle_events (ts, profile, event, detail) "
-                    "VALUES (?, ?, ?, ?)",
-                    (
-                        datetime.now(UTC).isoformat(),
-                        profile,
-                        event,
-                        json.dumps(detail),
-                    ),
-                )
-                await conn.commit()
+            await self._repo.record(profile, event, detail)
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "lifecycle record failed", lifecycle_event=event, error=str(e)
@@ -58,22 +44,7 @@ class LifecycleLogger:
 
     async def recent(self, profile: str, limit: int = 50) -> List[Dict[str, Any]]:
         try:
-            async with self._db.get_connection() as conn:
-                cursor = await conn.execute(
-                    "SELECT ts, profile, event, detail FROM lifecycle_events "
-                    "WHERE profile = ? ORDER BY id DESC LIMIT ?",
-                    (profile, limit),
-                )
-                rows = await cursor.fetchall()
-            return [
-                {
-                    "ts": r[0],
-                    "profile": r[1],
-                    "event": r[2],
-                    "detail": json.loads(r[3]),
-                }
-                for r in rows
-            ]
+            return await self._repo.recent(profile, limit)
         except Exception as e:  # noqa: BLE001
             logger.warning("lifecycle recent failed", error=str(e))
             return []

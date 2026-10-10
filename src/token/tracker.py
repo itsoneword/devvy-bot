@@ -2,16 +2,21 @@
 
 Records per-turn token usage in SQLite and provides query methods
 for cumulative session tracking.
+
+Thin wrapper over TokenTrackingRepository / MemoryExtractionRepository
+(dv-5e4f Phase 0) -- the SQL moved into src/storage/, this class's public
+API is unchanged.
 """
 
 from datetime import datetime
 from typing import Dict, Optional
 
-import aiosqlite
 import structlog
 
 from ..storage.database import DatabaseManager
+from ..storage.extraction_repository import MemoryExtractionRepository
 from ..storage.models import MemoryExtractionModel
+from ..storage.token_repository import TokenTrackingRepository
 
 logger = structlog.get_logger()
 
@@ -21,6 +26,8 @@ class TokenTracker:
 
     def __init__(self, db: DatabaseManager) -> None:
         self._db = db
+        self._tokens = TokenTrackingRepository(db)
+        self._extractions = MemoryExtractionRepository(db)
 
     async def record_turn(
         self,
@@ -32,22 +39,9 @@ class TokenTracker:
         cost: float,
     ) -> None:
         """Insert a row into session_tracking."""
-        async with self._db.get_connection() as conn:
-            await conn.execute(
-                "INSERT INTO session_tracking "
-                "(session_id, user_id, input_tokens, output_tokens, "
-                "cumulative_tokens, cost) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    session_id,
-                    user_id,
-                    input_tokens,
-                    output_tokens,
-                    cumulative_tokens,
-                    cost,
-                ),
-            )
-            await conn.commit()
-
+        await self._tokens.record_turn(
+            session_id, user_id, input_tokens, output_tokens, cumulative_tokens, cost
+        )
         logger.debug(
             "Recorded token turn",
             session_id=session_id,
@@ -58,49 +52,17 @@ class TokenTracker:
 
     async def get_session_totals(self, session_id: str) -> Dict[str, int]:
         """Return {input_tokens, output_tokens, total_tokens} for a session."""
-        async with self._db.get_connection() as conn:
-            row = await (
-                await conn.execute(
-                    "SELECT COALESCE(SUM(input_tokens), 0) as input_tokens, "
-                    "COALESCE(SUM(output_tokens), 0) as output_tokens "
-                    "FROM session_tracking WHERE session_id = ?",
-                    (session_id,),
-                )
-            ).fetchone()
-            if row:
-                return {
-                    "input_tokens": row[0],
-                    "output_tokens": row[1],
-                    "total_tokens": row[0] + row[1],
-                }
-            return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        return await self._tokens.get_session_totals(session_id)
 
     async def get_cumulative_for_session(self, session_id: str) -> int:
         """Return the latest cumulative_tokens value for a session."""
-        async with self._db.get_connection() as conn:
-            row = await (
-                await conn.execute(
-                    "SELECT cumulative_tokens FROM session_tracking "
-                    "WHERE session_id = ? ORDER BY id DESC LIMIT 1",
-                    (session_id,),
-                )
-            ).fetchone()
-            return row[0] if row else 0
+        return await self._tokens.get_cumulative_for_session(session_id)
 
     async def get_last_extraction(
         self, session_id: str
     ) -> Optional[MemoryExtractionModel]:
         """Return the most recent memory extraction for a session."""
-        async with self._db.get_connection() as conn:
-            conn.row_factory = aiosqlite.Row
-            row = await (
-                await conn.execute(
-                    "SELECT * FROM memory_extractions "
-                    "WHERE session_id = ? ORDER BY id DESC LIMIT 1",
-                    (session_id,),
-                )
-            ).fetchone()
-            return MemoryExtractionModel.from_row(row) if row else None
+        return await self._extractions.get_last_extraction(session_id)
 
     async def get_usage_by_project(
         self, user_id: int, since: Optional[datetime] = None
@@ -114,29 +76,4 @@ class TokenTracker:
         means all-time. Codex-backend turns aren't recorded in
         session_tracking today, so this only covers Claude usage.
         """
-        query = (
-            "SELECT s.project_path, "
-            "SUM(st.input_tokens + st.output_tokens) as tokens, "
-            "SUM(st.cost) as cost, COUNT(*) as turns "
-            "FROM session_tracking st "
-            "JOIN sessions s ON s.session_id = st.session_id "
-            "WHERE st.user_id = ?"
-        )
-        params: list = [user_id]
-        if since is not None:
-            query += " AND st.timestamp >= ?"
-            params.append(since.strftime("%Y-%m-%d %H:%M:%S"))
-        query += " GROUP BY s.project_path"
-
-        async with self._db.get_connection() as conn:
-            cur = await conn.execute(query, tuple(params))
-            rows = await cur.fetchall()
-
-        return {
-            row[0]: {
-                "tokens": row[1] or 0,
-                "cost": row[2] or 0.0,
-                "turns": row[3] or 0,
-            }
-            for row in rows
-        }
+        return await self._tokens.get_usage_by_project(user_id, since)

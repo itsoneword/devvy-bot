@@ -26,7 +26,7 @@ from .indexer import _profile_from_cwd
 # 50k/150k were the pre-dv-9f31 numbers, counted against uncached input only —
 # they drew lines the bot has not used since 2026-08-04.
 EVAL_THRESHOLD = int(os.getenv("WINDOW_EVAL_INTERVAL_TOKENS", "120000"))
-REFRESH_THRESHOLD = int(os.getenv("WINDOW_REFRESH_THRESHOLD_TOKENS", "320000"))
+REFRESH_THRESHOLD = int(os.getenv("WINDOW_REFRESH_THRESHOLD_TOKENS", "220000"))
 
 # Reconciliation tolerances (plan: tunable, query-time).
 TURN_COUNT_TOLERANCE = 2

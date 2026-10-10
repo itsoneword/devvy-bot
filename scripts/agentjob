@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""agentjob — one unattended agent turn through the model router (dv-ef90).
+
+What `scripts/bgjob` and the server monitor run instead of a bare CLI call with
+every permission bypassed: the same tool-call policy as
+chat turns, asks sent to the owner over the bot, and a `model_calls` row.
+
+Usage:
+  agentjob --profile devops --prompt-file prompt.txt [--cwd DIR] [--model sonnet]
+           [--name NAME] [--purpose background_job|monitor]
+
+The answer goes to stdout; the exit code is 0 on success. Needs the bot's
+poetry environment; re-executes itself in it when started with another python.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def _reexec_in_venv() -> None:
+    """Scripts and cron start us with the system python; the SDK lives in the
+    poetry venv. Find it once and re-exec."""
+    if os.environ.get("AGENTJOB_REEXEC"):
+        sys.exit("error: claude_agent_sdk not importable even in the poetry venv")
+    poetry = os.environ.get("POETRY_BIN") or "poetry"
+    try:
+        venv = subprocess.run(
+            [poetry, "env", "info", "-p"],
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        sys.exit(f"error: cannot locate the poetry venv ({exc})")
+    python = Path(venv) / "bin" / "python"
+    os.environ["AGENTJOB_REEXEC"] = "1"
+    os.execv(str(python), [str(python), *sys.argv])
+
+
+try:
+    import claude_agent_sdk  # noqa: F401
+except ImportError:
+    home_poetry = Path.home() / ".local/bin/poetry"
+    if "POETRY_BIN" not in os.environ and home_poetry.exists():
+        os.environ["POETRY_BIN"] = str(home_poetry)
+    _reexec_in_venv()
+
+sys.path.insert(0, str(REPO))
+
+import structlog  # noqa: E402
+
+# stdout is the answer (bgjob appends it to output.md); every log line goes to
+# stderr, including the loader's and the registry's.
+structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
+
+from src.model_router.job import JobSpec, bot_link_from_env, run_job  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--profile", required=True, help="profile slug (policy flags)")
+    ap.add_argument("--prompt-file", required=True, type=Path)
+    ap.add_argument("--cwd", type=Path, default=None, help="default: the profile's")
+    ap.add_argument("--model", default="sonnet")
+    ap.add_argument("--name", default="job")
+    ap.add_argument("--purpose", default="background_job", choices=["background_job", "monitor"])
+    args = ap.parse_args()
+
+    from src.config.loader import load_config
+    from src.profiles import load_profile_registry
+
+    config = load_config(config_file=REPO / ".env")
+    if config.profiles_config_path is None:
+        sys.exit("error: PROFILES_CONFIG_PATH is not set")
+    registry = load_profile_registry(
+        config.profiles_config_path,
+        sandbox_default=config.sandbox_enabled,
+        data_root=config.devvy_data_root,
+    )
+    profile = registry.get_by_slug(args.profile)
+    if profile is None:
+        sys.exit(f"error: unknown profile '{args.profile}'")
+    sandbox = profile.sandbox if profile.sandbox is not None else config.sandbox_enabled
+    cwd = (args.cwd or profile.working_dir).expanduser().resolve()
+    if not cwd.is_dir():
+        sys.exit(f"error: working dir does not exist: {cwd}")
+
+    spec = JobSpec(
+        purpose=args.purpose,
+        name=args.name,
+        prompt=args.prompt_file.read_text(encoding="utf-8"),
+        model=args.model,
+        working_directory=cwd,
+        full_access=not sandbox,
+        unrestricted=bool(profile.unrestricted),
+        profile=profile.slug,
+        cli_path=config.claude_cli_path or None,
+    )
+    return asyncio.run(run_job(spec, bot_link_from_env(REPO)))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

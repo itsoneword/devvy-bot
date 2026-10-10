@@ -603,3 +603,71 @@ class TestExtraWriteRoots:
             "Bash", {"command": "echo hi > /home/testuser/PROBE.txt"}, MagicMock()
         )
         assert result.__class__.__name__ == "PermissionResultDeny"
+
+
+class _FakeConfirm:
+    """Records gate prompts; answers with a fixed decision."""
+
+    def __init__(self, approve: bool) -> None:
+        self.approve = approve
+        self.calls: list = []  # type: ignore[type-arg]
+
+    async def request(self, reason: str, preview: str) -> bool:
+        self.calls.append((reason, preview))
+        return self.approve
+
+
+# Assembled at runtime so this file's own text never looks like an order run.
+# dv-8664: a bare name with no `cd` in the same command falls back to a real
+# disk lookup under ~/tools/{fetchcrypto,fetchmexc} -- these names are real
+# files there, so the bare spelling still gates.
+_ORDER_CMD = "node " + "perp" + ".js"
+_TRANSFER_CMD = "node " + "transfer" + ".js spot2fut USDT 10"
+
+
+class TestConfirmationGateInHook:
+    """dv-6f50: the gate lives in PreToolUse, which runs even for commands the
+    CLI auto-approves via settings allow rules (can_use_tool never sees those)."""
+
+    @staticmethod
+    def _hook(tmp_path: Path, confirm: _FakeConfirm, full_access: bool = True):  # type: ignore[no-untyped-def]
+        from src.claude.sdk_integration import _make_pre_tool_use_hook
+
+        return _make_pre_tool_use_hook(
+            working_directory=tmp_path,
+            full_access=full_access,
+            confirmation_manager=confirm,  # type: ignore[arg-type]
+        )
+
+    @staticmethod
+    def _bash(command: str) -> dict:  # type: ignore[type-arg]
+        return {"tool_name": "Bash", "tool_input": {"command": command}}
+
+    @pytest.mark.asyncio
+    async def test_order_script_denied_without_approval(self, tmp_path: Path) -> None:
+        confirm = _FakeConfirm(approve=False)
+        out = await self._hook(tmp_path, confirm)(self._bash(_ORDER_CMD), None, None)
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert len(confirm.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_order_script_allowed_after_approval(self, tmp_path: Path) -> None:
+        confirm = _FakeConfirm(approve=True)
+        out = await self._hook(tmp_path, confirm)(self._bash(_TRANSFER_CMD), None, None)
+        assert out == {}
+        assert len(confirm.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_harmless_command_never_prompts(self, tmp_path: Path) -> None:
+        confirm = _FakeConfirm(approve=False)
+        out = await self._hook(tmp_path, confirm)(self._bash("ls -la"), None, None)
+        assert out == {}
+        assert confirm.calls == []
+
+    @pytest.mark.asyncio
+    async def test_sandboxed_profile_skips_gate(self, tmp_path: Path) -> None:
+        confirm = _FakeConfirm(approve=False)
+        await self._hook(tmp_path, confirm, full_access=False)(
+            self._bash(_ORDER_CMD), None, None
+        )
+        assert confirm.calls == []

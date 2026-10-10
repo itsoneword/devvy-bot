@@ -22,6 +22,7 @@ from ..events.bus import EventBus
 from ..events.types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 from ..storage.database import DatabaseManager
 from ..storage.deviz_board import DevizBoard
+from ..storage.webhook_repository import WebhookEventRepository
 from .auth import verify_github_signature, verify_shared_secret
 
 if TYPE_CHECKING:
@@ -54,6 +55,36 @@ class PromptRequest(BaseModel):
     chat_id: Optional[int] = None
 
 
+class PolicyAskRequest(BaseModel):
+    """A background job hit an ask rule: show the owner the button, wait."""
+
+    reason: str
+    preview: str = ""
+    source: str = "background job"
+
+
+class ModelCallRequest(BaseModel):
+    """One `model_calls` row from a process that cannot write the DB itself."""
+
+    purpose: str
+    kind: str
+    harness: str
+    harness_version: Optional[str] = None
+    model: Optional[str] = None
+    attended: bool = False
+    profile: Optional[str] = None
+    user_id: Optional[int] = None
+    session_id: Optional[str] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cost_usd: Optional[float] = None
+    duration_ms: int = 0
+    outcome: str
+    error: Optional[str] = None
+
+
 class ScheduleRequest(BaseModel):
     name: str
     prompt: str
@@ -81,8 +112,15 @@ def create_api_app(
     db_manager: Optional[DatabaseManager] = None,
     scheduler: Optional["JobScheduler"] = None,
     profile_registry: Optional["ProfileRegistry"] = None,
+    confirmation_manager: Optional[Any] = None,
+    model_calls: Optional[Any] = None,
 ) -> FastAPI:
-    """Create the FastAPI application."""
+    """Create the FastAPI application.
+
+    ``confirmation_manager`` serves background jobs' ask rules
+    (``/internal/policy/ask``); ``model_calls`` is the ``ModelCallRepository``
+    their call records go into (``/internal/model_calls``). Both dv-ef90.
+    """
 
     app = FastAPI(
         title="Claude Code Telegram - Webhook API",
@@ -149,8 +187,7 @@ def create_api_app(
 
         # Atomic dedupe: attempt INSERT first, only publish if new
         if db_manager and delivery_id:
-            is_new = await _try_record_webhook(
-                db_manager,
+            is_new = await WebhookEventRepository(db_manager).record_if_new(
                 event_id=str(uuid.uuid4()),
                 provider=provider,
                 event_type=event_type_name,
@@ -254,6 +291,66 @@ def create_api_app(
         logger.info("Internal prompt published", profile=body.profile, name=body.name)
         return {"status": "queued", "event_id": event.id}
 
+    @app.post("/internal/policy/ask")
+    async def internal_policy_ask(
+        body: PolicyAskRequest,
+        authorization: Optional[str] = Header(None),
+    ) -> Dict[str, bool]:
+        """A background job's ask rule: the owner's button, one hour, then deny."""
+        _require_internal_auth(authorization)
+        if confirmation_manager is None:
+            logger.warning("policy ask with no confirmation manager -> denied")
+            return {"approved": False}
+        from src.model_router.job import ASK_TIMEOUT_SECONDS
+
+        approved = await confirmation_manager.request(
+            body.reason,
+            body.preview,
+            timeout_seconds=ASK_TIMEOUT_SECONDS,
+            source=body.source,
+        )
+        return {"approved": bool(approved)}
+
+    @app.post("/internal/model_calls")
+    async def internal_model_call(
+        body: ModelCallRequest,
+        authorization: Optional[str] = Header(None),
+    ) -> Dict[str, str]:
+        """Record one model call made by a process outside the bot."""
+        _require_internal_auth(authorization)
+        if model_calls is None:
+            raise HTTPException(status_code=503, detail="model_calls not available")
+        from src.model_router.types import PURPOSES
+        from src.storage.model_calls import ModelCall
+
+        if body.purpose not in PURPOSES:
+            raise HTTPException(status_code=400, detail="unknown purpose")
+        await model_calls.record(
+            ModelCall(
+                purpose=body.purpose,
+                kind=body.kind,
+                harness=body.harness,
+                harness_version=body.harness_version,
+                provider={"claude": "anthropic", "openai_codex": "openai"}.get(
+                    body.harness, body.harness
+                ),
+                model=body.model,
+                attended=body.attended,
+                profile=body.profile,
+                user_id=body.user_id,
+                session_id=body.session_id,
+                input_tokens=body.input_tokens,
+                output_tokens=body.output_tokens,
+                cache_read_tokens=body.cache_read_tokens,
+                cache_creation_tokens=body.cache_creation_tokens,
+                cost_usd=body.cost_usd,
+                duration_ms=body.duration_ms,
+                outcome=body.outcome,
+                error=body.error,
+            )
+        )
+        return {"status": "recorded"}
+
     @app.post("/internal/schedule")
     async def internal_schedule_add(
         body: ScheduleRequest,
@@ -320,10 +417,21 @@ def create_api_app(
         authorization: Optional[str] = Header(None),
     ) -> Dict[str, str]:
         _require_internal_auth(authorization)
-        if not scheduler:
-            raise HTTPException(status_code=503, detail="Scheduler not enabled")
-        await scheduler.remove_job(job_id)
-        return {"status": "removed", "job_id": job_id}
+        # This path carries no Telegram/user identity at all (dv-8c19) — any
+        # holder of WEBHOOK_API_SECRET could cancel ANY user's job with no
+        # ownership check possible. Simplest interim per the ticket's own
+        # direction: refuse the delete entirely rather than fake-authorize
+        # it. Cancel from chat (`schedule_remove`) instead, which does have
+        # an owner to check against. Revisit once dv-3948 gives this path a
+        # caller identity.
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "job removal is not available over the internal API "
+                "(no caller identity to authorize against); cancel it from "
+                "chat with schedule_remove instead"
+            ),
+        )
 
     @app.post("/internal/tasks")
     async def internal_task_add(
@@ -374,56 +482,27 @@ def create_api_app(
     return app
 
 
-async def _try_record_webhook(
-    db_manager: DatabaseManager,
-    event_id: str,
-    provider: str,
-    event_type: str,
-    delivery_id: str,
-    payload: Dict[str, Any],
-) -> bool:
-    """Atomically insert a webhook event, returning whether it was new.
-
-    Uses INSERT OR IGNORE on the unique delivery_id column.
-    If the row already exists the insert is a no-op and changes() == 0.
-    Returns True if the event is new (inserted), False if duplicate.
-    """
-    import json
-
-    async with db_manager.get_connection() as conn:
-        await conn.execute(
-            """
-            INSERT OR IGNORE INTO webhook_events
-            (event_id, provider, event_type, delivery_id, payload,
-             processed)
-            VALUES (?, ?, ?, ?, ?, 1)
-            """,
-            (
-                event_id,
-                provider,
-                event_type,
-                delivery_id,
-                json.dumps(payload),
-            ),
-        )
-        cursor = await conn.execute("SELECT changes()")
-        row = await cursor.fetchone()
-        inserted = row[0] > 0 if row else False
-        await conn.commit()
-        return inserted
-
-
 async def run_api_server(
     event_bus: EventBus,
     settings: Settings,
     db_manager: Optional[DatabaseManager] = None,
     scheduler: Optional["JobScheduler"] = None,
     profile_registry: Optional["ProfileRegistry"] = None,
+    confirmation_manager: Optional[Any] = None,
+    model_calls: Optional[Any] = None,
 ) -> None:
     """Run the FastAPI server using uvicorn."""
     import uvicorn
 
-    app = create_api_app(event_bus, settings, db_manager, scheduler, profile_registry)
+    app = create_api_app(
+        event_bus,
+        settings,
+        db_manager,
+        scheduler,
+        profile_registry,
+        confirmation_manager=confirmation_manager,
+        model_calls=model_calls,
+    )
 
     config = uvicorn.Config(
         app=app,

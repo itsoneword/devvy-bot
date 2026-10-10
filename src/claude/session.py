@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
 import structlog
 
@@ -42,7 +42,14 @@ class ClaudeSession:
     last_eval_checkpoint: int = 0
 
     def is_expired(self, timeout_hours: int) -> bool:
-        """Check if session has expired."""
+        """Age of this session against an arbitrary wall-clock window.
+
+        **Not a resume gate, and must never become one again.** Conversation
+        lifetime is owned by the window mechanism and measured in context
+        size (WindowRepository.should_refresh); wiring elapsed time back into
+        session lookup is what silently dropped a 51h-idle profile's context
+        on 2026-09-10 (docs/DECISIONS.md). Kept only as a reporting helper.
+        """
         age = datetime.now(UTC) - _to_utc(self.last_used)
         return age > timedelta(hours=timeout_hours)
 
@@ -121,8 +128,10 @@ class SessionStorage:
         """Load session owned by user_id from storage."""
         raise NotImplementedError
 
-    async def delete_session(self, session_id: str) -> None:
-        """Delete session from storage."""
+    async def delete_session(
+        self, session_id: str, reason: str = "unspecified"
+    ) -> None:
+        """Retire a session's resume mapping, recording why (dv-2a5a)."""
         raise NotImplementedError
 
     async def get_user_sessions(self, user_id: int) -> List[ClaudeSession]:
@@ -142,6 +151,12 @@ class SessionManager:
         self.config = config
         self.storage = storage
         self.active_sessions: Dict[str, ClaudeSession] = {}
+        # Called after every retirement with (session_id, reason, project_path).
+        # The facade installs a lifecycle emitter here so eviction inside
+        # this class still lands in lifecycle_events (dv-2a5a).
+        self.on_retire: Optional[
+            Callable[[str, str, Optional[Path]], Awaitable[None]]
+        ] = None
 
     async def get_or_create_session(
         self,
@@ -157,7 +172,10 @@ class SessionManager:
             session_id=session_id,
         )
 
-        # Check for existing session
+        # Check for existing session. Ownership is the only gate: session age
+        # deliberately does NOT disqualify a session here, because lifetime is
+        # measured in context size by the window mechanism, not in wall-clock
+        # hours (docs/DECISIONS.md 2026-09-10).
         if session_id and session_id in self.active_sessions:
             session = self.active_sessions[session_id]
             if session.user_id != user_id:
@@ -167,28 +185,51 @@ class SessionManager:
                     session_owner=session.user_id,
                     requesting_user=user_id,
                 )
-            elif not session.is_expired(self.config.session_timeout_hours):
+            else:
                 logger.debug("Using active session", session_id=session_id)
                 return session
 
         # Try to load from storage (filtered by user_id)
         if session_id:
             session = await self.storage.load_session(session_id, user_id)
-            if session and not session.is_expired(self.config.session_timeout_hours):
+            if session:
                 self.active_sessions[session_id] = session
                 logger.info("Loaded session from storage", session_id=session_id)
                 return session
 
-        # Check user session limit
-        user_sessions = await self._get_user_sessions(user_id)
-        if len(user_sessions) >= self.config.max_sessions_per_user:
-            # Remove oldest session
-            oldest = min(user_sessions, key=lambda s: s.last_used)
-            await self.remove_session(oldest.session_id)
+        # Enforce the session cap WITHIN this working directory only.
+        #
+        # It used to be a global per-user cap that evicted the oldest session
+        # across every directory. With a cap of 5 and more profiles than that
+        # (devops, channel, general, chef, coach, pm, research), opening a
+        # session in profile #6 silently retired the resume mapping of
+        # whichever profile the user had left alone longest — the same
+        # "context disappears for no reason the user can see" failure the
+        # wall-clock timeout caused, reached by a different door. Observed
+        # 2026-09-10: the owner sitting exactly at the cap.
+        #
+        # Scoping the cap per (user, working_dir) keeps its original purpose
+        # (bounding runaway session churn inside one project) and makes the
+        # profiles independent: no profile can evict another's live head.
+        dir_sessions = [
+            s
+            for s in await self._get_user_sessions(user_id)
+            if s.project_path == project_path
+        ]
+        if len(dir_sessions) >= self.config.max_sessions_per_user:
+            # Retire the oldest session *of this directory*.
+            oldest = min(dir_sessions, key=lambda s: _to_utc(s.last_used))
+            await self.remove_session(
+                oldest.session_id,
+                reason=f"dir_cap:{self.config.max_sessions_per_user}",
+                project_path=project_path,
+            )
             logger.info(
-                "Removed oldest session due to limit",
+                "Removed oldest session in directory due to limit",
                 removed_session_id=oldest.session_id,
                 user_id=user_id,
+                project_path=str(project_path),
+                limit=self.config.max_sessions_per_user,
             )
 
         # Create session with empty ID — Claude will provide the real one
@@ -264,28 +305,50 @@ class SessionManager:
             message_count=session.message_count,
         )
 
-    async def remove_session(self, session_id: str) -> None:
-        """Remove session."""
-        if session_id in self.active_sessions:
-            del self.active_sessions[session_id]
+    async def remove_session(
+        self,
+        session_id: str,
+        reason: str = "unspecified",
+        project_path: Optional[Path] = None,
+    ) -> None:
+        """Retire a session's resume mapping.
 
-        await self.storage.delete_session(session_id)
-        logger.info("Session removed", session_id=session_id)
+        ``reason`` is mandatory in spirit: it is written to
+        ``sessions.deactivated_reason`` and logged, so that a conversation
+        that vanished can be explained from the database afterwards
+        (dv-2a5a). ``project_path`` lets the retire hook attribute the event
+        to a profile; it falls back to the cached session's path.
+        """
+        cached = self.active_sessions.pop(session_id, None)
+        if project_path is None and cached is not None:
+            project_path = cached.project_path
 
-    async def cleanup_expired_sessions(self) -> int:
-        """Remove expired sessions."""
-        logger.info("Starting session cleanup")
+        await self.storage.delete_session(session_id, reason=reason)
+        logger.info(
+            "Session removed",
+            session_id=session_id,
+            reason=reason,
+            project_path=str(project_path) if project_path else None,
+        )
+        if self.on_retire is not None:
+            try:
+                await self.on_retire(session_id, reason, project_path)
+            except Exception as hook_error:  # pragma: no cover - never fatal
+                logger.warning(
+                    "Session retire hook failed",
+                    session_id=session_id,
+                    error=str(hook_error),
+                )
 
-        all_sessions = await self.storage.get_all_sessions()
-        expired_count = 0
-
-        for session in all_sessions:
-            if session.is_expired(self.config.session_timeout_hours):
-                await self.remove_session(session.session_id)
-                expired_count += 1
-
-        logger.info("Session cleanup completed", expired_sessions=expired_count)
-        return expired_count
+    # NOTE: `cleanup_expired_sessions()` was removed on 2026-09-10.
+    #
+    # It ran on every shutdown and marked is_active=FALSE on every session
+    # older than session_timeout_hours, which made each `/restart` a silent
+    # context wipe for any profile the user had not touched that day — a soft
+    # delete no code path can undo. Session rows are inert bookkeeping
+    # (~100 bytes) and only the newest per (user, working_dir) is ever
+    # resumed, so there is nothing to reclaim and age is never a reason to
+    # retire a session. See docs/DECISIONS.md 2026-09-10.
 
     async def _get_user_sessions(self, user_id: int) -> List[ClaudeSession]:
         """Get all sessions for a user."""
@@ -317,7 +380,6 @@ class SessionManager:
                 "turns": session.total_turns,
                 "messages": session.message_count,
                 "tools_used": session.tools_used,
-                "expired": session.is_expired(self.config.session_timeout_hours),
             }
 
         return None
@@ -328,14 +390,14 @@ class SessionManager:
 
         total_cost = sum(s.total_cost for s in sessions)
         total_messages = sum(s.message_count for s in sessions)
-        active_sessions = [
-            s for s in sessions if not s.is_expired(self.config.session_timeout_hours)
-        ]
 
         return {
             "user_id": user_id,
             "total_sessions": len(sessions),
-            "active_sessions": len(active_sessions),
+            # _get_user_sessions already returns only is_active rows, and a
+            # session no longer goes inactive with age — so every session
+            # listed here is resumable. No wall-clock partition to make.
+            "active_sessions": len(sessions),
             "total_cost": total_cost,
             "total_messages": total_messages,
             "projects": list(set(str(s.project_path) for s in sessions)),

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from src.storage.database import DatabaseManager
+from src.storage.schema.migrate import head_revision
 
 
 @pytest.fixture
@@ -55,7 +56,7 @@ class TestDatabaseManager:
                 "cost_tracking",
                 "project_threads",
                 "user_preferences",
-                "schema_version",
+                "alembic_version",
             ]
 
             for table in expected_tables:
@@ -93,8 +94,17 @@ class TestDatabaseManager:
                 assert index in indexes
 
     async def test_migration_tracking(self, db_manager):
-        """Test that migrations are tracked."""
+        """Alembic records the applied revision; a fresh DB is at head and
+        carries no legacy schema_version table (dv-5e4f Phase 1)."""
         async with db_manager.get_connection() as conn:
-            cursor = await conn.execute("SELECT MAX(version) FROM schema_version")
-            version = await cursor.fetchone()
-            assert version[0] >= 1  # At least initial migration
+            cursor = await conn.execute("SELECT version_num FROM alembic_version")
+            assert [r[0] for r in await cursor.fetchall()] == [head_revision("bot")]
+            cursor = await conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'schema_version'"
+            )
+            assert await cursor.fetchone() is None
+
+    async def test_second_initialize_is_a_noop(self, db_manager):
+        """Restart against a current DB: nothing to do, no backup written."""
+        await db_manager.initialize()
+        assert not (db_manager.database_path.parent / "backups").exists()

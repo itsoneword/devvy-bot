@@ -227,8 +227,10 @@ async def test_switch_then_turn_runs_new_backend_with_seed_and_force_new(
     assert kwargs["session_id"] is None  # never the retired Claude session
     assert kwargs["model"] == _CODEX_DEFAULT_MODEL
     assert Path(kwargs["working_directory"]) == workdir
-    # The armed seed: the outgoing window's tail precedes the user's message.
+    # The armed seed: the current window, rebuilt in full (dv-168e: a
+    # backend switch no longer rolls), precedes the user's message.
     prompt = kwargs["prompt"]
+    assert "rebuilt in full" in prompt
     assert "old-q" in prompt and "old-a" in prompt
     assert prompt.rstrip().endswith("so did you fix it?")
     assert prompt.index("old-q") < prompt.index("so did you fix it?")
@@ -238,7 +240,7 @@ async def test_switch_then_turn_runs_new_backend_with_seed_and_force_new(
     assert context.user_data.get("force_new_session") is False
     # ... and the transition is consumed in the DB, so the NEXT turn resumes.
     after = await window_repo.get_or_create(USER_ID, workdir)
-    assert after.window_id == before.window_id + 1
+    assert after.window_id == before.window_id
     assert after.force_new_session is False
     assert after.pending_seed_window is None
 

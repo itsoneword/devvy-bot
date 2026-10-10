@@ -100,6 +100,37 @@ validate the installed copy too, since that is the file sudo actually reads.
 | `data/soul.md`, memory files | No — read at session start |
 | `CLAUDE.md` | No — read at session start |
 
+**Backend parity gate (dv-b7c4).** Before restarting with backend, sandbox or
+model changes (`src/agent_backends/`, `src/claude/sdk_integration.py`,
+`src/agent_bridge/`, `src/security/`, profile sandbox flags, a claude/codex
+CLI upgrade), run both layers and restart only if both pass:
+
+```bash
+poetry run pytest tests/unit/test_backend_conformance.py   # launch config per backend x profile
+poetry run python scripts/backend_smoke.py                 # one real cheap turn per cell, temp data root
+```
+
+The smoke prints a PASS/FAIL table (bot tool recorded success=1 and actually
+delivered; denied path stays denied) and exits non-zero on any FAIL.
+
+## Background Jobs
+
+Everything that runs without a user message (inventory 2026-10-04; re-check
+with `systemctl list-timers --all`, `crontab -l`, and active `scheduled_jobs`
+rows before trusting it).
+
+| Job | Where | When | Model call |
+|---|---|---|---|
+| Memory evaluator | `src/bot/orchestration/windowing.py` | window roll, token checkpoint, "remember", `/new` — see `configuration.md` § Memory Evaluator | `claude` CLI (`EVALUATOR_MODEL`), codex CLI on the codex backend |
+| Memory consolidation report | `src/main.py` APScheduler | `0 6 * * 1` + debounced pressure-valve runs | `claude` CLI |
+| Fact-quality check | `src/evaluator/fact_quality.py` | `0 7 * * *`, off unless `FACT_QUALITY_CHECK_ENABLED` | `claude` CLI, haiku |
+| Reminders / items | `scheduled_jobs` table, `src/scheduler/` | per row | `deliver=agent`: an agent turn; `message`: none |
+| Task pump | user `taskpump.timer` → `scripts/taskpump tick` | every 10 min | tick: none; spawns agent jobs (`docs/taskpump.md`) |
+| Your own host jobs (backups, monitors) | user crontab or systemd timers | as you set them | outside the bot |
+
+`src/evaluator/refresh.py` (`ContextRefreshService`) is constructed in
+`main.py` but never called.
+
 ## Troubleshooting
 
 ```bash

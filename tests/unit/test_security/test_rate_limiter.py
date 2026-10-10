@@ -422,6 +422,22 @@ class TestPerUserCapOverrides:
         allowed, _ = await rate_limiter.check_rate_limit(111, cost=0.001, role="guest")
         assert allowed
 
+    async def test_two_ledgers_have_independent_exemptions(self, rate_limiter):
+        """The USD gate and the token gate must not share one exemption rule.
+
+        Collapsing them either voids the spouse's USD override (owners skip
+        both gates) or blocks an owner on the aggregate token counter. The
+        override budgets dollars only: USD capped, tokens uncapped.
+        """
+        assert rate_limiter.effective_daily_cap(222, "owner") == 50.0
+        assert rate_limiter.effective_daily_token_cap(222, "owner") is None
+        await rate_limiter.record_cost(222, 51.0)
+        allowed, msg = await rate_limiter.check_rate_limit(
+            222, cost=0.001, role="owner"
+        )
+        assert not allowed
+        assert "Cost limit exceeded" in msg
+
     async def test_owner_without_override_stays_uncapped(self, rate_limiter):
         """The exemption survives for owners nobody wrote a number for."""
         await rate_limiter.record_cost(999, 5000.0)
@@ -629,18 +645,19 @@ class TestUnmeteredTokenBudget:
         assert allowed is True
         assert rate_limiter.effective_daily_token_cap(1, "owner") is None
 
-    async def test_usd_override_switches_on_token_cap_for_owner(self):
-        # An override says "this owner is budgeted" -- for both ledgers.
+    async def test_usd_override_does_not_switch_on_token_cap_for_owner(self):
+        # An override budgets USD only. The aggregate local token counter
+        # cannot block an owner.
         config = create_test_config(
             claude_cost_limit_overrides={1: 50.0},
             unmetered_max_tokens_per_user=1_000,
         )
         limiter = RateLimiter(config)
-        assert limiter.effective_daily_token_cap(1, "owner") == 1_000
+        assert limiter.effective_daily_token_cap(1, "owner") is None
         await limiter.record_tokens(1, 1_000)
         allowed, message = await limiter.check_rate_limit(1, cost=0.001, role="owner")
-        assert allowed is False
-        assert "Token budget exceeded" in message
+        assert allowed is True
+        assert message is None
 
     async def test_free_updates_skip_the_token_gate(self, rate_limiter):
         # cost=0 = command/button press: must not be locked out by tokens.

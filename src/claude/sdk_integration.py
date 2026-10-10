@@ -3,6 +3,9 @@
 import asyncio
 import json
 import os
+import re
+import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -34,6 +37,7 @@ from claude_agent_sdk import (
     ResultMessage,
     ThinkingBlock,
     ToolPermissionContext,
+    ToolResultBlock,
     ToolUseBlock,
     UserMessage,
 )
@@ -42,6 +46,9 @@ from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk.types import McpHttpServerConfig, StreamEvent
 
 from ..config.settings import Settings
+from ..model_router.harness import CLAUDE_ACCOUNT_ENV
+from ..security import policy
+from ..security.denylist import sandbox_deny_read
 from ..security.read_scope import ReadScope, build_read_scope
 from ..security.validators import SecurityValidator
 from .exceptions import (
@@ -84,6 +91,38 @@ _SYNTHETIC_PLACEHOLDER_TEXTS = frozenset(
 )
 
 
+async def _await_with_idle_timeout(
+    task: "asyncio.Future[Any]",
+    last_activity: Callable[[], float],
+    idle_limit: float,
+) -> None:
+    """Await ``task``, timing out only after ``idle_limit`` seconds of silence.
+
+    ``last_activity()`` returns a ``time.monotonic()`` stamp updated by the
+    task every time the CLI sends something. The deadline is recomputed from
+    that stamp, so a turn that streams for an hour is fine while one that
+    stalls for ``idle_limit`` is killed — wall-clock length is not evidence of
+    a hang (see the call site for the incident this replaced).
+
+    Raises ``asyncio.TimeoutError`` on stall; the task is always cancelled and
+    awaited first so its cleanup runs. Any exception from the task propagates.
+    """
+    try:
+        while True:
+            idle_for = time.monotonic() - last_activity()
+            if idle_for >= idle_limit:
+                raise asyncio.TimeoutError
+            done, _pending = await asyncio.wait({task}, timeout=idle_limit - idle_for)
+            if done:
+                break
+    except BaseException:
+        task.cancel()
+        with suppress(BaseException):
+            await task
+        raise
+    task.result()
+
+
 def _is_synthetic_placeholder(text: Optional[str]) -> bool:
     if not text:
         return False
@@ -104,8 +143,17 @@ def _is_json_decode_text(text: str) -> bool:
 
 
 def _project_jsonl_dir(working_directory: Path) -> Path:
-    """Map a cwd to its `~/.claude/projects/<sanitized>/` directory."""
-    sanitized = str(working_directory).replace("/", "-")
+    """Map a cwd to its `~/.claude/projects/<sanitized>/` directory.
+
+    The CLI replaces EVERY non-alphanumeric character with ``-``, not just
+    ``/``: ``/home/x/Devvybot/devvy_bot`` lives under
+    ``-home-x-Devvybot-devvy-bot``. Replacing only slashes made this helper
+    return a directory that never exists for any cwd containing ``_`` or
+    ``.``, so ``transcript.exists()`` was always False and every process
+    error on such a profile was classified as ``transcript_missing`` and
+    deleted the session mapping (2026-09-17 13:59, devops).
+    """
+    sanitized = re.sub(r"[^A-Za-z0-9]", "-", str(working_directory))
     return Path.home() / ".claude" / "projects" / sanitized
 
 
@@ -330,6 +378,56 @@ def _peak_context_tokens(messages: List[Any]) -> int:
     return peak
 
 
+_TOOL_ERROR_MAX_CHARS = 1000
+
+
+def _tool_result_error_text(content: Any) -> str:
+    """Render a failed ToolResultBlock's content as a short error string.
+
+    ``content`` is a str, a list of content-block dicts (usually
+    ``{"type": "text", "text": ...}``), or None. Truncated so one runaway
+    tool error (e.g. a dumped stack trace) doesn't bloat tool_usage rows.
+    """
+    if content is None:
+        text = ""
+    elif isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item, str):
+                parts.append(item)
+        text = "\n".join(parts) if parts else str(content)
+    else:
+        text = str(content)
+    text = text.strip()
+    if len(text) > _TOOL_ERROR_MAX_CHARS:
+        text = text[:_TOOL_ERROR_MAX_CHARS] + "...[truncated]"
+    return text or "tool call failed"
+
+
+def _tool_result_errors(messages: List[Any]) -> Dict[str, str]:
+    """Map ``tool_use_id`` -> error text for every failed ToolResultBlock.
+
+    Tool results (including denials from the PreToolUse hook / can_use_tool,
+    which the CLI surfaces as an ``is_error`` result on the denied call, not
+    as a separate event) arrive as ``ToolResultBlock``s inside a
+    ``UserMessage.content`` list. ``ToolUseBlock``s carry no outcome of their
+    own (dv-73e2), so this is paired against them by ``tool_use_id``.
+    """
+    errors: Dict[str, str] = {}
+    for msg in messages:
+        content = getattr(msg, "content", None)
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, ToolResultBlock) and block.is_error:
+                errors[block.tool_use_id] = _tool_result_error_text(block.content)
+    return errors
+
+
 @dataclass
 class ClaudeResponse:
     """Response from Claude Code SDK."""
@@ -368,6 +466,12 @@ class ClaudeResponse:
     # True when this turn's resume failed and the facade retried on a fresh
     # backend session (dv-b41f) — the orchestrator surfaces it in the footer.
     session_restarted: bool = False
+    # Human-readable reason when THIS turn opened a fresh backend session
+    # ("cold start, 10 turns seeded", "resume failed (transcript_missing),
+    # 5 turns seeded"). None on a plain resumed turn. Rendered in the footer
+    # so a context reset is distinguishable from a healthy window roll
+    # (dv-2a5a): before this, both read as the same drop in the level gauge.
+    session_fresh_reason: Optional[str] = None
 
     @property
     def cost_usd(self) -> float:
@@ -409,27 +513,28 @@ class StreamUpdate:
     metadata: Optional[Dict] = None
 
 
-def _is_tenant_data(file_path: str) -> bool:
-    """True when *file_path* is one of the shared multi-tenant SQLite stores."""
-    import fnmatch
-
-    from ..security.denylist import TENANT_DATA_PATTERNS
-
-    name = Path(file_path).name
-    return any(fnmatch.fnmatch(name, pat) for pat in TENANT_DATA_PATTERNS)
-
-
-# Search tools recurse from their `path` root and print matched lines, so the
-# root itself must pass the search-ancestor rule on guest sessions (dv-7de7).
-_SEARCH_TOOLS = {"Grep", "Glob", "LS"}
+# The rules moved to src/security/policy.py (dv-1601); these names stay for
+# can_use_tool below and for existing imports.
+_is_tenant_data = policy.is_tenant_data
+_is_secret_path = policy.is_secret_path
+_glob_literal_prefix = policy.glob_literal_prefix
+_SEARCH_TOOLS = policy.SEARCH_TOOLS
 
 
 def _make_pre_tool_use_hook(
     working_directory: Path,
     full_access: bool = False,
     read_scope: Optional[ReadScope] = None,
+    unrestricted: bool = False,
+    confirmation_manager: Optional["ConfirmationManager"] = None,
 ) -> Any:
     """Deny secrets / multi-tenant stores for EVERY tool call.
+
+    Also hosts the destructive-op confirmation gate (dv-6f50). It used to live
+    in ``can_use_tool``, which the CLI skips for any command matching a
+    settings allow rule: on 2026-09-29 an allow-listed ``node -e 0 perp.js``
+    produced no gate event at all, so a bare ``node perp.js ...`` would have
+    placed a real order unapproved. Hooks run before allow rules.
 
     ``can_use_tool`` is not enough on its own: the CLI consults it only for
     paths *outside* the session cwd. Verified 2026-08-04 -- with cwd set to this
@@ -441,8 +546,33 @@ def _make_pre_tool_use_hook(
 
     So this hook carries the denylist concerns (which must hold everywhere) and
     ``can_use_tool`` keeps the boundary/confirmation logic. (dv-6dbc)
+
+    The rules themselves live in ``src/security/policy.py`` (dv-1601): the
+    Codex PreToolUse hook reaches the same ``decide()`` over the agent bridge.
+
+    ``unrestricted`` (profile flag, dv-e38e): skip the data-root areas
+    (secrets/, archive/, db/); the credential-filename rules still apply.
     """
-    _PATH_KEYS = ("file_path", "path", "notebook_path")
+    turn = policy.TurnPolicy(
+        working_directory=working_directory,
+        full_access=full_access,
+        unrestricted=unrestricted,
+        read_scope=read_scope,
+    )
+
+    def deny(tool_name: str, reason: str) -> Dict[str, Any]:
+        logger.warning(
+            "PreToolUse hook denied tool call",
+            tool_name=tool_name,
+            reason=reason,
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
 
     async def pre_tool_use(
         input_data: Dict[str, Any],
@@ -451,74 +581,39 @@ def _make_pre_tool_use_hook(
     ) -> Dict[str, Any]:
         tool_name = input_data.get("tool_name") or ""
         tool_input = input_data.get("tool_input") or {}
-
-        def deny(reason: str) -> Dict[str, Any]:
-            logger.warning(
-                "PreToolUse hook denied tool call",
-                tool_name=tool_name,
-                reason=reason,
+        decision = policy.decide(tool_name, tool_input, turn)
+        if decision.action == policy.DENY:
+            return deny(tool_name, decision.reason)
+        # Confirmation gate. No manager to ask -> deny, the same fail-closed
+        # answer the Codex route gives (src/agent_bridge/policy_gate.py).
+        if decision.action == policy.ASK and confirmation_manager is None:
+            return deny(
+                tool_name,
+                f"{decision.reason}: needs the owner's confirmation, "
+                "which is not available",
             )
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
+        if decision.action == policy.ASK and confirmation_manager is not None:
+            approved = await confirmation_manager.request(
+                decision.reason, decision.preview
+            )
+            if not approved:
+                logger.warning(
+                    "Destructive op denied by confirmation gate",
+                    tool_name=tool_name,
+                    reason=decision.reason,
+                )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"Denied by owner (confirmation gate): {decision.reason}"
+                        ),
+                    }
                 }
-            }
-
-        if tool_name in {"Bash", "bash", "shell"}:
-            command = tool_input.get("command", "")
-            if command:
-                ok, error = check_bash_denied_paths(
-                    command,
-                    working_directory,
-                    full_access=full_access,
-                    read_scope=read_scope,
-                )
-                if not ok:
-                    return deny(error or "Denied path")
-            return {}
-
-        for key in _PATH_KEYS:
-            candidate = tool_input.get(key)
-            if not candidate or not isinstance(candidate, str):
-                continue
-            if _is_secret_path(candidate):
-                return deny(
-                    f"Access denied: '{candidate}' is a credential file. "
-                    f"Secrets are not readable from an agent session by any "
-                    f"profile -- ask the owner to read or change it directly."
-                )
-            if not full_access and _is_tenant_data(candidate):
-                return deny(
-                    f"Access denied: '{candidate}' holds every user's private "
-                    f"data. Use the memory and tools this session already "
-                    f"provides for the current user."
-                )
-            # Guest read scope (dv-7de7): cross-user trees + allowlist. The
-            # hook is the primary gate because can_use_tool never fires for
-            # in-cwd paths; both checks no-op on owner sessions.
-            if read_scope is not None:
-                ok, error = read_scope.check_read(candidate)
-                if not ok:
-                    return deny(error or "Denied path")
-                if tool_name in _SEARCH_TOOLS:
-                    ok, error = read_scope.check_search_root(candidate)
-                    if not ok:
-                        return deny(error or "Denied search root")
         return {}
 
     return pre_tool_use
-
-
-def _is_secret_path(file_path: str) -> bool:
-    """True when *file_path*'s basename matches a credential pattern."""
-    import fnmatch
-
-    from ..security.denylist import DEFAULT_DENIED_PATTERNS
-
-    name = Path(file_path).name
-    return any(fnmatch.fnmatch(name, pat) for pat in DEFAULT_DENIED_PATTERNS)
 
 
 def _make_can_use_tool_callback(
@@ -529,6 +624,7 @@ def _make_can_use_tool_callback(
     confirmation_manager: Optional["ConfirmationManager"] = None,
     read_scope: Optional[ReadScope] = None,
     extra_write_roots: Sequence[Path] = (),
+    unrestricted: bool = False,
 ) -> Any:
     """Create a can_use_tool callback for SDK-level tool permission validation.
 
@@ -647,29 +743,8 @@ def _make_can_use_tool_callback(
                     "job_start tool for work that must outlive the turn."
                 )
             )
-        # Destructive-op confirmation gate (full-access profiles only). Sandboxed
-        # profiles can't do cross-FS/network damage from bash, so they skip this.
-        if full_access and confirmation_manager is not None:
-            from ..security.destructive import classify
-
-            reason = classify(tool_name, tool_input, working_directory)
-            if reason:
-                preview = (
-                    tool_input.get("command")
-                    or tool_input.get("file_path")
-                    or tool_input.get("path")
-                    or ""
-                )
-                approved = await confirmation_manager.request(reason, str(preview))
-                if not approved:
-                    logger.warning(
-                        "Destructive op denied by confirmation gate",
-                        tool_name=tool_name,
-                        reason=reason,
-                    )
-                    return PermissionResultDeny(
-                        message=f"Denied by owner (confirmation gate): {reason}"
-                    )
+        # The destructive-op confirmation gate moved to the PreToolUse hook
+        # (dv-6f50): this callback is skipped for allow-listed commands.
 
         # File path validation
         if tool_name in _FILE_TOOLS:
@@ -680,7 +755,7 @@ def _make_can_use_tool_callback(
                     return PermissionResultAllow()
 
                 valid, _resolved, error = security_validator.validate_path(
-                    file_path, working_directory
+                    file_path, working_directory, unrestricted=unrestricted
                 )
                 if not valid:
                     logger.warning(
@@ -772,6 +847,7 @@ def _make_can_use_tool_callback(
                     working_directory,
                     full_access=full_access,
                     read_scope=read_scope,
+                    unrestricted=unrestricted,
                 )
                 if not valid:
                     logger.warning(
@@ -1026,6 +1102,13 @@ class ClaudeSDKManager:
         profile = self.profile_registry.get_by_working_dir(working_directory)
         return profile.extra_dirs if profile is not None else ()
 
+    def _unrestricted_for(self, working_directory: Path) -> bool:
+        """The profile's ``unrestricted`` flag (dv-e38e); False outside profiles."""
+        if self.profile_registry is None:
+            return False
+        profile = self.profile_registry.get_by_working_dir(working_directory)
+        return bool(profile is not None and profile.unrestricted)
+
     def _sandbox_enabled_for(self, working_directory: Path) -> bool:
         """Resolve the bash-sandbox flag for the profile at this working dir.
 
@@ -1170,13 +1253,76 @@ class ClaudeSDKManager:
             logger.warning("profile mcp seam invalid", path=str(profile.mcp))
             return {}
         headers: Dict[str, str] = {}
-        tok = os.environ.get(spec.get("auth_env", ""))
-        if tok:
-            headers["Authorization"] = f"Bearer {tok}"
+        auth_env = str(spec.get("auth_env") or "")
+        if self._seam_token(auth_env):
+            # By reference, not value (dv-2976): the SDK passes mcp_servers to
+            # the CLI as `--mcp-config <json>` argv, which `ps` shows to every
+            # user. Claude CLI expands ${VAR} in MCP headers from its own env
+            # (verified on 2.1.283), and _seam_env puts the token there.
+            headers["Authorization"] = f"Bearer ${{{auth_env}}}"
         cfg: McpHttpServerConfig = {"type": "http", "url": str(spec["url"])}
         if headers:
             cfg["headers"] = headers
         return {"channel-intel": cfg}
+
+    def _seam_token(self, auth_env: str) -> Optional[str]:
+        """The bearer an MCP seam names by env var: Settings first (secrets
+        are scrubbed from os.environ at startup), then the env (dev runs)."""
+        from src.utils.agent_env import is_env_name
+
+        if not is_env_name(auth_env):
+            return None
+        return self.config.secret_value(auth_env) or os.environ.get(auth_env)
+
+    def _seam_env(self, working_directory: Path) -> Dict[str, str]:
+        """``{auth_env: token}`` for this profile's MCP seam, or {}.
+
+        Goes into ``ClaudeAgentOptions.env``: only this turn's CLI gets it.
+        """
+        if not self.profile_registry:
+            return {}
+        profile = self.profile_registry.get_by_working_dir(working_directory)
+        if not profile or not profile.mcp:
+            return {}
+        try:
+            spec = json.loads(Path(profile.mcp).read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(spec, dict):
+            return {}
+        auth_env = str(spec.get("auth_env") or "")
+        token = self._seam_token(auth_env)
+        return {auth_env: token} if token else {}
+
+    def _route_mcp_env_secrets(self, servers: Any) -> Dict[str, str]:
+        """Move secret-looking stdio MCP ``env`` values out of argv (dv-2976).
+
+        Each such entry is replaced by ``${NAME}`` (the CLI expands it from
+        its own env, verified on 2.1.283) and returned for
+        ``ClaudeAgentOptions.env``. Today only TELEGRAM_IMAGE_ROOTS (paths)
+        is set, so this is a guard for the next server someone adds.
+        """
+        from src.utils.agent_env import split_mcp_env
+
+        routed_all: Dict[str, str] = {}
+        if not isinstance(servers, dict):
+            return routed_all
+        secrets = self.config.secret_values()
+        for name, cfg in servers.items():
+            env = cfg.get("env") if isinstance(cfg, dict) else None
+            if not isinstance(env, dict) or not env:
+                continue
+            _, routed = split_mcp_env(env, secrets)
+            for var, value in routed.items():
+                env[var] = f"${{{var}}}"
+                routed_all[var] = value
+            if routed:
+                logger.warning(
+                    "MCP env secret routed via environment, not argv",
+                    server=name,
+                    names=sorted(routed),
+                )
+        return routed_all
 
     async def execute_command(
         self,
@@ -1259,6 +1405,7 @@ class ClaudeSDKManager:
             # prompt's cwd confinement is relaxed to match.
             sandbox_enabled = self._sandbox_enabled_for(Path(working_directory))
             full_access = not sandbox_enabled
+            unrestricted = self._unrestricted_for(Path(working_directory))
             extra_dirs = self._extra_dirs_for(Path(working_directory))
 
             # Per-session read scope (dv-7de7): guest sessions get a read
@@ -1370,8 +1517,9 @@ class ClaudeSDKManager:
                 allowed_tools=sdk_allowed_tools,
                 disallowed_tools=sdk_disallowed_tools,
                 cli_path=self.config.claude_cli_path or None,
+                permission_mode="default",
                 include_partial_messages=stream_callback is not None,
-                sandbox={
+                sandbox={  # type: ignore[arg-type]
                     "enabled": sandbox_enabled,
                     # Must stay False: when true the CLI auto-approves bash for
                     # sandboxed profiles, so `sqlite3 data/bot.db` never reaches
@@ -1379,6 +1527,15 @@ class ClaudeSDKManager:
                     # not reads -- and reads are the cross-user leak (dv-6dbc).
                     "autoAllowBashIfSandboxed": False,
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
+                    # Data-root areas no agent may read (dv-2c1c): the CLI
+                    # mounts an empty tmpfs over each, so bash in the bwrap
+                    # jail never sees them. A key the SDK's TypedDict does
+                    # not declare; the CLI reads it (verified in 2.1.283).
+                    "filesystem": {
+                        "denyRead": sandbox_deny_read(
+                            full_access, unrestricted=unrestricted
+                        )
+                    },
                 },
                 system_prompt=base_prompt,
                 setting_sources=["project"],
@@ -1425,6 +1582,18 @@ class ClaudeSDKManager:
                     cwd=str(working_directory),
                 )
 
+            # Per-turn env for the CLI (dv-2976): secrets reach it only here,
+            # never via os.environ (scrubbed at startup) or argv.
+            # The account-separation switches are set here explicitly, the
+            # same copy plain calls get (dv-11a5), not left to inheritance.
+            turn_env = {
+                **CLAUDE_ACCOUNT_ENV,
+                **self._seam_env(Path(working_directory)),
+                **self._route_mcp_env_secrets(options.mcp_servers),
+            }
+            if turn_env:
+                options.env = {**options.env, **turn_env}
+
             # Denylist enforcement that must hold for EVERY tool call, including
             # reads of files inside cwd -- which can_use_tool never sees.
             options.hooks = {
@@ -1435,8 +1604,13 @@ class ClaudeSDKManager:
                                 working_directory=Path(working_directory),
                                 full_access=full_access,
                                 read_scope=read_scope,
+                                unrestricted=unrestricted,
+                                confirmation_manager=self._confirmation_manager,
                             )
-                        ]
+                        ],
+                        # The gate waits up to 120s for the owner's tap; the
+                        # SDK's 60s default would kill the hook first.
+                        timeout=180,
                     )
                 ]
             }
@@ -1451,6 +1625,7 @@ class ClaudeSDKManager:
                     confirmation_manager=self._confirmation_manager,
                     read_scope=read_scope,
                     extra_write_roots=extra_dirs,
+                    unrestricted=unrestricted,
                 )
 
             # Resume previous session if we have a session_id
@@ -1464,7 +1639,12 @@ class ClaudeSDKManager:
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
 
+            # Watchdog clock: the timeout is measured from the last message the
+            # CLI sent, not from the start of the turn. See the wait loop below.
+            last_activity = time.monotonic()
+
             async def _run_client() -> None:
+                nonlocal last_activity
                 # Use connect(None) + query(prompt) pattern because
                 # can_use_tool requires the prompt as AsyncIterable, not
                 # a plain string. connect(None) uses an empty async
@@ -1485,6 +1665,9 @@ class ClaudeSDKManager:
                     # causing us to lose all subsequent messages including
                     # the ResultMessage.
                     async for raw_data in client._query.receive_messages():
+                        # Any traffic from the CLI — including a tool result
+                        # after a long-running command — resets the watchdog.
+                        last_activity = time.monotonic()
                         try:
                             message = parse_message(raw_data)
                         except MessageParseError as e:
@@ -1520,10 +1703,20 @@ class ClaudeSDKManager:
                     self._active_clients.discard(client)
                     await client.disconnect()
 
-            # Execute with timeout
-            await asyncio.wait_for(
-                _run_client(),
-                timeout=self.config.claude_timeout_seconds,
+            # Execute with an *idle* timeout, not a total-wall-clock one.
+            #
+            # This used to be asyncio.wait_for(..., claude_timeout_seconds),
+            # which capped the entire turn. A turn that is healthily streaming
+            # tool calls for 11 minutes was killed exactly like a hung one:
+            # on 2026-09-17 two turns died at 600s while sub-agents were still
+            # reporting, losing the whole reply (the work on disk survived, the
+            # answer did not). Wall-clock length is not evidence of a hang;
+            # silence is. So the clock now restarts on every message from the
+            # CLI, and only an actually stalled turn trips it.
+            await _await_with_idle_timeout(
+                asyncio.ensure_future(_run_client()),
+                lambda: last_activity,
+                self.config.claude_timeout_seconds,
             )
 
             # Extract cost, tools, token usage, and session_id from result message
@@ -1553,21 +1746,28 @@ class ClaudeSDKManager:
                     claude_session_id = getattr(message, "session_id", None)
                     result_content = getattr(message, "result", None)
                     current_time = asyncio.get_event_loop().time()
+                    # dv-73e2: a ToolUseBlock alone carries no outcome. Pair
+                    # each one against its ToolResultBlock (by tool_use_id) so
+                    # a failed/denied call is recorded with its error instead
+                    # of silently landing in tool_usage as success=1.
+                    tool_errors = _tool_result_errors(messages)
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
                             msg_content = getattr(msg, "content", [])
                             if msg_content and isinstance(msg_content, list):
                                 for block in msg_content:
                                     if isinstance(block, ToolUseBlock):
-                                        tools_used.append(
-                                            {
-                                                "name": getattr(
-                                                    block, "name", "unknown"
-                                                ),
-                                                "timestamp": current_time,
-                                                "input": getattr(block, "input", {}),
-                                            }
+                                        tool_entry: Dict[str, Any] = {
+                                            "name": getattr(block, "name", "unknown"),
+                                            "timestamp": current_time,
+                                            "input": getattr(block, "input", {}),
+                                        }
+                                        error = tool_errors.get(
+                                            getattr(block, "id", None)
                                         )
+                                        if error:
+                                            tool_entry["error"] = error
+                                        tools_used.append(tool_entry)
                     break
 
             # Fallback: extract session_id from StreamEvent messages if
@@ -1702,10 +1902,11 @@ class ClaudeSDKManager:
         except asyncio.TimeoutError:
             logger.error(
                 "Claude SDK command timed out",
-                timeout_seconds=self.config.claude_timeout_seconds,
+                idle_timeout_seconds=self.config.claude_timeout_seconds,
             )
             raise ClaudeTimeoutError(
-                f"Claude SDK timed out after {self.config.claude_timeout_seconds}s"
+                "Claude SDK produced no output for "
+                f"{self.config.claude_timeout_seconds}s"
             )
 
         except CLINotFoundError as e:

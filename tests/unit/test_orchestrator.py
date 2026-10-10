@@ -157,6 +157,7 @@ async def test_owner_menu_is_the_settled_short_list_in_order(tmp_dir, deps):
         "help",
         "status",
         "usage",
+        "limits",
         "model",
         "tasks",
     ]
@@ -378,8 +379,8 @@ def test_selected_codex_model_falls_back_from_unsupported(agentic_settings, deps
         "agent_model": "openai-codex/gpt-5.4-pro",
     }
 
-    assert orchestrator._selected_model(context) == "openai-codex/gpt-5.4-mini"
-    assert context.user_data["agent_model"] == "openai-codex/gpt-5.4-mini"
+    assert orchestrator._selected_model(context) == "openai-codex/gpt-5.6-sol"
+    assert context.user_data["agent_model"] == "openai-codex/gpt-5.6-sol"
 
 
 async def test_restart_command_sends_sigterm(deps):

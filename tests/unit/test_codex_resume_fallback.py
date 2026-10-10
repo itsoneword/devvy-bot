@@ -9,7 +9,6 @@ events, one `thread/resume ... no rollout found` line on stderr) and
 succeeds on the fresh run.
 """
 
-import json
 import stat
 import tempfile
 from datetime import datetime, timezone
@@ -22,6 +21,7 @@ from src.agent_backends.codex_cli import (
     CodexCliIntegration,
     CodexResumeError,
     CodexSessionStore,
+    InMemoryCodexSessionStore,
     is_resume_failure,
 )
 from src.claude.sdk_integration import ClaudeResponse
@@ -139,9 +139,17 @@ async def _seed_history(storage: Storage, workdir: Path, turns: List[str]) -> No
         )
 
 
-def _integration(settings, storage, tmp_path, codex, *, with_session_manager=True):
-    store = CodexSessionStore(tmp_path / "codex_sessions.json")
-    store.record(USER_ID, tmp_path / "workspace", DEAD_THREAD, 1, 1)
+async def _integration(
+    settings, storage, tmp_path, codex, *, with_session_manager=True
+):
+    # The real bot.db-backed store when there is a DB (dv-ebde), else the
+    # in-memory one. The DB store needs the users row _seed_history made.
+    store = (
+        CodexSessionStore(storage.db_manager)
+        if storage is not None
+        else InMemoryCodexSessionStore()
+    )
+    await store.record(USER_ID, tmp_path / "workspace", DEAD_THREAD, 1, 1)
     manager = (
         SessionManager(settings, SQLiteSessionStorage(storage.db_manager))
         if with_session_manager
@@ -171,7 +179,9 @@ async def test_dead_thread_retries_fresh_seeded_and_flags_response(
     workdir = tmp_path / "workspace"
     workdir.mkdir()
     await _seed_history(storage, workdir, ["first question", "second question"])
-    integ, store = _integration(settings, storage, tmp_path, _fake_codex(tmp_path))
+    integ, store = await _integration(
+        settings, storage, tmp_path, _fake_codex(tmp_path)
+    )
 
     resp = await integ.run_command(
         prompt="third question",
@@ -202,7 +212,19 @@ async def test_dead_thread_retries_fresh_seeded_and_flags_response(
     assert "could not be resumed" not in calls[0][-1]
 
     # Store now points at the fresh thread; the dead id is gone.
-    assert store.thread_for(USER_ID, workdir) == NEW_THREAD
+    assert await store.thread_for(USER_ID, workdir) == NEW_THREAD
+    # dv-ebde: the retry path writes the Codex columns on the new row, and the
+    # dead thread keeps its row with the head flag dropped.
+    async with storage.db_manager.get_connection() as conn:
+        cur = await conn.execute(
+            "SELECT session_id, backend, thread_head, thread_total_input, "
+            "thread_total_output, cumulative_tokens FROM sessions "
+            "WHERE session_id IN (?, ?) ORDER BY session_id",
+            (DEAD_THREAD, NEW_THREAD),
+        )
+        rows = {r[0]: tuple(r[1:]) for r in await cur.fetchall()}
+    assert rows[NEW_THREAD] == ("openai_codex", 1, 50, 5, 55)
+    assert rows[DEAD_THREAD][:2] == ("openai_codex", 0)
     # Fresh thread's totals start from zero, so this turn's flow is the raw
     # turn.completed number, not a delta against the dead thread.
     assert resp.input_tokens == 50 and resp.output_tokens == 5
@@ -220,7 +242,7 @@ async def test_no_session_manager_retries_unseeded(settings, tmp_path):
     """No history to read -> fresh retry with the plain prompt, still flagged."""
     workdir = tmp_path / "workspace"
     workdir.mkdir()
-    integ, store = _integration(
+    integ, store = await _integration(
         settings, None, tmp_path, _fake_codex(tmp_path), with_session_manager=False
     )
 
@@ -231,8 +253,10 @@ async def test_no_session_manager_retries_unseeded(settings, tmp_path):
     assert resp.session_restarted is True
     calls = _calls(tmp_path)
     assert len(calls) == 2
-    assert calls[1][-1] == "hello"
-    assert store.thread_for(USER_ID, workdir) == NEW_THREAD
+    # dv-ca94: every turn now carries a <current_time> prefix ahead of the
+    # (here unseeded, so otherwise unmodified) prompt.
+    assert calls[1][-1].endswith("\n\nhello")
+    assert await store.thread_for(USER_ID, workdir) == NEW_THREAD
 
 
 async def test_non_resume_failure_on_a_resumed_thread_does_not_retry(
@@ -252,7 +276,7 @@ async def test_non_resume_failure_on_a_resumed_thread_does_not_retry(
     script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
     workdir = tmp_path / "workspace"
     workdir.mkdir()
-    integ, store = _integration(
+    integ, store = await _integration(
         settings, None, tmp_path, script, with_session_manager=False
     )
 
@@ -264,13 +288,13 @@ async def test_non_resume_failure_on_a_resumed_thread_does_not_retry(
     assert not isinstance(excinfo.value, CodexResumeError)
     assert "invalid_request_error" in str(excinfo.value)
     assert len(_calls(tmp_path)) == 1
-    assert store.thread_for(USER_ID, workdir) == DEAD_THREAD
+    assert await store.thread_for(USER_ID, workdir) == DEAD_THREAD
 
 
 async def test_fresh_retry_failure_propagates_without_looping(settings, tmp_path):
     workdir = tmp_path / "workspace"
     workdir.mkdir()
-    integ, store = _integration(
+    integ, store = await _integration(
         settings,
         None,
         tmp_path,
@@ -287,17 +311,17 @@ async def test_fresh_retry_failure_propagates_without_looping(settings, tmp_path
     assert not isinstance(excinfo.value, CodexResumeError)
     assert len(_calls(tmp_path)) == 2
     # The dead id was dropped; nothing new was recorded for the failed retry.
-    assert store.thread_for(USER_ID, workdir) is None
+    assert await store.thread_for(USER_ID, workdir) is None
 
 
 async def test_explicit_dead_session_id_also_falls_back(settings, tmp_path):
     """A caller-supplied session_id takes the same path as the stored one."""
     workdir = tmp_path / "workspace"
     workdir.mkdir()
-    integ, store = _integration(
+    integ, store = await _integration(
         settings, None, tmp_path, _fake_codex(tmp_path), with_session_manager=False
     )
-    store.clear(USER_ID, workdir)
+    await store.clear(USER_ID, workdir)
 
     resp = await integ.run_command(
         prompt="hello",
@@ -310,4 +334,4 @@ async def test_explicit_dead_session_id_also_falls_back(settings, tmp_path):
     assert resp.session_id == NEW_THREAD
     calls = _calls(tmp_path)
     assert DEAD_THREAD in calls[0] and "resume" not in calls[1]
-    assert json.loads((tmp_path / "codex_sessions.json").read_text())
+    assert await store.thread_for(USER_ID, workdir) == NEW_THREAD

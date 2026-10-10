@@ -5,6 +5,7 @@ NotificationHandler: subscribes to AgentResponseEvent and delivers to Telegram.
 """
 
 import contextlib
+import dataclasses
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncContextManager, Dict, List, Optional
@@ -12,6 +13,8 @@ from typing import TYPE_CHECKING, Any, AsyncContextManager, Dict, List, Optional
 import structlog
 
 from ..claude.facade import ClaudeIntegration
+from ..items.loop_guard import automated_turn
+from ..model_router import get_router
 from .bus import Event, EventBus
 from .health_export import build_health_export_prompt, summarize_health_export
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
@@ -27,7 +30,7 @@ class AgentHandler:
     """Translates incoming events into Claude agent executions.
 
     Webhook and scheduled events are converted into prompts and sent
-    to ClaudeIntegration.run_command(). The response is published
+    through the model router to ClaudeIntegration. The response is published
     back as an AgentResponseEvent for delivery.
     """
 
@@ -45,8 +48,12 @@ class AgentHandler:
         storage: Optional[Any] = None,
         window_repo: Optional[Any] = None,
         default_agent_model: Optional[str] = None,
+        items: Optional[Any] = None,
     ) -> None:
         self.event_bus = event_bus
+        # Optional ItemService (dv-752a), attached in main once the scheduler
+        # exists. Item-linked jobs fire through it; None = plain jobs only.
+        self.items: Any = items
         self.claude = claude_integration
         self.default_working_directory = default_working_directory
         self.default_user_id = default_user_id
@@ -118,7 +125,10 @@ class AgentHandler:
 
         try:
             async with self._turn_lock(self.default_user_id):
-                response = await self.claude.run_command(
+                response = await get_router().run_turn(
+                    self.claude,
+                    purpose="webhook",
+                    attended=False,
                     prompt=prompt,
                     working_directory=self.default_working_directory,
                     user_id=self.default_user_id,
@@ -182,7 +192,10 @@ class AgentHandler:
 
         try:
             async with self._turn_lock(self.health_export_user_id):
-                response = await self.claude.run_command(
+                response = await get_router().run_turn(
+                    self.claude,
+                    purpose="webhook",
+                    attended=False,
                     prompt=prompt,
                     working_directory=working_directory,
                     user_id=self.health_export_user_id,
@@ -222,6 +235,15 @@ class AgentHandler:
         decides, in :meth:`_per_user_workspace_for`, whether an unresolved
         role may fall back to "owner" for *workspace* purposes only.
         """
+        if event.run_as:
+            # Item jobs (dv-752a): the handler set the ASSIGNEE explicitly.
+            # created_by on those rows is the creator, and running as them
+            # would fire the reminder in the creator's workspace and memory.
+            return event.run_as
+        if event.item_id and len(event.target_chat_ids) == 1:
+            # Item job fired without an item service wired: its single
+            # target chat is the assignee, never the creator in created_by.
+            return event.target_chat_ids[0]
         if event.created_by:
             return event.created_by
         if len(event.target_chat_ids) == 1:
@@ -297,10 +319,70 @@ class AgentHandler:
         if not isinstance(event, ScheduledEvent):
             return
 
+        if event.item_id and self.items is not None:
+            await self._handle_item_event(event)
+            return
+
         if event.delivery == "message":
             await self._deliver_verbatim(event)
             return
 
+        await self._run_agent_job(event)
+
+    async def _handle_item_event(self, event: ScheduledEvent) -> None:
+        """Fire a family item (dv-752a): live text, run as the assignee.
+
+        A job whose item is no longer open (done/cancelled from either side)
+        is dropped instead of delivered. The fire is recorded on the item so
+        both sides' next turn sees it (turn-start injection).
+        """
+        items = self.items
+        item = await items.repo.get(event.item_id)
+        if item is None or item.status != "open":
+            logger.info(
+                "item job skipped: item not open",
+                item_id=event.item_id,
+                status=getattr(item, "status", None),
+            )
+            if items.scheduler is not None:
+                await items.scheduler.remove_jobs_for_item(event.item_id)
+            return
+        cross = item.creator_id != item.assignee_id
+        sender = None
+        if cross:
+            names = await items.names(item.assignee_id)
+            sender = names.get(item.creator_id) or f"id {item.creator_id}"
+        fired = dataclasses.replace(
+            event,
+            run_as=item.assignee_id,
+            prompt=item.text,
+            target_chat_ids=[item.assignee_id],
+        )
+        logger.info(
+            "Firing family item",
+            item_id=item.id,
+            assignee_id=item.assignee_id,
+            cross_member=cross,
+            deliver=item.deliver,
+        )
+        if item.deliver == "agent":
+            origin = f"set by {sender}" if sender else "the user set for themselves"
+            fired = dataclasses.replace(
+                fired,
+                prompt=(
+                    f"[Reminder #{item.id} ({origin}) is due now. Deliver it to "
+                    f"the user in your own words, briefly.]\n{item.text}"
+                ),
+            )
+            await self._run_agent_job(fired)
+        else:
+            await self._deliver_verbatim(
+                fired, header=f"⏰ от {sender}" if sender else None, sender=sender
+            )
+        await items.mark_fired(item)
+
+    async def _run_agent_job(self, event: ScheduledEvent) -> None:
+        """Run a scheduled job as an agent turn for its owner."""
         logger.info(
             "Processing scheduled event through agent",
             job_id=event.job_id,
@@ -324,15 +406,21 @@ class AgentHandler:
         requester_chat_id = event.target_chat_ids[0] if event.target_chat_ids else None
 
         try:
+            # Loop guard (dv-752a): while this scheduler-driven turn runs, the
+            # item tools refuse to create items for other family members.
             async with self._turn_lock(owner_id):
-                response = await self.claude.run_command(
-                    prompt=prompt,
-                    working_directory=working_dir,
-                    user_id=owner_id,
-                    requester_chat_id=requester_chat_id,
-                    role=owner_role,
-                    model=await self._owner_model_pref(owner_id),
-                )
+                with automated_turn(owner_id):
+                    response = await get_router().run_turn(
+                        self.claude,
+                        purpose="scheduled",
+                        attended=False,
+                        prompt=prompt,
+                        working_directory=working_dir,
+                        user_id=owner_id,
+                        requester_chat_id=requester_chat_id,
+                        role=owner_role,
+                        model=await self._owner_model_pref(owner_id),
+                    )
 
             if response.content:
                 for chat_id in event.target_chat_ids:
@@ -360,7 +448,12 @@ class AgentHandler:
                 event_id=event.id,
             )
 
-    async def _deliver_verbatim(self, event: ScheduledEvent) -> None:
+    async def _deliver_verbatim(
+        self,
+        event: ScheduledEvent,
+        header: Optional[str] = None,
+        sender: Optional[str] = None,
+    ) -> None:
         """Deliver a scheduled reminder's text straight to Telegram — no LLM
         turn. Three side channels keep the agent able to see it later:
         a messages row in the profile's current session (recall + window
@@ -391,7 +484,9 @@ class AgentHandler:
             )
 
         text = event.prompt
-        header = f"⏰ {profile_slug}" if profile_slug else "⏰ reminder"
+        if header is None:
+            header = f"⏰ {profile_slug}" if profile_slug else "⏰ reminder"
+        origin = f" from {sender}" if sender else ""
         delivered_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
         saved_message_id: Optional[int] = None
@@ -427,7 +522,7 @@ class AgentHandler:
                 await self.storage.pending_notes.add(
                     user_id,
                     str(working_dir),
-                    f"[a scheduled reminder was delivered to the user at "
+                    f"[a scheduled reminder{origin} was delivered to the user at "
                     f"{delivered_at}, without an agent turn — if their "
                     f"message reads like an answer, this is the question: "
                     f'"{text}"]',

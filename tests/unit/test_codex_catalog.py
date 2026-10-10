@@ -27,6 +27,13 @@ CANNED = {
             "priority": 3,
         },
         {
+            "slug": "gpt-5.6-sol",
+            "display_name": "GPT-5.6-Sol",
+            "visibility": "list",
+            "context_window": 272000,
+            "priority": 4,
+        },
+        {
             "slug": "gpt-5.4-mini",
             "display_name": "GPT-5.4-Mini",
             "visibility": "list",
@@ -68,14 +75,15 @@ CANNED = {
 def test_parse_keeps_listable_models_in_priority_order():
     models = parse_codex_models(json.dumps(CANNED))
     assert [m.slug for m in models] == [
+        "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
         "gpt-5.5",
         "gpt-5.4-mini",
     ]
-    assert models[0].display_name == "GPT-5.6-Terra"
+    assert models[0].display_name == "GPT-5.6-Sol"
     assert models[0].context_window == 272000
-    assert models[0].ref == "openai-codex/gpt-5.6-terra"
+    assert models[0].ref == "openai-codex/gpt-5.6-sol"
 
 
 def test_parse_rejects_a_catalog_with_nothing_listable():
@@ -92,13 +100,13 @@ def test_parse_rejects_unrecognisable_payloads():
 def test_supported_refs_always_keeps_the_pinned_constants():
     models = parse_codex_models(CANNED)
     refs = supported_refs(
-        models, always=("openai-codex/gpt-5.5", "openai-codex/gpt-5.4-mini")
+        models, always=("openai-codex/gpt-5.5", "openai-codex/gpt-5.6-sol")
     )
     assert "openai-codex/gpt-5.6-luna" in refs
     assert "openai-codex/gpt-5.5" in refs
     # ...even when the live catalog has dropped one of them.
-    refs = supported_refs([], always=("openai-codex/gpt-5.4-mini",))
-    assert refs == frozenset({"openai-codex/gpt-5.4-mini"})
+    refs = supported_refs([], always=("openai-codex/gpt-5.6-sol",))
+    assert refs == frozenset({"openai-codex/gpt-5.6-sol"})
 
 
 class _Proc:
@@ -148,7 +156,9 @@ async def test_invalidate_forces_a_refetch(monkeypatch):
 async def test_failed_cli_falls_back_to_the_two_constants(monkeypatch):
     _patch_exec(monkeypatch, _Proc(b"", returncode=1, stderr=b"boom" * 200))
     catalog = CodexModelCatalog()
-    assert await catalog.get() == list(FALLBACK_MODELS)
+    models = await catalog.get()
+    assert models == list(FALLBACK_MODELS)
+    assert [model.slug for model in models] == ["gpt-5.6-sol", "gpt-5.5"]
 
 
 async def test_unparsable_output_falls_back(monkeypatch):

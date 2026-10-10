@@ -5,14 +5,16 @@
 # admin: sandbox is off and guests can never reach it.
 #
 # The slug placeholder is filled in by scripts/install_profiles.py (default:
-# the template directory name). ${DEVVY_ROOT} is resolved by the profile
-# registry at boot and defaults to the repo root, so nothing here is
-# machine-specific.
+# the template directory name). ${DEVVY_ROOT} (the repo root) and
+# ${DEVVY_WORKSPACES} (<DEVVY_DATA_ROOT>/workspaces, or ${DEVVY_ROOT}/workspaces
+# when no data root is set) are resolved by the profile registry at boot, so
+# nothing here is machine-specific. Memory and persona live in the data root
+# like every other agent's; only working_dir is the checkout.
 - slug: "@SLUG@"
   name: Server / DevOps
   working_dir: ${DEVVY_ROOT}
-  memory_dir: ${DEVVY_ROOT}/data/memory
-  persona: ${DEVVY_ROOT}/data/agent.md
+  memory_dir: ${DEVVY_WORKSPACES}/@SLUG@/memory
+  persona: ${DEVVY_WORKSPACES}/@SLUG@/persona.md
   # devops reuses the single-profile agent persona rather than getting a second,
   # drifting copy -- so it names its template explicitly instead of relying on
   # the <templates>/profiles/<slug>/persona.md convention. This template
@@ -20,5 +22,6 @@
   persona_template: ${DEVVY_ROOT}/data/templates/agent.md
   default: true
   sandbox: false            # trusted admin: full bash network + cross-FS access
+  unrestricted: true        # server admin: no secrets/archive/db denies; Codex full access
   shared: true              # working_dir is a repo checkout; never split per-user
   max_turns: 100            # multi-file work exceeds the global CLAUDE_MAX_TURNS

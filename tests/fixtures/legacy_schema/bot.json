@@ -1,0 +1,3966 @@
+{
+  "fts_tables": {
+    "memory_facts_fts": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "content",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 1,
+          "name": "memory_facts_fts",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 1,
+          "name": "rank",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE VIRTUAL TABLE memory_facts_fts USING fts5(content, content='memory_facts', content_rowid='id')"
+    },
+    "messages_fts": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "prompt",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "response",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 1,
+          "name": "messages_fts",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 1,
+          "name": "rank",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE VIRTUAL TABLE messages_fts USING fts5( prompt, response, content='messages', content_rowid='message_id', prefix='2 3 4' )"
+    }
+  },
+  "indexes": {
+    "idx_agent_tasks_status": {
+      "sql": "CREATE INDEX idx_agent_tasks_status ON agent_tasks(status, due_at)",
+      "tbl_name": "agent_tasks"
+    },
+    "idx_audit_log_timestamp": {
+      "sql": "CREATE INDEX idx_audit_log_timestamp ON audit_log(timestamp)",
+      "tbl_name": "audit_log"
+    },
+    "idx_audit_log_user_id": {
+      "sql": "CREATE INDEX idx_audit_log_user_id ON audit_log(user_id)",
+      "tbl_name": "audit_log"
+    },
+    "idx_bot_users_family": {
+      "sql": "CREATE INDEX idx_bot_users_family ON bot_users(family_id)",
+      "tbl_name": "bot_users"
+    },
+    "idx_cost_tracking_user_date": {
+      "sql": "CREATE INDEX idx_cost_tracking_user_date ON cost_tracking(user_id, date)",
+      "tbl_name": "cost_tracking"
+    },
+    "idx_item_notes_item": {
+      "sql": "CREATE INDEX idx_item_notes_item ON item_notes(item_id, created_at)",
+      "tbl_name": "item_notes"
+    },
+    "idx_items_assignee": {
+      "sql": "CREATE INDEX idx_items_assignee ON items(assignee_id, status, due_at)",
+      "tbl_name": "items"
+    },
+    "idx_items_creator": {
+      "sql": "CREATE INDEX idx_items_creator ON items(creator_id, status)",
+      "tbl_name": "items"
+    },
+    "idx_memory_extractions_session": {
+      "sql": "CREATE INDEX idx_memory_extractions_session ON memory_extractions(session_id)",
+      "tbl_name": "memory_extractions"
+    },
+    "idx_memory_extractions_timestamp": {
+      "sql": "CREATE INDEX idx_memory_extractions_timestamp ON memory_extractions(timestamp)",
+      "tbl_name": "memory_extractions"
+    },
+    "idx_memory_facts_agent": {
+      "sql": "CREATE INDEX idx_memory_facts_agent ON memory_facts(agent_id, tier, status)",
+      "tbl_name": "memory_facts"
+    },
+    "idx_memory_facts_kind": {
+      "sql": "CREATE INDEX idx_memory_facts_kind ON memory_facts(agent_id, kind, invalid_at)",
+      "tbl_name": "memory_facts"
+    },
+    "idx_messages_session_id": {
+      "sql": "CREATE INDEX idx_messages_session_id ON messages(session_id)",
+      "tbl_name": "messages"
+    },
+    "idx_messages_timestamp": {
+      "sql": "CREATE INDEX idx_messages_timestamp ON messages(timestamp)",
+      "tbl_name": "messages"
+    },
+    "idx_messages_window_id": {
+      "sql": "CREATE INDEX idx_messages_window_id ON messages(window_id)",
+      "tbl_name": "messages"
+    },
+    "idx_model_calls_purpose": {
+      "sql": "CREATE INDEX idx_model_calls_purpose ON model_calls(purpose, ts)",
+      "tbl_name": "model_calls"
+    },
+    "idx_model_calls_ts": {
+      "sql": "CREATE INDEX idx_model_calls_ts ON model_calls(ts)",
+      "tbl_name": "model_calls"
+    },
+    "idx_pending_notes_scope": {
+      "sql": "CREATE INDEX idx_pending_notes_scope ON pending_notes(user_id, working_dir)",
+      "tbl_name": "pending_notes"
+    },
+    "idx_project_threads_chat_active": {
+      "sql": "CREATE INDEX idx_project_threads_chat_active ON project_threads(chat_id, is_active)",
+      "tbl_name": "project_threads"
+    },
+    "idx_project_threads_slug": {
+      "sql": "CREATE INDEX idx_project_threads_slug ON project_threads(project_slug)",
+      "tbl_name": "project_threads"
+    },
+    "idx_scheduled_jobs_active": {
+      "sql": "CREATE INDEX idx_scheduled_jobs_active ON scheduled_jobs(is_active)",
+      "tbl_name": "scheduled_jobs"
+    },
+    "idx_scheduled_jobs_item": {
+      "sql": "CREATE INDEX idx_scheduled_jobs_item ON scheduled_jobs(item_id)",
+      "tbl_name": "scheduled_jobs"
+    },
+    "idx_sent_messages_tg": {
+      "sql": "CREATE UNIQUE INDEX idx_sent_messages_tg ON sent_messages(telegram_chat_id, telegram_message_id)",
+      "tbl_name": "sent_messages"
+    },
+    "idx_session_tracking_session": {
+      "sql": "CREATE INDEX idx_session_tracking_session ON session_tracking(session_id)",
+      "tbl_name": "session_tracking"
+    },
+    "idx_session_tracking_timestamp": {
+      "sql": "CREATE INDEX idx_session_tracking_timestamp ON session_tracking(timestamp)",
+      "tbl_name": "session_tracking"
+    },
+    "idx_sessions_project_path": {
+      "sql": "CREATE INDEX idx_sessions_project_path ON sessions(project_path)",
+      "tbl_name": "sessions"
+    },
+    "idx_sessions_user_id": {
+      "sql": "CREATE INDEX idx_sessions_user_id ON sessions(user_id)",
+      "tbl_name": "sessions"
+    },
+    "idx_sessions_user_project": {
+      "sql": "CREATE INDEX idx_sessions_user_project ON sessions(user_id, project_path)",
+      "tbl_name": "sessions"
+    },
+    "idx_webhook_events_delivery": {
+      "sql": "CREATE INDEX idx_webhook_events_delivery ON webhook_events(delivery_id)",
+      "tbl_name": "webhook_events"
+    },
+    "idx_webhook_events_provider": {
+      "sql": "CREATE INDEX idx_webhook_events_provider ON webhook_events(provider, received_at)",
+      "tbl_name": "webhook_events"
+    }
+  },
+  "tables": {
+    "agent_tasks": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "title",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "body",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": "'user'",
+          "hidden": 0,
+          "name": "created_by",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "assignee",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "due_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "'open'",
+          "hidden": 0,
+          "name": "status",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 8,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "updated_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_agent_tasks_status": [
+          {
+            "cid": 6,
+            "name": "status",
+            "seqno": 0
+          },
+          {
+            "cid": 5,
+            "name": "due_at",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_agent_tasks_status",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE agent_tasks ( id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, body TEXT, created_by TEXT NOT NULL DEFAULT 'user', assignee TEXT, due_at TIMESTAMP, status TEXT NOT NULL DEFAULT 'open', -- 'open'|'done' created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP )"
+    },
+    "audit_log": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "event_type",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "event_data",
+          "notnull": 0,
+          "pk": 0,
+          "type": "JSON"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "TRUE",
+          "hidden": 0,
+          "name": "success",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "timestamp",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "ip_address",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "user_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "users",
+          "to": "user_id"
+        }
+      ],
+      "index_columns": {
+        "idx_audit_log_timestamp": [
+          {
+            "cid": 5,
+            "name": "timestamp",
+            "seqno": 0
+          }
+        ],
+        "idx_audit_log_user_id": [
+          {
+            "cid": 1,
+            "name": "user_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_audit_log_timestamp",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_audit_log_user_id",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE audit_log ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, event_type TEXT NOT NULL, event_data JSON, success BOOLEAN DEFAULT TRUE, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, ip_address TEXT, FOREIGN KEY (user_id) REFERENCES users(user_id) )"
+    },
+    "bot_users": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "telegram_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": "'guest'",
+          "hidden": 0,
+          "name": "role",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "family_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "added_by",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "'admin'",
+          "hidden": 0,
+          "name": "source",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "display_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "relation",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "is_admin",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "family_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "families",
+          "to": "id"
+        }
+      ],
+      "index_columns": {
+        "idx_bot_users_family": [
+          {
+            "cid": 2,
+            "name": "family_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_bot_users_family",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE bot_users ( telegram_id INTEGER PRIMARY KEY, role TEXT NOT NULL DEFAULT 'guest', -- 'owner'|'guest' family_id INTEGER REFERENCES families(id), added_by INTEGER, source TEXT NOT NULL DEFAULT 'admin', -- 'env'|'admin'|'family' created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP , display_name TEXT, relation TEXT, is_admin INTEGER NOT NULL DEFAULT 0)"
+    },
+    "conversation_windows": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "working_dir",
+          "notnull": 1,
+          "pk": 2,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": "1",
+          "hidden": 0,
+          "name": "window_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": "'claude'",
+          "hidden": 0,
+          "name": "active_backend",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "cumulative_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "last_eval_checkpoint",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "last_checkpoint_message_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "updated_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 8,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "last_context_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "pending_seed_window",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 10,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "force_new_session",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_conversation_windows_1": [
+          {
+            "cid": 0,
+            "name": "user_id",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "working_dir",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_conversation_windows_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE conversation_windows ( user_id INTEGER NOT NULL, working_dir TEXT NOT NULL, window_id INTEGER NOT NULL DEFAULT 1, active_backend TEXT NOT NULL DEFAULT 'claude', cumulative_tokens INTEGER NOT NULL DEFAULT 0, last_eval_checkpoint INTEGER NOT NULL DEFAULT 0, last_checkpoint_message_id INTEGER NOT NULL DEFAULT 0, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_context_tokens INTEGER NOT NULL DEFAULT 0, pending_seed_window INTEGER, force_new_session INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, working_dir) )"
+    },
+    "cost_tracking": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "date",
+          "notnull": 1,
+          "pk": 0,
+          "type": "DATE"
+        },
+        {
+          "cid": 3,
+          "dflt_value": "0.0",
+          "hidden": 0,
+          "name": "daily_cost",
+          "notnull": 0,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "request_count",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "user_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "users",
+          "to": "user_id"
+        }
+      ],
+      "index_columns": {
+        "idx_cost_tracking_user_date": [
+          {
+            "cid": 1,
+            "name": "user_id",
+            "seqno": 0
+          },
+          {
+            "cid": 2,
+            "name": "date",
+            "seqno": 1
+          }
+        ],
+        "sqlite_autoindex_cost_tracking_1": [
+          {
+            "cid": 1,
+            "name": "user_id",
+            "seqno": 0
+          },
+          {
+            "cid": 2,
+            "name": "date",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_cost_tracking_user_date",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "sqlite_autoindex_cost_tracking_1",
+          "origin": "u",
+          "partial": 0,
+          "seq": 1,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE cost_tracking ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, date DATE NOT NULL, daily_cost REAL DEFAULT 0.0, request_count INTEGER DEFAULT 0, UNIQUE(user_id, date), FOREIGN KEY (user_id) REFERENCES users(user_id) )"
+    },
+    "families": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_by",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE families ( id INTEGER PRIMARY KEY AUTOINCREMENT, created_by INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP )"
+    },
+    "item_notes": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "item_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "author_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "kind",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "body",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "path",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "'manual'",
+          "hidden": 0,
+          "name": "source",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "item_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "items",
+          "to": "id"
+        }
+      ],
+      "index_columns": {
+        "idx_item_notes_item": [
+          {
+            "cid": 1,
+            "name": "item_id",
+            "seqno": 0
+          },
+          {
+            "cid": 7,
+            "name": "created_at",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_item_notes_item",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE item_notes ( id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL REFERENCES items(id), author_id INTEGER, kind TEXT NOT NULL, body TEXT NOT NULL, path TEXT, source TEXT NOT NULL DEFAULT 'manual', created_at TEXT NOT NULL )"
+    },
+    "item_seen": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "profile_slug",
+          "notnull": 1,
+          "pk": 2,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "seen_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_item_seen_1": [
+          {
+            "cid": 0,
+            "name": "user_id",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "profile_slug",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_item_seen_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE item_seen ( user_id INTEGER NOT NULL, profile_slug TEXT NOT NULL, seen_at TEXT NOT NULL, PRIMARY KEY (user_id, profile_slug) )"
+    },
+    "items": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "family_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "creator_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "assignee_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "text",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "'open'",
+          "hidden": 0,
+          "name": "status",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "due_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "recurrence",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": "'UTC'",
+          "hidden": 0,
+          "name": "tz",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "ends_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 10,
+          "dflt_value": "'message'",
+          "hidden": 0,
+          "name": "deliver",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 11,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "profile_slug",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 12,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_profile",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 13,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "last_fired_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 14,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "done_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 15,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "done_by",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 16,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 17,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "updated_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 18,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "deadline",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_items_assignee": [
+          {
+            "cid": 3,
+            "name": "assignee_id",
+            "seqno": 0
+          },
+          {
+            "cid": 5,
+            "name": "status",
+            "seqno": 1
+          },
+          {
+            "cid": 6,
+            "name": "due_at",
+            "seqno": 2
+          }
+        ],
+        "idx_items_creator": [
+          {
+            "cid": 2,
+            "name": "creator_id",
+            "seqno": 0
+          },
+          {
+            "cid": 5,
+            "name": "status",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_items_creator",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_items_assignee",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE items ( id INTEGER PRIMARY KEY AUTOINCREMENT, family_id INTEGER, creator_id INTEGER NOT NULL, assignee_id INTEGER NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', due_at TEXT, recurrence TEXT, tz TEXT NOT NULL DEFAULT 'UTC', ends_at TEXT, deliver TEXT NOT NULL DEFAULT 'message', profile_slug TEXT, source_profile TEXT, last_fired_at TEXT, done_at TEXT, done_by INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL , deadline TEXT)"
+    },
+    "lifecycle_events": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "ts",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "profile",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "event",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "detail",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE lifecycle_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, profile TEXT NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL )"
+    },
+    "memory_extractions": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "prompt_hash",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "raw_response",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "parsed_insights",
+          "notnull": 0,
+          "pk": 0,
+          "type": "JSON"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "'pending'",
+          "hidden": 0,
+          "name": "validation_status",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "target_files",
+          "notnull": 0,
+          "pk": 0,
+          "type": "JSON"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "error_message",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "cumulative_tokens_at_run",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 10,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "timestamp",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 11,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "op_stats",
+          "notnull": 0,
+          "pk": 0,
+          "type": "JSON"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "user_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "users",
+          "to": "user_id"
+        }
+      ],
+      "index_columns": {
+        "idx_memory_extractions_session": [
+          {
+            "cid": 1,
+            "name": "session_id",
+            "seqno": 0
+          }
+        ],
+        "idx_memory_extractions_timestamp": [
+          {
+            "cid": 10,
+            "name": "timestamp",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_memory_extractions_timestamp",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_memory_extractions_session",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE \"memory_extractions\" ( id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, user_id INTEGER NOT NULL, prompt_hash TEXT NOT NULL, raw_response TEXT, parsed_insights JSON, validation_status TEXT NOT NULL DEFAULT 'pending', target_files JSON, error_message TEXT, cumulative_tokens_at_run INTEGER, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, op_stats JSON, FOREIGN KEY (user_id) REFERENCES users(user_id) )"
+    },
+    "memory_facts": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "agent_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": "'general'",
+          "hidden": 0,
+          "name": "tier",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "label",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "content",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "'active'",
+          "hidden": 0,
+          "name": "status",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 8,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "updated_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 9,
+          "dflt_value": "'user_fact'",
+          "hidden": 0,
+          "name": "kind",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 10,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "superseded_by",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 11,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "valid_from",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 12,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "invalid_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 13,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "recorded_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 14,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_ref",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 15,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "conflict_group",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 16,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "invalidated_by",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "superseded_by",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "memory_facts",
+          "to": "id"
+        }
+      ],
+      "index_columns": {
+        "idx_memory_facts_agent": [
+          {
+            "cid": 1,
+            "name": "agent_id",
+            "seqno": 0
+          },
+          {
+            "cid": 2,
+            "name": "tier",
+            "seqno": 1
+          },
+          {
+            "cid": 5,
+            "name": "status",
+            "seqno": 2
+          }
+        ],
+        "idx_memory_facts_kind": [
+          {
+            "cid": 1,
+            "name": "agent_id",
+            "seqno": 0
+          },
+          {
+            "cid": 9,
+            "name": "kind",
+            "seqno": 1
+          },
+          {
+            "cid": 12,
+            "name": "invalid_at",
+            "seqno": 2
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_memory_facts_kind",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_memory_facts_agent",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE memory_facts ( id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, tier TEXT NOT NULL DEFAULT 'general', -- 'pinned'|'general' label TEXT, -- optional grouping content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', -- 'active'|'superseded' source TEXT, -- 'evaluator'|'manual' created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP , kind TEXT NOT NULL DEFAULT 'user_fact', superseded_by INTEGER REFERENCES memory_facts(id), valid_from TIMESTAMP, invalid_at TIMESTAMP, recorded_at TIMESTAMP, source_ref TEXT, conflict_group TEXT, invalidated_by TEXT)"
+    },
+    "memory_facts_fts_config": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "k",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "v",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_memory_facts_fts_config_1": [
+          {
+            "cid": 0,
+            "name": "k",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_memory_facts_fts_config_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE 'memory_facts_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+    },
+    "memory_facts_fts_data": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "block",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE 'memory_facts_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+    },
+    "memory_facts_fts_docsize": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "sz",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE 'memory_facts_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+    },
+    "memory_facts_fts_idx": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "segid",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "term",
+          "notnull": 1,
+          "pk": 2,
+          "type": ""
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "pgno",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_memory_facts_fts_idx_1": [
+          {
+            "cid": 0,
+            "name": "segid",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "term",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_memory_facts_fts_idx_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE 'memory_facts_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+    },
+    "messages": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "message_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "timestamp",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "prompt",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "response",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "0.0",
+          "hidden": 0,
+          "name": "cost",
+          "notnull": 0,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "duration_ms",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "error",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "window_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "user_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "users",
+          "to": "user_id"
+        },
+        {
+          "from": "session_id",
+          "id": 1,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "sessions",
+          "to": "session_id"
+        }
+      ],
+      "index_columns": {
+        "idx_messages_session_id": [
+          {
+            "cid": 1,
+            "name": "session_id",
+            "seqno": 0
+          }
+        ],
+        "idx_messages_timestamp": [
+          {
+            "cid": 3,
+            "name": "timestamp",
+            "seqno": 0
+          }
+        ],
+        "idx_messages_window_id": [
+          {
+            "cid": 9,
+            "name": "window_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_messages_window_id",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_messages_timestamp",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        },
+        {
+          "name": "idx_messages_session_id",
+          "origin": "c",
+          "partial": 0,
+          "seq": 2,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE messages ( message_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, user_id INTEGER NOT NULL, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, prompt TEXT NOT NULL, response TEXT, cost REAL DEFAULT 0.0, duration_ms INTEGER, error TEXT, window_id INTEGER, FOREIGN KEY (session_id) REFERENCES sessions(session_id), FOREIGN KEY (user_id) REFERENCES users(user_id) )"
+    },
+    "messages_fts_config": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "k",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "v",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_messages_fts_config_1": [
+          {
+            "cid": 0,
+            "name": "k",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_messages_fts_config_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE 'messages_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+    },
+    "messages_fts_data": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "block",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE 'messages_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+    },
+    "messages_fts_docsize": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "sz",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE 'messages_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+    },
+    "messages_fts_idx": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "segid",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "term",
+          "notnull": 1,
+          "pk": 2,
+          "type": ""
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "pgno",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_messages_fts_idx_1": [
+          {
+            "cid": 0,
+            "name": "segid",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "term",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_messages_fts_idx_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE 'messages_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+    },
+    "model_calls": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "ts",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "purpose",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "kind",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "harness",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "harness_version",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "provider",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "model",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": "1",
+          "hidden": 0,
+          "name": "attended",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "profile",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 10,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 11,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 12,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "input_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 13,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "output_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 14,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "cache_read_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 15,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "cache_creation_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 16,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "cost_usd",
+          "notnull": 0,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 17,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "duration_ms",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 18,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "outcome",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 19,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "error",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_model_calls_purpose": [
+          {
+            "cid": 2,
+            "name": "purpose",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "ts",
+            "seqno": 1
+          }
+        ],
+        "idx_model_calls_ts": [
+          {
+            "cid": 1,
+            "name": "ts",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_model_calls_purpose",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_model_calls_ts",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE model_calls ( id INTEGER PRIMARY KEY AUTOINCREMENT, ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP, purpose TEXT NOT NULL, kind TEXT NOT NULL, harness TEXT NOT NULL, harness_version TEXT, provider TEXT NOT NULL, model TEXT, attended INTEGER NOT NULL DEFAULT 1, profile TEXT, user_id INTEGER, session_id TEXT, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL, duration_ms INTEGER NOT NULL DEFAULT 0, outcome TEXT NOT NULL, error TEXT )"
+    },
+    "pending_notes": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "working_dir",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "note",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_pending_notes_scope": [
+          {
+            "cid": 1,
+            "name": "user_id",
+            "seqno": 0
+          },
+          {
+            "cid": 2,
+            "name": "working_dir",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_pending_notes_scope",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE pending_notes ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, working_dir TEXT NOT NULL, note TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP )"
+    },
+    "pinned_messages": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "chat_id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "pin_as",
+          "notnull": 1,
+          "pk": 2,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "message_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "updated_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_pinned_messages_1": [
+          {
+            "cid": 0,
+            "name": "chat_id",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "pin_as",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_pinned_messages_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE pinned_messages ( chat_id INTEGER NOT NULL, pin_as TEXT NOT NULL, message_id INTEGER NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (chat_id, pin_as) )"
+    },
+    "project_threads": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "project_slug",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "chat_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "message_thread_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "topic_name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "TRUE",
+          "hidden": 0,
+          "name": "is_active",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "updated_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_project_threads_chat_active": [
+          {
+            "cid": 2,
+            "name": "chat_id",
+            "seqno": 0
+          },
+          {
+            "cid": 5,
+            "name": "is_active",
+            "seqno": 1
+          }
+        ],
+        "idx_project_threads_slug": [
+          {
+            "cid": 1,
+            "name": "project_slug",
+            "seqno": 0
+          }
+        ],
+        "sqlite_autoindex_project_threads_1": [
+          {
+            "cid": 2,
+            "name": "chat_id",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "project_slug",
+            "seqno": 1
+          }
+        ],
+        "sqlite_autoindex_project_threads_2": [
+          {
+            "cid": 2,
+            "name": "chat_id",
+            "seqno": 0
+          },
+          {
+            "cid": 3,
+            "name": "message_thread_id",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_project_threads_slug",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_project_threads_chat_active",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        },
+        {
+          "name": "sqlite_autoindex_project_threads_2",
+          "origin": "u",
+          "partial": 0,
+          "seq": 2,
+          "unique": 1
+        },
+        {
+          "name": "sqlite_autoindex_project_threads_1",
+          "origin": "u",
+          "partial": 0,
+          "seq": 3,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE project_threads ( id INTEGER PRIMARY KEY AUTOINCREMENT, project_slug TEXT NOT NULL, chat_id INTEGER NOT NULL, message_thread_id INTEGER NOT NULL, topic_name TEXT NOT NULL, is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(chat_id, project_slug), UNIQUE(chat_id, message_thread_id) )"
+    },
+    "scheduled_jobs": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "job_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "job_name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "cron_expression",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "prompt",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "''",
+          "hidden": 0,
+          "name": "target_chat_ids",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "working_directory",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "skill_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "created_by",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 8,
+          "dflt_value": "TRUE",
+          "hidden": 0,
+          "name": "is_active",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "cid": 9,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 10,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "updated_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 11,
+          "dflt_value": "'agent'",
+          "hidden": 0,
+          "name": "delivery",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 12,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "item_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 13,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "timezone",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 14,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "ends_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_scheduled_jobs_active": [
+          {
+            "cid": 8,
+            "name": "is_active",
+            "seqno": 0
+          }
+        ],
+        "idx_scheduled_jobs_item": [
+          {
+            "cid": 12,
+            "name": "item_id",
+            "seqno": 0
+          }
+        ],
+        "sqlite_autoindex_scheduled_jobs_1": [
+          {
+            "cid": 0,
+            "name": "job_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_scheduled_jobs_item",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_scheduled_jobs_active",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        },
+        {
+          "name": "sqlite_autoindex_scheduled_jobs_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 2,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE scheduled_jobs ( job_id TEXT PRIMARY KEY, job_name TEXT NOT NULL, cron_expression TEXT NOT NULL, prompt TEXT NOT NULL, target_chat_ids TEXT DEFAULT '', working_directory TEXT NOT NULL, skill_name TEXT, created_by INTEGER DEFAULT 0, is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP , delivery TEXT NOT NULL DEFAULT 'agent', item_id INTEGER, timezone TEXT, ends_at TEXT)"
+    },
+    "schema_version": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "version",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE schema_version ( version INTEGER PRIMARY KEY )"
+    },
+    "sent_messages": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "telegram_chat_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "telegram_message_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "kind",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "messages_message_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "profile_slug",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_sent_messages_tg": [
+          {
+            "cid": 1,
+            "name": "telegram_chat_id",
+            "seqno": 0
+          },
+          {
+            "cid": 2,
+            "name": "telegram_message_id",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_sent_messages_tg",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE sent_messages ( id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_chat_id INTEGER NOT NULL, telegram_message_id INTEGER NOT NULL, kind TEXT NOT NULL, -- 'turn_reply'|'system_notify' messages_message_id INTEGER, -- messages.message_id or NULL profile_slug TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP )"
+    },
+    "session_tracking": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "input_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "output_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "cumulative_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "0.0",
+          "hidden": 0,
+          "name": "cost",
+          "notnull": 0,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "timestamp",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "user_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "users",
+          "to": "user_id"
+        },
+        {
+          "from": "session_id",
+          "id": 1,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "sessions",
+          "to": "session_id"
+        }
+      ],
+      "index_columns": {
+        "idx_session_tracking_session": [
+          {
+            "cid": 1,
+            "name": "session_id",
+            "seqno": 0
+          }
+        ],
+        "idx_session_tracking_timestamp": [
+          {
+            "cid": 7,
+            "name": "timestamp",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_session_tracking_timestamp",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_session_tracking_session",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE session_tracking ( id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, user_id INTEGER NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cumulative_tokens INTEGER NOT NULL DEFAULT 0, cost REAL DEFAULT 0.0, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (session_id) REFERENCES sessions(session_id), FOREIGN KEY (user_id) REFERENCES users(user_id) )"
+    },
+    "sessions": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "project_path",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "last_used",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "0.0",
+          "hidden": 0,
+          "name": "total_cost",
+          "notnull": 0,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "total_turns",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "message_count",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 8,
+          "dflt_value": "TRUE",
+          "hidden": 0,
+          "name": "is_active",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "deactivated_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 10,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "deactivated_reason",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 11,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "backend",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 12,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "thread_head",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 13,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "thread_total_input",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 14,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "thread_total_output",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 15,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "cumulative_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "user_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "users",
+          "to": "user_id"
+        }
+      ],
+      "index_columns": {
+        "idx_sessions_project_path": [
+          {
+            "cid": 2,
+            "name": "project_path",
+            "seqno": 0
+          }
+        ],
+        "idx_sessions_user_id": [
+          {
+            "cid": 1,
+            "name": "user_id",
+            "seqno": 0
+          }
+        ],
+        "idx_sessions_user_project": [
+          {
+            "cid": 1,
+            "name": "user_id",
+            "seqno": 0
+          },
+          {
+            "cid": 2,
+            "name": "project_path",
+            "seqno": 1
+          }
+        ],
+        "sqlite_autoindex_sessions_1": [
+          {
+            "cid": 0,
+            "name": "session_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_sessions_user_project",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_sessions_project_path",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        },
+        {
+          "name": "idx_sessions_user_id",
+          "origin": "c",
+          "partial": 0,
+          "seq": 2,
+          "unique": 0
+        },
+        {
+          "name": "sqlite_autoindex_sessions_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 3,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE sessions ( session_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, project_path TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP, total_cost REAL DEFAULT 0.0, total_turns INTEGER DEFAULT 0, message_count INTEGER DEFAULT 0, is_active BOOLEAN DEFAULT TRUE, deactivated_at TIMESTAMP, deactivated_reason TEXT, backend TEXT, thread_head INTEGER NOT NULL DEFAULT 0, thread_total_input INTEGER NOT NULL DEFAULT 0, thread_total_output INTEGER NOT NULL DEFAULT 0, cumulative_tokens INTEGER NOT NULL DEFAULT 0, FOREIGN KEY (user_id) REFERENCES users(user_id) )"
+    },
+    "tool_usage": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "message_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "tool_name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "tool_input",
+          "notnull": 0,
+          "pk": 0,
+          "type": "JSON"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "timestamp",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "TRUE",
+          "hidden": 0,
+          "name": "success",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "error_message",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "message_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "messages",
+          "to": "message_id"
+        },
+        {
+          "from": "session_id",
+          "id": 1,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "sessions",
+          "to": "session_id"
+        }
+      ],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE tool_usage ( id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, message_id INTEGER, tool_name TEXT NOT NULL, tool_input JSON, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, success BOOLEAN DEFAULT TRUE, error_message TEXT, FOREIGN KEY (session_id) REFERENCES sessions(session_id), FOREIGN KEY (message_id) REFERENCES messages(message_id) )"
+    },
+    "user_holds": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "held_until",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "reason",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "set_by",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "set_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE user_holds ( user_id INTEGER PRIMARY KEY, held_until TIMESTAMP NOT NULL, reason TEXT, set_by INTEGER, set_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP )"
+    },
+    "user_preferences": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "active_profile",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "agent_backend",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "agent_model",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "updated_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "pinned_switch_message_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE user_preferences ( user_id INTEGER PRIMARY KEY, active_profile TEXT, agent_backend TEXT, agent_model TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP , pinned_switch_message_id INTEGER)"
+    },
+    "user_tokens": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "token_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "token_hash",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "expires_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "last_used",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "TRUE",
+          "hidden": 0,
+          "name": "is_active",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BOOLEAN"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "user_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "users",
+          "to": "user_id"
+        }
+      ],
+      "index_columns": {
+        "sqlite_autoindex_user_tokens_1": [
+          {
+            "cid": 2,
+            "name": "token_hash",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_user_tokens_1",
+          "origin": "u",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE user_tokens ( token_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMP, last_used TIMESTAMP, is_active BOOLEAN DEFAULT TRUE, FOREIGN KEY (user_id) REFERENCES users(user_id) )"
+    },
+    "users": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "telegram_username",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "first_seen",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 3,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "last_active",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "FALSE",
+          "hidden": 0,
+          "name": "is_allowed",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "0.0",
+          "hidden": 0,
+          "name": "total_cost",
+          "notnull": 0,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "message_count",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "session_count",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE users ( user_id INTEGER PRIMARY KEY, telegram_username TEXT, first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP, is_allowed BOOLEAN DEFAULT FALSE, total_cost REAL DEFAULT 0.0, message_count INTEGER DEFAULT 0, session_count INTEGER DEFAULT 0 )"
+    },
+    "webhook_events": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "event_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "provider",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "event_type",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "delivery_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "payload",
+          "notnull": 0,
+          "pk": 0,
+          "type": "JSON"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "FALSE",
+          "hidden": 0,
+          "name": "processed",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BOOLEAN"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "received_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_webhook_events_delivery": [
+          {
+            "cid": 4,
+            "name": "delivery_id",
+            "seqno": 0
+          }
+        ],
+        "idx_webhook_events_provider": [
+          {
+            "cid": 2,
+            "name": "provider",
+            "seqno": 0
+          },
+          {
+            "cid": 7,
+            "name": "received_at",
+            "seqno": 1
+          }
+        ],
+        "sqlite_autoindex_webhook_events_1": [
+          {
+            "cid": 4,
+            "name": "delivery_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_webhook_events_provider",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_webhook_events_delivery",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        },
+        {
+          "name": "sqlite_autoindex_webhook_events_1",
+          "origin": "u",
+          "partial": 0,
+          "seq": 2,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE webhook_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL, provider TEXT NOT NULL, event_type TEXT NOT NULL, delivery_id TEXT UNIQUE, payload JSON, processed BOOLEAN DEFAULT FALSE, received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP )"
+    },
+    "window_bundles": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "working_dir",
+          "notnull": 1,
+          "pk": 2,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "window_id",
+          "notnull": 1,
+          "pk": 3,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "agent_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "bundle_text",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "bundle_sha256",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "persona_chars",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "facts_count",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "pointers_count",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "family_count",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 10,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "total_chars",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 11,
+          "dflt_value": "CURRENT_TIMESTAMP",
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_window_bundles_1": [
+          {
+            "cid": 0,
+            "name": "user_id",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "working_dir",
+            "seqno": 1
+          },
+          {
+            "cid": 2,
+            "name": "window_id",
+            "seqno": 2
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_window_bundles_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE window_bundles ( user_id INTEGER NOT NULL, working_dir TEXT NOT NULL, window_id INTEGER NOT NULL, agent_id TEXT NOT NULL, bundle_text TEXT NOT NULL, bundle_sha256 TEXT NOT NULL, persona_chars INTEGER NOT NULL, facts_count INTEGER NOT NULL, pointers_count INTEGER NOT NULL, family_count INTEGER NOT NULL, total_chars INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, working_dir, window_id) )"
+    }
+  },
+  "triggers": {
+    "memory_facts_ad": {
+      "sql": "CREATE TRIGGER memory_facts_ad AFTER DELETE ON memory_facts BEGIN INSERT INTO memory_facts_fts(memory_facts_fts, rowid, content) VALUES ('delete', old.id, old.content); END",
+      "tbl_name": "memory_facts"
+    },
+    "memory_facts_ai": {
+      "sql": "CREATE TRIGGER memory_facts_ai AFTER INSERT ON memory_facts BEGIN INSERT INTO memory_facts_fts(rowid, content) VALUES (new.id, new.content); END",
+      "tbl_name": "memory_facts"
+    },
+    "memory_facts_au": {
+      "sql": "CREATE TRIGGER memory_facts_au AFTER UPDATE ON memory_facts BEGIN INSERT INTO memory_facts_fts(memory_facts_fts, rowid, content) VALUES ('delete', old.id, old.content); INSERT INTO memory_facts_fts(rowid, content) VALUES (new.id, new.content); END",
+      "tbl_name": "memory_facts"
+    },
+    "messages_fts_ad": {
+      "sql": "CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, prompt, response) VALUES ('delete', old.message_id, old.prompt, COALESCE(old.response, '')); END",
+      "tbl_name": "messages"
+    },
+    "messages_fts_ai": {
+      "sql": "CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, prompt, response) VALUES (new.message_id, new.prompt, COALESCE(new.response, '')); END",
+      "tbl_name": "messages"
+    },
+    "messages_fts_au": {
+      "sql": "CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, prompt, response) VALUES ('delete', old.message_id, old.prompt, COALESCE(old.response, '')); INSERT INTO messages_fts(rowid, prompt, response) VALUES (new.message_id, new.prompt, COALESCE(new.response, '')); END",
+      "tbl_name": "messages"
+    }
+  },
+  "views": {
+    "daily_stats": {
+      "sql": "CREATE VIEW daily_stats AS SELECT date(timestamp) as date, COUNT(DISTINCT user_id) as active_users, COUNT(*) as total_messages, SUM(cost) as total_cost, AVG(duration_ms) as avg_duration FROM messages GROUP BY date(timestamp)"
+    },
+    "user_stats": {
+      "sql": "CREATE VIEW user_stats AS SELECT u.user_id, u.telegram_username, COUNT(DISTINCT s.session_id) as total_sessions, COUNT(m.message_id) as total_messages, SUM(m.cost) as total_cost, MAX(m.timestamp) as last_activity FROM users u LEFT JOIN sessions s ON u.user_id = s.user_id LEFT JOIN messages m ON u.user_id = m.user_id GROUP BY u.user_id"
+    }
+  }
+}

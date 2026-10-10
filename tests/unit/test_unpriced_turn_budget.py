@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.agent_backends.codex_cli import CodexCliIntegration, CodexSessionStore
+from src.agent_backends.codex_cli import CodexCliIntegration, InMemoryCodexSessionStore
 from src.bot.orchestrator import MessageOrchestrator
 from src.claude.sdk_integration import ClaudeResponse
 from src.config.settings import Settings
@@ -39,7 +39,7 @@ async def test_codex_turn_reports_no_price_not_zero(tmp_path):
     integ = CodexCliIntegration(
         config=_settings(),
         codex_bin=str(_fake_codex(tmp_path)),
-        session_store=CodexSessionStore(tmp_path / "s.json"),
+        session_store=InMemoryCodexSessionStore(),
     )
     resp = await integ.run_command(
         prompt="hello",

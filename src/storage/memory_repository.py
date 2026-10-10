@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import structlog
 
@@ -260,6 +260,56 @@ class MemoryRepository:
             )
             row = await cur.fetchone()
             return MemoryFact(*row) if row else None
+
+    async def active_scopes(self) -> List[str]:
+        """Every agent_id with at least one still-active fact (invalid_at IS
+        NULL), ordered. Used by the consolidation report to decide which
+        scopes to run over."""
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(
+                "SELECT DISTINCT agent_id FROM memory_facts "
+                "WHERE invalid_at IS NULL ORDER BY agent_id"
+            )
+            return [row[0] for row in await cur.fetchall()]
+
+    async def expiry_candidates(
+        self, agent_id: str, cutoff: datetime
+    ) -> List[MemoryFact]:
+        """Facts invalidated before ``cutoff`` and not yet marked expired --
+        the consolidation report's and the daily fact-quality check's age-only
+        expiry list."""
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(
+                f"SELECT {_fact_columns()} FROM memory_facts "
+                "WHERE agent_id=? AND invalid_at IS NOT NULL AND invalid_at < ? "
+                "AND status != 'expired' ORDER BY invalid_at",
+                (agent_id, cutoff.isoformat()),
+            )
+            return [MemoryFact(*row) for row in await cur.fetchall()]
+
+    async def new_facts_since(
+        self, created_after_bound: str, agent_id: Optional[str] = None
+    ) -> List[MemoryFact]:
+        """Active facts created after ``created_after_bound``, optionally
+        scoped to one agent_id -- the daily fact-quality check's input batch.
+
+        ``created_after_bound`` must already be formatted to match
+        ``created_at`` (CURRENT_TIMESTAMP: space-separated, naive UTC, no
+        'T') -- the caller owns that conversion (see
+        ``src/evaluator/fact_quality.py`` for why: same-day rows compare
+        wrong if the separator doesn't match)."""
+        sql = (
+            f"SELECT {_fact_columns()} FROM memory_facts "
+            "WHERE created_at > ? AND status='active'"
+        )
+        params: List[Any] = [created_after_bound]
+        if agent_id is not None:
+            sql += " AND agent_id=?"
+            params.append(agent_id)
+        sql += " ORDER BY agent_id, id"
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(sql, tuple(params))
+            return [MemoryFact(*row) for row in await cur.fetchall()]
 
     async def get_fact_history(self, fact_id: int, agent_id: str) -> List[MemoryFact]:
         """The full supersede chain containing ``fact_id``, oldest first.

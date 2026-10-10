@@ -192,6 +192,190 @@ class TestScheduleAdd:
         assert scheduler.add_job.call_args.kwargs["created_by"] == 0
 
 
+class TestScheduleAddTimezone:
+    """dv-ca94: a naive 'at' (no UTC offset) is the USER's local time, not
+    UTC -- "today at 17:00" for a Lisbon user must fire at 16:00Z in
+    September (DST) and 17:00Z in January (standard time)."""
+
+    @pytest.fixture
+    def lisbon_services(
+        self, event_bus: FakeEventBus, scheduler: AsyncMock
+    ) -> AgentServices:
+        return AgentServices(
+            event_bus=event_bus,
+            task_repo=AsyncMock(),
+            scheduler=scheduler,
+            user_timezone="Europe/Lisbon",
+        )
+
+    async def test_naive_at_interpreted_in_dst_offset(
+        self,
+        lisbon_services: AgentServices,
+        captured_tools: Dict[str, Any],
+        scheduler: AsyncMock,
+    ) -> None:
+        tools = _build(lisbon_services, captured_tools, requester_chat_id=1)
+
+        result = await tools["schedule_add"].handler(
+            {"name": "remind", "prompt": "ping", "at": "2027-09-27T17:00:00"}
+        )
+
+        run_at = scheduler.add_job.call_args.kwargs["run_at"]
+        assert run_at == datetime(2027, 9, 27, 16, 0, tzinfo=UTC)
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["at_utc"] == "2027-09-27T16:00:00+00:00"
+        assert "17:00:00+01:00" in payload["at_local"]
+
+    async def test_naive_at_interpreted_in_standard_offset(
+        self,
+        lisbon_services: AgentServices,
+        captured_tools: Dict[str, Any],
+        scheduler: AsyncMock,
+    ) -> None:
+        """Same wall-clock hour, no DST: Lisbon is UTC+0 in January."""
+        tools = _build(lisbon_services, captured_tools, requester_chat_id=1)
+
+        await tools["schedule_add"].handler(
+            {"name": "remind", "prompt": "ping", "at": "2027-01-15T17:00:00"}
+        )
+
+        run_at = scheduler.add_job.call_args.kwargs["run_at"]
+        assert run_at == datetime(2027, 1, 15, 17, 0, tzinfo=UTC)
+
+    async def test_explicit_offset_is_left_alone(
+        self,
+        lisbon_services: AgentServices,
+        captured_tools: Dict[str, Any],
+        scheduler: AsyncMock,
+    ) -> None:
+        """A model that deliberately means UTC (or another zone) is trusted
+        -- only a BARE time defaults to the local zone."""
+        tools = _build(lisbon_services, captured_tools, requester_chat_id=1)
+
+        await tools["schedule_add"].handler(
+            {"name": "remind", "prompt": "ping", "at": "2027-09-27T17:00:00+00:00"}
+        )
+
+        run_at = scheduler.add_job.call_args.kwargs["run_at"]
+        assert run_at == datetime(2027, 9, 27, 17, 0, tzinfo=UTC)
+
+    async def test_bad_configured_timezone_falls_back_to_utc(
+        self,
+        event_bus: FakeEventBus,
+        scheduler: AsyncMock,
+        captured_tools: Dict[str, Any],
+    ) -> None:
+        services = AgentServices(
+            event_bus=event_bus,
+            task_repo=AsyncMock(),
+            scheduler=scheduler,
+            user_timezone="Not/AZone",
+        )
+        tools = _build(services, captured_tools, requester_chat_id=1)
+
+        await tools["schedule_add"].handler(
+            {"name": "remind", "prompt": "ping", "at": "2027-09-27T17:00:00"}
+        )
+
+        run_at = scheduler.add_job.call_args.kwargs["run_at"]
+        assert run_at == datetime(2027, 9, 27, 17, 0, tzinfo=UTC)
+
+
+class TestScheduleAuthorization:
+    """dv-8c19: a user may only see/manage jobs they created or that target
+    them; legacy unattributed (created_by=0) rows stay owner-only."""
+
+    def _rows(self) -> list:
+        return [
+            {"job_id": "mine", "created_by": 111, "target_chat_ids": "111"},
+            {"job_id": "theirs", "created_by": 222, "target_chat_ids": "222"},
+            {
+                "job_id": "for-me",
+                "created_by": 222,
+                "target_chat_ids": "111,222",
+            },
+            {"job_id": "legacy", "created_by": 0, "target_chat_ids": ""},
+        ]
+
+    async def test_list_scopes_to_own_and_targeted_jobs(
+        self,
+        services: AgentServices,
+        captured_tools: Dict[str, Any],
+        scheduler: AsyncMock,
+    ) -> None:
+        scheduler.list_jobs = AsyncMock(return_value=self._rows())
+        tools = _build(services, captured_tools, requester_chat_id=111, user_id=111)
+        result = await tools["schedule_list"].handler({})
+        ids = {row["job_id"] for row in json.loads(result["content"][0]["text"])}
+        assert ids == {"mine", "for-me"}
+
+    async def test_list_owner_role_sees_legacy_rows_not_others_jobs(
+        self,
+        services: AgentServices,
+        captured_tools: Dict[str, Any],
+        scheduler: AsyncMock,
+    ) -> None:
+        scheduler.list_jobs = AsyncMock(return_value=self._rows())
+        build_agent_mcp_server(
+            services,
+            "general",
+            Path("/tmp/ws"),
+            requester_chat_id=111,
+            user_id=111,
+            role="owner",
+        )
+        result = await captured_tools["schedule_list"].handler({})
+        ids = {row["job_id"] for row in json.loads(result["content"][0]["text"])}
+        assert ids == {"mine", "for-me", "legacy"}
+        assert "theirs" not in ids
+
+    async def test_remove_refuses_another_users_job(
+        self,
+        services: AgentServices,
+        captured_tools: Dict[str, Any],
+        scheduler: AsyncMock,
+    ) -> None:
+        scheduler.list_jobs = AsyncMock(return_value=self._rows())
+        scheduler.remove_job = AsyncMock(return_value=True)
+        tools = _build(services, captured_tools, requester_chat_id=111, user_id=111)
+
+        result = await tools["schedule_remove"].handler({"job_id": "theirs"})
+
+        assert result.get("isError") is True
+        assert "belongs to another user" in result["content"][0]["text"]
+        scheduler.remove_job.assert_not_called()
+
+    async def test_remove_allows_job_targeting_the_caller(
+        self,
+        services: AgentServices,
+        captured_tools: Dict[str, Any],
+        scheduler: AsyncMock,
+    ) -> None:
+        scheduler.list_jobs = AsyncMock(return_value=self._rows())
+        scheduler.remove_job = AsyncMock(return_value=True)
+        tools = _build(services, captured_tools, requester_chat_id=111, user_id=111)
+
+        result = await tools["schedule_remove"].handler({"job_id": "for-me"})
+
+        assert "removed" in result["content"][0]["text"]
+        scheduler.remove_job.assert_called_once_with("for-me")
+
+    async def test_remove_allows_own_job(
+        self,
+        services: AgentServices,
+        captured_tools: Dict[str, Any],
+        scheduler: AsyncMock,
+    ) -> None:
+        scheduler.list_jobs = AsyncMock(return_value=self._rows())
+        scheduler.remove_job = AsyncMock(return_value=True)
+        tools = _build(services, captured_tools, requester_chat_id=111, user_id=111)
+
+        result = await tools["schedule_remove"].handler({"job_id": "mine"})
+
+        assert "removed" in result["content"][0]["text"]
+        scheduler.remove_job.assert_called_once_with("mine")
+
+
 class TestGetWeather:
     async def test_get_weather_returns_data(
         self,

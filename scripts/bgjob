@@ -139,6 +139,24 @@ def job_progress(unit: str) -> str:
         return ""
 
 
+def job_elapsed(jid: str) -> str:
+    """Wall-clock age of a job, derived from its timestamped id.
+
+    The id prefix is the only start timestamp that exists for every job
+    regardless of how it was launched, so no meta.json change is needed.
+    """
+    try:
+        started = datetime.strptime(jid[:15], "%Y%m%d-%H%M%S").replace(tzinfo=UTC)
+    except (ValueError, IndexError):
+        return ""
+    secs = int((datetime.now(UTC) - started).total_seconds())
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
 def live_jobs() -> list:
     out = []
     for jid in all_jobs():
@@ -146,6 +164,32 @@ def live_jobs() -> list:
         if meta.get("unit") and unit_active(meta["unit"]):
             out.append(jid)
     return out
+
+
+def _venv_python() -> str:
+    """The bot's poetry venv python, resolved here (outside the sandbox) so the
+    job does not have to find poetry itself."""
+    try:
+        import claude_agent_sdk  # noqa: F401
+
+        return sys.executable
+    except ImportError:
+        pass
+    poetry = shutil.which("poetry") or str(Path.home() / ".local/bin/poetry")
+    try:
+        venv = subprocess.run(
+            [poetry, "env", "info", "-p"],
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        sys.exit(f"error: cannot locate the bot's poetry venv ({exc})")
+    python = Path(venv) / "bin" / "python"
+    if not python.exists():
+        sys.exit(f"error: venv python not found at {python}")
+    return str(python)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -199,11 +243,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     }
     (d / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    # systemd --user units get a minimal PATH without ~/.local/bin, so the
-    # wrapper must call claude by absolute path or it dies with rc=127.
-    claude_bin = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
-    if not Path(claude_bin).exists():
-        sys.exit(f"error: claude CLI not found (looked at {claude_bin})")
+    # The turn runs through the model router (scripts/agentjob, dv-ef90): same
+    # tool-call policy as chat, asks go to the owner over the bot, and the call
+    # is recorded. systemd --user units get a minimal PATH, so the wrapper
+    # names the script and its python by absolute path.
+    agentjob = REPO / "scripts" / "agentjob"
+    python_bin = _venv_python()
 
     # Filesystem confinement is enforced by bubblewrap, NOT by systemd.
     # systemd --user accepts ProtectSystem=strict / ReadWritePaths / ProtectHome
@@ -246,7 +291,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         # above already names the full output path for the truncated case.
         f"out_bytes=$(wc -c < {str(output)!r} 2>/dev/null || echo 0)\n"
         f'if [ "$out_bytes" -gt 0 ]; then\n'
-        f"  body=$(tail -c 1500 {str(output)!r})\n"
+        # `tail -c` is a byte cut and can start mid-character; iconv -c drops
+        # the partial bytes so the notifier never sees invalid UTF-8 (dv-c9d1).
+        f"  body=$(tail -c 1500 {str(output)!r} | iconv -f utf-8 -t utf-8 -c)\n"
         f'  if [ "$out_bytes" -gt 1500 ]; then body="…$body"; fi\n'
         f'  msg="$msg\n'
         f"\n"
@@ -300,16 +347,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         # user cannot tell which request it belongs to.
         "t0=$(date +%s)\n"
         "started_h=$(date -u '+%H:%M UTC')\n"
-        # Any nested Task-tool subagents the job spawns stay on sonnet even if
-        # the job itself was started with a bigger --model.
-        "export CLAUDE_CODE_SUBAGENT_MODEL=sonnet\n"
         f"cd {cwd!r} || exit 1\n"
-        f"{bwrap_prefix} {claude_bin!r} "
-        f'-p "$(cat {str(d / "prompt.txt")!r})" '
-        f"--model {shlex.quote(args.model)} "
-        f"--permission-mode bypassPermissions "
-        f"--output-format text "
-        f">> {str(output)!r} 2>&1\n"
+        f"{bwrap_prefix} {shlex.quote(python_bin)} {str(agentjob)!r} "
+        f"--profile {shlex.quote(args.profile)} --cwd {cwd!r} "
+        f"--prompt-file {str(d / 'prompt.txt')!r} "
+        f"--model {shlex.quote(args.model)} --name {shlex.quote(args.name)} "
+        # stdout is the answer; the runner's log lines go to their own file.
+        f">> {str(output)!r} 2>> {str(d / 'stderr.log')!r}\n"
         "rc=$?\n"
         f'echo "$rc" > {str(d / "exit_code")!r}\n' + notify_tail,
         encoding="utf-8",
@@ -353,6 +397,17 @@ def cmd_run(args: argparse.Namespace) -> int:
             [str(AGENTCTL), "notify", render_jobs_status(), "--pin-as", "jobs"],
             capture_output=True,
             text=True,
+        )
+        # Keep the pin live rather than frozen at launch. Detached and
+        # single-instance (flock in cmd_pin): a second job start finds the
+        # lock held and returns immediately. It exits on its own once nothing
+        # is running, so nothing has to clean it up.
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "pin", "--watch"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
         )
 
     print(f"started {job_id}  (unit {unit})")
@@ -429,30 +484,65 @@ def render_jobs_status(exclude: str | None = None) -> str:
         meta = read_meta(jid)
         unit = meta.get("unit", "")
         if unit and unit_active(unit):
-            prog = job_progress(unit)
-            tail = f" ({prog})" if prog else ""
+            bits = [b for b in (job_elapsed(jid), job_progress(unit)) if b]
+            tail = f" ({' · '.join(bits)})" if bits else ""
             prof = meta.get("profile", "?")
             lines.append(f"• {prof} · {meta.get('name', jid)}{tail}")
     if not lines:
         return ""
-    return f"⏳ Background jobs running ({len(lines)})\n" + "\n".join(lines)
+    stamp = datetime.now(UTC).strftime("%H:%M UTC")
+    return (
+        f"⏳ Background jobs running ({len(lines)})\n"
+        + "\n".join(lines)
+        + f"\nupdated {stamp}"
+    )
 
 
-def cmd_pin(args: argparse.Namespace) -> int:
-    """Push the current status into the pinned post (empty retires it)."""
+def _push_pin(text: str) -> int:
     r = subprocess.run(
-        [
-            str(AGENTCTL),
-            "notify",
-            render_jobs_status(exclude=args.exclude),
-            "--pin-as",
-            "jobs",
-        ],
+        [str(AGENTCTL), "notify", text, "--pin-as", "jobs"],
         capture_output=True,
         text=True,
     )
-    print(r.stdout.strip() or r.stderr.strip())
-    return 0 if r.returncode == 0 else 1
+    return r.returncode
+
+
+def cmd_pin(args: argparse.Namespace) -> int:
+    """Push the current status into the pinned post (empty retires it).
+
+    With --watch, keep re-pushing while anything is running, so the pin shows
+    a live elapsed/CPU figure instead of a snapshot frozen at launch. The
+    notification service edits the existing message in place (keyed by
+    (chat_id, pin_as)), so a refresh costs one editMessageText and never a new
+    post. Single-instance: two jobs starting back to back must not spawn two
+    watchers both editing the same message.
+    """
+    if not getattr(args, "watch", False):
+        rc = _push_pin(render_jobs_status(exclude=args.exclude))
+        return 0 if rc == 0 else 1
+
+    import fcntl
+    import time
+
+    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    lock = open(JOBS_ROOT / ".pinwatch.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0  # another watcher owns the pin
+
+    last = None
+    # Bounded so a wedged watcher can never edit the pin forever.
+    deadline = time.monotonic() + args.max_hours * 3600
+    while time.monotonic() < deadline:
+        text = render_jobs_status()
+        if text != last:
+            _push_pin(text)
+            last = text
+        if not text:
+            return 0  # nothing running: pin retired, we are done
+        time.sleep(args.interval)
+    return 0
 
 
 def cmd_flush(_args: argparse.Namespace) -> int:
@@ -554,6 +644,15 @@ def main() -> int:
         default=None,
         help="treat this job as not-running (used by a finishing job whose "
         "unit is still active while it refreshes the pin)",
+    )
+    p.add_argument(
+        "--watch",
+        action="store_true",
+        help="keep refreshing the pin while jobs run, then exit when none are",
+    )
+    p.add_argument("--interval", type=int, default=90, help="--watch period, seconds")
+    p.add_argument(
+        "--max-hours", type=float, default=12.0, help="--watch safety deadline"
     )
     p.set_defaults(fn=cmd_pin)
 

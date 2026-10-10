@@ -55,9 +55,10 @@ HEADER = """\
 #
 # and restart the bot afterwards -- PROFILES_CONFIG_PATH is read once, at boot.
 #
-# Paths use ${DEVVY_ROOT}, which defaults to this file's parent directory's
-# parent (the checkout root), so nothing here is tied to one machine. Full
-# reference for every key: config/profiles.example.yaml.
+# Paths use ${DEVVY_WORKSPACES} (<DEVVY_DATA_ROOT>/workspaces, or the legacy
+# ${DEVVY_ROOT}/workspaces when no data root is set) and ${DEVVY_ROOT} (the
+# checkout root), so nothing here is tied to one machine. Full reference for
+# every key: config/profiles.example.yaml.
 #
 # Editing by hand is fine. Keep one rule: a profile that allows the `guest`
 # role must not set `sandbox: false` -- the registry refuses that combination
@@ -150,6 +151,14 @@ def assert_installable(fragment: str, slug: str) -> None:
             f"profile {slug!r} would allow guests with sandbox: false -- full"
             " bash network and cross-filesystem access for a guest. The"
             " registry refuses this at boot; refusing to write it now."
+        )
+    if guest_allowed and re.search(
+        r"^\s*unrestricted:\s*true\b", fragment, re.MULTILINE
+    ):
+        raise TemplateError(
+            f"profile {slug!r} would allow guests AND be unrestricted -- the"
+            " server-admin flag. The registry refuses this at boot; refusing"
+            " to write it now."
         )
     # Same shape for extra_dirs (dv-3103): extra write roots are an owner-only
     # grant, and the registry refuses them on a guest-allowed profile.

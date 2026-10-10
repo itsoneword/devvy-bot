@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional
 
 import structlog
 
@@ -25,10 +27,19 @@ from src.claude.sdk_integration import ClaudeResponse, StreamUpdate
 from src.claude.turn_setup import (
     compose_persona,
     composer_for,
+    current_time_context,
     image_roots_env,
+    prepend_items_context,
     resolve_turn_context,
 )
 from src.config.settings import Settings
+from src.storage.codex_sessions import CodexSessionStore, InMemoryCodexSessionStore
+from src.storage.repositories import MessageRepository
+from src.utils.agent_env import agent_child_env, is_env_name, split_mcp_env
+
+from .codex_execpolicy import ensure_rules as ensure_money_guard_rules
+from .codex_sandbox import sandbox_args
+from .codex_usage import CodexUsageClient
 
 if TYPE_CHECKING:
     from src.agent_backends.protocol import BackendSession
@@ -42,6 +53,11 @@ logger = structlog.get_logger()
 # Per-stream buffer for the codex subprocess. Well above any single line the
 # CLI is known to emit (~250KB worst case observed) so readline() on stdout
 # cannot raise, while still bounding memory if the CLI ever goes haywire.
+# The PreToolUse hook Codex runs before every tool call (dv-1601).
+_POLICY_HOOK_SCRIPT = (
+    Path(__file__).resolve().parent.parent / "agent_bridge" / "codex_policy_hook.py"
+)
+
 STREAM_LIMIT = 8 * 1024 * 1024
 
 # What `codex exec resume <id>` says when the thread is gone. Verified on
@@ -106,6 +122,32 @@ class CodexEventOutcome:
     thread_id: Optional[str] = None
     usage: Optional[Dict[str, Any]] = None
     final_message: Optional[str] = None
+    # Codex item id of a started/completed tool item, to pair the two.
+    item_id: Optional[str] = None
+    # Set on item.completed when that tool item failed (dv-c7d1).
+    tool_error: Optional[str] = None
+
+
+def _tool_item_error(item: Dict[str, Any]) -> Optional[str]:
+    """Error text for a failed MCP / shell item, or None if it succeeded."""
+    itype = item.get("type")
+    status = item.get("status")
+    if itype == "mcp_tool_call":
+        err = item.get("error")
+        if isinstance(err, dict):
+            err = err.get("message")
+        if err or status == "failed":
+            return str(err or "MCP tool call failed")
+        return None
+    if itype == "command_execution":
+        code = item.get("exit_code")
+        if status == "declined":
+            return "command declined"
+        if (isinstance(code, int) and code != 0) or status == "failed":
+            tail = str(item.get("aggregated_output") or "").strip()[-200:]
+            msg = f"exit code {code}" if code is not None else "command failed"
+            return f"{msg}: {tail}" if tail else msg
+    return None
 
 
 def map_codex_event(event: Dict[str, Any]) -> CodexEventOutcome:
@@ -121,147 +163,120 @@ def map_codex_event(event: Dict[str, Any]) -> CodexEventOutcome:
     if etype == "turn.completed":
         return CodexEventOutcome(usage=event.get("usage") or {})
     if etype == "item.started":
-        item = event.get("item") or {}
-        itype = item.get("type")
-        if itype == "command_execution":
-            cmd = str(item.get("command", ""))
-            return CodexEventOutcome(
-                stream_update=StreamUpdate(
-                    type="system",
-                    tool_calls=[{"name": "Bash", "input": {"command": cmd}}],
-                )
-            )
-        if itype == "file_change":
-            changes = item.get("changes") or [{}]
-            path = str(changes[0].get("path", ""))
-            return CodexEventOutcome(
-                stream_update=StreamUpdate(
-                    type="system",
-                    tool_calls=[{"name": "Edit", "input": {"file_path": path}}],
-                )
-            )
-        if itype == "mcp_tool_call":
-            name = str(item.get("tool") or item.get("name") or "mcp_tool")
-            args = item.get("arguments") or {}
-            # Codex has sent arguments as a JSON *string* as well as an
-            # object. The stream callback that intercepts send_image_to_user
-            # does `input.get("file_path")` on this, so a string would raise
-            # inside the callback and take the whole turn's progress with it.
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except ValueError:
-                    args = {"raw": args}
-            if not isinstance(args, dict):
-                args = {"raw": args}
-            return CodexEventOutcome(
-                stream_update=StreamUpdate(
-                    type="system",
-                    tool_calls=[{"name": name, "input": args}],
-                )
-            )
-        return CodexEventOutcome()
+        outcome = _map_started_item(event.get("item") or {})
+        outcome.item_id = (event.get("item") or {}).get("id")
+        return outcome
     if etype == "item.completed":
         item = event.get("item") or {}
         if item.get("type") == "agent_message":
             return CodexEventOutcome(final_message=item.get("text"))
-        return CodexEventOutcome()
+        return CodexEventOutcome(
+            item_id=item.get("id"), tool_error=_tool_item_error(item)
+        )
     return CodexEventOutcome()
 
 
-class CodexSessionStore:
-    """Persist Codex thread ids per (user, working_dir) as JSON.
+def _map_started_item(item: Dict[str, Any]) -> CodexEventOutcome:
+    """Progress entry for a tool item that just started."""
+    itype = item.get("type")
+    if itype == "command_execution":
+        cmd = str(item.get("command", ""))
+        return CodexEventOutcome(
+            stream_update=StreamUpdate(
+                type="system",
+                tool_calls=[{"name": "Bash", "input": {"command": cmd}}],
+            )
+        )
+    if itype == "file_change":
+        changes = item.get("changes") or [{}]
+        path = str(changes[0].get("path", ""))
+        return CodexEventOutcome(
+            stream_update=StreamUpdate(
+                type="system",
+                tool_calls=[{"name": "Edit", "input": {"file_path": path}}],
+            )
+        )
+    if itype == "mcp_tool_call":
+        name = str(item.get("tool") or item.get("name") or "mcp_tool")
+        args = item.get("arguments") or {}
+        # Codex has sent arguments as a JSON *string* as well as an
+        # object. The stream callback that intercepts send_image_to_user
+        # does `input.get("file_path")` on this, so a string would raise
+        # inside the callback and take the whole turn's progress with it.
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = {"raw": args}
+        if not isinstance(args, dict):
+            args = {"raw": args}
+        return CodexEventOutcome(
+            stream_update=StreamUpdate(
+                type="system",
+                tool_calls=[{"name": name, "input": args}],
+            )
+        )
+    if itype in {"collabAgentToolCall", "collab_agent_tool_call"}:
+        # App Server calls this a CollabAgentToolCallThreadItem.  The
+        # exec JSONL adapter has used both camelCase and snake_case item
+        # names across releases, so accept both.  Keep the persisted
+        # input deliberately small: the child prompt is already part of
+        # the rollout and copying it into tool_usage would recreate the
+        # context-amplification problem this telemetry is meant to expose.
+        details = {
+            "tool": item.get("tool"),
+            "status": item.get("status"),
+            "model": item.get("model"),
+            "receiver_thread_ids": item.get("receiverThreadIds")
+            or item.get("receiver_thread_ids")
+            or [],
+        }
+        return CodexEventOutcome(
+            stream_update=StreamUpdate(
+                type="system",
+                tool_calls=[{"name": "Subagent", "input": details}],
+            )
+        )
+    if itype in {"contextCompaction", "context_compaction"}:
+        return CodexEventOutcome(
+            stream_update=StreamUpdate(
+                type="system",
+                tool_calls=[
+                    {
+                        "name": "ContextCompaction",
+                        "input": {"item_id": item.get("id")},
+                    }
+                ],
+            )
+        )
+    return CodexEventOutcome()
 
-    Mirrors the Claude session-manager's resume-by-directory behaviour so Codex
-    turns continue a conversation and `/sessions` can report them. Datetimes are
-    timezone-aware UTC ISO strings.
+
+_MCP_SERVER_KEY = re.compile(r"^mcp_servers\.([A-Za-z0-9_]+)\.")
+
+
+def _with_mcp_auto_approval(overrides: List[str]) -> List[str]:
+    """Append ``default_tools_approval_mode="approve"`` for every MCP server
+    that ``overrides`` registers (dv-c7d1).
+
+    Under the confined permission profile (dv-e38e) codex-cli 0.157 asks for
+    approval before each MCP tool call, and ``codex exec`` runs with approval
+    policy ``never``, so every call failed with "MCP tool call requires
+    approval, but approval policy is never". Only the bot's own servers are
+    listed here (agent bridge, config/mcp.json stdio servers, the profile
+    seam); they enforce their own auth, and codex runs them outside the
+    command sandbox anyway, so pre-approving them does not widen the
+    filesystem confinement. Values: auto | prompt | writes | approve.
     """
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._data: Dict[str, Dict[str, Any]] = {}
-        self._load()
-
-    @staticmethod
-    def _key(user_id: int, working_dir: Path) -> str:
-        return f"{user_id}::{Path(working_dir)}"
-
-    def _load(self) -> None:
-        try:
-            if self.path.exists():
-                raw = json.loads(self.path.read_text())
-                if isinstance(raw, dict):
-                    self._data = raw
-        except (OSError, ValueError):
-            logger.warning("Failed to load Codex session store", path=str(self.path))
-            self._data = {}
-
-    def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(self._data, indent=2))
-        tmp.replace(self.path)
-
-    def record(
-        self,
-        user_id: int,
-        working_dir: Path,
-        thread_id: str,
-        input_tokens: int,
-        output_tokens: int,
-        thread_total_input: Optional[int] = None,
-        thread_total_output: Optional[int] = None,
-    ) -> None:
-        """Add one turn's flow (`input_tokens` + `output_tokens`, PER TURN) to
-        the (user, dir) counter and remember the thread's running totals as
-        the CLI reported them, so the next turn can take its delta."""
-        from datetime import datetime, timezone
-
-        key = self._key(user_id, working_dir)
-        entry = self._data.get(key, {"cumulative_tokens": 0})
-        entry["session_id"] = thread_id
-        entry["working_dir"] = str(Path(working_dir))
-        entry["user_id"] = user_id
-        entry["cumulative_tokens"] = (
-            int(entry.get("cumulative_tokens", 0))
-            + int(input_tokens)
-            + int(output_tokens)
-        )
-        if thread_total_input is not None:
-            entry["thread_total_input"] = int(thread_total_input)
-        if thread_total_output is not None:
-            entry["thread_total_output"] = int(thread_total_output)
-        entry["updated_at"] = datetime.now(timezone.utc).isoformat()
-        self._data[key] = entry
-        self._save()
-
-    def thread_totals(
-        self, user_id: int, working_dir: Path, thread_id: str
-    ) -> Tuple[int, int]:
-        """(input, output) running totals recorded at the end of the previous
-        turn on `thread_id`, or (0, 0) if the store knows a different thread
-        (fresh session) or none."""
-        entry = self._data.get(self._key(user_id, working_dir))
-        if not entry or entry.get("session_id") != thread_id:
-            return 0, 0
-        return (
-            int(entry.get("thread_total_input", 0) or 0),
-            int(entry.get("thread_total_output", 0) or 0),
-        )
-
-    def thread_for(self, user_id: int, working_dir: Path) -> Optional[str]:
-        entry = self._data.get(self._key(user_id, working_dir))
-        return entry.get("session_id") if entry else None
-
-    def info_for(self, user_id: int, working_dir: Path) -> Optional[Dict[str, Any]]:
-        return self._data.get(self._key(user_id, working_dir))
-
-    def clear(self, user_id: int, working_dir: Path) -> None:
-        self._data.pop(self._key(user_id, working_dir), None)
-        self._save()
-
-    def sessions_for_user(self, user_id: int) -> List[Dict[str, Any]]:
-        return [e for e in self._data.values() if e.get("user_id") == user_id]
+    names: List[str] = []
+    for arg in overrides:
+        m = _MCP_SERVER_KEY.match(arg)
+        if m and m.group(1) not in names:
+            names.append(m.group(1))
+    out = list(overrides)
+    for name in names:
+        out += ["-c", f'mcp_servers.{name}.default_tools_approval_mode="approve"']
+    return out
 
 
 def _strip_provider_prefix(model: str) -> str:
@@ -336,7 +351,7 @@ class CodexCliIntegration:
     def __init__(
         self,
         config: Settings,
-        session_store: CodexSessionStore,
+        session_store: CodexSessionStore | InMemoryCodexSessionStore,
         codex_bin: str = "codex",
         prompt_composer: Optional[PromptComposer] = None,
         profile_registry: Any = None,
@@ -348,10 +363,13 @@ class CodexCliIntegration:
         self.config = config
         self.store = session_store
         self.codex_bin = codex_bin
+        self.account_usage = CodexUsageClient(codex_bin=codex_bin)
         self.prompt_composer = prompt_composer
         self.profile_registry = profile_registry
         self.memory_retriever = memory_retriever
         self.bundle_provider = bundle_provider
+        # Optional ItemService (dv-752a): per-turn <family_reminders>.
+        self.items_service: Any = None
         # The `sessions` table is the FK parent of `messages`, `tool_usage`
         # and every downstream reader (evaluator conversation text, window
         # seeding, /sessions). Codex threads used to live ONLY in the JSON
@@ -373,6 +391,10 @@ class CodexCliIntegration:
         self.agent_bridge = bridge
         logger.info("Codex backend: agent bridge attached", url=bridge.url)
 
+    async def read_account_limits(self) -> Dict[str, Any]:
+        """Read provider limits without starting a model turn."""
+        return await self.account_usage.read()
+
     # --- AgentBackend surface (src/agent_backends/protocol.py) ---
 
     def attach_tools(self, services: Any, bridge: Any = None) -> None:
@@ -384,16 +406,16 @@ class CodexCliIntegration:
         self, user_id: int, working_directory: Path
     ) -> Optional[str]:
         """The thread ``_exec_turn`` would resume when no session id is passed."""
-        return self.store.thread_for(user_id, working_directory)
+        return await self.store.thread_for(user_id, working_directory)
 
     async def sessions_for_user(self, user_id: int) -> List["BackendSession"]:
-        """Threads in the JSON store for ``user_id`` as backend-neutral records."""
+        """Active Codex threads for ``user_id`` as backend-neutral records."""
         from datetime import datetime, timezone
 
         from .protocol import BackendSession
 
         out: List[BackendSession] = []
-        for e in self.store.sessions_for_user(user_id):
+        for e in await self.store.sessions_for_user(user_id):
             raw_ts = e.get("updated_at")
             try:
                 last_used = datetime.fromisoformat(str(raw_ts))
@@ -420,7 +442,7 @@ class CodexCliIntegration:
         lives on this object: the old ``set_user_model`` side channel was
         per-process, lost on restart, and raced across chats (dv-4207).
         """
-        return self.config.agent_model or "openai-codex/gpt-5.4-mini"
+        return self.config.agent_model or "openai-codex/gpt-5.6-sol"
 
     def _build_argv(
         self,
@@ -430,28 +452,83 @@ class CodexCliIntegration:
         out_file: Path,
         resume_id: Optional[str],
         images: Optional[List[Path]] = None,
+        user_id: Optional[int] = None,
     ) -> List[str]:
         # Exec-level options must precede the `resume` subcommand — `codex exec
         # resume` does not accept them as its own args (it rejects e.g. `-C`).
         base = [self.codex_bin, "exec"]
         base += [
+            "-c",
+            "agents.max_concurrent_threads_per_session=2",
             "--json",
             "-C",
             str(cwd),
             "-m",
             _strip_provider_prefix(model),
-            "-s",
-            "danger-full-access",
+            *self._sandbox_args(cwd, user_id),
             "--skip-git-repo-check",
             "-o",
             str(out_file),
         ]
         for img in images or []:
             base += ["-i", str(img)]
-        base += self._mcp_overrides(cwd)
+        base += _with_mcp_auto_approval(self._mcp_overrides(cwd))
+        base += self._policy_hook_args()
         if resume_id:
             base += ["resume", resume_id]
         return base
+
+    def _policy_hook_args(self) -> List[str]:
+        """Mount the PreToolUse hook that asks the bot before every tool call.
+
+        The same rules the Claude hook enforces (src/security/policy.py),
+        reached over the agent bridge (dv-1601). Verified on codex-cli
+        0.157.1: the hook fires before shell commands, apply_patch and MCP
+        calls even under ``danger-full-access``, and a deny blocks the call.
+        The hook is passed per turn, so it needs the trust bypass; nothing
+        under ``~/.codex`` is touched. The timeout leaves room for the
+        owner's 120 s confirmation window.
+        """
+        if not getattr(self.agent_bridge, "policy_url", None):
+            return []
+        command = f"{sys.executable} {_POLICY_HOOK_SCRIPT}"
+        return [
+            "--dangerously-bypass-hook-trust",
+            "-c",
+            'hooks.PreToolUse=[{matcher="",hooks=[{type="command",'
+            f"command={json.dumps(command)},timeout=300}}]}}]",
+        ]
+
+    def _sandbox_args(self, cwd: Path, user_id: Optional[int]) -> List[str]:
+        """Per-profile sandbox (dv-e38e): full access only for ``unrestricted``
+        profiles; everything else, including a cwd no profile owns, runs in
+        the confined permission profile (see codex_sandbox.py)."""
+        profile = self._profile_for(cwd)
+        return sandbox_args(
+            unrestricted=bool(getattr(profile, "unrestricted", False)),
+            full_access=self._full_access_for(cwd),
+            cwd=cwd,
+            extra_dirs=getattr(profile, "extra_dirs", ()) or (),
+            registry=self.profile_registry,
+            user_id=user_id,
+        )
+
+    def _profile_for(self, cwd: Path) -> Any:
+        return (
+            self.profile_registry.get_by_working_dir(cwd)
+            if self.profile_registry
+            else None
+        )
+
+    def _profile_unrestricted(self, cwd: Path) -> bool:
+        return bool(getattr(self._profile_for(cwd), "unrestricted", False))
+
+    def _full_access_for(self, cwd: Path) -> bool:
+        """Unsandboxed profile (devops): same rule as the Claude SDK path."""
+        sandbox = getattr(self._profile_for(cwd), "sandbox", None)
+        if sandbox is None:
+            sandbox = self.config.sandbox_enabled
+        return not sandbox
 
     def _stdio_mcp_overrides(self, working_directory: Path) -> List[str]:
         """Mount ``config/mcp.json``'s stdio servers for this Codex turn.
@@ -476,6 +553,30 @@ class CodexCliIntegration:
         owns those, and mounting one twice under two names would double the
         tool list.
         """
+        overrides: List[str] = []
+        for key, command, args, env in self._stdio_mcp_servers(working_directory):
+            # json.dumps renders a TOML basic string / array; `-c` parses its
+            # value as TOML, so quoting has to survive the shell-free argv.
+            overrides += ["-c", f"mcp_servers.{key}.command={json.dumps(str(command))}"]
+            if args:
+                overrides += ["-c", f"mcp_servers.{key}.args={json.dumps(args)}"]
+            # argv is world-readable (`ps`): only non-secret values go inline.
+            # Secret ones travel in the child env and are forwarded by NAME
+            # (`env_vars`, codex-cli 0.157.1); see _stdio_mcp_secret_env.
+            safe, routed = split_mcp_env(env, self.config.secret_values())
+            for var, value in safe.items():
+                overrides += ["-c", f"mcp_servers.{key}.env.{var}={json.dumps(value)}"]
+            if routed:
+                overrides += [
+                    "-c",
+                    f"mcp_servers.{key}.env_vars={json.dumps(sorted(routed))}",
+                ]
+        return overrides
+
+    def _stdio_mcp_servers(
+        self, working_directory: Path
+    ) -> List["tuple[str, str, List[str], Dict[str, str]]"]:
+        """``config/mcp.json`` stdio servers as (key, command, args, env)."""
         from src.bot.utils.image_extractor import IMAGE_ROOTS_ENV
 
         path = self.config.mcp_config_path
@@ -488,8 +589,7 @@ class CodexCliIntegration:
             return []
         if not isinstance(servers, dict):
             return []
-
-        overrides: List[str] = []
+        out: List["tuple[str, str, List[str], Dict[str, str]]"] = []
         for name, cfg in servers.items():
             if not isinstance(cfg, dict):
                 continue
@@ -498,19 +598,65 @@ class CodexCliIntegration:
                 continue
             key = str(name).replace("-", "_")
             env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
+            env = {k: v for k, v in env.items() if is_env_name(k)}
             if name == "telegram":
                 env[IMAGE_ROOTS_ENV] = image_roots_env(
                     self.config.approved_directory, working_directory
                 )
-            # json.dumps renders a TOML basic string / array; `-c` parses its
-            # value as TOML, so quoting has to survive the shell-free argv.
-            overrides += ["-c", f"mcp_servers.{key}.command={json.dumps(str(command))}"]
             args = [str(a) for a in (cfg.get("args") or [])]
-            if args:
-                overrides += ["-c", f"mcp_servers.{key}.args={json.dumps(args)}"]
-            for var, value in env.items():
-                overrides += ["-c", f"mcp_servers.{key}.env.{var}={json.dumps(value)}"]
-        return overrides
+            out.append((key, str(command), args, env))
+        return out
+
+    def _stdio_mcp_secret_env(self, working_directory: Path) -> Dict[str, str]:
+        """The secret stdio-MCP env values kept out of argv (see above)."""
+        secrets = self.config.secret_values()
+        routed_all: Dict[str, str] = {}
+        for _, _, _, env in self._stdio_mcp_servers(working_directory):
+            routed_all.update(split_mcp_env(env, secrets)[1])
+        return routed_all
+
+    def _seam_env(self, working_directory: Path) -> Dict[str, str]:
+        """``{auth_env: token}`` for this profile's HTTP MCP seam, or {}.
+
+        Codex reads the bearer from the named var (``bearer_token_env_var``),
+        so the child needs it; the value comes from Settings, since the bot
+        scrubbed its own env at startup (dv-2976).
+        """
+        if not self.profile_registry:
+            return {}
+        profile = self.profile_registry.get_by_working_dir(working_directory)
+        seam_path = getattr(profile, "mcp", None) if profile else None
+        if not seam_path:
+            return {}
+        try:
+            seam = json.loads(Path(seam_path).read_text())
+        except (OSError, ValueError):
+            return {}
+        auth_env = str(seam.get("auth_env") or "") if isinstance(seam, dict) else ""
+        if not is_env_name(auth_env):
+            return {}
+        token = self.config.secret_value(auth_env) or os.environ.get(auth_env)
+        return {auth_env: token} if token else {}
+
+    def _child_env(
+        self, working_directory: Path, extra: Optional[Dict[str, str]] = None
+    ) -> Dict[str, str]:
+        """Allowlisted env for this turn's codex child (dv-2976): PATH/HOME/
+        CODEX_* and friends, plus exactly the secrets this turn needs.
+
+        ``TZ`` is set explicitly to the configured user timezone (dv-ca94),
+        not merely allowed through: the host runs UTC, so without this the
+        CLI's own ``environment_context`` and any of its builtin time tools
+        report ``Etc/UTC`` regardless of where the user actually is.
+        """
+        return agent_child_env(
+            {
+                "TZ": self.config.user_timezone,
+                **self._seam_env(working_directory),
+                **self._stdio_mcp_secret_env(working_directory),
+                **(extra or {}),
+            }
+        )
 
     def _mcp_overrides(self, working_directory: Path) -> List[str]:
         """Return `-c` overrides registering this turn's MCP servers.
@@ -619,7 +765,7 @@ class CodexCliIntegration:
         registry's TTL (src/agent_bridge/tokens.py).
         """
         token: Optional[str] = None
-        child_env: Optional[Dict[str, str]] = None
+        turn_vars: Dict[str, str] = {}
         if self.agent_bridge is not None:
             from src.agent_bridge import TOKEN_ENV_VAR
 
@@ -631,7 +777,19 @@ class CodexCliIntegration:
             # The ONLY place the token goes: this child's environment. Not the
             # command line (world-readable in /proc), not a config file, not a
             # log line.
-            child_env = {**os.environ, TOKEN_ENV_VAR: token}
+            turn_vars[TOKEN_ENV_VAR] = token
+            policy_url = getattr(self.agent_bridge, "policy_url", None)
+            if policy_url:
+                from src.agent_bridge import POLICY_URL_ENV_VAR
+
+                turn_vars[POLICY_URL_ENV_VAR] = policy_url
+            elif self._profile_unrestricted(working_directory):
+                logger.warning(
+                    "Codex turn on an unrestricted profile has no policy hook",
+                    working_directory=str(working_directory),
+                )
+        # Never the bot's whole env: an allowlist plus this turn's vars.
+        child_env = self._child_env(working_directory, turn_vars)
         try:
             return await self._run_turn(
                 prompt=prompt,
@@ -712,7 +870,7 @@ class CodexCliIntegration:
             # Only the resume index is dropped. The `sessions` row stays: it
             # is the FK parent of the dead thread's `messages`, which are the
             # history recall_conversation and the seed above read from.
-            self.store.clear(user_id, working_directory)
+            await self.store.clear(user_id, working_directory)
             logger.info(
                 "Codex fresh thread after resume failure",
                 failed_thread_id=resume_error.thread_id,
@@ -750,25 +908,9 @@ class CodexCliIntegration:
         )
         if db_manager is None:
             return select_tail([], total_turns=None)
-        import aiosqlite
-
-        async with db_manager.get_connection() as conn:
-            conn.row_factory = aiosqlite.Row
-            rows = await (
-                await conn.execute(
-                    "SELECT prompt, response FROM messages "
-                    "WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
-                    (thread_id, SEED_TAIL_TURNS),
-                )
-            ).fetchall()
-            count_row = await (
-                await conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-                    (thread_id,),
-                )
-            ).fetchone()
-        pairs = [(r["prompt"], r["response"]) for r in reversed(rows)]
-        total = int(count_row[0]) if count_row else None
+        messages = MessageRepository(db_manager)
+        pairs = await messages.get_recent_pairs(thread_id, SEED_TAIL_TURNS)
+        total = await messages.count_session_messages(thread_id)
         return select_tail(pairs, total_turns=total)
 
     async def _exec_turn(
@@ -786,11 +928,35 @@ class CodexCliIntegration:
     ) -> ClaudeResponse:
         """One `codex exec` subprocess, start to finish. No retry logic."""
         start = time.time()
-        prompt = await self._with_persona(working_directory, prompt, family_id, user_id)
-
+        # Every turn, resumed or fresh (dv-ca94) — unlike the persona bundle
+        # below, this must never be cached into the saved thread transcript.
+        prompt = f"{current_time_context(self.config.user_timezone)}\n\n{prompt}"
+        prompt = await prepend_items_context(
+            self.items_service,
+            self.profile_registry,
+            prompt,
+            working_directory,
+            user_id,
+        )
         resume_id: Optional[str] = None
         if not force_new:
-            resume_id = session_id or self.store.thread_for(user_id, working_directory)
+            resume_id = session_id or await self.store.thread_for(
+                user_id, working_directory
+            )
+
+        # A resumed Codex thread already contains the frozen bundle in its
+        # first user turn.  Re-prepending it here permanently appends another
+        # 7-10k tokens to the saved transcript on every Telegram message.
+        # Fresh threads (including resume-failed retries and window rolls)
+        # still receive the full bundle exactly once.
+        if resume_id is None:
+            prompt = await self._with_persona(
+                working_directory, prompt, family_id, user_id
+            )
+
+        # Hard-forbid the real-money exchange scripts on every Codex turn
+        # (dv-4fc2): no Approve/Deny gate exists here. Raises -> no turn.
+        ensure_money_guard_rules(codex_home())
 
         out_file = working_directory / ".codex_last_message.txt"
         argv = self._build_argv(
@@ -799,6 +965,7 @@ class CodexCliIntegration:
             out_file=out_file,
             resume_id=resume_id,
             images=images,
+            user_id=user_id,
         )
         argv.append(prompt)
 
@@ -811,6 +978,7 @@ class CodexCliIntegration:
         # response.tools_used) sees every Codex turn as tool-less and flags
         # any "I saved it" as a mismatch.
         tools_used: List[Dict[str, Any]] = []
+        tool_items: Dict[str, Dict[str, Any]] = {}
         error_events: List[str] = []
 
         proc = await asyncio.create_subprocess_exec(
@@ -823,8 +991,8 @@ class CodexCliIntegration:
             # running forever. Observed 2026-08-30 -- a timed-out turn left an
             # orphan alive for 30+ minutes.
             start_new_session=True,
-            # None -> inherit the bot's environment (the pre-bridge default).
-            # Otherwise a copy of it plus this turn's bridge token.
+            # Allowlisted (run_command -> _child_env); None only for direct
+            # _exec_turn callers, which then inherit the scrubbed bot env.
             env=child_env,
             # StreamReader's default line limit is 64KiB, and readline() RAISES
             # on a longer line rather than returning it. codex emits single
@@ -898,8 +1066,15 @@ class CodexCliIntegration:
                     usage = outcome.usage
                 if outcome.final_message:
                     final_fallback = outcome.final_message
+                if outcome.tool_error and outcome.item_id in tool_items:
+                    # dv-c7d1: a failed MCP call / non-zero shell exit is
+                    # stored as success=0 with this message in tool_usage.
+                    tool_items[outcome.item_id]["error"] = outcome.tool_error
                 if outcome.stream_update:
-                    tools_used.extend(outcome.stream_update.tool_calls or [])
+                    calls = outcome.stream_update.tool_calls or []
+                    tools_used.extend(calls)
+                    if outcome.item_id and len(calls) == 1:
+                        tool_items[outcome.item_id] = calls[0]
                     if on_stream:
                         await on_stream(outcome.stream_update)
             await asyncio.wait_for(
@@ -947,12 +1122,12 @@ class CodexCliIntegration:
         # against the total stored at the end of the previous turn on the
         # same thread; a fresh thread starts from zero. Recording the raw
         # number, as this used to, summed a sum: the general chain read 3.7M
-        # tokens after a handful of chat turns (codex_sessions.json,
+        # tokens after a handful of chat turns (the old codex_sessions.json,
         # 2026-09-05).
         total_in = int(usage.get("input_tokens", 0) or 0)
         total_out = int(usage.get("output_tokens", 0) or 0)
         prev_in, prev_out = (
-            self.store.thread_totals(user_id, working_directory, thread_id)
+            await self.store.thread_totals(user_id, working_directory, thread_id)
             if thread_id
             else (0, 0)
         )
@@ -974,15 +1149,6 @@ class CodexCliIntegration:
                     thread_id=thread_id,
                     rollout_found=info is not None,
                 )
-            self.store.record(
-                user_id,
-                working_directory,
-                thread_id,
-                in_tok,
-                out_tok,
-                thread_total_input=total_in,
-                thread_total_output=total_out,
-            )
 
         # cost=None, not 0.0 (dv-0722): the CLI reports no USD figure, the
         # catalog (`codex debug models`) carries no prices, and the account is
@@ -1001,6 +1167,18 @@ class CodexCliIntegration:
             tools_used=tools_used,
         )
         await self._persist_session(user_id, working_directory, response)
+        # After _persist_session: the Codex columns live on the same
+        # `sessions` row (dv-ebde), whose `users` FK parent that call ensures.
+        if thread_id:
+            await self.store.record(
+                user_id,
+                working_directory,
+                thread_id,
+                in_tok,
+                out_tok,
+                thread_total_input=total_in,
+                thread_total_output=total_out,
+            )
         return response
 
     async def _persist_session(
@@ -1079,13 +1257,15 @@ class CodexCliIntegration:
         family_id: Optional[int] = None,
         user_id: Optional[int] = None,
     ) -> str:
-        """Prepend the active profile's composed persona to the user prompt.
+        """Prepend the active profile's composed persona to a fresh thread.
 
         Codex reads a project's own ``AGENTS.md`` from cwd as developer
         instructions, so the bot persona must NOT be written there: the root
         ``AGENTS.md`` is human-authored, dev-only, and no agent may clobber it.
-        Injecting through the prompt each turn keeps the persona + DB-backed
-        memory facts fresh without touching any project file.
+        Codex has no system-prompt flag, so the bundle lives in the first user
+        message and is retained by the saved thread.  Callers must not invoke
+        this for resume turns: doing so duplicates the frozen bundle in the
+        permanent conversation history.
 
         ``user_id`` resolves per-user memory scope on ``personal_memory``
         profiles, mirroring the Claude SDK path.
@@ -1125,4 +1305,7 @@ class CodexCliIntegration:
             memory_retriever=self.memory_retriever,
             bundle_provider=self.bundle_provider,
             family_id=family_id,
+            # Without it a devops Codex turn is told to stay in its cwd, and a
+            # window Codex opens freezes that line for Claude too (dv-6a9b).
+            full_access=self._full_access_for(Path(working_directory)),
         )

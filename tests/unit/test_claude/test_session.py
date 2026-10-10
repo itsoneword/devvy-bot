@@ -290,38 +290,101 @@ class TestSessionManager:
 
         assert session2.session_id == "real-session-id"
 
-    async def test_session_limit_enforcement(self, session_manager):
-        """Test session limit enforcement."""
+    async def test_session_limit_enforcement_within_directory(self, session_manager):
+        """The cap (2 here) applies per working directory: opening a third
+        session in the SAME directory retires that directory's oldest."""
         # Seed sessions that have already received real IDs (simulating
         # the full create -> Claude responds -> update_session lifecycle)
-        for i, path in enumerate(["/test/project1", "/test/project2"], start=1):
+        for i in (1, 2):
             s = ClaudeSession(
                 session_id=f"session-{i}",
                 user_id=123,
-                project_path=Path(path),
+                project_path=Path("/test/project1"),
                 created_at=datetime.now(UTC),
                 last_used=datetime.now(UTC) - timedelta(hours=i),  # older = higher i
             )
             await session_manager.storage.save_session(s)
             session_manager.active_sessions[s.session_id] = s
 
-        # Verify we have 2 sessions
         assert len(await session_manager._get_user_sessions(123)) == 2
 
-        # Creating third session should remove the oldest (session-2)
+        await session_manager.get_or_create_session(
+            user_id=123, project_path=Path("/test/project1")
+        )
+
+        # session-2 (the older of that directory) evicted; session-3 is new
+        # and unsaved, so only session-1 remains persisted.
+        persisted = await session_manager._get_user_sessions(123)
+        assert [s.session_id for s in persisted] == ["session-1"]
+        assert await session_manager.storage.load_session("session-2", 123) is None
+
+    async def test_session_limit_never_evicts_another_directory(self, session_manager):
+        """A new profile's session must not retire an idle profile's session.
+
+        Regression for 2026-09-10: the cap was global per user, so with more
+        profiles than the cap the least-recently-used profile silently lost
+        its resume mapping (docs/DECISIONS.md).
+        """
+        for i, path in enumerate(["/test/project1", "/test/project2"], start=1):
+            s = ClaudeSession(
+                session_id=f"session-{i}",
+                user_id=123,
+                project_path=Path(path),
+                created_at=datetime.now(UTC),
+                # Both far older than any plausible wall-clock timeout.
+                last_used=datetime.now(UTC) - timedelta(days=30 * i),
+            )
+            await session_manager.storage.save_session(s)
+            session_manager.active_sessions[s.session_id] = s
+
+        # Cap is 2 and the user already has 2 sessions — but in other dirs.
         await session_manager.get_or_create_session(
             user_id=123, project_path=Path("/test/project3")
         )
 
-        # After eviction, only session-1 remains persisted
-        # (session-2 evicted, session-3 is new/unsaved so not yet in storage)
         persisted = await session_manager._get_user_sessions(123)
-        assert len(persisted) == 1  # Only session-1 persisted
-        assert persisted[0].session_id == "session-1"
+        assert sorted(s.session_id for s in persisted) == ["session-1", "session-2"]
 
-        # session-2 should be gone
-        loaded = await session_manager.storage.load_session("session-2", user_id=123)
-        assert loaded is None
+    async def test_ancient_session_is_still_resumable(self, session_manager):
+        """Age alone never disqualifies a session from being reused."""
+        ancient = ClaudeSession(
+            session_id="ancient-session",
+            user_id=123,
+            project_path=Path("/test/project"),
+            created_at=datetime.now(UTC) - timedelta(days=90),
+            last_used=datetime.now(UTC) - timedelta(days=90),
+        )
+        await session_manager.storage.save_session(ancient)
+
+        # Not in the active cache: must come back from storage, not be
+        # replaced by a fresh empty session.
+        session = await session_manager.get_or_create_session(
+            user_id=123,
+            project_path=Path("/test/project"),
+            session_id="ancient-session",
+        )
+
+        assert session.session_id == "ancient-session"
+        assert session.is_new_session is False
+
+    async def test_ancient_session_reused_from_active_cache(self, session_manager):
+        """Same, for a session still held in the in-process cache."""
+        ancient = ClaudeSession(
+            session_id="cached-ancient",
+            user_id=123,
+            project_path=Path("/test/project"),
+            created_at=datetime.now(UTC) - timedelta(days=90),
+            last_used=datetime.now(UTC) - timedelta(days=90),
+        )
+        session_manager.active_sessions["cached-ancient"] = ancient
+
+        session = await session_manager.get_or_create_session(
+            user_id=123,
+            project_path=Path("/test/project"),
+            session_id="cached-ancient",
+        )
+
+        assert session is ancient
 
     async def test_get_or_create_rejects_wrong_user_active_cache(self, session_manager):
         """Requesting another user's session via active cache creates a new one."""
@@ -519,3 +582,55 @@ class TestUpdateSessionRotatesDiscardedId:
         await session_manager.update_session(session, response)
 
         assert session.session_id == "stable-id"
+
+
+class TestRetirementAudit:
+    """Every path that retires a resume mapping says why (dv-2a5a)."""
+
+    @pytest.fixture
+    def session_manager(self):
+        config = Settings(
+            telegram_bot_token="test-token",
+            telegram_bot_username="test_bot",
+            approved_directory=Path("/tmp"),
+            max_sessions_per_user=2,
+        )
+        return SessionManager(config, InMemorySessionStorage())
+
+    async def test_directory_cap_eviction_records_reason(self, session_manager):
+        for i in (1, 2):
+            s = ClaudeSession(
+                session_id=f"session-{i}",
+                user_id=123,
+                project_path=Path("/test/project1"),
+                created_at=datetime.now(UTC),
+                last_used=datetime.now(UTC) - timedelta(hours=i),
+            )
+            await session_manager.storage.save_session(s)
+            session_manager.active_sessions[s.session_id] = s
+
+        await session_manager.get_or_create_session(
+            user_id=123, project_path=Path("/test/project1")
+        )
+
+        assert session_manager.storage.retired == [("session-2", "dir_cap:2")]
+
+    async def test_retire_hook_receives_reason_and_path(self, session_manager):
+        calls = []
+
+        async def hook(session_id, reason, project_path):
+            calls.append((session_id, reason, project_path))
+
+        session_manager.on_retire = hook
+        s = ClaudeSession(
+            session_id="s1",
+            user_id=1,
+            project_path=Path("/p"),
+            created_at=datetime.now(UTC),
+            last_used=datetime.now(UTC),
+        )
+        session_manager.active_sessions["s1"] = s
+        await session_manager.remove_session("s1", reason="context_refresh")
+
+        # project_path falls back to the cached session's path.
+        assert calls == [("s1", "context_refresh", Path("/p"))]

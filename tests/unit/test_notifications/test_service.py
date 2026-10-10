@@ -104,34 +104,40 @@ class TestNotificationService:
 
 
 class TestPinPersistence:
-    """The pinned-message map must survive a bot restart."""
+    """The pinned-message map must survive a bot restart (bot.db, dv-ebde)."""
 
-    async def test_pin_saved_and_reloaded(self, event_bus, mock_bot, tmp_path):
+    @pytest.fixture
+    async def pins(self, tmp_path):
+        from src.storage.facade import Storage
+
+        storage = Storage(f"sqlite:///{tmp_path / 'bot.db'}")
+        await storage.initialize()
+        yield storage.pinned_messages
+        await storage.close()
+
+    async def _started(self, event_bus, mock_bot, pins) -> NotificationService:
+        svc = NotificationService(event_bus=event_bus, bot=mock_bot, pin_store=pins)
+        await svc._load_pins()  # what start() does, without the sender task
+        return svc
+
+    async def test_pin_saved_and_reloaded(self, event_bus, mock_bot, pins):
         from unittest.mock import MagicMock
 
-        state = tmp_path / "pins.json"
-        svc = NotificationService(
-            event_bus=event_bus, bot=mock_bot, pin_state_path=state
-        )
+        svc = await self._started(event_bus, mock_bot, pins)
         mock_bot.send_message.return_value = MagicMock(message_id=42)
         await svc._send_or_edit_pinned(
             100, AgentResponseEvent(chat_id=100, text="running", pin_as="jobs")
         )
         assert svc._pinned_messages == {(100, "jobs"): 42}
-        assert state.exists()
+        assert await pins.load_all() == {(100, "jobs"): 42}
 
-        restarted = NotificationService(
-            event_bus=event_bus, bot=mock_bot, pin_state_path=state
-        )
+        restarted = await self._started(event_bus, mock_bot, pins)
         assert restarted._pinned_messages == {(100, "jobs"): 42}
 
-    async def test_retire_removes_from_state(self, event_bus, mock_bot, tmp_path):
+    async def test_retire_removes_from_state(self, event_bus, mock_bot, pins):
         from unittest.mock import MagicMock
 
-        state = tmp_path / "pins.json"
-        svc = NotificationService(
-            event_bus=event_bus, bot=mock_bot, pin_state_path=state
-        )
+        svc = await self._started(event_bus, mock_bot, pins)
         mock_bot.send_message.return_value = MagicMock(message_id=7)
         await svc._send_or_edit_pinned(
             100, AgentResponseEvent(chat_id=100, text="running", pin_as="jobs")
@@ -141,18 +147,33 @@ class TestPinPersistence:
             100, AgentResponseEvent(chat_id=100, text="", pin_as="jobs")
         )
         assert svc._pinned_messages == {}
-        restarted = NotificationService(
-            event_bus=event_bus, bot=mock_bot, pin_state_path=state
-        )
+        restarted = await self._started(event_bus, mock_bot, pins)
         assert restarted._pinned_messages == {}
 
-    async def test_corrupt_state_file_starts_empty(self, event_bus, mock_bot, tmp_path):
-        state = tmp_path / "pins.json"
-        state.write_text("{not json")
-        svc = NotificationService(
-            event_bus=event_bus, bot=mock_bot, pin_state_path=state
-        )
+    async def test_start_loads_pins(self, event_bus, mock_bot, pins):
+        await pins.set(100, "jobs", 9)
+        svc = NotificationService(event_bus=event_bus, bot=mock_bot, pin_store=pins)
+        await svc.start()
+        try:
+            assert svc._pinned_messages == {(100, "jobs"): 9}
+        finally:
+            await svc.stop()
+
+    async def test_unreadable_store_starts_empty(self, event_bus, mock_bot):
+        broken = AsyncMock()
+        broken.load_all.side_effect = RuntimeError("db gone")
+        svc = NotificationService(event_bus=event_bus, bot=mock_bot, pin_store=broken)
+        await svc._load_pins()
         assert svc._pinned_messages == {}
+
+    async def test_repository_round_trip(self, pins):
+        await pins.set(1, "a", 10)
+        await pins.set(1, "b", 11)
+        await pins.set(1, "a", 12)  # upsert
+        assert await pins.load_all() == {(1, "a"): 12, (1, "b"): 11}
+        await pins.delete(1, "a")
+        await pins.delete(1, "missing")  # no-op
+        assert await pins.load_all() == {(1, "b"): 11}
 
 
 class TestLedgeredDelivery:
@@ -205,3 +226,117 @@ class TestLedgeredDelivery:
         mock_bot.send_message.return_value = self._sent(100, 78)
         await svc._rate_limited_send(100, AgentResponseEvent(chat_id=100, text="hi"))
         ledger.record.assert_not_awaited()
+
+
+class TestLoneSurrogates:
+    """dv-c9d1: a str with lone surrogates (bgjob's byte-cut tail, decoded by
+    argv's surrogateescape) must still be delivered -- sanitized to U+FFFD --
+    instead of dying in PTB's UTF-8 encode."""
+
+    BROKEN = "ok …\udc80\udc94 `ensure_workspace_for` tail"
+
+    @staticmethod
+    def _strict_encode(**kwargs):
+        """Mimic PTB: encoding the request body raises on lone surrogates,
+        and PTB re-raises that as a NetworkError (a TelegramError)."""
+        from unittest.mock import MagicMock
+
+        from telegram.error import NetworkError
+
+        try:
+            kwargs["text"].encode("utf-8")
+        except UnicodeEncodeError as e:
+            raise NetworkError(f"Unknown error in HTTP implementation: {e!r}")
+        sent = MagicMock()
+        sent.message_id = 55
+        sent.chat.id = kwargs["chat_id"]
+        return sent
+
+    async def _deliver(self, service: NotificationService, event) -> None:
+        """Real entry point: handle_response queues, the sender delivers."""
+        await service.handle_response(event)
+        queued = service._send_queue.get_nowait()
+        for chat_id in service._resolve_chat_ids(queued):
+            await service._rate_limited_send(chat_id, queued)
+
+    async def test_lone_surrogates_delivered_with_replacement_char(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        mock_bot.send_message.side_effect = self._strict_encode
+        await self._deliver(service, AgentResponseEvent(chat_id=100, text=self.BROKEN))
+
+        mock_bot.send_message.assert_called_once()
+        text = mock_bot.send_message.call_args.kwargs["text"]
+        text.encode("utf-8")  # must not raise
+        assert "�" in text
+        assert text.startswith("ok …")
+        assert text.endswith("`ensure_workspace_for` tail")
+
+    async def test_pinned_new_status_with_lone_surrogates_is_sent(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        mock_bot.send_message.side_effect = self._strict_encode
+        await self._deliver(
+            service,
+            AgentResponseEvent(chat_id=100, text=self.BROKEN, pin_as="jobs"),
+        )
+
+        mock_bot.send_message.assert_called_once()
+        text = mock_bot.send_message.call_args.kwargs["text"]
+        text.encode("utf-8")
+        assert "�" in text
+        mock_bot.pin_chat_message.assert_awaited_once()
+        assert service._pinned_messages == {(100, "jobs"): 55}
+
+    async def test_pinned_existing_status_with_lone_surrogates_is_edited(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        from telegram.error import NetworkError
+
+        async def strict_edit(**kwargs):
+            try:
+                kwargs["text"].encode("utf-8")
+            except UnicodeEncodeError as e:
+                raise NetworkError(f"Unknown error in HTTP implementation: {e!r}")
+
+        mock_bot.edit_message_text.side_effect = strict_edit
+        mock_bot.send_message.side_effect = self._strict_encode
+        service._pinned_messages[(100, "jobs")] = 9
+
+        await self._deliver(
+            service,
+            AgentResponseEvent(chat_id=100, text=self.BROKEN, pin_as="jobs"),
+        )
+
+        mock_bot.edit_message_text.assert_awaited_once()
+        text = mock_bot.edit_message_text.call_args.kwargs["text"]
+        text.encode("utf-8")
+        assert "�" in text
+        assert mock_bot.edit_message_text.call_args.kwargs["message_id"] == 9
+        # Edited in place, not dropped and re-created.
+        mock_bot.send_message.assert_not_called()
+        assert service._pinned_messages == {(100, "jobs"): 9}
+
+    async def test_valid_emoji_and_em_dash_pass_unchanged(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        mock_bot.send_message.side_effect = self._strict_encode
+        text = "✅ devops · job \"t\" finished — 😀 👨‍👩‍👧 done…"
+        await self._deliver(service, AgentResponseEvent(chat_id=100, text=text))
+
+        mock_bot.send_message.assert_called_once()
+        assert mock_bot.send_message.call_args.kwargs["text"] == text
+
+    async def test_text_of_only_lone_surrogates_still_delivered(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        """added: the degenerate case -- nothing valid left -- is still sent."""
+        mock_bot.send_message.side_effect = self._strict_encode
+        await self._deliver(
+            service, AgentResponseEvent(chat_id=100, text="\udc80\udc94")
+        )
+
+        mock_bot.send_message.assert_called_once()
+        text = mock_bot.send_message.call_args.kwargs["text"]
+        text.encode("utf-8")
+        assert text and set(text) == {"�"}

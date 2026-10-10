@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import src.storage.user_data as user_data_module
+from src.storage.schema.legacy import build_legacy
 from src.storage.user_data import UserDataManager, UserDataRepository
 
 USER_A = 111111111
@@ -368,12 +369,10 @@ class TestActivitySourceMigration:
     ) -> None:
         db_path = str(tmp_path / "data.db")
 
-        class _PreMigration3(UserDataManager):
-            def _get_migrations(self):
-                return super()._get_migrations()[:2]
-
-        legacy_db = _PreMigration3(db_path)
-        await legacy_db.initialize()
+        # A pre-Alembic data.db at legacy v2, then the current runner
+        # bridges it (legacy 3..4 replayed, verified, stamped).
+        build_legacy(db_path, "data", upto=2)
+        legacy_db = UserDataManager(db_path)  # pool only, no initialize
         async with legacy_db.get_connection() as conn:
             await conn.execute(
                 "INSERT INTO logs_activity (user_id, date, type, duration_min, "

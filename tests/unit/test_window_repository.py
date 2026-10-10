@@ -10,7 +10,21 @@ from src.storage.window_repository import WindowRepository
 async def repo():
     db = DatabaseManager(tempfile.mktemp(suffix=".db"))
     await db.initialize()
-    return WindowRepository(db)
+    # Checkpoint mechanics are tested with it ON; the deployment default is 0.
+    return WindowRepository(db, eval_interval_tokens=120_000)
+
+
+async def test_checkpoint_off_by_default_never_fires(repo):
+    off = WindowRepository(repo._db)
+    assert off.eval_interval_tokens == 0
+    st = await off.record_turn(
+        7, "/p", backend="claude", added_tokens=1, context_tokens=145_000
+    )
+    assert off.should_run_evaluator(st) is False
+    await off.mark_evaluator_run(7, "/p", max_message_id=5)
+    st = await off.get_or_create(7, "/p")
+    assert st.last_eval_checkpoint == 0
+    assert st.last_checkpoint_message_id == 5
 
 
 async def test_get_or_create_defaults(repo):
@@ -72,6 +86,14 @@ async def test_thresholds_are_configurable(repo):
     )
     assert repo.should_run_evaluator(st) is True
     assert repo.should_refresh(st) is True
+
+
+async def test_should_refresh_accepts_a_model_specific_threshold(repo):
+    st = await repo.record_turn(
+        7, "/p", backend="openai_codex", added_tokens=1, context_tokens=180_000
+    )
+    assert repo.should_refresh(st) is False
+    assert repo.should_refresh(st, threshold_tokens=170_000) is True
 
 
 async def test_context_tokens_none_falls_back_to_flow_sum(repo):

@@ -32,8 +32,12 @@ class InMemorySessionStorage(SessionStorage):
             return None
         return session
 
-    async def delete_session(self, session_id: str) -> None:
+    async def delete_session(
+        self, session_id: str, reason: str = "unspecified"
+    ) -> None:
         self.sessions.pop(session_id, None)
+        self.retired: List[tuple] = getattr(self, "retired", [])
+        self.retired.append((session_id, reason))
 
     async def get_user_sessions(self, user_id: int) -> List[ClaudeSession]:
         return [s for s in self.sessions.values() if s.user_id == user_id]

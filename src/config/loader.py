@@ -5,9 +5,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 import structlog
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from src.exceptions import ConfigurationError, InvalidConfigError
+from src.utils.agent_env import is_secret_name, scrub_process_env
+from src.utils.paths import data_layout
 
 from .environments import DevelopmentConfig, ProductionConfig, TestingConfig
 from .settings import Settings
@@ -30,13 +32,24 @@ def load_config(
     Raises:
         ConfigurationError: If configuration is invalid
     """
-    # Load .env file explicitly
+    # Config .env: non-secret keys go to os.environ (as load_dotenv did, so
+    # code and CLIs reading config from the env still see it); secret keys
+    # never do. Secrets reach Settings only, via ``_env_file`` (dv-2976).
     env_file = config_file or Path(".env")
     if env_file.exists():
         logger.info("Loading .env file", path=str(env_file))
-        load_dotenv(env_file)
+        _export_config_env(env_file)
     else:
         logger.warning("No .env file found", path=str(env_file))
+    secrets_file = secrets_file_for(env_file)
+    env_files: tuple = (env_file,)
+    if secrets_file is not None:
+        if secrets_file.exists():
+            _warn_if_loose(secrets_file)
+            env_files = (env_file, secrets_file)
+            logger.info("Loading secrets file", path=str(secrets_file))
+        else:
+            logger.warning("No secrets file found", path=str(secrets_file))
 
     # Determine environment
     env = env or os.getenv("ENVIRONMENT", "development")
@@ -54,7 +67,8 @@ def load_config(
 
         # Load base settings from environment variables
         # pydantic-settings will automatically read from environment variables
-        settings = Settings()  # type: ignore[call-arg]
+        # Later files win: the secrets file overrides the config .env.
+        settings = Settings(_env_file=env_files)  # type: ignore[call-arg]
 
         # Apply environment-specific overrides
         settings = _apply_environment_overrides(settings, env)
@@ -75,6 +89,64 @@ def load_config(
     except Exception as e:
         logger.error("Failed to load configuration", error=str(e), environment=env)
         raise ConfigurationError(f"Configuration loading failed: {e}") from e
+
+
+def secrets_file_for(env_file: Path) -> Optional[Path]:
+    """The secrets file for this deployment, or None (legacy: .env holds them).
+
+    ``DEVVY_DATA_ROOT`` from the process env, else from ``env_file``.
+    """
+    return data_layout(dotenv=env_file).bot_secrets_file
+
+
+def secret_env_names(settings: Settings, env_file: Optional[Path] = None) -> set:
+    """Names to scrub from os.environ: Settings' secret fields and every key
+    of the secrets file (all of it is secret by definition)."""
+    names = {
+        name.upper()
+        for name, field in Settings.model_fields.items()
+        if "SecretStr" in str(field.annotation) or is_secret_name(name)
+    }
+    secrets_file = secrets_file_for(env_file or Path(".env"))
+    if secrets_file is not None and secrets_file.exists():
+        names |= {k for k in dotenv_values(secrets_file) if k}
+    return names
+
+
+def scrub_secrets_from_environ(
+    settings: Settings, env_file: Optional[Path] = None
+) -> list:
+    """Drop bot secrets from os.environ once Settings holds them (dv-2976).
+
+    Every child the bot spawns (Claude CLI via the SDK, codex, evaluator,
+    bgjob) inherits os.environ, so after this none of them gets a secret the
+    bot did not hand it explicitly. Returns the removed names (never values).
+    """
+    removed = scrub_process_env(secret_env_names(settings, env_file))
+    logger.info("Scrubbed secrets from process env", names=removed)
+    return removed
+
+
+def _export_config_env(env_file: Path) -> None:
+    """load_dotenv(env_file) minus secrets: set unset non-secret keys only."""
+    for key, value in dotenv_values(env_file).items():
+        if not key or value is None or is_secret_name(key):
+            continue
+        os.environ.setdefault(key, value)
+
+
+def _warn_if_loose(path: Path) -> None:
+    """A secrets file readable by group/others is a misconfiguration."""
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        return
+    if mode & 0o077:
+        logger.warning(
+            "Secrets file is group/world accessible; chmod 600 it",
+            path=str(path),
+            mode=oct(mode),
+        )
 
 
 def _apply_environment_overrides(settings: Settings, env: Optional[str]) -> Settings:

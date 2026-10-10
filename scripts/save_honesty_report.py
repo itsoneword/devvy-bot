@@ -42,6 +42,7 @@ from src.bot.orchestration.save_honesty import (  # noqa: E402
 from src.bot.orchestration.windowing import (  # noqa: E402
     mentions_remember_trigger,
 )
+from src.utils.paths import data_layout  # noqa: E402
 
 # Legacy reply envelope: "[Replying to <label>:\n<quoted>]\n\n<user text>".
 _LEGACY_ENVELOPE = re.compile(r"^\[Replying to [^\]]*\]\s*", re.DOTALL)
@@ -190,7 +191,7 @@ def trigger_scan(conn: sqlite3.Connection) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", default="data/bot.db")
+    parser.add_argument("--db", default=str(data_layout().bot_db))
     parser.add_argument("--corpus", choices=["food-coach"])
     parser.add_argument("--negative-control", action="store_true")
     parser.add_argument("--trigger-scan", action="store_true")

@@ -97,9 +97,39 @@ def test_mcp_servers_for_channel(tmp_path, monkeypatch, make_manager):
     chan = mgr._mcp_servers_for(tmp_path / "chan")
     assert chan["channel-intel"]["type"] == "http"
     assert chan["channel-intel"]["url"] == "http://127.0.0.1:8765/mcp"
-    assert chan["channel-intel"]["headers"]["Authorization"] == "Bearer tkn"
+    # By reference: the SDK puts mcp_servers in the CLI's argv (dv-2976).
+    auth = chan["channel-intel"]["headers"]["Authorization"]
+    assert auth == "Bearer ${CHANNEL_INTEL_TOKEN}"
+    assert "tkn" not in auth
+    assert mgr._seam_env(tmp_path / "chan") == {"CHANNEL_INTEL_TOKEN": "tkn"}
 
     assert mgr._mcp_servers_for(tmp_path / "dev") == {}
+    assert mgr._seam_env(tmp_path / "dev") == {}
+
+
+def test_seam_token_comes_from_settings_not_environ(
+    tmp_path, monkeypatch, make_manager
+):
+    """After the startup scrub the token exists only in Settings (dv-2976)."""
+    from pydantic import SecretStr
+
+    seam = tmp_path / "channel-intel.json"
+    seam.write_text(
+        '{"type":"http","url":"http://127.0.0.1:8765/mcp","auth_env":"CHANNEL_INTEL_TOKEN"}'
+    )
+    monkeypatch.delenv("CHANNEL_INTEL_TOKEN", raising=False)
+    mgr = make_manager(
+        profiles=[
+            {"slug": "channel", "working_dir": tmp_path / "chan", "mcp": seam},
+        ]
+    )
+    mgr.config.channel_intel_token = SecretStr("from-settings-123")
+    chan = mgr._mcp_servers_for(tmp_path / "chan")
+    auth = chan["channel-intel"]["headers"]["Authorization"]
+    assert auth == "Bearer ${CHANNEL_INTEL_TOKEN}"
+    assert mgr._seam_env(tmp_path / "chan") == {
+        "CHANNEL_INTEL_TOKEN": "from-settings-123"
+    }
 
 
 def test_mcp_servers_no_token(tmp_path, monkeypatch, make_manager):

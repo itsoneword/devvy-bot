@@ -284,9 +284,20 @@ class VoiceHandler:
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:
+            # The status alone cannot tell a revoked key from an exhausted
+            # quota: ElevenLabs answers 401 for both and puts the difference
+            # ("quota_exceeded", "invalid_api_key", "detected_unusual_activity")
+            # in the body. Logging only error_type left a 401 on 2026-09-21
+            # undiagnosable from the logs. The body carries no credentials.
+            detail = ""
+            failed = getattr(exc, "response", None)
+            if failed is not None:
+                detail = (getattr(failed, "text", "") or "")[:300]
             logger.warning(
                 "ElevenLabs transcription request failed",
                 error_type=type(exc).__name__,
+                status_code=getattr(failed, "status_code", None),
+                detail=detail,
             )
             raise RuntimeError("ElevenLabs transcription request failed.") from exc
 

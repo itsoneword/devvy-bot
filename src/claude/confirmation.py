@@ -15,6 +15,7 @@ Fails **closed**: on timeout or with no owner chat configured, the op is denied.
 from __future__ import annotations
 
 import asyncio
+import html
 import uuid
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -49,8 +50,21 @@ class ConfirmationManager:
         self._pending: Dict[str, asyncio.Future[bool]] = {}
         self._pending_messages: Dict[str, Tuple[int, int]] = {}
 
-    async def request(self, reason: str, preview: str) -> bool:
-        """Ask the owner to approve a destructive op. Returns True if approved."""
+    async def request(
+        self,
+        reason: str,
+        preview: str,
+        *,
+        timeout_seconds: Optional[float] = None,
+        source: Optional[str] = None,
+    ) -> bool:
+        """Ask the owner to approve a destructive op. Returns True if approved.
+
+        ``timeout_seconds`` overrides the manager's default: an unattended
+        background job waits an hour (owner, dv-ef90), a chat turn two
+        minutes. ``source`` names who is asking (a job's name) in the prompt.
+        """
+        timeout = self._timeout if timeout_seconds is None else timeout_seconds
         if not self._chat_ids:
             logger.warning(
                 "Destructive op denied: no owner chat configured for confirmation",
@@ -65,10 +79,11 @@ class ConfirmationManager:
 
         text = (
             "⚠️ <b>Confirm risky action</b>\n"
-            f"<b>{reason}</b>\n\n"
-            f"<pre>{_truncate(preview, 500)}</pre>\n"
+            + (f"from background job <i>{html.escape(source)}</i>\n" if source else "")
+            + f"<b>{html.escape(reason)}</b>\n\n"
+            f"<pre>{html.escape(_truncate(preview, 500))}</pre>\n"
             "Approve to run it, or deny to block. "
-            f"Denied automatically in {int(self._timeout)}s."
+            f"Denied automatically in {_human_duration(timeout)}."
         )
         chat_id = self._chat_ids[0]
         try:
@@ -81,7 +96,7 @@ class ConfirmationManager:
             self._pending_messages[token] = (chat_id, message_id)
 
         try:
-            approved = await asyncio.wait_for(fut, timeout=self._timeout)
+            approved = await asyncio.wait_for(fut, timeout=timeout)
             logger.info("Confirmation resolved", reason=reason, approved=approved)
             return approved
         except asyncio.TimeoutError:
@@ -128,3 +143,13 @@ class ConfirmationManager:
 def _truncate(text: str, limit: int) -> str:
     text = text or ""
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _human_duration(seconds: float) -> str:
+    total = int(seconds)
+    if total >= 3600 and total % 3600 == 0:
+        hours = total // 3600
+        return f"{hours}h"
+    if total >= 60 and total % 60 == 0:
+        return f"{total // 60}min"
+    return f"{total}s"

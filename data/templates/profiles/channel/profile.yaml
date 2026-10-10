@@ -11,7 +11,7 @@
 #   python3 scripts/install_profiles.py --add channel
 - slug: "@SLUG@"
   name: TG Channel Editor
-  working_dir: ${DEVVY_ROOT}/workspaces/@SLUG@
-  memory_dir: ${DEVVY_ROOT}/workspaces/@SLUG@/memory
-  persona: ${DEVVY_ROOT}/workspaces/@SLUG@/persona.md
+  working_dir: ${DEVVY_WORKSPACES}/@SLUG@
+  memory_dir: ${DEVVY_WORKSPACES}/@SLUG@/memory
+  persona: ${DEVVY_WORKSPACES}/@SLUG@/persona.md
   mcp: ${DEVVY_ROOT}/config/mcp/channel-intel.json

@@ -39,6 +39,7 @@ from src.utils.constants import (
     DEFAULT_WATCHDOG_MAX_TOKENS_PER_HOUR,
     DEFAULT_WATCHDOG_MAX_TURNS_PER_HOUR,
 )
+from src.utils.paths import DataLayout, sqlite_url
 
 
 class Settings(BaseSettings):
@@ -109,7 +110,12 @@ class Settings(BaseSettings):
         DEFAULT_CLAUDE_MAX_TURNS, description="Max conversation turns"
     )
     claude_timeout_seconds: int = Field(
-        DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
+        DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+        description=(
+            "Idle timeout for one SDK turn: seconds of silence from the CLI "
+            "before the turn is killed. Not a wall-clock cap — a turn that "
+            "keeps streaming tool calls runs as long as it needs."
+        ),
     )
     # The SDK reads the CLI's stream-json on stdout and dies on any single
     # message over this limit (default 1 MiB). One Read of a ~700 KB PNG
@@ -165,9 +171,10 @@ class Settings(BaseSettings):
 
     # Unmetered-backend token budget (dv-0722). A Codex turn on a ChatGPT
     # subscription reports no USD price (ClaudeResponse.cost is None), so
-    # the daily budget and the watchdog count its tokens instead. Same role
-    # tiers, owner exemption and per-user-override precedence as the USD
-    # caps above; a user is refused when EITHER ledger is exhausted.
+    # the daily budget and the watchdog count its tokens instead. It uses the
+    # same role tiers as the USD caps, but owners are always exempt from this
+    # local hard gate: a USD override does not change that. A non-owner is
+    # refused when either applicable ledger is exhausted.
     unmetered_max_tokens_per_user: int = Field(
         DEFAULT_UNMETERED_MAX_TOKENS_PER_USER,
         description="Max daily tokens on unmetered (no-USD-price) backends per user",
@@ -231,7 +238,7 @@ class Settings(BaseSettings):
     # emitted zero ops on 2 of 5 samples where sonnet found a fact, 3 ops where
     # sonnet found 5-7 on the largest, ran slower per call, and blew a 180s
     # ceiling on the biggest prompt against a 120s production timeout. The cost
-    # win came from evaluator_lean_context, not from the model.
+    # win came from stripping the harness (now always on), not from the model.
     #
     # Re-gated 2026-08-07 for dv-c5d9 with the semantic judge, post-027fd66
     # prompt, 55k-char slices, 9 samples: haiku failed every D10 bar —
@@ -246,16 +253,14 @@ class Settings(BaseSettings):
             "(e.g. 'sonnet', 'haiku', or a full model id)."
         ),
     )
-    # An extraction subprocess is a bare `claude -p`, so by default it inherits
-    # the whole Claude Code harness for its cwd: this repo's CLAUDE.md, the
-    # skill listing, MCP tool definitions and the agent system prompt. Measured
-    # 2026-08-04: that floor is ~42k tokens on a run whose answer was "[]".
-    # None of it is relevant to extracting facts from a transcript.
-    evaluator_lean_context: bool = Field(
-        True,
+    # Extraction on the Codex backend used to pass no model and ran whatever
+    # ~/.codex/config.toml named. The router always passes one (dv-ef90); the
+    # default is what that file named on 2026-10-04.
+    evaluator_codex_model: str = Field(
+        "openai-codex/gpt-6-sol",
         description=(
-            "Strip the Claude Code harness (project settings, skills, MCP "
-            "servers, tools, default system prompt) from evaluator CLI calls."
+            "Model for the memory evaluator's extraction call when the active "
+            "backend is Codex."
         ),
     )
     # Runaway guard, not a cost lever. The delta embeds everything since
@@ -339,13 +344,39 @@ class Settings(BaseSettings):
             "tool call; log + inform the owner (SAVE_CLAIM_CHECK_ENABLED)."
         ),
     )
+    # Recipe search-retry (dv-300d / dv-5d5f follow-up): the chef profile
+    # measurably writes recipes from memory instead of searching (78 of 81
+    # historical chef recipe turns, zero Web* calls). The trigger is
+    # mechanical (see recipe_retry.needs_search_retry), not judge-scored — a
+    # blind LLM judge cannot separate a confidently wrong recipe from a
+    # correct one (dv-300d validation gate). Default OFF: a second SDK turn
+    # per flagged answer has a real cost, so this ships opt-in, one retry
+    # per turn at most.
+    recipe_retry_enabled: bool = Field(
+        False,
+        description=(
+            "Re-run a recipe-shaped answer with a forced web search when the "
+            "original turn made zero WebSearch/WebFetch calls "
+            "(RECIPE_RETRY_ENABLED)."
+        ),
+    )
+    recipe_retry_profiles: str = Field(
+        "chef",
+        description=(
+            "Comma-separated profile slugs the recipe search-retry applies "
+            "to (RECIPE_RETRY_PROFILES)."
+        ),
+    )
     openai_codex_credentials_path: Path = Field(
         Path("data/model_auth/openai_codex.json"),
         description="Local JSON token store for OpenAI Codex OAuth credentials",
     )
     codex_session_store_path: Path = Field(
         Path("data/codex_sessions.json"),
-        description="JSON store of Codex thread ids per (user, working_dir)",
+        description=(
+            "Legacy Codex thread JSON (pre dv-ebde). Read-only: imported once "
+            "into the bot.db sessions table at startup, never written"
+        ),
     )
     # NOTE: When changing this list, also update docs/tools.md,
     # docs/configuration.md, .env.example,
@@ -406,6 +437,15 @@ class Settings(BaseSettings):
     )
 
     # Storage
+
+    # One data root (dv-c66a): unset = legacy layout, every default below is
+    # what it always was. Set = db/, secrets/, state/ under it; any path
+    # variable set explicitly still wins. See src/utils/paths.py.
+    devvy_data_root: Optional[Path] = Field(
+        None,
+        description="Data root holding db/, workspaces/, secrets/, state/ "
+        "(unset = legacy data/ layout inside the checkout)",
+    )
     database_url: str = Field(
         DEFAULT_DATABASE_URL, description="Database connection URL"
     )
@@ -428,17 +468,22 @@ class Settings(BaseSettings):
         Path(".deviz/tasks"),
         description="Directory holding the deviz task board markdown files",
     )
+    # DEPRECATED (2026-09-10), read by nothing that decides anything. Kept so
+    # an existing SESSION_TIMEOUT_HOURS in a deployment's env stays harmless.
+    # Conversations end by context SIZE (window rotation), never by elapsed
+    # time — see docs/DECISIONS.md.
     session_timeout_hours: int = Field(
-        DEFAULT_SESSION_TIMEOUT_HOURS, description="Session timeout"
+        DEFAULT_SESSION_TIMEOUT_HOURS, description="Deprecated, unused"
     )
     session_timeout_minutes: int = Field(
         default=120,
-        description="Session timeout in minutes",
+        description="Deprecated, unused",
         ge=10,
         le=1440,  # Max 24 hours
     )
     max_sessions_per_user: int = Field(
-        DEFAULT_MAX_SESSIONS_PER_USER, description="Max concurrent sessions"
+        DEFAULT_MAX_SESSIONS_PER_USER,
+        description="Max sessions kept per user PER working directory",
     )
 
     # Features
@@ -552,21 +597,27 @@ class Settings(BaseSettings):
     # compared against them was a per-turn SUM, so heavy profiles rolled every
     # turn at either value (devvy_bot rolled 7x in 5 hours; coach 5x). Fixed
     # 2026-08-05 in ClaudeResponse.peak_context_tokens — these thresholds are
-    # now read against a real level and are left where they are, because 320k
-    # is where the old (accidentally correct) cadence actually rotated and it
-    # sits above the CLI's own auto-compact point: compaction, which
-    # summarises, handles overflow first; the hard roll, which discards all
-    # but the tail, stays the last resort it was meant to be.
+    # now read against a real level.  The later 320k default was invalid for
+    # Codex models whose catalog window is 272k (about 258.4k usable input in
+    # the rollout).  220k was the backend-neutral default until 2026-10-04,
+    # when it was lowered to the 150k the live .env had long been running.
+    # Codex orchestration also clamps it to 80% of the selected catalog
+    # model's window, leaving headroom instead of relying on invisible
+    # provider compaction.
+    # 0 since 2026-10-04 (owner): the window-roll extraction re-reads the whole
+    # window, so a mid-window checkpoint ~30k before the roll was a second,
+    # mostly redundant run. Rolls, /new and "remember" still evaluate.
     window_eval_interval_tokens: int = Field(
-        120_000,
-        ge=10_000,
+        0,
+        ge=0,
         description=(
             "Run the memory evaluator each time the conversation's real "
-            "context crosses another multiple of this many tokens."
+            "context crosses another multiple of this many tokens. "
+            "0 = off (evaluate only at window roll, /new and 'remember')."
         ),
     )
     window_refresh_threshold_tokens: int = Field(
-        320_000,
+        150_000,
         ge=20_000,
         description=(
             "Roll the conversation window (fresh backend session seeded with "
@@ -659,6 +710,21 @@ class Settings(BaseSettings):
     )
     webhook_api_secret: Optional[str] = Field(
         None, description="Shared secret for generic webhook providers"
+    )
+    # Bearer for the channel-intel MCP seam (config/mcp/channel-intel.json
+    # names it by env var, ``auth_env``). Read here, never from os.environ:
+    # the bot scrubs secrets from its env at startup (dv-2976).
+    channel_intel_token: Optional[SecretStr] = Field(
+        None, description="Bearer token for the channel-intel MCP server"
+    )
+    # Hireli trusted-client MCP (dv-9f02). The bot itself is the MCP client
+    # (src/claude/hireli_tools.py); the key never reaches an agent. Must be
+    # the direct local URL: Hireli refuses the service key on proxied requests.
+    hireli_mcp_url: Optional[str] = Field(
+        None, description="Hireli MCP endpoint, e.g. http://127.0.0.1:8001/mcp"
+    )
+    hireli_service_key: Optional[SecretStr] = Field(
+        None, description="Hireli trusted-client service key"
     )
     notification_chat_ids: Optional[List[int]] = Field(
         None, description="Default Telegram chat IDs for proactive notifications"
@@ -922,6 +988,42 @@ class Settings(BaseSettings):
 
         return self
 
+    @field_validator("devvy_data_root", mode="before")
+    @classmethod
+    def blank_data_root_is_unset(cls, v: Any) -> Any:
+        """``DEVVY_DATA_ROOT=`` (empty) means legacy layout, not the cwd."""
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @model_validator(mode="after")
+    def derive_data_root_paths(self) -> "Settings":
+        """Fill path defaults from DEVVY_DATA_ROOT; explicit values win."""
+        if self.devvy_data_root is None:
+            return self
+        root = Path(self.devvy_data_root).expanduser()
+        object.__setattr__(self, "devvy_data_root", root)
+        layout = self.data_layout
+        derived: Dict[str, Any] = {
+            "database_url": sqlite_url(layout.bot_db),
+            "user_database_url": sqlite_url(layout.data_db),
+            "openai_codex_credentials_path": layout.codex_credentials,
+            # The global soul/memory files (activity log, /memory) are the
+            # devops agent's, so they follow its workspace (dv-4030): left on
+            # data/memory they would keep writing into the retired tree.
+            "memory_path": layout.devops_workspace / "memory",
+            "soul_md_path": layout.devops_workspace / "soul.md",
+        }
+        for attr, value in derived.items():
+            if attr not in self.model_fields_set:
+                object.__setattr__(self, attr, value)
+        return self
+
+    @property
+    def data_layout(self) -> DataLayout:
+        """Every runtime path for this deployment (legacy when root unset)."""
+        return DataLayout(root=self.devvy_data_root)
+
     @model_validator(mode="after")
     def validate_soul_memory_paths(self) -> "Settings":
         """Validate and resolve soul/memory paths against approved_directory."""
@@ -987,6 +1089,40 @@ class Settings(BaseSettings):
             if self.anthropic_api_key
             else None
         )
+
+    def secret_values(self) -> List[str]:
+        """Every configured secret value (for leak guards; never log these).
+
+        Settings' SecretStr fields plus secret-named str fields
+        (webhook_api_secret, ...). Values under 8 chars are skipped: too
+        short to match on without false positives."""
+        from src.utils.agent_env import is_secret_name
+
+        out: List[str] = []
+        for name, field in type(self).model_fields.items():
+            if "SecretStr" not in str(field.annotation) and not is_secret_name(name):
+                continue
+            value = getattr(self, name, None)
+            if isinstance(value, SecretStr):
+                value = value.get_secret_value()
+            if isinstance(value, str) and len(value) >= 8:
+                out.append(value)
+        return out
+
+    def secret_value(self, env_name: str) -> Optional[str]:
+        """The value of the setting named by env var ``env_name``, or None.
+
+        For config that names a secret by env var (an MCP seam's
+        ``auth_env``). Looks up the Settings field only: secrets are not in
+        os.environ once the bot has started (dv-2976)."""
+        if not env_name:
+            return None
+        value = getattr(self, env_name.lower(), None)
+        if isinstance(value, SecretStr):
+            value = value.get_secret_value()
+        if isinstance(value, str) and value:
+            return value
+        return None
 
     @property
     def mistral_api_key_str(self) -> Optional[str]:

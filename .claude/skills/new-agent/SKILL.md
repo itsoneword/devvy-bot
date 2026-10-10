@@ -61,13 +61,13 @@ data/templates/local/<slug>/persona.md     # the persona
 # <Name> -- <one line purpose>. Created <date> via the new-agent interview.
 - slug: "@SLUG@"
   name: <Name>
-  working_dir: ${DEVVY_ROOT}/workspaces/@SLUG@      # put it where the OTHER profiles' workspaces
-  memory_dir: ${DEVVY_ROOT}/workspaces/@SLUG@/memory   # are (see config/profiles.yaml) -- on some
-  persona: ${DEVVY_ROOT}/workspaces/@SLUG@/persona.md  # installs that is ${DEVVY_ROOT}/../workspaces
+  working_dir: ${DEVVY_WORKSPACES}/@SLUG@             # always these three lines, verbatim:
+  memory_dir: ${DEVVY_WORKSPACES}/@SLUG@/memory       # the registry points DEVVY_WORKSPACES at
+  persona: ${DEVVY_WORKSPACES}/@SLUG@/persona.md      # <DEVVY_DATA_ROOT>/workspaces
   # permission_policy:            # only if guests were requested
   #   allowed_roles: [owner, guest]
   # shared: true                  # only if one shared workspace was requested
-  # extra_dirs:                   # owner-only; absolute or ${DEVVY_ROOT}-relative
+  # extra_dirs:                   # owner-only; absolute paths
   #   - /home/<user>/notes
   # user_data_tools: [logs]       # only for tracking profiles
 ```

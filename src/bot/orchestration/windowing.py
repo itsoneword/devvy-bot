@@ -12,8 +12,12 @@ from typing import Any, Optional
 import structlog
 
 from ...profiles.registry import ProfileRegistry
+from ...storage.repositories import MessageRepository
 
 logger = structlog.get_logger()
+
+_CODEX_BACKEND = "openai_codex"
+_CODEX_REFRESH_WINDOW_FRACTION = 0.80
 
 
 # Phrases that mean "save this durably" — forces an off-cycle evaluator run
@@ -49,6 +53,35 @@ def _context_tokens_of(response: Any) -> Optional[int]:
     return int(tokens) if tokens else None
 
 
+def effective_refresh_threshold(
+    configured_threshold: int,
+    *,
+    backend: str,
+    model_ref: Optional[str] = None,
+) -> int:
+    """Clamp a Codex roll threshold to the selected model's context window.
+
+    The catalog reports 272k for current Codex models while rollouts expose
+    about 258.4k usable input.  Rotating at 80% leaves room for the response
+    and one unexpectedly large tool result.  Claude keeps the operator's
+    configured threshold because its model metadata comes from another
+    transport and is not represented in the Codex catalog.
+    """
+    configured = int(configured_threshold)
+    if backend != _CODEX_BACKEND or not model_ref:
+        return configured
+
+    from ...agent_backends.codex_catalog import CODEX_CATALOG
+
+    model = next(
+        (item for item in CODEX_CATALOG.cached() if item.ref == model_ref), None
+    )
+    if model is None or model.context_window <= 0:
+        return configured
+    model_safe = max(20_000, int(model.context_window * _CODEX_REFRESH_WINDOW_FRACTION))
+    return min(configured, model_safe)
+
+
 async def account_turn_and_maybe_eval(
     *,
     window_repo: Any,
@@ -63,6 +96,7 @@ async def account_turn_and_maybe_eval(
     family_id: Optional[int] = None,
     force_eval: bool = False,
     context_tokens: Optional[int] = None,
+    refresh_threshold_tokens: Optional[int] = None,
 ) -> Any:
     """Record a turn against the conversation window and, at each
     eval-interval checkpoint (``WINDOW_EVAL_INTERVAL_TOKENS``), trigger the
@@ -92,7 +126,7 @@ async def account_turn_and_maybe_eval(
     # prompt_hash seconds apart -- 14 of 66 extractions, 21% pure waste, and two
     # "Memory updated" pings for one turn. The refresh run is the one to keep:
     # its facts feed the continuity seed the next window opens on.
-    will_refresh = window_repo.should_refresh(state)
+    will_refresh = window_repo.should_refresh(state, refresh_threshold_tokens)
     if (
         evaluator
         and not will_refresh
@@ -221,6 +255,20 @@ async def consume_pending_seed(
     user_data.pop("pending_seed_window", None)
     if not old_window:
         return user_message
+    if state.pending_seed_window == state.window_id:
+        # Armed (in the DB) to seed from the window still in progress: a
+        # backend switch (dv-168e, see arm_backend_switch). Nothing was
+        # rolled, so there is no context to reclaim -- rebuild the WHOLE
+        # window for the fresh session on the new backend. A roll always
+        # arms the PREVIOUS window id, so the two modes cannot collide; the
+        # legacy user_data fallback only ever carried roll seeds.
+        return await _full_window_seed(
+            window_repo,
+            user_id=user_id,
+            working_dir=working_dir,
+            window_id=old_window,
+            user_message=user_message,
+        )
     rows = await window_repo.tail_messages(
         user_id, working_dir, window_id=old_window, limit=SEED_TAIL_TURNS
     )
@@ -242,6 +290,69 @@ async def consume_pending_seed(
     )
 
 
+async def _full_window_seed(
+    window_repo: Any,
+    *,
+    user_id: int,
+    working_dir: Any,
+    window_id: int,
+    user_message: str,
+) -> str:
+    """Every stored turn of the current window (plus a tool-names line per
+    turn) under a ``backend_switch`` header. The only bound is the window's own rotation threshold; the char
+    backstop is sized to it (est. 4 chars/token, generous for anything but
+    pathological text) and its firing is logged, never silent."""
+    from src.bot.window_seed import build_seed_preamble, select_full_window
+
+    turns = await window_repo.window_turns_with_tools(
+        user_id, working_dir, window_id=window_id
+    )
+    max_chars = int(window_repo.refresh_threshold_tokens) * 4
+    tail = select_full_window(turns, max_chars=max_chars)
+    if tail.truncated:
+        logger.warning(
+            "Backend-switch rebuild hit the window-size backstop",
+            user_id=user_id,
+            working_dir=str(working_dir),
+            window_id=window_id,
+            total_turns=tail.total_turns,
+            shown_turns=tail.shown_turns,
+            max_chars=max_chars,
+        )
+    logger.info(
+        "Backend-switch rebuild seeded",
+        user_id=user_id,
+        window_id=window_id,
+        turns=tail.shown_turns,
+        chars=len(tail.text),
+    )
+    return build_seed_preamble(
+        tail=tail, user_message=user_message, reason="backend_switch"
+    )
+
+
+async def arm_backend_switch(
+    window_repo: Any,
+    user_data: dict,
+    *,
+    user_id: int,
+    working_dir: Any,
+) -> None:
+    """Backend switch (dv-168e): NO roll, no extraction -- same window id,
+    the token counter carries on. Arms the same durable transition a roll
+    does, but seeded from the CURRENT window, which ``consume_pending_seed``
+    reads as "rebuild this window in full". The new backend's native session
+    (if any) is stale -- it lacks the other model's turns -- so force_new is
+    armed too, in ``conversation_windows`` so a restart before the next
+    message cannot drop it (dv-9f31/dv-a826)."""
+    state = await window_repo.get_or_create(user_id, working_dir)
+    await window_repo.set_pending_transition(
+        user_id, working_dir, seed_window=state.window_id, force_new_session=True
+    )
+    user_data["pending_seed_window"] = state.window_id
+    user_data["force_new_session"] = True
+
+
 async def refresh_window(
     window_repo: Any,
     evaluator: Any,
@@ -254,8 +365,9 @@ async def refresh_window(
     agent_id: str = "devops",
     family_id: Optional[int] = None,
 ) -> None:
-    """Compaction/switch transition: final eval on the active backend,
-    roll the window, and arm the seed for the next turn.
+    """Compaction transition: final eval on the active backend, roll the
+    window, and arm the seed for the next turn. (A backend switch no longer
+    rolls -- see ``arm_backend_switch``.)
 
     Runs strictly BETWEEN turns — the caller invokes it after the current
     turn's response is complete, so a long execution is never cut mid-flight
@@ -318,16 +430,10 @@ async def window_conversation_text(
     if not storage:
         return ""
     wd = str(Path(working_dir))
-    async with storage.db_manager.get_connection() as conn:
-        cur = await conn.execute(
-            "SELECT m.prompt, m.response FROM messages m "
-            "JOIN sessions s ON m.session_id = s.session_id "
-            "WHERE m.user_id=? AND s.project_path=? AND m.window_id=? "
-            "AND m.message_id > ? "
-            "ORDER BY m.message_id ASC",
-            (user_id, wd, state.window_id, state.last_checkpoint_message_id),
-        )
-        rows = await cur.fetchall()
+    messages = MessageRepository(storage.db_manager)
+    rows = await messages.get_window_messages(
+        user_id, wd, state.window_id, state.last_checkpoint_message_id
+    )
     parts: list[str] = []
     for prompt, response in rows:
         # Guarded like the facade version: persisted system notifications

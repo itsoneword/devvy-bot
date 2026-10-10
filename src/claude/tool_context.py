@@ -61,6 +61,19 @@ class AgentServices:
     # Optional["UserDataRepository"] (dv-5f3a): the data.db access seam.
     # Powers the per-profile data tools; None -> none mounted.
     user_data: Any = None
+    # Optional["HireliClient"] (dv-9f02): holds the Hireli service key in the
+    # bot process. None -> the hireli_* tools are not mounted.
+    hireli: Any = None
+    # Optional["ExchangeClient"] (dv-8664): runs the fetchcrypto/fetchmexc
+    # scripts for the exchange_* tools. None -> those tools are not mounted.
+    exchange: Any = None
+    # IANA zone naive schedule times are interpreted in (dv-ca94). Install-
+    # wide today (Settings.user_timezone, default Europe/Lisbon) — there is
+    # no per-user timezone yet; that lands with the dv-752a settings menu.
+    user_timezone: str = "UTC"
+    # Optional["ItemService"] (dv-752a): family todos & reminders. None ->
+    # the item_* tools are not mounted.
+    items: Any = None
 
 
 @dataclass(frozen=True)

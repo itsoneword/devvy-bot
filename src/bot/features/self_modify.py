@@ -16,14 +16,15 @@ import structlog
 
 logger = structlog.get_logger()
 
-# Tier 1: files the bot can freely edit (no restart needed)
+# Tier 1: files the bot can freely edit (no restart needed). `data/` is the
+# legacy data dir; with DEVVY_DATA_ROOT set the data root sits outside the
+# checkout, so its files are tier 0 here (dv-2c1c).
 _TIER1_PREFIXES = [
     "data/",
     "config/",
 ]
 _TIER1_FILES = [
     "CLAUDE.md",
-    ".env",
 ]
 
 # Tier 2: files that need approval and trigger a restart
@@ -33,6 +34,9 @@ _TIER2_PREFIXES = [
     "deploy/",
 ]
 _TIER2_FILES = [
+    # Bot secrets: agents cannot read or write them at all (denylist); if
+    # anything routes a change here it needs the owner.
+    ".env",
     "pyproject.toml",
     "poetry.lock",
     "install.sh",
@@ -55,6 +59,13 @@ class SelfModificationGuard:
             2 = code change (source, deps)
         """
         resolved = Path(file_path).resolve()
+        # Key material and the archive (dv-2c1c) need the owner wherever the
+        # data root lives, inside the checkout (legacy data/model_auth) or not.
+        from src.security.denylist import protected_dirs
+
+        for area in protected_dirs().everyone:
+            if resolved == area or area in resolved.parents:
+                return 2
         try:
             relative = str(resolved.relative_to(self.bot_root))
         except ValueError:

@@ -181,14 +181,16 @@ class StreamingMixin(OrchestratorBase):
             if update_obj.tool_calls and need_mcp_intercept:
                 for tc in update_obj.tool_calls:
                     tc_name = tc.get("name", "")
-                    if tc_name == "send_image_to_user" or tc_name.endswith(
-                        "__send_image_to_user"
-                    ):
+                    bare = tc_name.rsplit("__", 1)[-1]
+                    if bare in ("send_image_to_user", "send_file_to_user"):
                         tc_input = tc.get("input", {})
                         file_path = tc_input.get("file_path", "")
                         caption = tc_input.get("caption", "")
                         img = validate_image_path(
-                            file_path, approved_directory, caption
+                            file_path,
+                            approved_directory,
+                            caption,
+                            any_file=bare == "send_file_to_user",
                         )
                         if img:
                             mcp_images.append(img)

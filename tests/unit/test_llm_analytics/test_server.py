@@ -548,11 +548,11 @@ class TestChains:
         assert [p["first_of_session"] for p in series] == [True, False, True]
         assert series[0]["session_id"] == S1
         assert series[-1]["session_id"] == S2
-        # Threshold annotations track the live Settings defaults (raised to
-        # 120k/320k on 2026-08-04/05 -- see settings.py window_* fields).
+        # Threshold annotations track the live Settings defaults (see
+        # settings.py window_* fields).
         assert body["annotations"] == {
             "eval_threshold": 120000,
-            "refresh_threshold": 320000,
+            "refresh_threshold": 220000,
             "db_current_counter": 26,
         }
 

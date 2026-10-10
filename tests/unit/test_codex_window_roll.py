@@ -18,12 +18,13 @@ from pathlib import Path
 
 import pytest
 
-from src.agent_backends.codex_cli import CodexCliIntegration, CodexSessionStore
+from src.agent_backends.codex_cli import CodexCliIntegration
 from src.bot.orchestration.windowing import window_conversation_text
 from src.claude.prompt_composer import PromptComposer
 from src.claude.session import SessionManager
 from src.claude.window_bundle import WindowBundleProvider
 from src.config.settings import Settings
+from src.storage.codex_sessions import CodexSessionStore
 from src.storage.facade import Storage
 from src.storage.memory_repository import MemoryRepository
 from src.storage.session_storage import SQLiteSessionStorage
@@ -93,7 +94,7 @@ async def test_roll_on_codex_materializes_a_new_bundle_and_a_usable_seed(
     integ = CodexCliIntegration(
         config=settings,
         codex_bin=str(_fake_codex(tmp_path)),
-        session_store=CodexSessionStore(tmp_path / "codex_sessions.json"),
+        session_store=CodexSessionStore(storage.db_manager),
         bundle_provider=provider,
         session_manager=SessionManager(
             settings, SQLiteSessionStorage(storage.db_manager)
@@ -142,12 +143,20 @@ async def test_roll_on_codex_materializes_a_new_bundle_and_a_usable_seed(
     assert (old, new) == (first_window, first_window + 1)
     assert await bundle_repo.get(USER_ID, workdir, new) is None
 
-    await integ.run_command(
+    rolled = await integ.run_command(
         prompt="а сегодня?",
         working_directory=workdir,
         user_id=USER_ID,
         force_new=True,
     )
+
+    # dv-ebde: the fresh thread the roll opened carries the Codex columns and
+    # is now the head; the outgoing thread keeps its numbers, head dropped.
+    rows = await _codex_columns(storage, response.session_id, rolled.session_id)
+    assert rows[rolled.session_id] == ("openai_codex", 1, 90_000, 500, 90_500)
+    assert rows[response.session_id] == ("openai_codex", 0, 90_000, 500, 90_500)
+    store = CodexSessionStore(storage.db_manager)
+    assert await store.thread_for(USER_ID, workdir) == rolled.session_id
 
     rolled_bundle = await bundle_repo.get(USER_ID, workdir, new)
     assert rolled_bundle is not None
@@ -156,3 +165,56 @@ async def test_roll_on_codex_materializes_a_new_bundle_and_a_usable_seed(
     assert (await bundle_repo.get(USER_ID, workdir, old)).bundle_sha256 == (
         first_bundle.bundle_sha256
     )
+
+
+async def _codex_columns(storage, *session_ids):
+    out = {}
+    async with storage.db_manager.get_connection() as conn:
+        for sid in session_ids:
+            cur = await conn.execute(
+                "SELECT backend, thread_head, thread_total_input, "
+                "thread_total_output, cumulative_tokens FROM sessions "
+                "WHERE session_id = ?",
+                (sid,),
+            )
+            row = await cur.fetchone()
+            out[sid] = tuple(row) if row else None
+    return out
+
+
+async def test_backend_switch_roll_writes_codex_columns(storage, settings, tmp_path):
+    """Switching Claude -> Codex rolls the window and arms force_new_session;
+    the Codex turn that follows runs with force_new=True in a dir whose newest
+    row is a Claude session. The new thread must become the head with its own
+    columns, and the Claude row must stay untagged."""
+    from datetime import UTC, datetime
+
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+    manager = SessionManager(settings, SQLiteSessionStorage(storage.db_manager))
+    now = datetime.now(UTC)
+    from src.claude.session import ClaudeSession
+
+    await SQLiteSessionStorage(storage.db_manager).save_session(
+        ClaudeSession(
+            session_id="claude-1",
+            user_id=USER_ID,
+            project_path=workdir,
+            created_at=now,
+            last_used=now,
+        )
+    )
+    integ = CodexCliIntegration(
+        config=settings,
+        codex_bin=str(_fake_codex(tmp_path)),
+        session_store=CodexSessionStore(storage.db_manager),
+        session_manager=manager,
+    )
+    resp = await integ.run_command(
+        prompt="hi", working_directory=workdir, user_id=USER_ID, force_new=True
+    )
+    rows = await _codex_columns(storage, resp.session_id, "claude-1")
+    assert rows[resp.session_id] == ("openai_codex", 1, 90_000, 500, 90_500)
+    assert rows["claude-1"] == (None, 0, 0, 0, 0)
+    store = CodexSessionStore(storage.db_manager)
+    assert await store.thread_for(USER_ID, workdir) == resp.session_id

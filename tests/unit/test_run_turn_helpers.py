@@ -78,17 +78,22 @@ def _response(
     output_tokens=200,
     cost=0.0042,
     tools_used=(),
+    failed_tools=(),
     session_restarted=False,
+    session_fresh_reason=None,
 ) -> MagicMock:
     r = MagicMock()
     r.session_id = "sess-1"
     r.content = content
-    r.tools_used = [{"name": t} for t in tools_used]
+    r.tools_used = [{"name": t} for t in tools_used] + [
+        {"name": t, "error": "denied"} for t in failed_tools
+    ]
     r.input_tokens = input_tokens
     r.output_tokens = output_tokens
     r.cost = cost
     r.num_turns = 1
     r.session_restarted = session_restarted
+    r.session_fresh_reason = session_fresh_reason
     return r
 
 
@@ -97,6 +102,7 @@ def _window(last_context_tokens=42_000, threshold=150_000):
     repo.refresh_threshold_tokens = threshold
     wstate = MagicMock()
     wstate.last_context_tokens = last_context_tokens
+    wstate.window_id = 17
     return repo, wstate
 
 
@@ -152,7 +158,25 @@ def test_verbose_1_footer_is_model_tail_and_window_gauge_only(orch):
 
     assert len(msgs) == 1
     assert msgs[0].parse_mode == "HTML"
-    assert msgs[0].text == "reply\n\n---\ngpt-5 | win 42k/150k"
+    assert msgs[0].text == "reply\n\n---\ngpt-5 | win 42k/150k #17"
+
+
+def test_footer_uses_the_model_aware_refresh_threshold(orch):
+    o, settings = orch
+    repo, wstate = _window(threshold=320_000)
+    state = _footer_state(
+        o,
+        settings,
+        verbose_level=1,
+        window_repo=repo,
+        window_state_for_footer=wstate,
+        window_refresh_threshold_for_footer=217_600,
+    )
+    msgs = [FormattedMessage(text="reply", parse_mode=None)]
+
+    o._render_footer(state, _response(), msgs)
+
+    assert msgs[0].text == "reply\n\n---\ngpt-5 | win 42k/217k #17"
 
 
 def test_rotation_replaces_the_gauge(orch):
@@ -192,6 +216,32 @@ def test_session_restart_flag_is_surfaced(orch):
     o._render_footer(state, _response(session_restarted=True), msgs)
 
     assert msgs[0].text.endswith("gpt-5 | ↻ session restarted (resume failed)")
+
+
+def test_fresh_session_reason_replaces_restart_flag(orch):
+    """A fresh backend session names its cause next to the gauge, so a
+    context reset and a window roll no longer look alike (dv-2a5a)."""
+    o, settings = orch
+    repo, wstate = _window()
+    state = _footer_state(
+        o, settings, verbose_level=1, window_repo=repo, window_state_for_footer=wstate
+    )
+    msgs = [FormattedMessage(text="reply", parse_mode=None)]
+
+    o._render_footer(
+        state,
+        _response(
+            session_restarted=True,
+            session_fresh_reason="resume failed (transcript_missing), 5 turns seeded",
+        ),
+        msgs,
+    )
+
+    assert msgs[0].text == (
+        "reply\n\n---\ngpt-5 | 🆕 new session "
+        "(resume failed (transcript_missing), 5 turns seeded) | win 42k/150k #17"
+    )
+    assert "↻" not in msgs[0].text
 
 
 def test_verbose_2_adds_real_tokens_and_price(orch):
@@ -335,6 +385,27 @@ async def test_claim_without_write_logs_mismatch_and_informs_owner(orch):
     assert event.parse_mode is None
     assert "[claim_no_write] devops msg=77:" in event.text
     assert "Записал" in event.text
+
+
+async def test_failed_write_tool_does_not_satisfy_claim(orch):
+    # dv-73e2: a denied/failed tool call carries an "error" and must not
+    # count as satisfying a write claim just because its name is a write
+    # tool -- the claim is a lie if the only "Write" call failed.
+    o, settings = orch
+    storage = _storage()
+    bus = MagicMock()
+    bus.publish = AsyncMock()
+    state = _honesty_state(o, settings, storage=storage, event_bus=bus)
+
+    await o._run_save_honesty(
+        state, _response("Записал: обед — суп.", failed_tools=["Write"])
+    )
+
+    kinds = [(e[0], e[2].get("success", True)) for e in _events(storage)]
+    assert kinds == [("save_claim_detected", True), ("save_claim_mismatch", False)]
+    assert _events(storage)[0][1]["satisfied_by"] is None
+    assert _events(storage)[1][1]["mismatch_kind"] == "claim_no_write"
+    bus.publish.assert_awaited_once()
 
 
 async def test_trigger_matches_raw_text_not_the_reply_envelope(orch):

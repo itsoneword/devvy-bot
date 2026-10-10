@@ -15,7 +15,7 @@ import pytest
 
 from src.agent_backends.codex_cli import (
     CodexCliIntegration,
-    CodexSessionStore,
+    InMemoryCodexSessionStore,
     read_rollout_token_info,
 )
 from src.config.settings import Settings
@@ -96,9 +96,9 @@ async def test_turn_reports_rollout_level_and_delta_flow(
 ):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "home"))
     _write_rollout(tmp_path / "home", THREAD, [_token_count(175_970, 35_604)])
-    store = CodexSessionStore(tmp_path / "s.json")
+    store = InMemoryCodexSessionStore()
     # Previous turn on the same thread ended at these totals.
-    store.record(
+    await store.record(
         7, tmp_path, THREAD, 0, 0, thread_total_input=100_000, thread_total_output=4_000
     )
     integ = CodexCliIntegration(
@@ -110,7 +110,7 @@ async def test_turn_reports_rollout_level_and_delta_flow(
     assert resp.context_tokens == 35_604  # the level, not 175,970
     assert resp.input_tokens == 75_970  # this turn's flow: total minus previous
     assert resp.output_tokens == 575
-    info = store.info_for(7, tmp_path)
+    info = await store.info_for(7, tmp_path)
     assert info["thread_total_input"] == 175_970
     assert info["cumulative_tokens"] == 75_970 + 575
 
@@ -122,7 +122,7 @@ async def test_turn_without_a_rollout_reports_unknown_level(
     integ = CodexCliIntegration(
         config=settings,
         codex_bin=str(_fake_codex(tmp_path, 175_970)),
-        session_store=CodexSessionStore(tmp_path / "s.json"),
+        session_store=InMemoryCodexSessionStore(),
     )
     resp = await integ.run_command(prompt="hi", working_directory=tmp_path, user_id=7)
     assert resp.context_tokens == 0  # unknown -> the window holds its last level

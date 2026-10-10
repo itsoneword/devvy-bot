@@ -1,11 +1,11 @@
 """Callback-query handlers for the orchestrator.
 
-cd:/model:/agent: callback handling, backend-switch window rolling and
+cd:/model:/agent: callback handling, backend-switch rebuild arming and
 switch-message pinning. Code is moved verbatim from src/bot/orchestrator.py.
 """
 
 import asyncio
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import structlog
 from telegram import Update
@@ -21,7 +21,8 @@ from .agents_menu import (
 )
 from .base import CLAUDE_BACKEND, CODEX_BACKEND, OrchestratorBase, policy_for
 from .routing import _PROFILE_BADGES
-from .windowing import refresh_window, window_conversation_text
+from ..window_seed import model_switch_note
+from .windowing import arm_backend_switch
 
 logger = structlog.get_logger()
 
@@ -78,46 +79,62 @@ class CallbacksMixin(OrchestratorBase):
         new_backend: str,
         prev_backend: str,
     ) -> None:
-        """On a real backend change, run the SAME transition as a 150k
-        compaction (``refresh_window``): final extraction over the outgoing
-        window's un-extracted tail, roll, and arm the seed durably in the DB
-        so the next turn continues the conversation on the new backend.
+        """On a real backend change, arm a full-window rebuild (dv-168e).
 
-        This used to roll and write the seed to ``user_data`` only. That is
-        in-memory: a restart between the switch and the next message dropped
-        both the seed and ``force_new_session``, so the turn resumed the
-        retired session with no continuity — the dv-9f31 failure, which had
-        only been fixed on the compaction path (dv-a826).
+        The window is NOT rolled: same window id, the token counter carries
+        on, and no extraction runs here (the 150k rotation path still does
+        its own). The next turn starts a fresh native session on the new
+        backend seeded with every stored turn of the current window -- the
+        new backend's old session, if any, lacks the other model's turns and
+        must never be resumed. The intent is armed in ``conversation_windows``
+        (not only user_data) so a restart before the next message cannot
+        drop it (dv-9f31/dv-a826). Same-backend tier changes return early:
+        their session resumes as is.
         """
         if new_backend == prev_backend:
             return
         window_repo = context.bot_data.get("window_repo")
         if not window_repo:
             return
-        # Same resolver as text turns and /new (dv-c07a): rolling on the
-        # current_directory/home fallback rotated a phantom window while the
-        # conversation kept running in the profile workspace.
+        # Same resolver as text turns and /new (dv-c07a): arming on the
+        # current_directory/home fallback would target a phantom window while
+        # the conversation keeps running in the profile workspace.
         user_id = query.from_user.id if query.from_user else None
         if user_id is None or context.user_data is None:
             return
-        working_dir = self._routed_working_dir(context, user_id)
-        state = await window_repo.get_or_create(user_id, working_dir)
-        # The extraction runs on the backend just selected: prefs are already
-        # persisted at this point, so it is the active one — same rule as the
-        # compaction path, which evaluates on ``selected_backend``.
-        await refresh_window(
+        await arm_backend_switch(
             window_repo,
-            context.bot_data.get("evaluator_service"),
             context.user_data,
             user_id=user_id,
-            working_dir=working_dir,
-            backend=new_backend,
-            conversation_text=await window_conversation_text(
-                context.bot_data.get("storage"), user_id, working_dir, state
-            ),
-            agent_id=self._agent_id_for(context, working_dir, user_id),
-            family_id=self._family_id_for(context, user_id, working_dir),
+            working_dir=self._routed_working_dir(context, user_id),
         )
+
+    async def _note_model_switch(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        query: Any,
+        *,
+        prev: Tuple[str, Optional[str]],
+        new: Tuple[str, Optional[str]],
+    ) -> None:
+        """Mark the switch point in the conversation itself (dv-168e).
+
+        A backend switch rebuilds the current window in a fresh session on
+        the new backend; a same-backend tier change resumes the session as is. In
+        both cases the new model would otherwise read earlier replies as its
+        own. The note rides the one-shot ``pending_notes`` queue (durable,
+        same working-dir scope the next turn consumes), so it lands in the
+        next prompt -- and the transcript -- exactly where the switch happened.
+        """
+        if prev == new:
+            return
+        storage = context.bot_data.get("storage")
+        notes = getattr(storage, "pending_notes", None)
+        user_id = query.from_user.id if query.from_user else None
+        if notes is None or user_id is None or context.user_data is None:
+            return
+        working_dir = self._routed_working_dir(context, user_id)
+        await notes.add(user_id, str(working_dir), model_switch_note(prev, new))
 
     async def _handle_model_callback(
         self, query: Any, context: ContextTypes.DEFAULT_TYPE, data: str
@@ -128,6 +145,7 @@ class CallbacksMixin(OrchestratorBase):
         # and the ids written to prefs come from the backend's policy
         # (src/agent_backends/protocol.py), not from inline literals.
         prev_backend = context.user_data.get("agent_backend", CLAUDE_BACKEND)
+        prev_model = context.user_data.get("agent_model")
         if data == "model:claude" or data.startswith("model:claude:"):
             tier = data.split(":", 2)[2] if data.count(":") >= 2 else ""
             # "claude" is the stored sentinel for "no tier: config default".
@@ -143,6 +161,12 @@ class CallbacksMixin(OrchestratorBase):
                 )
             await self._maybe_roll_on_switch(
                 context, query, new_backend=CLAUDE_BACKEND, prev_backend=prev_backend
+            )
+            await self._note_model_switch(
+                context,
+                query,
+                prev=(prev_backend, prev_model),
+                new=(CLAUDE_BACKEND, model),
             )
             label = model if model in self._CLAUDE_TIERS else "default model"
             await query.edit_message_text(
@@ -189,6 +213,12 @@ class CallbacksMixin(OrchestratorBase):
                 )
             await self._maybe_roll_on_switch(
                 context, query, new_backend=CODEX_BACKEND, prev_backend=prev_backend
+            )
+            await self._note_model_switch(
+                context,
+                query,
+                prev=(prev_backend, prev_model),
+                new=(CODEX_BACKEND, model_ref),
             )
             await query.edit_message_text(
                 "Model backend set to OpenAI Codex: "
@@ -375,6 +405,12 @@ class CallbacksMixin(OrchestratorBase):
 
         if data.startswith("agents:"):
             await self._handle_agents_menu_callback(query, context, data)
+            return
+
+        if data.startswith("rem:"):
+            from .commands.reminders import handle_reminders_callback
+
+            await handle_reminders_callback(query, context, data)
             return
 
         if data.startswith("auth:"):

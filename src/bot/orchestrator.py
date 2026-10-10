@@ -48,6 +48,7 @@ OWNER_ONLY_COMMANDS = frozenset(
         "sync_threads",
         "diag",
         "identity",
+        "limits",
         "adduser",
         "rmuser",
     }
@@ -95,6 +96,7 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
     CommandSpec("help", "List every command you can run", "core", _EVERYONE),
     CommandSpec("status", "Show session status", "session", _OWNER),
     CommandSpec("usage", "Show cost spent and budget caps", "session", _EVERYONE),
+    CommandSpec("limits", "Show OpenAI/Codex account limits", "session", _OWNER),
     CommandSpec("model", "Choose model backend / log in", "session", _OWNER),
     CommandSpec("tasks", "Show the shared task board", "session", _OWNER),
     # --- Unlisted from here down: registered and working, surfaced by /help.
@@ -103,6 +105,7 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
     CommandSpec("memory", "Show loaded memory and context size", "session"),
     CommandSpec("repo", "List repos / switch workspace", "session"),
     CommandSpec("schedules", "List scheduled agent jobs", "session"),
+    CommandSpec("reminders", "Your reminders & todos: list, cancel", "session"),
     CommandSpec(
         "sessions", "Show each profile's last activity", "session", requires="profiles"
     ),
@@ -153,7 +156,7 @@ class MessageOrchestrator(
         runtime KeyError.
         """
         from .features import server_monitor
-        from .orchestration.commands import auth, system
+        from .orchestration.commands import auth, reminders, system
 
         return {
             "start": self.agentic_start,
@@ -163,9 +166,11 @@ class MessageOrchestrator(
             "resume": self.agentic_resume,
             "restart": system.restart_command,
             "auth": auth.auth_command,
+            "reminders": reminders.reminders_command,
             "help": self.agentic_help,
             "status": self.agentic_status,
             "usage": self.agentic_usage,
+            "limits": self.agentic_limits,
             "model": self.agentic_model,
             "tasks": self.agentic_tasks,
             "family": self.agentic_family,
@@ -267,7 +272,7 @@ class MessageOrchestrator(
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
-                pattern=r"^(cd:|model:|agent:|agents:|auth:)",
+                pattern=r"^(cd:|model:|agent:|agents:|auth:|rem:)",
             )
         )
 

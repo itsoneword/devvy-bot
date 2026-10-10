@@ -170,6 +170,73 @@ async def compose_persona(
     )
 
 
+def current_time_context(tz_name: str) -> str:
+    """One line stating 'now' in the configured local zone, for both backends.
+
+    dv-ca94: an agent that only ever sees UTC (the Codex ``clock`` tool, the
+    host's own ``Etc/UTC`` TZ) writes "17:00 today" as ``17:00Z`` and the
+    reminder fires an hour late for a Lisbon user. Prepended to the PROMPT
+    (never the persona/system prompt) so it is fresh every turn without
+    invalidating the frozen per-window bundle (dv-5e2a) — the same reason
+    ``_prepend_today_state`` lives on the prompt path, not here as a
+    composed section.
+
+    Falls back to UTC for an unknown/invalid zone name rather than raising —
+    a bad ``USER_TIMEZONE`` must not break every turn.
+    """
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        tz = ZoneInfo(tz_name or "UTC")
+    except (ZoneInfoNotFoundError, ValueError):
+        tz_name = "UTC"
+        tz = ZoneInfo("UTC")
+    now_local = datetime.now(tz)
+    now_utc = datetime.now(UTC)
+    offset = now_local.strftime("%z") or "+0000"
+    offset_fmt = f"{offset[:3]}:{offset[3:]}"
+    return (
+        f"<current_time>Now: {now_local.strftime('%Y-%m-%d %H:%M')} local "
+        f"({tz_name}, UTC{offset_fmt}); UTC: {now_utc.strftime('%Y-%m-%dT%H:%M')}Z. "
+        "A bare date/time you give a scheduling tool (no UTC offset) is "
+        "interpreted in this local zone, not UTC.</current_time>"
+    )
+
+
+async def prepend_items_context(
+    items: Any,
+    registry: Optional["ProfileRegistry"],
+    prompt: str,
+    working_directory: Path,
+    user_id: Optional[int],
+) -> str:
+    """Prefix the ``<family_reminders>`` block (dv-752a), both backends.
+
+    The family roster plus reminder activity since this user's previous turn
+    in this agent: a reminder delivered here (so a bare reply to it is
+    understood) and what happened to reminders this user set for others (so
+    the creator's agent knows). Prompt, never the system prompt, for the
+    same frozen-bundle reason as ``<current_time>``. Nothing is written into
+    anyone's memory. Any failure degrades to the unchanged prompt.
+    """
+    if items is None or not user_id:
+        return prompt
+    try:
+        from ..profiles.registry import agent_id_for_working_dir
+
+        slug = agent_id_for_working_dir(registry, working_directory)
+        block = await items.turn_context(int(user_id), slug)
+    except Exception as exc:  # noqa: BLE001 — never fail a turn for context
+        import structlog
+
+        structlog.get_logger().warning(
+            "family_reminders context skipped", user_id=user_id, error=str(exc)
+        )
+        return prompt
+    return f"{block}\n\n{prompt}" if block else prompt
+
+
 def image_roots_env(approved_directory: Any, working_directory: Path) -> str:
     """``TELEGRAM_IMAGE_ROOTS`` for this turn: deliverable roots, pathsep-joined.
 

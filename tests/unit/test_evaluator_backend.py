@@ -1,23 +1,8 @@
-import asyncio
 import json
 
 import pytest
 
 from src.evaluator.service import EvaluatorService
-
-
-class _FakeProcess:
-    """Stand-in for asyncio.subprocess.Process capturing stdin input."""
-
-    def __init__(self, stdout: bytes = b"[]", stderr: bytes = b"", returncode: int = 0):
-        self._stdout = stdout
-        self._stderr = stderr
-        self.returncode = returncode
-        self.received_input: bytes | None = None
-
-    async def communicate(self, input: bytes | None = None):  # noqa: A002
-        self.received_input = input
-        return self._stdout, self._stderr
 
 
 @pytest.fixture
@@ -94,56 +79,6 @@ async def test_invoke_cli_dispatches_to_codex(service, monkeypatch):
     assert json.loads(out)[0]["op"] == "add"
 
 
-async def test_invoke_claude_cli_pipes_prompt_via_stdin_not_argv(service, monkeypatch):
-    """Regression test: a long conversation embedded in the evaluator prompt
-    used to be passed as a CLI argument (`claude -p "<prompt>"`), which blows
-    past the OS ARG_MAX limit ("Argument list too long") on large
-    conversations. The prompt must go via stdin instead, which has no such
-    cap."""
-    huge_prompt = "x" * 5_000_000  # far past any ARG_MAX, trivial over stdin
-    captured = {}
-
-    async def fake_exec(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return _FakeProcess(stdout=b'{"result": "[]"}')
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-
-    result = await service._invoke_claude_cli(huge_prompt)
-
-    assert huge_prompt not in captured["args"]  # never placed in argv
-    assert captured["kwargs"]["stdin"] == asyncio.subprocess.PIPE
-    assert result == "[]"
-
-
-async def test_invoke_codex_cli_pipes_prompt_via_stdin_not_argv(service, monkeypatch):
-    """Same ARG_MAX regression, codex backend: prompt must go via stdin with
-    the `-` positional argument, not as a raw argv element."""
-    from pathlib import Path
-
-    huge_prompt = "y" * 5_000_000
-    captured = {}
-
-    async def fake_exec(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        # Simulate codex writing its --output-schema-constrained result to
-        # the -o path before this coroutine returns.
-        out_path = Path(args[args.index("-o") + 1])
-        out_path.write_text('{"extractions": []}')
-        return _FakeProcess()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-
-    result = await service._invoke_codex_cli(huge_prompt)
-
-    assert huge_prompt not in captured["args"]
-    assert captured["args"][-1] == "-"  # stdin sentinel, not the prompt
-    assert captured["kwargs"]["stdin"] == asyncio.subprocess.PIPE
-    assert json.loads(result) == []  # _unwrap_codex_output strips the wrapper
-
-
 def test_codex_schema_every_op_field_is_nullable_except_op(service):
     """Strict mode forces every field into `required`, so every field that a
     metadata-only op does not carry MUST accept null — otherwise requiring
@@ -156,66 +91,43 @@ def test_codex_schema_every_op_field_is_nullable_except_op(service):
         assert "null" in spec["type"], name
 
 
-async def test_invoke_codex_cli_reports_the_error_it_finds_on_stdout(
+async def test_invoke_codex_cli_asks_the_router_with_schema_and_model(
     service, monkeypatch
 ):
-    """`codex exec --json` puts API failures on STDOUT as `error`/`turn.failed`
-    events and leaves stderr empty. Reporting stderr alone produced the
-    useless live line `Evaluator failed: Codex CLI failed (exit 1): `."""
-    stdout = b"\n".join(
-        [
-            b'{"type":"thread.started","thread_id":"th-1"}',
-            b'{"type":"error","message":"400 invalid_json_schema: Missing \'label\'."}',
-            b'{"type":"turn.failed","error":'
-            b'{"message":"400 invalid_json_schema: Missing \'label\'."}}',
-        ]
-    )
+    """Extraction on Codex is a plain router call: explicit model, the op
+    schema, and the object wrapper stripped from the answer."""
+    from unittest.mock import AsyncMock
 
-    async def fake_exec(*args, **kwargs):
-        return _FakeProcess(stdout=stdout, stderr=b"", returncode=1)
+    from src.model_router import CallResult, ModelRouter, set_router
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    caller = AsyncMock(return_value=CallResult(text='{"extractions": []}'))
+    set_router(ModelRouter(plain_callers={"openai_codex": caller}))
+    try:
+        result = await service._invoke_codex_cli("PROMPT")
+    finally:
+        set_router(None)
 
-    with pytest.raises(RuntimeError) as excinfo:
-        await service._invoke_codex_cli("PROMPT")
-    message = str(excinfo.value)
-    assert "exit 1" in message
-    assert "invalid_json_schema" in message
-    # turn.failed restates the error event; say it once.
-    assert message.count("invalid_json_schema") == 1
+    request = caller.await_args.args[0]
+    assert request.purpose == "extraction" and request.harness == "openai_codex"
+    assert request.model == "openai-codex/gpt-6-sol"
+    assert request.json_schema == service._codex_output_schema()
+    assert json.loads(result) == []
 
 
-async def test_invoke_codex_cli_never_reports_an_empty_reason(service, monkeypatch):
-    async def fake_exec(*args, **kwargs):
-        return _FakeProcess(stdout=b"", stderr=b"", returncode=1)
+async def test_invoke_claude_cli_asks_the_router(service):
+    from unittest.mock import AsyncMock
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    from src.model_router import CallResult, ModelRouter, set_router
 
-    with pytest.raises(RuntimeError, match=r"exit 1\): \(no output\)"):
-        await service._invoke_codex_cli("PROMPT")
+    caller = AsyncMock(return_value=CallResult(text="[]"))
+    set_router(ModelRouter(plain_callers={"claude": caller}))
+    try:
+        assert await service._invoke_claude_cli("PROMPT") == "[]"
+        await service._invoke_reconcile_cli("PROMPT")
+    finally:
+        set_router(None)
 
-
-async def test_invoke_codex_cli_runs_read_only_outside_the_bot_cwd(
-    service, monkeypatch
-):
-    """This call reads a prompt and emits JSON. It used to ask for
-    danger-full-access in the bot's own working directory, which bought
-    nothing and pointed a shell-capable agent at the repository."""
-    from pathlib import Path
-
-    captured = {}
-
-    async def fake_exec(*args, **kwargs):
-        captured["args"] = args
-        Path(args[args.index("-o") + 1]).write_text('{"extractions": []}')
-        return _FakeProcess()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    await service._invoke_codex_cli("PROMPT")
-
-    args = captured["args"]
-    assert args[args.index("-s") + 1] == "read-only"
-    assert "danger-full-access" not in args
-    # -C points at the same throwaway temp dir the schema/out files live in.
-    workdir = Path(args[args.index("-C") + 1])
-    assert workdir == Path(args[args.index("-o") + 1]).parent
+    extraction, reconcile = (c.args[0] for c in caller.await_args_list)
+    assert extraction.purpose == "extraction" and extraction.model == "sonnet"
+    assert reconcile.purpose == "reconcile" and reconcile.model == "haiku"
+    assert extraction.timeout_seconds == service._timeout

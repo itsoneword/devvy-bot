@@ -46,7 +46,7 @@ async def test_successful_refresh() -> None:
 
     assert result is True
     evaluator.run.assert_awaited_once()
-    session_mgr.remove_session.assert_awaited_once_with("sess-1")
+    session_mgr.remove_session.assert_awaited_once_with("sess-1", reason="context_refresh")
     notify.assert_awaited_once_with(
         42,
         "Session refreshed at 150k tokens. Memory preserved -- starting fresh session.",
@@ -67,7 +67,7 @@ async def test_refresh_continues_when_evaluator_fails() -> None:
     result = await svc.refresh(session, user_id=42)
 
     assert result is True
-    session_mgr.remove_session.assert_awaited_once_with("sess-1")
+    session_mgr.remove_session.assert_awaited_once_with("sess-1", reason="context_refresh")
     notify.assert_awaited_once()
 
 

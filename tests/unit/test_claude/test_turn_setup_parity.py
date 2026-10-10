@@ -5,7 +5,7 @@ composes its persona text and computes the telegram image roots. The Claude
 SDK manager and the Codex CLI backend both call it. These tests pin the
 parity — same inputs, same TurnContext, same composed text, same roots — and
 the one deliberate difference: Claude passes the text as ``system_prompt``,
-Codex prepends it to the user prompt.
+Codex prepends it to the first user prompt of a fresh thread.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
-from src.agent_backends.codex_cli import CodexCliIntegration, CodexSessionStore
+from src.agent_backends.codex_cli import CodexCliIntegration, InMemoryCodexSessionStore
 from src.bot.utils.image_extractor import IMAGE_ROOTS_ENV
 from src.claude.prompt_composer import PromptComposer
 from src.claude.sdk_integration import ClaudeSDKManager
@@ -120,7 +120,7 @@ def pair(tmp_path: Path) -> Tuple[ClaudeSDKManager, CodexCliIntegration, Any]:
     )
     codex = CodexCliIntegration(
         config=settings,
-        session_store=CodexSessionStore(tmp_path / "s.json"),
+        session_store=InMemoryCodexSessionStore(),
         profile_registry=registry,
         memory_retriever=retriever,
     )
@@ -318,7 +318,7 @@ class TestPersonaParity:
         settings = _settings(tmp_path)
         claude = ClaudeSDKManager(settings)
         codex = CodexCliIntegration(
-            config=settings, session_store=CodexSessionStore(tmp_path / "s.json")
+            config=settings, session_store=InMemoryCodexSessionStore()
         )
 
         assert await claude._persona_text(tmp_path, "hi", user_id=USER_ID) is None
@@ -336,7 +336,7 @@ class TestPersonaParity:
         composer = _Broken(memory_path=tmp_path, agent_md_path=tmp_path / "a.md")
         codex = CodexCliIntegration(
             config=settings,
-            session_store=CodexSessionStore(tmp_path / "s.json"),
+            session_store=InMemoryCodexSessionStore(),
             prompt_composer=composer,
         )
         assert await codex._with_persona(tmp_path, "hi", user_id=USER_ID) == "hi"
@@ -363,7 +363,7 @@ class TestImageRootsParity:
         claude = ClaudeSDKManager(settings, profile_registry=registry)
         codex = CodexCliIntegration(
             config=settings,
-            session_store=CodexSessionStore(tmp_path / "s.json"),
+            session_store=InMemoryCodexSessionStore(),
             profile_registry=registry,
         )
         coach = tmp_path / "coach"
@@ -386,3 +386,70 @@ class TestImageRootsParity:
     def test_working_dir_is_the_fallback_root(self, tmp_path) -> None:
         assert str(tmp_path / "wd") in image_roots_env(None, tmp_path / "wd")
         assert str(tmp_path / "wd") not in image_roots_env(tmp_path, tmp_path / "wd")
+
+
+class TestCurrentTimeContext:
+    """dv-ca94: both backends prepend the same ``<current_time>`` line to
+    every turn's prompt so an agent's own time arithmetic uses the
+    configured local zone, not host/UTC."""
+
+    def test_states_local_time_tz_and_utc(self) -> None:
+        from src.claude.turn_setup import current_time_context
+
+        text = current_time_context("Europe/Lisbon")
+        assert "<current_time>" in text
+        assert "Europe/Lisbon" in text
+        assert "UTC+" in text or "UTC-" in text
+        assert "UTC:" in text
+
+    def test_bad_zone_falls_back_to_utc_without_raising(self) -> None:
+        from src.claude.turn_setup import current_time_context
+
+        text = current_time_context("Not/AZone")
+        assert "UTC" in text  # falls back, never raises
+
+    def test_empty_zone_falls_back_to_utc(self) -> None:
+        from src.claude.turn_setup import current_time_context
+
+        text = current_time_context("")
+        assert "UTC" in text
+
+
+async def test_codex_drops_cwd_confinement_on_unsandboxed_profile(
+    tmp_path: Path,
+) -> None:
+    """dv-6a9b: devops (sandbox: false) on Codex was told "All file
+    operations must stay within <cwd>" and refused to run a tool outside
+    its repo, while Claude got the full-access line."""
+    devops = tmp_path / "devops"
+    devops.mkdir()
+    (devops / "agent.md").write_text("You are Atlas.", encoding="utf-8")
+    registry = ProfileRegistry(
+        [
+            ProfileDefinition(
+                slug="devops",
+                name="Devops",
+                working_dir=devops,
+                memory_dir=devops / "memory",
+                persona=devops / "agent.md",
+                default=True,
+                sandbox=False,
+                unrestricted=True,
+            )
+        ]
+    )
+    codex = CodexCliIntegration(
+        config=_settings(tmp_path),
+        session_store=InMemoryCodexSessionStore(),
+        profile_registry=registry,
+        memory_retriever=_FakeRetriever(),
+    )
+    provider = _FakeBundleProvider(None)
+    codex.bundle_provider = provider  # type: ignore[assignment]
+
+    text = await codex._persona_text(devops, "hi", user_id=USER_ID)
+
+    assert text is not None
+    assert "must stay within" not in text
+    assert "full-access to the server" in text
+    assert provider.calls[0]["full_access"] is True

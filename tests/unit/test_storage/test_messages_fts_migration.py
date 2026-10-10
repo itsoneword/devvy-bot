@@ -1,4 +1,4 @@
-"""Migration 14: messages_fts (dv-r3c1).
+"""messages_fts (dv-r3c1; legacy migration 14, now Alembic bot 0002).
 
 Covers the two properties that matter for an external-content FTS5 table:
 existing rows get backfilled once, and re-running the migration script is a
@@ -68,12 +68,12 @@ async def test_new_row_is_indexed_via_trigger(db: DatabaseManager):
 
 
 async def test_rerunning_migrations_does_not_duplicate_or_error(db: DatabaseManager):
-    """Backfill runs once (schema_version guards it); re-invoking the
-    migration runner must be inert, not a double-index or a crash."""
+    """Re-invoking the schema runner on a current DB (Alembic at head) must
+    be inert, not a double-index or a crash."""
     await _insert_message(db, "s1", "pre-existing backfilled row")
 
     # Simulate a second boot against the same (already-migrated) database.
-    await db._run_migrations()
+    await db.initialize()
 
     async with db.get_connection() as conn:
         cur = await conn.execute(

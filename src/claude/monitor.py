@@ -249,6 +249,7 @@ def check_bash_denied_paths(
     working_directory: Path,
     full_access: bool = False,
     read_scope: Optional[ReadScope] = None,
+    unrestricted: bool = False,
 ) -> Tuple[bool, Optional[str]]:
     """Reject bash commands that touch denied paths, read or write.
 
@@ -267,6 +268,10 @@ def check_bash_denied_paths(
     and the search-ancestor rule for recursive readers (grep/rg/find/...).
     Owner sessions carry ``guest_allowlist=None`` and every scope check
     no-ops.
+
+    ``unrestricted`` (profile flag, dv-e38e; devops) drops the data-root
+    area checks (secrets/, archive/, db/ and the tree-read rule over their
+    parents). The credential-filename and tenant-DB rules above still apply.
     """
     lowered = command.lower()
 
@@ -298,6 +303,12 @@ def check_bash_denied_paths(
                     f"messages, tokens). Use the memory and tools this session "
                     f"already provides for the current user."
                 )
+
+    area_error = _protected_area_error(
+        command, working_directory, full_access, unrestricted=unrestricted
+    )
+    if area_error is not None:
+        return False, area_error
 
     try:
         tokens = shlex.split(command)
@@ -331,7 +342,9 @@ def check_bash_denied_paths(
         if resolved is None:
             continue
 
-        allowed, error = denylist.is_path_allowed(str(resolved))
+        allowed, error = denylist.is_path_allowed(
+            str(resolved), unrestricted=unrestricted
+        )
         if not allowed:
             return False, (f"Access denied: '{token}' is a denied location ({error})")
 
@@ -373,6 +386,113 @@ def check_bash_denied_paths(
                     return False, error
 
     return True, None
+
+
+# Commands that walk a tree and print or copy what they find: rooting one at
+# an ANCESTOR of a protected data-root area (secrets/, archive/, db/) reads
+# it wholesale, which no per-path check sees. Applies to every session.
+_TREE_READ_COMMANDS: Set[str] = _RECURSIVE_READ_COMMANDS | {
+    "cp",
+    "rsync",
+    "scp",
+    "zip",
+}
+# Copiers whose LAST argument is the destination: `cp x ~/` must not count
+# as reading all of $HOME.
+_DEST_LAST_COMMANDS: Set[str] = {"cp", "rsync", "scp"}
+
+# Characters that end a path inside a quoted script: `open('/x/y')`,
+# `path=/x/y`, `["/x/y", ...]`.
+_FRAGMENT_SPLIT = re.compile(r"[\s'\"(),;=:\[\]{}<>|&`]+")
+
+
+def _protected_area_error(
+    command: str,
+    working_directory: Path,
+    full_access: bool,
+    unrestricted: bool = False,
+) -> Optional[str]:
+    """Deny commands that reach a protected data-root area (dv-2c1c).
+
+    Best effort, by design: bash is a programming language and this is a
+    lexical check. It catches the area named literally (absolute, ``~/``,
+    or relative to the cwd or to a preceding ``cd``), inside quoted scripts
+    (``python3 -c "open('/root/secrets/x')"``), and as the root of a
+    recursive reader or copier. It does NOT catch paths built at runtime
+    (``$HOME``/variables, command substitution, globs like ``~/Dev*/sec*``,
+    encoded strings, a script file written first and run second). The real
+    boundary for sandboxed profiles is the bwrap ``denyRead`` mount; devops
+    runs unsandboxed and has only this.
+    """
+    from src.security.denylist import (
+        protected_path_error,
+        protected_search_error,
+        session_protected_dirs,
+    )
+
+    view = session_protected_dirs(full_access, unrestricted)
+    dirs = view.everyone + view.tenant
+    if not dirs:
+        return None
+
+    home = Path.home()
+    for area in dirs:
+        literals = {str(area)}
+        try:
+            literals.add("~/" + str(area.relative_to(home)))
+        except ValueError:
+            pass
+        for literal in literals:
+            if literal in command:
+                return (
+                    f"Access denied: command references {area}, a directory "
+                    f"no agent session may read (keys, archive, or every "
+                    f"user's databases). Ask the owner directly."
+                )
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    def _looks_like_path(fragment: str) -> bool:
+        return "/" in fragment or fragment.startswith(("~", "."))
+
+    # Per-chain walk so a `cd` re-bases the relative paths after it.
+    base = working_directory
+    chain: List[str] = []
+    for token in tokens + [";"]:
+        if token not in _COMMAND_SEPARATORS:
+            chain.append(token)
+            continue
+        if not chain:
+            continue
+        name = Path(chain[0]).name
+        args = [t for t in chain[1:] if not t.startswith("-")]
+        for token_ in chain:
+            for fragment in _FRAGMENT_SPLIT.split(token_):
+                fragment = _strip_glob(fragment)
+                if not fragment or not _looks_like_path(fragment):
+                    continue
+                error = protected_path_error(fragment, base, full_access)
+                if error is not None:
+                    return error
+        if name in _TREE_READ_COMMANDS:
+            sources = args
+            if name in _DEST_LAST_COMMANDS and len(args) > 1:
+                sources = args[:-1]
+            elif name == "zip" and args:
+                sources = args[1:]  # first arg is the zip being written
+            for arg in sources:
+                root = _strip_glob(arg) or "."
+                error = protected_search_error(root, base, full_access)
+                if error is not None:
+                    return error
+        if name == "cd" and args:
+            target = Path(args[0]).expanduser()
+            base = target if target.is_absolute() else base / target
+        chain = []
+    return None
 
 
 _REDIRECT_OPS: Set[str] = {">", ">>", "1>", "2>", "&>", ">|", "2>>", "&>>"}

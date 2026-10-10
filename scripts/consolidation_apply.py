@@ -3,7 +3,9 @@
 
 The recurring pass (src/consolidation/service.py) is report-only; this script
 is the ONLY writer. It executes exactly the ``- [x]``-annotated lines of a
-``data/consolidation/report-*.md``:
+``report-*.md`` from ``DataLayout.consolidation_dir``
+(``<root>/workspaces/devops/reports/consolidation/``, or ``data/consolidation/``
+in the legacy layout). A bare ``--report`` file name is looked up there:
 
     - [x] MERGE scope=<scope> survivor=<id> close=<id>[,<id>...]
     - [x] EXPIRE scope=<scope> id=<id>
@@ -32,6 +34,9 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.utils.paths import data_layout  # noqa: E402
 
 _ACTION_RE = re.compile(
     r"^\s*-\s*\[x\]\s+(MERGE|EXPIRE)\s+(.+?)\s*$", re.IGNORECASE | re.MULTILINE
@@ -99,7 +104,7 @@ def apply_report(conn: sqlite3.Connection, report_path: Path) -> None:
 
 
 def backup(db_path: str) -> Path:
-    backups = Path("data/backups")
+    backups = data_layout().db_dir / "backups"
     backups.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S")
     dest = backups / f"bot-{stamp}.db"
@@ -116,10 +121,12 @@ def backup(db_path: str) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True)
-    parser.add_argument("--db", default="data/bot.db")
+    parser.add_argument("--db", default=str(data_layout().bot_db))
     parser.add_argument("--no-backup", action="store_true")
     args = parser.parse_args()
 
+    if not args.report.exists() and args.report.name == str(args.report):
+        args.report = data_layout().consolidation_dir / args.report
     if not args.report.exists():
         sys.exit(f"report not found: {args.report}")
     if not args.no_backup:

@@ -181,9 +181,15 @@ class SecurityValidator:
         )
 
     def validate_path(
-        self, user_path: str, current_dir: Optional[Path] = None
+        self,
+        user_path: str,
+        current_dir: Optional[Path] = None,
+        unrestricted: bool = False,
     ) -> Tuple[bool, Optional[Path], Optional[str]]:
         """Validate and resolve user-provided path.
+
+        ``unrestricted`` (dv-e38e): the session's profile is exempt from the
+        data-root protected dirs; see ``DenylistValidator.is_path_allowed``.
 
         Returns:
             Tuple of (is_valid, resolved_path, error_message)
@@ -223,7 +229,9 @@ class SecurityValidator:
             # Mode-specific validation
             if self._denylist:
                 # Denylist mode: block specific sensitive paths
-                allowed, error = self._denylist.is_path_allowed(str(target))
+                allowed, error = self._denylist.is_path_allowed(
+                    str(target), unrestricted=unrestricted
+                )
                 if not allowed:
                     return False, None, error
             elif self.approved_directory is not None:

@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from src.mcp.telegram_server import send_image_to_user
+from src.mcp.telegram_server import send_file_to_user, send_image_to_user
+from src.bot.utils.image_extractor import validate_image_path
 
 
 @pytest.fixture
@@ -55,3 +56,25 @@ class TestSendImageToUser:
         img.write_bytes(b"\x00" * 10)
         result = await send_image_to_user(str(img))
         assert "Image queued for delivery" in result
+
+
+class TestSendFileToUser:
+    async def test_pdf_queued(self, tmp_path: Path) -> None:
+        pdf = tmp_path / "cv.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+        assert "File queued for delivery" in await send_file_to_user(str(pdf))
+
+    async def test_outside_roots_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pdf = tmp_path / "cv.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+        monkeypatch.setenv("TELEGRAM_IMAGE_ROOTS", str(tmp_path / "ws"))
+        assert "NOT sent" in await send_file_to_user(str(pdf))
+
+    def test_validator_accepts_any_file_only_when_asked(self, tmp_path: Path) -> None:
+        pdf = tmp_path / "cv.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+        assert validate_image_path(str(pdf), tmp_path) is None
+        att = validate_image_path(str(pdf), tmp_path, any_file=True)
+        assert att is not None and att.mime_type == "application/pdf"

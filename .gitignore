@@ -142,6 +142,16 @@ data/*
 # Loaded by PromptComposer at runtime; must ship (it is tracked, but a plain
 # `git add -A` on a fresh export silently drops it without this line).
 !data/shared-capabilities.md
+# Persona files are a behaviour spec, not data: an undiffable persona means
+# "it used to work better" can never be checked (dv-5d5f). Re-include the
+# subdirectory, re-ignore its contents, then un-ignore agent.md only — the
+# three-line dance is required because the parent is excluded above.
+!data/chef/
+data/chef/*
+!data/chef/agent.md
+!data/coach/
+data/coach/*
+!data/coach/agent.md
 *.db
 *.db-journal
 
@@ -209,3 +219,6 @@ deploy/rendered/
 /smoke-test-report.md
 .idea
 .vscode
+
+# dv-5e4f Phase 0.1: prod-derived golden-replay snapshots (never commit real data)
+data/golden/

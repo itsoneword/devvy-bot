@@ -7,6 +7,46 @@ from src.storage.database import DatabaseManager
 from src.storage.window_repository import WindowRepository
 
 
+def test_codex_refresh_threshold_is_clamped_to_model_window(monkeypatch):
+    from src.agent_backends import codex_catalog
+    from src.agent_backends.codex_catalog import CodexModel
+    from src.bot.orchestration.windowing import effective_refresh_threshold
+
+    monkeypatch.setattr(
+        codex_catalog.CODEX_CATALOG,
+        "_models",
+        [CodexModel("gpt-5.6-sol", "Sol", 272_000)],
+        raising=False,
+    )
+
+    assert (
+        effective_refresh_threshold(
+            320_000,
+            backend="openai_codex",
+            model_ref="openai-codex/gpt-5.6-sol",
+        )
+        == 217_600
+    )
+    # An operator's stricter deployment value still wins.
+    assert (
+        effective_refresh_threshold(
+            150_000,
+            backend="openai_codex",
+            model_ref="openai-codex/gpt-5.6-sol",
+        )
+        == 150_000
+    )
+    # This catalog cannot safely make claims about Claude's context window.
+    assert (
+        effective_refresh_threshold(
+            320_000,
+            backend="claude",
+            model_ref="openai-codex/gpt-5.6-sol",
+        )
+        == 320_000
+    )
+
+
 @pytest.mark.parametrize(
     "text",
     [

@@ -12,7 +12,9 @@ import structlog
 from ..claude.sdk_integration import ClaudeResponse
 from .database import DatabaseManager
 from .deviz_board import DevizBoard
+from .extraction_repository import MemoryExtractionRepository
 from .hold_repository import UserHoldRepository
+from .lifecycle_repository import LifecycleRepository
 from .memory_repository import MemoryRepository
 from .models import (
     AuditLogModel,
@@ -22,6 +24,7 @@ from .models import (
     UserModel,
 )
 from .pending_notes import PendingNoteRepository
+from .pinned_messages import PinnedMessageRepository
 from .repositories import (
     AnalyticsRepository,
     AuditLogRepository,
@@ -33,10 +36,13 @@ from .repositories import (
     UserPreferencesRepository,
     UserRepository,
 )
+from .scheduler_repository import SchedulerRepository
 from .sent_messages import SentMessageRepository
 from .task_repository import TaskRepository
+from .token_repository import TokenTrackingRepository
 from .user_data import UserDataManager, UserDataRepository
 from .user_repository import BotUserRepository
+from .webhook_repository import WebhookEventRepository
 
 logger = structlog.get_logger()
 
@@ -83,6 +89,14 @@ class Storage:
         self.sent_messages = SentMessageRepository(self.db_manager)
         self.pending_notes = PendingNoteRepository(self.db_manager)
         self.holds = UserHoldRepository(self.db_manager)
+        self.pinned_messages = PinnedMessageRepository(self.db_manager)
+        # dv-5e4f Phase 0: repos for SQL moved out of
+        # scheduler/token-tracker/evaluator/observability/api-server.
+        self.scheduled_jobs = SchedulerRepository(self.db_manager)
+        self.token_tracking = TokenTrackingRepository(self.db_manager)
+        self.extractions = MemoryExtractionRepository(self.db_manager)
+        self.webhook_events = WebhookEventRepository(self.db_manager)
+        self.lifecycle = LifecycleRepository(self.db_manager)
 
     async def initialize(self):
         """Initialize storage system."""
@@ -146,6 +160,9 @@ class Storage:
         # Save tool usage
         if response.tools_used:
             for tool in response.tools_used:
+                # A backend may mark one call failed (Codex item.completed,
+                # dv-c7d1) even when the turn as a whole succeeded.
+                tool_error = tool.get("error")
                 tool_usage = ToolUsageModel(
                     id=None,
                     session_id=session_id,
@@ -153,8 +170,9 @@ class Storage:
                     tool_name=tool["name"],
                     tool_input=tool.get("input", {}),
                     timestamp=datetime.now(UTC),
-                    success=not response.is_error,
-                    error_message=response.error_type if response.is_error else None,
+                    success=not response.is_error and not tool_error,
+                    error_message=tool_error
+                    or (response.error_type if response.is_error else None),
                 )
                 await self.tools.save_tool_usage(tool_usage)
 
@@ -315,17 +333,6 @@ class Storage:
             "messages": [m.to_dict() for m in messages],
             "tool_usage": [t.to_dict() for t in tools],
         }
-
-    async def cleanup_old_data(self, days: int = 30) -> Dict[str, int]:
-        """Cleanup old data."""
-        logger.info("Starting data cleanup", days=days)
-
-        # Cleanup old sessions
-        sessions_cleaned = await self.sessions.cleanup_old_sessions(days)
-
-        logger.info("Data cleanup complete", sessions_cleaned=sessions_cleaned)
-
-        return {"sessions_cleaned": sessions_cleaned}
 
     async def get_user_dashboard(self, user_id: int) -> Dict[str, Any]:
         """Get comprehensive user dashboard data."""

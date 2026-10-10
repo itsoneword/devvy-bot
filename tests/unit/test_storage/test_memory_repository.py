@@ -356,3 +356,59 @@ async def test_search_general_fill_respects_limit(repo):
         await repo.add_fact("chef", "general", f"unrelated fact number {i}")
     facts = await repo.search_general("chef", "совершенно другой язык", limit=3)
     assert len(facts) == 3
+
+
+# -- dv-5e4f Phase 0: methods added to host consolidation/fact_quality SQL --
+
+
+async def test_active_scopes_lists_distinct_agents_with_active_facts(repo):
+    await repo.add_fact("chef", "general", "fact one")
+    await repo.add_fact("devops", "general", "fact two")
+    await repo.add_fact("chef", "general", "fact three")
+    assert await repo.active_scopes() == ["chef", "devops"]
+
+
+async def test_active_scopes_excludes_fully_invalidated_agent(repo):
+    import datetime as dt
+
+    fact_id = await repo.add_fact("coach", "general", "stale fact")
+    await repo.invalidate_fact(fact_id, "coach", source="test")
+    assert "coach" not in await repo.active_scopes()
+    _ = dt  # not otherwise needed; keeps import local to this test
+
+
+async def test_expiry_candidates_by_cutoff(repo):
+    import datetime as dt
+
+    fact_id = await repo.add_fact("chef", "general", "old fact")
+    await repo.invalidate_fact(fact_id, "chef", source="test")
+
+    # Fresh invalidation: not yet a candidate at a tight cutoff.
+    recent_cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(days=30)
+    assert await repo.expiry_candidates("chef", recent_cutoff) == []
+
+    # A cutoff in the future catches anything invalidated before "now".
+    future_cutoff = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=1)
+    candidates = await repo.expiry_candidates("chef", future_cutoff)
+    assert [f.id for f in candidates] == [fact_id]
+
+
+async def test_new_facts_since_bound_and_scope(repo):
+    import datetime as dt
+
+    before = (
+        (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=1))
+        .replace(tzinfo=None)
+        .isoformat(sep=" ")
+    )
+    await repo.add_fact("chef", "general", "fresh chef fact")
+    await repo.add_fact("devops", "general", "fresh devops fact")
+
+    all_scopes = await repo.new_facts_since(before)
+    assert {f.agent_id for f in all_scopes} == {"chef", "devops"}
+
+    chef_only = await repo.new_facts_since(before, agent_id="chef")
+    assert {f.agent_id for f in chef_only} == {"chef"}
+
+    after = dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(sep=" ")
+    assert await repo.new_facts_since(after) == []

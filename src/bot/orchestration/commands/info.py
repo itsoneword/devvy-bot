@@ -8,6 +8,7 @@ import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from ....agent_backends.codex_usage import CodexUsageError, format_codex_limits
 from ....agent_backends.protocol import BackendSession
 from ....profiles.registry import family_agent_id_for_agent, guest_agent_id
 from ....projects import PrivateTopicsUnavailableError
@@ -275,6 +276,29 @@ class InfoCommandsMixin(OrchestratorBase):
             await storage.log_bot_event(user_id, "command_usage", {})
         await update.message.reply_text("\n".join(lines))
 
+    async def agentic_limits(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show provider-side Codex limits without invoking an LLM."""
+        backends = context.bot_data.get("backends") or {}
+        backend = backends.get("openai_codex") or context.bot_data.get(
+            "codex_integration"
+        )
+        reader = getattr(backend, "read_account_limits", None)
+        if reader is None:
+            await update.message.reply_text("Codex backend не подключён.")
+            return
+        try:
+            snapshot = await reader()
+        except CodexUsageError as exc:
+            await update.message.reply_text(f"Не удалось получить лимиты Codex: {exc}")
+            return
+        except Exception:
+            logger.warning("limits: Codex account query failed", exc_info=True)
+            await update.message.reply_text("Не удалось получить лимиты Codex.")
+            return
+        await update.message.reply_text(format_codex_limits(snapshot))
+
     def _stop_notice(self, error_type: Optional[str]) -> Optional[str]:
         """User-facing note for a run that stopped before producing a result.
 
@@ -350,7 +374,11 @@ class InfoCommandsMixin(OrchestratorBase):
         """
         from ....agent_backends.codex_catalog import CODEX_CATALOG
 
-        models = await CODEX_CATALOG.get()
+        # Entitlements can change immediately after a ChatGPT plan upgrade.
+        # `/model` is explicitly the point where the user asks to see them,
+        # so refresh rather than leaving a recently upgraded account on the
+        # hour-long catalog cache.
+        models = await CODEX_CATALOG.get(force=True)
         rows: List[List[InlineKeyboardButton]] = []
         for i in range(0, len(models), 2):
             rows.append(
@@ -514,9 +542,12 @@ class InfoCommandsMixin(OrchestratorBase):
                 f"{w_state.last_context_tokens / 1000:.1f}k"
                 f" / {window_repo.refresh_threshold_tokens // 1000}k"
             )
-            next_threshold = (
-                w_state.last_eval_checkpoint + 1
-            ) * window_repo.eval_interval_tokens
+            if window_repo.eval_interval_tokens > 0:
+                next_threshold = (
+                    w_state.last_eval_checkpoint + 1
+                ) * window_repo.eval_interval_tokens
+            else:
+                next_threshold = window_repo.refresh_threshold_tokens
             lines.append(f"Next evaluator: ~{next_threshold // 1000}k tokens")
 
         # Evaluator status via token_tracker
@@ -626,12 +657,17 @@ class InfoCommandsMixin(OrchestratorBase):
                 "Scheduler is disabled (ENABLE_SCHEDULER=false)."
             )
             return
-        async with storage.db_manager.get_connection() as conn:
-            cursor = await conn.execute(
-                "SELECT job_id, job_name, cron_expression, working_directory "
-                "FROM scheduled_jobs WHERE is_active = 1 ORDER BY created_at"
-            )
-            rows = [dict(r) for r in await cursor.fetchall()]
+        from ....storage.scheduler_repository import SchedulerRepository
+
+        all_rows = await SchedulerRepository(storage.db_manager).list_active_jobs()
+        # Same authorization rule as the agent tools (dv-8c19) — created it,
+        # or it targets you, or (legacy unattributed rows) you're an owner.
+        from ....scheduler.scheduler import job_visible_to
+
+        user_id = update.effective_user.id
+        role = self._resolve_role(user_id, context)
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        rows = [r for r in all_rows if job_visible_to(r, user_id, role, chat_id)]
         await storage.log_bot_event(
             update.effective_user.id, "command_schedules", {"count": len(rows)}
         )

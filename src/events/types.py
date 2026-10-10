@@ -48,6 +48,12 @@ class ScheduledEvent(Event):
     # job's real owner from this before target_chat_ids (dv-3e91) — without
     # it a job owned by one family member ran as another.
     created_by: int = 0
+    # dv-752a: the ``items`` row this job fires, or None for a plain job.
+    # The handler reads the live item and runs the job as its ASSIGNEE.
+    item_id: Optional[int] = None
+    # Explicit run-as user, set by the handler for item jobs; 0 = resolve
+    # from created_by / target_chat_ids as before.
+    run_as: int = 0
 
 
 @dataclass

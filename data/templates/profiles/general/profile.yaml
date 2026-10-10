@@ -9,8 +9,8 @@
 # common workspace for every owner-role user.
 - slug: "@SLUG@"
   name: General Assistant
-  working_dir: ${DEVVY_ROOT}/workspaces/@SLUG@
-  memory_dir: ${DEVVY_ROOT}/workspaces/@SLUG@/memory
-  persona: ${DEVVY_ROOT}/workspaces/@SLUG@/persona.md
+  working_dir: ${DEVVY_WORKSPACES}/@SLUG@
+  memory_dir: ${DEVVY_WORKSPACES}/@SLUG@/memory
+  persona: ${DEVVY_WORKSPACES}/@SLUG@/persona.md
   permission_policy:
     allowed_roles: [owner, guest]

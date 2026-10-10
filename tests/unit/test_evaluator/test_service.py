@@ -245,37 +245,7 @@ class TestExtractionIdempotence:
 
 
 class TestExtractionInvocation:
-    """The CLI argv the extractor builds, and the delta it is allowed to send."""
-
-    def test_model_is_configurable(self, repo, db, writer, mock_tracker):
-        service = EvaluatorService(
-            memory_repo=repo,
-            writer=writer,
-            token_tracker=mock_tracker,
-            db=db,
-            model="haiku",
-            lean_context=False,
-        )
-        args = service._claude_cli_args()
-        assert args[:2] == ["--model", "haiku"]
-        assert "--system-prompt" not in args
-        assert args[-3:] == ["--output-format", "json", "-p"]
-
-    def test_lean_context_strips_the_harness(self, service):
-        """Default: sonnet, and none of this repo's CLAUDE.md/skills/MCP context."""
-        args = service._claude_cli_args()
-        assert args[:2] == ["--model", "sonnet"]
-        for flag in (
-            "--system-prompt",
-            "--tools",
-            "--setting-sources",
-            "--strict-mcp-config",
-            "--disable-slash-commands",
-        ):
-            assert flag in args
-        # --setting-sources must be empty, not absent: an empty value is what
-        # suppresses project settings (and with them CLAUDE.md and skills).
-        assert args[args.index("--setting-sources") + 1] == ""
+    """The delta the extractor is allowed to send."""
 
     def test_delta_under_the_cap_is_untouched(self, service):
         text = "User: hi\n\nAssistant: hello"
@@ -593,38 +563,6 @@ class TestEpisodicGuardWiring:
         assert len(await repo.get_facts("coach")) == 1
         stats = await _op_stats(db)
         assert stats["rejected_episodic"] == 0
-
-
-class TestTimeoutKill:
-    async def test_timeout_kills_subprocess_and_labels_error(
-        self, repo, db, writer, mock_tracker
-    ):
-        service = EvaluatorService(
-            memory_repo=repo,
-            writer=writer,
-            token_tracker=mock_tracker,
-            db=db,
-            timeout_seconds=1,
-        )
-        service._timeout = 0  # fire immediately
-
-        import asyncio as _asyncio
-
-        proc = MagicMock()
-
-        async def hang(input=None):
-            await _asyncio.sleep(30)
-
-        proc.communicate = hang
-        proc.kill = MagicMock()
-        proc.wait = AsyncMock()
-
-        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
-            spawn.return_value = proc
-            with pytest.raises(RuntimeError, match="^timeout after"):
-                await service._invoke_claude_cli("prompt")
-        proc.kill.assert_called_once()
-        proc.wait.assert_awaited()
 
 
 class TestEvaluatorTrigger:

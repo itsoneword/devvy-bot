@@ -362,14 +362,19 @@ def _format_error_message(error: Exception | str) -> str:
             "• Check your current usage with /status"
         )
 
-    if "timed out after" in error_lower or "claude sdk timed out" in error_lower:
+    if (
+        "timed out after" in error_lower
+        or "claude sdk timed out" in error_lower
+        or "produced no output for" in error_lower
+    ):
         return (
             "⏰ <b>Request Timeout</b>\n\n"
             f"{escape_html(error_str)}\n\n"
+            "The agent went silent rather than simply taking a long time — "
+            "work already written to disk survives, the reply does not.\n\n"
             "<b>What you can do:</b>\n"
-            "• Try breaking your request into smaller parts\n"
-            "• Avoid asking for very large file operations in one go\n"
-            "• Try again — transient slowdowns happen"
+            "• Ask what state the work is in before redoing it\n"
+            "• Try again — transient stalls happen"
         )
 
     if "overloaded" in error_lower:

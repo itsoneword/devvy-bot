@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import structlog
 
@@ -89,3 +89,28 @@ class SentMessageRepository:
         except Exception as e:
             logger.warning("sent_messages ledger lookup failed", error=str(e))
             return None
+
+    async def list_for_message(self, messages_message_id: int) -> List[SentMessage]:
+        """All ``turn_reply`` sends ledgered for one ``messages`` row,
+        oldest first (``id`` is autoincrement, so insertion order).
+
+        Used by the recipe search-retry edit-in-place delivery (dv-e7fa) to
+        find the LAST physical Telegram message of a turn reply that may
+        have been chunked across several messages, and to detect that it
+        was chunked at all.
+        """
+        try:
+            async with self._db.get_connection() as conn:
+                cur = await conn.execute(
+                    "SELECT id, telegram_chat_id, telegram_message_id, kind, "
+                    "messages_message_id, profile_slug, created_at "
+                    "FROM sent_messages "
+                    "WHERE messages_message_id=? AND kind='turn_reply' "
+                    "ORDER BY id ASC",
+                    (messages_message_id,),
+                )
+                rows = await cur.fetchall()
+                return [SentMessage(*row) for row in rows]
+        except Exception as e:
+            logger.warning("sent_messages ledger list failed", error=str(e))
+            return []

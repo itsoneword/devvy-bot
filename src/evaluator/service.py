@@ -12,12 +12,14 @@ import asyncio
 import hashlib
 import json
 from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 import structlog
 
+from ..model_router import CLAUDE_HARNESS, CODEX_HARNESS, CallRequest, get_router
 from ..profiles.registry import family_agent_id_for_agent
+from ..storage.extraction_repository import MemoryExtractionRepository
+from ..storage.repositories import MessageRepository
 from .episodic_guard import classify as classify_episodic
 from .prompts import build_evaluator_prompt, format_current_facts
 from .reconciler import FactReconciler, MappedOps, Verdict, map_verdicts
@@ -31,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-# Replaces Claude Code's default system prompt when lean_context is on. Kept
+# Replaces Claude Code's default system prompt on the extraction call. Kept
 # deliberately thin: the real instructions live in the user-message prompt
 # built by build_evaluator_prompt, and duplicating them here would only give
 # the model two places to disagree with itself.
@@ -57,7 +59,7 @@ class EvaluatorService:
         db: "DatabaseManager",
         notify_callback: Optional[Callable] = None,
         model: str = "sonnet",
-        lean_context: bool = True,
+        codex_model: str = "openai-codex/gpt-6-sol",
         max_delta_chars: int = 120_000,
         timeout_seconds: int = 120,
         reconcile_model: str = "haiku",
@@ -68,11 +70,15 @@ class EvaluatorService:
         self._writer = writer
         self._token_tracker = token_tracker
         self._db = db
+        self._extractions = MemoryExtractionRepository(db)
+        self._messages = MessageRepository(db)
         self._notify = notify_callback  # async fn(user_id, message, agent_id)
         self._model = model
-        self._lean_context = lean_context
+        # Extraction on the Codex backend. Always passed to the CLI: without
+        # it the call ran whatever ~/.codex/config.toml named.
+        self._codex_model = codex_model
         self._max_delta_chars = max_delta_chars
-        # A timeout kills the subprocess (it used to leak) and surfaces as a
+        # A timeout stops the CLI child (it used to leak) and surfaces as a
         # 'timeout ...' error_message so the rate is queryable (plan D6).
         self._timeout = timeout_seconds
         # Reconciler is a second haiku call (owner D4); haiku needs no gate
@@ -430,17 +436,11 @@ class EvaluatorService:
         if not message_id:
             return None
         try:
-            async with self._db.get_connection() as conn:
-                cur = await conn.execute(
-                    "SELECT timestamp FROM messages WHERE message_id=?",
-                    (message_id,),
-                )
-                row = await cur.fetchone()
-                if row and row[0] is not None:
-                    value = row[0]
-                    if isinstance(value, datetime):
-                        return value
-                    return datetime.fromisoformat(str(value))
+            value = await self._messages.get_message_timestamp(message_id)
+            if value is not None:
+                if isinstance(value, datetime):
+                    return value
+                return datetime.fromisoformat(str(value))
         except Exception as e:
             logger.warning("Checkpoint timestamp lookup failed", error=str(e))
         return None
@@ -527,89 +527,41 @@ class EvaluatorService:
         return await self._invoke_claude_cli(prompt)
 
     async def _invoke_reconcile_cli(self, prompt: str) -> str:
-        """The reconciler's transport: always the Claude CLI on the reconcile
-        model (haiku, owner D4) with the lean harness — a verdict list needs
-        no tools and no project context, whatever backend extraction used."""
+        """The reconciler's transport: always Claude on the reconcile model
+        (haiku, owner D4): a verdict list needs no tools and no project
+        context, whatever backend extraction used."""
         return await self._invoke_claude_cli(
             prompt,
             model=self._reconcile_model,
             system_prompt=RECONCILE_SYSTEM_PROMPT,
+            purpose="reconcile",
         )
-
-    def _claude_cli_args(
-        self, model: Optional[str] = None, system_prompt: Optional[str] = None
-    ) -> List[str]:
-        """Argv for the extraction subprocess.
-
-        With ``lean_context`` the harness is stripped: no project/user settings
-        (so no CLAUDE.md, no `.claude/skills` listing), no MCP servers, no
-        tools, and a one-line system prompt in place of Claude Code's. The
-        extractor reads a prompt and emits JSON — it never needs any of that,
-        and it was re-sending all of it on every run.
-        """
-        args = ["--model", model or self._model]
-        if self._lean_context:
-            args += [
-                "--system-prompt",
-                system_prompt or EXTRACTION_SYSTEM_PROMPT,
-                "--tools",
-                "",
-                "--setting-sources",
-                "",
-                "--strict-mcp-config",
-                "--disable-slash-commands",
-            ]
-        return args + ["--output-format", "json", "-p"]
 
     async def _invoke_claude_cli(
         self,
         prompt: str,
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
+        purpose: str = "extraction",
     ) -> str:
-        """Invoke the Claude CLI for JSON extraction.
+        """One plain Claude call through the model router (dv-ef90).
 
-        The prompt is piped via stdin rather than passed as a CLI argument:
-        evaluator prompts embed the whole conversation window and can exceed
-        the OS ARG_MAX limit (shared with the process environment), which
-        raises "Argument list too long" on large conversations. Stdin has no
-        such cap.
+        The router strips the harness (no CLAUDE.md, skills, MCP servers or
+        tools; measured 2026-08-04, that floor was ~42k tokens on runs that
+        returned ``[]``), sends the prompt over stdin, stops the child on
+        timeout and records the call.
         """
-        process = await asyncio.create_subprocess_exec(
-            "claude",
-            *self._claude_cli_args(model=model, system_prompt=system_prompt),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = await get_router().complete(
+            CallRequest(
+                purpose=purpose,
+                harness=CLAUDE_HARNESS,
+                prompt=prompt,
+                model=model or self._model,
+                system_prompt=system_prompt or EXTRACTION_SYSTEM_PROMPT,
+                timeout_seconds=self._timeout,
+            )
         )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=prompt.encode("utf-8")),
-                timeout=self._timeout,
-            )
-        except asyncio.TimeoutError:
-            # wait_for cancels communicate() but the CLI process itself kept
-            # running (observed leak, plan D6). Kill it, and label the error
-            # 'timeout ...' so the rate is one SQL query away.
-            process.kill()
-            await process.wait()
-            raise RuntimeError(f"timeout after {self._timeout}s (claude cli)")
-
-        if process.returncode != 0:
-            error_msg = stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(
-                f"Claude CLI failed (exit {process.returncode}): {error_msg}"
-            )
-
-        raw = stdout.decode("utf-8").strip()
-        # If --output-format json wraps in {"result": ...}, extract the text
-        try:
-            wrapper = json.loads(raw)
-            if isinstance(wrapper, dict) and "result" in wrapper:
-                return str(wrapper["result"])
-        except (json.JSONDecodeError, TypeError):
-            pass
-        return raw
+        return result.text
 
     def _codex_output_schema(self) -> dict:
         """JSON Schema matching validate_evaluator_output's op contract.
@@ -687,96 +639,22 @@ class EvaluatorService:
             return json.dumps(parsed["extractions"])
         return text
 
-    @staticmethod
-    def _codex_stdout_error(stdout: bytes) -> str:
-        """Pull the failure reason out of a `codex exec --json` stdout stream.
-
-        `codex exec` reports API and turn failures as JSONL `error` /
-        `turn.failed` events on STDOUT and leaves stderr completely empty, so
-        the obvious "report stderr" error path produced
-        `Codex CLI failed (exit 1): ` with nothing after the colon — the exact
-        journal line that made this bug undiagnosable from the logs (dv-0c01).
-        """
-        messages: List[str] = []
-        for raw in stdout.decode("utf-8", errors="replace").splitlines():
-            raw = raw.strip()
-            if not raw.startswith("{"):
-                continue
-            try:
-                event = json.loads(raw)
-            except ValueError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            if event.get("type") == "error":
-                messages.append(str(event.get("message", "")))
-            elif event.get("type") == "turn.failed":
-                err = event.get("error") or {}
-                if isinstance(err, dict):
-                    messages.append(str(err.get("message", "")))
-        # turn.failed usually restates the preceding error event verbatim.
-        deduped: List[str] = []
-        for msg in messages:
-            if msg and msg not in deduped:
-                deduped.append(msg)
-        return " | ".join(deduped)
-
     async def _invoke_codex_cli(self, prompt: str) -> str:
-        """Invoke `codex exec` constrained to the evaluator JSON schema.
-
-        Prompt goes via stdin (positional arg `-`), not argv — same ARG_MAX
-        reasoning as `_invoke_claude_cli`; `codex exec` reads stdin when the
-        prompt argument is `-`.
-
-        Runs read-only, rooted at the throwaway temp dir rather than the bot's
-        cwd: this call reads a prompt and emits JSON, so the full-access
-        sandbox it used to request bought nothing and pointed a shell-capable
-        agent at the repository.
-        """
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as td:
-            schema_path = Path(td) / "schema.json"
-            out_path = Path(td) / "out.txt"
-            schema_path.write_text(json.dumps(self._codex_output_schema()))
-            process = await asyncio.create_subprocess_exec(
-                "codex",
-                "exec",
-                "--json",
-                "-C",
-                td,
-                "-s",
-                "read-only",
-                "--skip-git-repo-check",
-                "--output-schema",
-                str(schema_path),
-                "-o",
-                str(out_path),
-                "-",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        """One plain Codex call through the model router, constrained to the
+        evaluator JSON schema. The router runs it read-only in a throwaway
+        directory on ``codex_model``."""
+        result = await get_router().complete(
+            CallRequest(
+                purpose="extraction",
+                harness=CODEX_HARNESS,
+                prompt=prompt,
+                model=self._codex_model,
+                system_prompt="",
+                json_schema=self._codex_output_schema(),
+                timeout_seconds=self._timeout,
             )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(input=prompt.encode("utf-8")),
-                    timeout=self._timeout,
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-                raise RuntimeError(f"timeout after {self._timeout}s (codex cli)")
-            if process.returncode != 0:
-                err = stderr.decode("utf-8", errors="replace").strip()
-                err = err or self._codex_stdout_error(stdout) or "(no output)"
-                raise RuntimeError(
-                    f"Codex CLI failed (exit {process.returncode}): {err[-500:]}"
-                )
-            if out_path.exists():
-                return self._unwrap_codex_output(
-                    out_path.read_text(encoding="utf-8").strip()
-                )
-            return "[]"
+        )
+        return self._unwrap_codex_output(result.text) if result.text else "[]"
 
     async def _handle_failure(
         self,
@@ -816,13 +694,7 @@ class EvaluatorService:
         unparseable JSON must still be retried on the next trigger.
         """
         try:
-            async with self._db.get_connection() as conn:
-                cur = await conn.execute(
-                    "SELECT 1 FROM memory_extractions WHERE user_id=? AND "
-                    "prompt_hash=? AND validation_status='success' LIMIT 1",
-                    (user_id, prompt_hash),
-                )
-                return await cur.fetchone() is not None
+            return await self._extractions.already_extracted(user_id, prompt_hash)
         except Exception as e:
             # Never let the guard block extraction; worst case we re-run.
             logger.warning("Extraction dedupe check failed", error=str(e))
@@ -843,27 +715,20 @@ class EvaluatorService:
     ) -> None:
         """Record extraction attempt in memory_extractions table."""
         try:
-            async with self._db.get_connection() as conn:
-                await conn.execute(
-                    """INSERT INTO memory_extractions
-                    (session_id, user_id, prompt_hash, raw_response,
-                     parsed_insights, validation_status, target_files,
-                     error_message, cumulative_tokens_at_run, op_stats)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        session_id,
-                        user_id,
-                        prompt_hash,
-                        raw_response,
-                        json.dumps(parsed_insights) if parsed_insights else None,
-                        status,
-                        json.dumps(target_files) if target_files else None,
-                        error_message,
-                        cumulative_tokens,
-                        json.dumps(op_stats) if op_stats else None,
-                    ),
-                )
-                await conn.commit()
+            await self._extractions.record_extraction(
+                session_id=session_id,
+                user_id=user_id,
+                prompt_hash=prompt_hash,
+                raw_response=raw_response,
+                parsed_insights_json=(
+                    json.dumps(parsed_insights) if parsed_insights else None
+                ),
+                validation_status=status,
+                target_files_json=json.dumps(target_files) if target_files else None,
+                error_message=error_message,
+                cumulative_tokens_at_run=cumulative_tokens,
+                op_stats_json=json.dumps(op_stats) if op_stats else None,
+            )
         except Exception as e:
             logger.error("Failed to record extraction", error=str(e))
 

@@ -1,7 +1,11 @@
 """Alternate agent backends used by the Telegram bot."""
 
 from .codex_catalog import CODEX_CATALOG, CodexModel, CodexModelCatalog
-from .codex_cli import CodexCliIntegration, CodexSessionStore
+from .codex_cli import (
+    CodexCliIntegration,
+    CodexSessionStore,
+    InMemoryCodexSessionStore,
+)
 from .protocol import (
     BACKEND_POLICIES,
     AgentBackend,
@@ -20,5 +24,6 @@ __all__ = [
     "CodexModel",
     "CodexModelCatalog",
     "CodexSessionStore",
+    "InMemoryCodexSessionStore",
     "policy_for",
 ]

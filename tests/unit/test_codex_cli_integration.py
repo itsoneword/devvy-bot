@@ -6,7 +6,7 @@ from typing import Optional
 
 import pytest
 
-from src.agent_backends.codex_cli import CodexCliIntegration, CodexSessionStore
+from src.agent_backends.codex_cli import CodexCliIntegration, InMemoryCodexSessionStore
 from src.claude.prompt_composer import PromptComposer
 from src.config.settings import Settings
 
@@ -65,7 +65,7 @@ def settings():
 
 async def test_run_command_streams_tools_and_returns_answer(tmp_path, settings):
     fake = _fake_codex(tmp_path)
-    store = CodexSessionStore(tmp_path / "s.json")
+    store = InMemoryCodexSessionStore()
     integ = CodexCliIntegration(
         config=settings, codex_bin=str(fake), session_store=store
     )
@@ -89,16 +89,37 @@ async def test_run_command_streams_tools_and_returns_answer(tmp_path, settings):
     assert resp.session_id == "th-xyz"
     assert resp.input_tokens == 11 and resp.output_tokens == 4
     assert "Bash" in seen  # tool activity streamed
-    assert store.thread_for(7, tmp_path) == "th-xyz"  # session persisted
+    assert await store.thread_for(7, tmp_path) == "th-xyz"  # session persisted
+
+
+def test_argv_caps_foreground_subagents_at_two(tmp_path, settings):
+    integ = CodexCliIntegration(
+        config=settings,
+        session_store=InMemoryCodexSessionStore(),
+    )
+    argv = integ._build_argv(
+        model="openai-codex/gpt-5.6-sol",
+        cwd=tmp_path,
+        out_file=tmp_path / "out.txt",
+        resume_id=None,
+    )
+    assert "agents.max_concurrent_threads_per_session=2" in argv
 
 
 async def test_run_command_resumes_from_store(tmp_path, settings):
     fake = _fake_codex(tmp_path)
-    store = CodexSessionStore(tmp_path / "s.json")
-    store.record(7, tmp_path, "th-prev", 1, 1)
+    store = InMemoryCodexSessionStore()
+    await store.record(7, tmp_path, "th-prev", 1, 1)
     captured = {}
+    mem = tmp_path / "mem"
+    mem.mkdir()
+    agent_md = tmp_path / "agent.md"
+    agent_md.write_text("A deliberately large frozen persona.")
     integ = CodexCliIntegration(
-        config=settings, codex_bin=str(fake), session_store=store
+        config=settings,
+        codex_bin=str(fake),
+        session_store=store,
+        prompt_composer=PromptComposer(memory_path=mem, agent_md_path=agent_md),
     )
     orig = integ._build_argv
     integ._build_argv = lambda **kw: captured.setdefault("argv", orig(**kw))  # type: ignore
@@ -112,6 +133,14 @@ async def test_run_command_resumes_from_store(tmp_path, settings):
         force_new=False,
     )
     assert "resume" in captured["argv"] and "th-prev" in captured["argv"]
+    # The persona already lives in th-prev's first message.  A resume must
+    # append only the new user text (plus the per-turn <current_time> line,
+    # dv-ca94 -- cheap and legitimately different every turn, unlike the
+    # static persona bundle), or every turn permanently duplicates the
+    # frozen bundle in the thread history.
+    assert captured["argv"][-1].endswith("\n\nagain")
+    assert "<current_time>" in captured["argv"][-1]
+    assert "large frozen persona" not in captured["argv"][-1]
 
 
 def _m_flag(argv):
@@ -126,7 +155,7 @@ async def test_run_command_model_kwarg_drives_the_m_argv(tmp_path, settings):
     integ = CodexCliIntegration(
         config=settings,
         codex_bin=str(fake),
-        session_store=CodexSessionStore(tmp_path / "s.json"),
+        session_store=InMemoryCodexSessionStore(),
     )
     captured = []
     orig = integ._build_argv
@@ -159,7 +188,7 @@ async def test_run_command_without_model_uses_the_config_default(tmp_path, setti
     integ = CodexCliIntegration(
         config=settings,
         codex_bin=str(fake),
-        session_store=CodexSessionStore(tmp_path / "s.json"),
+        session_store=InMemoryCodexSessionStore(),
     )
     captured = {}
     orig = integ._build_argv
@@ -169,7 +198,7 @@ async def test_run_command_without_model_uses_the_config_default(tmp_path, setti
         prompt="hi", working_directory=tmp_path, user_id=7, force_new=True
     )
 
-    expected = settings.agent_model or "openai-codex/gpt-5.4-mini"
+    expected = settings.agent_model or "openai-codex/gpt-5.6-sol"
     assert _m_flag(captured["argv"]) == expected.split("/", 1)[-1]
 
 
@@ -188,7 +217,7 @@ async def test_run_command_does_not_overwrite_agents_md(tmp_path, settings):
     agent_md.write_text("I am Atlas, the bot persona.")
     composer = PromptComposer(memory_path=mem, agent_md_path=agent_md)
 
-    store = CodexSessionStore(tmp_path / "s.json")
+    store = InMemoryCodexSessionStore()
     integ = CodexCliIntegration(
         config=settings,
         codex_bin=str(fake),
@@ -231,7 +260,7 @@ def test_mcp_overrides_added_for_profile_with_seam(tmp_path, settings):
     registry = _FakeRegistry([_FakeProfile(working_dir=channel_dir, mcp=seam)])
     integ = CodexCliIntegration(
         config=settings,
-        session_store=CodexSessionStore(tmp_path / "s.json"),
+        session_store=InMemoryCodexSessionStore(),
         profile_registry=registry,
     )
     argv = integ._build_argv(
@@ -251,7 +280,7 @@ def test_no_mcp_overrides_for_profile_without_seam(tmp_path, settings):
     registry = _FakeRegistry([_FakeProfile(working_dir=devops_dir, mcp=None)])
     integ = CodexCliIntegration(
         config=settings,
-        session_store=CodexSessionStore(tmp_path / "s.json"),
+        session_store=InMemoryCodexSessionStore(),
         profile_registry=registry,
     )
     argv = integ._build_argv(
@@ -286,7 +315,7 @@ async def test_failed_turn_reports_the_reason_from_stdout(tmp_path, settings):
     integ = CodexCliIntegration(
         config=settings,
         codex_bin=str(_failing_codex(tmp_path)),
-        session_store=CodexSessionStore(tmp_path / "s.json"),
+        session_store=InMemoryCodexSessionStore(),
     )
 
     with pytest.raises(RuntimeError) as excinfo:
@@ -298,3 +327,52 @@ async def test_failed_turn_reports_the_reason_from_stdout(tmp_path, settings):
     assert "exit 1" in message
     assert "invalid_request_error" in message
     assert message.count("invalid_request_error") == 1  # turn.failed dedup
+
+
+class TestCurrentTimezone:
+    """dv-ca94: the host runs UTC, so the Codex CLI's own
+    ``environment_context`` (and any builtin clock tool) needs TZ set
+    explicitly rather than inherited."""
+
+    def test_child_env_sets_tz_from_config(self, tmp_path, settings):
+        integ = CodexCliIntegration(
+            config=settings,
+            codex_bin="codex",
+            session_store=InMemoryCodexSessionStore(),
+        )
+
+        env = integ._child_env(tmp_path)
+
+        assert env["TZ"] == settings.user_timezone == "Europe/Lisbon"
+
+    async def test_run_command_prepends_current_time_line(self, tmp_path, settings):
+        """The subprocess actually receives a <current_time> line ahead of
+        the prompt -- verified via the fake codex echoing argv back."""
+        script = tmp_path / "codex_echo"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -e\n"
+            'outfile=""\n'
+            'args=("$@")\n'
+            "for ((i=0; i<${#args[@]}; i++)); do\n"
+            '  if [[ "${args[$i]}" == "-o" ]]; then outfile="${args[$((i+1))]}"; fi\n'
+            "done\n"
+            'prompt="${args[-1]}"\n'
+            'echo \'{"type":"thread.started","thread_id":"th-time"}\'\n'
+            'echo "{\\"type\\":\\"item.completed\\",\\"item\\":{\\"type\\":\\"agent_message\\",\\"text\\":\\"$prompt\\"}}"\n'
+            'echo \'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\'\n'
+            'if [[ -n "$outfile" ]]; then printf "%s" "$prompt" > "$outfile"; fi\n'
+        )
+        script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
+        integ = CodexCliIntegration(
+            config=settings,
+            codex_bin=str(script),
+            session_store=InMemoryCodexSessionStore(),
+        )
+
+        response = await integ.run_command(
+            prompt="hi", working_directory=tmp_path, user_id=1, force_new=True
+        )
+
+        assert "<current_time>" in response.content
+        assert "Europe/Lisbon" in response.content

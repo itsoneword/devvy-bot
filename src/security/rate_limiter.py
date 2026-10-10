@@ -212,21 +212,26 @@ class RateLimiter:
             return int(self.config.unmetered_max_tokens_per_user_guest)
         return int(self.config.unmetered_max_tokens_per_user)
 
-    def _budget_exempt(self, user_id: int, role: str) -> bool:
-        """Owners are uncapped unless a per-user USD override names them.
+    def _token_gate_exempt(self, user_id: int, role: str) -> bool:
+        """Whether this user is exempt from the unmetered-token hard cap.
 
-        One rule for both ledgers: an override is the operator saying "this
-        person is budgeted", so it also switches on the token cap for them.
+        Token-ledger only — it must never be consulted for the USD gate, which
+        has its own exemption rule in ``effective_daily_cap``. A per-user
+        override is deliberately a USD-budget setting: owners must not be
+        blocked by the local aggregate-token counter, which sums all model and
+        tool flow rather than measuring a context window or a reliably
+        attributable subscription cost.
         """
-        overrides = getattr(self.config, "claude_cost_limit_overrides", {}) or {}
-        return role == "owner" and user_id not in overrides
+        return role == "owner"
 
     def effective_daily_token_cap(self, user_id: int, role: str) -> Optional[int]:
         """The unmetered-token cap enforced for this user, or None if uncapped.
 
-        Mirrors ``effective_daily_cap`` so /usage and the gate agree.
+        This intentionally differs from ``effective_daily_cap``: a USD
+        override may budget an owner, but cannot enable the local token gate.
+        /usage and the gate still share this one source of truth.
         """
-        if self._budget_exempt(user_id, role):
+        if self._token_gate_exempt(user_id, role):
             return None
         return self._token_cap_for(role)
 
@@ -259,10 +264,17 @@ class RateLimiter:
         # CLAUDE_COST_LIMIT_OVERRIDES exists (e.g. primary owner $100/day,
         # spouse $50/day). Short-circuiting on role first silently voided
         # every override set on an owner.
-        if self._budget_exempt(user_id, role):
+        #
+        # Both the gate and /usage read that decision from
+        # effective_daily_cap: None there means "genuinely uncapped", and an
+        # override makes it a number for owners too. Asking the token
+        # ledger's exemption instead (role == "owner") voided every override
+        # again — the exact regression this comment block records.
+        usd_cap = self.effective_daily_cap(user_id, role)
+        if usd_cap is None:
             return True, None
 
-        cap = self._cost_cap_for(role, user_id)
+        cap = usd_cap
         current_cost = self.cost_tracker[user_id]
         if current_cost + cost > cap:
             remaining = max(0, cap - current_cost)
@@ -278,7 +290,9 @@ class RateLimiter:
         # gate is "already exhausted", trued up after each turn by
         # record_tokens. Checked regardless of which backend the coming turn
         # will use: the budget is per person, not per backend.
-        token_cap = self._token_cap_for(role)
+        token_cap = self.effective_daily_token_cap(user_id, role)
+        if token_cap is None:
+            return True, None
         used_tokens = self.token_tracker[user_id]
         if used_tokens >= token_cap:
             message = (

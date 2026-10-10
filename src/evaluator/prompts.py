@@ -38,6 +38,11 @@ Durability rules:
   facts.
 - A repeated pattern stated AS a pattern ("usually skips breakfast") is
   durable; the instance ("skipped breakfast today") is not.
+- Open work is not a fact: a todo, a plan in progress, an open question
+  ("need to check X"), or a ticket's current status goes stale silently
+  because a fact has no done state. Todos live in items, tickets on the
+  board. Emit nothing for them. A DECISION reached is a fact; the work it
+  leads to is not.
 
 Lifecycle rules:
 - One statement per op. NEVER combine an old fact and new information into one

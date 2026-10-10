@@ -5,7 +5,7 @@ profile into existence on a fresh machine:
 
 | File | What it is |
 |---|---|
-| `profile.yaml` | The registry entry, as a one-item YAML list. `@SLUG@` is substituted with the target slug; `${DEVVY_ROOT}` is resolved by the registry at boot. |
+| `profile.yaml` | The registry entry, as a one-item YAML list. `@SLUG@` is substituted with the target slug; `${DEVVY_WORKSPACES}` (agent files, under the data root) and `${DEVVY_ROOT}` (the checkout) are resolved by the registry at boot. |
 | `persona.md` | The persona, copied to the profile's `persona:` path on first boot if that file does not exist. |
 
 `devops` deliberately has **no** `persona.md`: it reuses the single-profile
@@ -43,7 +43,10 @@ Make a directory, drop in `profile.yaml` and `persona.md`, and it is offered by
 `--list` immediately. Two rules the loader enforces, so get them right here:
 
 - A profile that allows the `guest` role can never resolve to `sandbox: false`.
+  `unrestricted: true` (the server-admin flag, devops only) likewise needs
+  `sandbox: false` and no `guest` role.
   `install_profiles.py` refuses such a template up front rather than writing a
   config that aborts startup.
-- Every path goes through `${DEVVY_ROOT}` (or is relative to `config/`). An
-  absolute `/home/you/...` in a template makes it useless on any other machine.
+- Every path goes through `${DEVVY_WORKSPACES}` (agent files) or
+  `${DEVVY_ROOT}` (repo files such as `config/mcp/`). An absolute
+  `/home/you/...` in a template makes it useless on any other machine.

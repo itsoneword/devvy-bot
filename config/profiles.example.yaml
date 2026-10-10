@@ -11,6 +11,14 @@
 #
 # Each profile is an isolated session: own working_dir, memory, persona.
 #
+# Optional `unrestricted: true` (default false) marks the server-admin profile:
+# it is exempt from the data-root denies (secrets/, archive/, db/ and broad
+# grep/find/tar over their parents) and Codex runs it with danger-full-access.
+# Every other profile runs Codex confined (writes: its workspace + extra_dirs +
+# /tmp; reads: everything except those dirs, credential files and other users'
+# workspaces). Credential filename rules (.env, keys, ~/.ssh, ~/.claude) apply
+# to every profile. Requires `sandbox: false` and an owner-only profile.
+#
 # Optional per-profile `sandbox:` overrides the global SANDBOX_ENABLED default.
 #   false = full access (bash network + cross-filesystem writes) — for a trusted
 #           admin profile like devops.
@@ -91,6 +99,18 @@
 #       - ~/notes                       # Obsidian vault
 #       - ${DEVVY_ROOT}/../my-project   # another checkout on this host
 #
+# Optional per-profile `hireli: true` mounts the hireli_* tools (job
+# applications + interview prep on hireli.xyz). Needs HIRELI_MCP_URL and
+# HIRELI_SERVICE_KEY in .env. Each call carries the sender's Telegram id, so
+# every user sees only their own linked Hireli account — safe on guest
+# profiles. Users link by sending the bot `link <code>` from hireli.xyz/account.
+#
+# Optional per-profile `exchange: true` mounts the exchange_* tools (dv-8664):
+# balances, orders, trades and order/stop/transfer actions through external
+# exchange scripts (one per venue, see src/claude/exchange_tools.py). Owner
+# turns only; refused on a guest-allowed profile. Every write asks the owner
+# (src/security/destructive.py), whatever the profile's sandbox setting.
+#
 # Optional per-profile `enabled: false` hides a profile without deleting it:
 # no /slug command, no /agents button, no routing target — persona, memory
 # and workspace stay on disk. The default profile cannot be disabled. The
@@ -106,9 +126,16 @@
 #                     (<root>/config/profiles.yaml -> <root>), so the paths
 #                     below work in any checkout with nothing exported.
 #                     Export DEVVY_ROOT to override.
+#   ${DEVVY_WORKSPACES} — always defined: <DEVVY_DATA_ROOT>/workspaces when
+#                     DEVVY_DATA_ROOT is set (.env or environment), else the
+#                     legacy ${DEVVY_ROOT}/workspaces. Every agent's files
+#                     (persona.md, memory/, users/, guests/) live here.
+#   ${DEVVY_DATA_ROOT} — defined only when set (see docs/configuration.md).
 #   ~/…             — the service user's home.
-#   relative/path   — resolved against THIS FILE's directory, never the
-#                     process CWD.
+#   relative/path   — resolved against <DEVVY_DATA_ROOT>/workspaces when the
+#                     data root is set (so `coach` means that agent's
+#                     workspace), else against THIS FILE's directory. Never
+#                     the process CWD.
 #   /absolute/path  — used as-is.
 #
 # Resolution is lexical (normpath), so a symlinked working_dir keeps the name
@@ -137,21 +164,22 @@ profiles:
   - slug: devops              # default — preserves single-profile behavior
     name: Server / DevOps
     working_dir: ${DEVVY_ROOT}
-    memory_dir: ${DEVVY_ROOT}/data/memory
-    persona: ${DEVVY_ROOT}/data/agent.md
+    memory_dir: ${DEVVY_WORKSPACES}/devops/memory
+    persona: ${DEVVY_WORKSPACES}/devops/persona.md
     # devops reuses the single-profile agent persona, so it names its template
     # explicitly rather than getting a second, drifting copy under personas/.
     persona_template: ${DEVVY_ROOT}/data/templates/agent.md
     default: true
     sandbox: false            # trusted admin: full bash network + cross-FS access
+    unrestricted: true        # server admin: no secrets/archive/db denies; Codex full access
     shared: true              # working_dir is a repo checkout; never split per-user
     max_turns: 100            # complex multi-file work exceeds the global default
 
   - slug: general
     name: General Assistant
-    working_dir: ${DEVVY_ROOT}/workspaces/general
-    memory_dir: ${DEVVY_ROOT}/workspaces/general/memory
-    persona: ${DEVVY_ROOT}/workspaces/general/persona.md
+    working_dir: ${DEVVY_WORKSPACES}/general
+    memory_dir: ${DEVVY_WORKSPACES}/general/memory
+    persona: ${DEVVY_WORKSPACES}/general/persona.md
     permission_policy:
       allowed_roles: [owner, guest]
 
@@ -161,18 +189,18 @@ profiles:
 
   - slug: chef
     name: Personal Chef
-    working_dir: ${DEVVY_ROOT}/workspaces/chef
-    memory_dir: ${DEVVY_ROOT}/workspaces/chef/memory
-    persona: ${DEVVY_ROOT}/workspaces/chef/persona.md
+    working_dir: ${DEVVY_WORKSPACES}/chef
+    memory_dir: ${DEVVY_WORKSPACES}/chef/memory
+    persona: ${DEVVY_WORKSPACES}/chef/persona.md
     permission_policy:
       allowed_roles: [owner, guest]
     shared: true              # household recipes are shared, not per-person
 
   - slug: coach
     name: Health & Training Coach
-    working_dir: ${DEVVY_ROOT}/workspaces/coach
-    memory_dir: ${DEVVY_ROOT}/workspaces/coach/memory
-    persona: ${DEVVY_ROOT}/workspaces/coach/persona.md
+    working_dir: ${DEVVY_WORKSPACES}/coach
+    memory_dir: ${DEVVY_WORKSPACES}/coach/memory
+    persona: ${DEVVY_WORKSPACES}/coach/persona.md
     permission_policy:
       allowed_roles: [owner, guest]
     family_memory: false      # health data never joins the family-shared scope
@@ -180,9 +208,9 @@ profiles:
 
   - slug: pm
     name: Project Manager
-    working_dir: ${DEVVY_ROOT}/workspaces/pm
-    memory_dir: ${DEVVY_ROOT}/workspaces/pm/memory
-    persona: ${DEVVY_ROOT}/workspaces/pm/persona.md
+    working_dir: ${DEVVY_WORKSPACES}/pm
+    memory_dir: ${DEVVY_WORKSPACES}/pm/memory
+    persona: ${DEVVY_WORKSPACES}/pm/persona.md
     permission_policy:
       allowed_roles: [owner, guest]
     shared: true
@@ -192,7 +220,7 @@ profiles:
   # key. It needs src/channel_intel running; see src/channel_intel/README.md.
   # - slug: channel
   #   name: TG Channel Editor
-  #   working_dir: ${DEVVY_ROOT}/workspaces/channel
-  #   memory_dir: ${DEVVY_ROOT}/workspaces/channel/memory
-  #   persona: ${DEVVY_ROOT}/workspaces/channel/persona.md
+  #   working_dir: ${DEVVY_WORKSPACES}/channel
+  #   memory_dir: ${DEVVY_WORKSPACES}/channel/memory
+  #   persona: ${DEVVY_WORKSPACES}/channel/persona.md
   #   mcp: ${DEVVY_ROOT}/config/mcp/channel-intel.json

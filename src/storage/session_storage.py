@@ -158,16 +158,27 @@ class SQLiteSessionStorage(SessionStorage):
 
             return claude_session
 
-    async def delete_session(self, session_id: str) -> None:
-        """Delete session from database."""
+    async def delete_session(
+        self, session_id: str, reason: str = "unspecified"
+    ) -> None:
+        """Retire a session's resume mapping (soft delete).
+
+        This is the ONLY writer of ``is_active = FALSE``. It stamps when and
+        why so the retirement is answerable from the database later
+        (dv-2a5a): on 2026-09-10 a live session went inactive with no log
+        line and no identifiable writer. Logged at info, not debug, for the
+        same reason -- debug lines never reach the journal in production.
+        """
+        now = datetime.now(UTC).isoformat()
         async with self.db_manager.get_connection() as conn:
             await conn.execute(
-                "UPDATE sessions SET is_active = FALSE WHERE session_id = ?",
-                (session_id,),
+                "UPDATE sessions SET is_active = FALSE, deactivated_at = ?, "
+                "deactivated_reason = ? WHERE session_id = ?",
+                (now, reason, session_id),
             )
             await conn.commit()
 
-        logger.debug("Session marked as inactive", session_id=session_id)
+        logger.info("Session deactivated", session_id=session_id, reason=reason)
 
     async def get_user_sessions(self, user_id: int) -> List[ClaudeSession]:
         """Get all active sessions for a user."""
@@ -226,24 +237,8 @@ class SQLiteSessionStorage(SessionStorage):
 
             return sessions
 
-    async def cleanup_expired_sessions(self, timeout_hours: int) -> int:
-        """Mark expired sessions as inactive."""
-        async with self.db_manager.get_connection() as conn:
-            cursor = await conn.execute(
-                """
-                UPDATE sessions
-                SET is_active = FALSE
-                WHERE last_used < datetime('now', '-' || ? || ' hours')
-                  AND is_active = TRUE
-            """,
-                (timeout_hours,),
-            )
-            await conn.commit()
-
-            affected = cursor.rowcount
-            logger.info(
-                "Cleaned up expired sessions",
-                count=affected,
-                timeout_hours=timeout_hours,
-            )
-            return affected
+    # No bulk age-based deactivation here, deliberately. `cleanup_expired_
+    # sessions(timeout_hours)` was deleted 2026-09-10 (dv-2a5a): session age
+    # is never a reason to retire a resume mapping (docs/DECISIONS.md
+    # 2026-09-10), and an uncalled function that silently wipes context is
+    # one wiring change away from being called again.

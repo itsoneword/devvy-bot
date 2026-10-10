@@ -65,7 +65,7 @@ async def test_no_new_facts_no_report(service):
     notify = service._notify
 
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(return_value="[]"),
     ) as cli:
         reports = await service.run()
@@ -81,7 +81,7 @@ async def test_facts_older_than_the_window_are_not_new(service, repo, db):
     await _age_fact(db, fid, hours=48)
 
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(return_value="[]"),
     ):
         assert await service.run() == []
@@ -102,7 +102,7 @@ async def test_guard_and_judge_results_aggregate_per_scope(service, repo):
         {"id": good, "verdict": "durable", "why": "allergy"},
     )
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(return_value=judge),
     ):
         reports = await service.run()
@@ -134,7 +134,7 @@ async def test_scopes_are_reported_separately(service, repo):
     await repo.add_fact("chef", "general", DURABLE)
 
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(return_value="[]"),
     ):
         reports = await service.run()
@@ -152,7 +152,7 @@ async def test_core_and_pinned_facts_are_never_guard_flagged(service, repo):
     core = await repo.add_fact("coach#u1", "core", MEAL)
 
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(return_value="[]"),
     ):
         reports = await service.run()
@@ -168,7 +168,7 @@ async def test_judge_sees_only_this_scopes_facts(service, repo):
     b = await repo.add_fact("chef", "general", "prefers cast iron pans")
 
     cli = AsyncMock(return_value="[]")
-    with patch("src.evaluator.fact_quality.invoke_claude_cli", cli):
+    with patch("src.evaluator.fact_quality.complete_text", cli):
         await service.run()
 
     assert cli.await_count == 2
@@ -185,7 +185,7 @@ async def test_long_facts_are_cut_with_an_explained_marker(service, repo):
     fid = await repo.add_fact("chef", "general", long_fact, kind="conversation_result")
 
     cli = AsyncMock(return_value="[]")
-    with patch("src.evaluator.fact_quality.invoke_claude_cli", cli):
+    with patch("src.evaluator.fact_quality.complete_text", cli):
         await service.run()
 
     prompt = cli.await_args.args[0]
@@ -204,7 +204,7 @@ async def test_unknown_ids_and_verdicts_are_ignored(service, repo):
         {"id": good, "verdict": "nonsense", "why": "bad enum"},
     )
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(return_value=judge),
     ):
         reports = await service.run()
@@ -220,7 +220,7 @@ async def test_llm_failure_warns_and_still_reports(service, repo, capsys):
     meal = await repo.add_fact("coach#u1", "general", MEAL)
 
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(side_effect=RuntimeError("CLI down")),
     ):
         reports = await service.run()
@@ -238,7 +238,7 @@ async def test_unparseable_judge_output_does_not_crash(service, repo):
     await repo.add_fact("chef", "general", DURABLE)
 
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(return_value="I think they all look fine, honestly"),
     ):
         reports = await service.run()
@@ -252,7 +252,7 @@ async def test_fenced_json_is_parsed(service, repo):
     fenced = "```json\n" + _judge({"id": meal, "verdict": "episodic"}) + "\n```"
 
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(return_value=fenced),
     ):
         reports = await service.run()
@@ -266,7 +266,7 @@ async def test_notification_failure_does_not_crash_the_run(db, repo):
     await repo.add_fact("chef", "general", DURABLE)
 
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(return_value="[]"),
     ):
         reports = await service.run()
@@ -282,7 +282,7 @@ async def test_run_writes_nothing(service, repo):
     judge = _judge({"id": meal, "verdict": "episodic", "why": "meal log"})
 
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(return_value=judge),
     ):
         await service.run()
@@ -347,7 +347,7 @@ async def test_registered_job_runs_the_check(db, repo):
     await repo.add_fact("coach#u1", "general", MEAL)
 
     with patch(
-        "src.evaluator.fact_quality.invoke_claude_cli",
+        "src.evaluator.fact_quality.complete_text",
         AsyncMock(return_value="[]"),
     ):
         await scheduler.jobs[0][2]()

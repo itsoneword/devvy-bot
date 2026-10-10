@@ -73,12 +73,23 @@ class SessionModel:
     total_turns: int = 0
     message_count: int = 0
     is_active: bool = True
+    # Audit trail for the soft delete (schema v21): when the resume mapping
+    # was retired and by which code path. None while the session is live.
+    deactivated_at: Optional[datetime] = None
+    deactivated_reason: Optional[str] = None
+    # Codex thread bookkeeping (schema v22, dv-ebde). backend is None for
+    # Claude rows; see src/storage/codex_sessions.py.
+    backend: Optional[str] = None
+    thread_head: int = 0
+    thread_total_input: int = 0
+    thread_total_output: int = 0
+    cumulative_tokens: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         data = asdict(self)
         # Convert datetime to ISO format
-        for key in ["created_at", "last_used"]:
+        for key in ["created_at", "last_used", "deactivated_at"]:
             if data[key]:
                 data[key] = data[key].isoformat()
         return data
@@ -89,7 +100,7 @@ class SessionModel:
         data = dict(row)
 
         # Parse datetime fields
-        for field in ["created_at", "last_used"]:
+        for field in ["created_at", "last_used", "deactivated_at"]:
             data[field] = _parse_datetime(data.get(field))
 
         return cls(**data)

@@ -1,0 +1,3963 @@
+{
+  "channel_intel": {
+    "attach_images": [
+      {
+        "caption": "front door",
+        "confirmed": false,
+        "created_at": "<ts>",
+        "file_path": "images/img1.jpg",
+        "id": "<id>",
+        "owner": "me",
+        "place_id": 1,
+        "tags": [
+          "exterior"
+        ],
+        "vision_model": null
+      }
+    ],
+    "create_post": {
+      "body": "Loved it!",
+      "created_at": "<ts>",
+      "id": "<id>",
+      "owner": "me",
+      "place_ids": [
+        1
+      ],
+      "selected_image_refs": null,
+      "status": "draft",
+      "updated_at": "<ts>"
+    },
+    "find_images_for": [
+      {
+        "caption": "front door",
+        "confirmed": false,
+        "created_at": "<ts>",
+        "file_path": "images/img1.jpg",
+        "id": "<id>",
+        "owner": "me",
+        "place_id": 1,
+        "tags": [
+          "exterior"
+        ],
+        "vision_model": null
+      }
+    ],
+    "find_places": [
+      {
+        "created_at": "<ts>",
+        "enriched_at": null,
+        "features": [
+          "wifi",
+          "quiet"
+        ],
+        "id": "<id>",
+        "lat": null,
+        "liked": null,
+        "location": "Lisbon",
+        "lon": null,
+        "my_notes": null,
+        "name": "Sunny Cafe",
+        "opening_hours": null,
+        "owner": "me",
+        "price": "$$",
+        "score": 1.5,
+        "source": null,
+        "status": "want_to_visit",
+        "travel_time_from_home": null,
+        "type": "cafe",
+        "updated_at": "<ts>"
+      }
+    ],
+    "get_place": {
+      "created_at": "<ts>",
+      "enriched_at": null,
+      "features": [
+        "wifi",
+        "quiet"
+      ],
+      "id": "<id>",
+      "lat": null,
+      "liked": null,
+      "location": "Lisbon",
+      "lon": null,
+      "my_notes": null,
+      "name": "Sunny Cafe",
+      "opening_hours": null,
+      "owner": "me",
+      "price": "$$",
+      "score": null,
+      "source": null,
+      "status": "want_to_visit",
+      "travel_time_from_home": null,
+      "type": "cafe",
+      "updated_at": "<ts>"
+    },
+    "get_post": {
+      "body": "Loved it!",
+      "created_at": "<ts>",
+      "id": "<id>",
+      "owner": "me",
+      "place_ids": [
+        1
+      ],
+      "selected_image_refs": null,
+      "status": "draft",
+      "updated_at": "<ts>"
+    },
+    "get_preferences": {
+      "budget_norms": null,
+      "default_radius": null,
+      "home_location": null,
+      "liked_features": null,
+      "liked_place_ids": null,
+      "owner": "me"
+    },
+    "places_for_reference": [
+      1
+    ],
+    "record_visit": {
+      "activities": null,
+      "costs": null,
+      "created_at": "<ts>",
+      "date": "2026-01-01",
+      "id": "<id>",
+      "narrative": "great coffee",
+      "owner": "me",
+      "photo_refs": null,
+      "place_id": 1
+    },
+    "save_reference": {
+      "created_at": "<ts>",
+      "id": "<id>",
+      "image_refs": null,
+      "notes": null,
+      "owner": "me",
+      "source_channel": "friends_chat",
+      "tags": [
+        "food"
+      ],
+      "text": "try Sunny Cafe"
+    },
+    "search": [
+      {
+        "created_at": "<ts>",
+        "enriched_at": null,
+        "features": [
+          "wifi",
+          "quiet"
+        ],
+        "id": "<id>",
+        "lat": null,
+        "liked": null,
+        "location": "Lisbon",
+        "lon": null,
+        "my_notes": null,
+        "name": "Sunny Cafe",
+        "opening_hours": null,
+        "owner": "me",
+        "price": "$$",
+        "score": null,
+        "source": null,
+        "status": "want_to_visit",
+        "travel_time_from_home": null,
+        "type": "cafe",
+        "updated_at": "<ts>"
+      }
+    ],
+    "set_confirmed": {
+      "caption": "front door",
+      "confirmed": true,
+      "created_at": "<ts>",
+      "file_path": "images/img1.jpg",
+      "id": "<id>",
+      "owner": "me",
+      "place_id": 1,
+      "tags": [
+        "exterior"
+      ],
+      "vision_model": null
+    },
+    "upsert_place": {
+      "ambiguous": [],
+      "place": {
+        "created_at": "<ts>",
+        "enriched_at": null,
+        "features": [
+          "wifi",
+          "quiet"
+        ],
+        "id": "<id>",
+        "lat": null,
+        "liked": null,
+        "location": "Lisbon",
+        "lon": null,
+        "my_notes": null,
+        "name": "Sunny Cafe",
+        "opening_hours": null,
+        "owner": "me",
+        "price": "$$",
+        "score": null,
+        "source": null,
+        "status": "want_to_visit",
+        "travel_time_from_home": null,
+        "type": "cafe",
+        "updated_at": "<ts>"
+      }
+    }
+  },
+  "codex_sessions": {
+    "dump.sessions_codex_rows": [
+      {
+        "backend": "openai_codex",
+        "created_at": "<ts>",
+        "cumulative_tokens": 150,
+        "deactivated_at": null,
+        "deactivated_reason": null,
+        "is_active": 1,
+        "last_used": "<ts>",
+        "message_count": 0,
+        "project_path": "/work/codexproj",
+        "session_id": "thread-a",
+        "thread_head": 0,
+        "thread_total_input": 100,
+        "thread_total_output": 50,
+        "total_cost": 0.0,
+        "total_turns": 0,
+        "user_id": 902
+      },
+      {
+        "backend": "openai_codex",
+        "created_at": "<ts>",
+        "cumulative_tokens": 15,
+        "deactivated_at": null,
+        "deactivated_reason": null,
+        "is_active": 1,
+        "last_used": "<ts>",
+        "message_count": 0,
+        "project_path": "/work/codexproj",
+        "session_id": "thread-b",
+        "thread_head": 0,
+        "thread_total_input": 10,
+        "thread_total_output": 5,
+        "total_cost": 0.0,
+        "total_turns": 0,
+        "user_id": 902
+      }
+    ],
+    "import_codex_sessions_json.counts": {
+      "already": 0,
+      "inserted": 1,
+      "moved": 0,
+      "skipped": 0,
+      "tagged": 0
+    },
+    "import_codex_sessions_json.missing_file": {
+      "already": 0,
+      "inserted": 0,
+      "moved": 0,
+      "skipped": 0,
+      "tagged": 0
+    },
+    "import_codex_sessions_json.rerun_counts": {
+      "already": 1,
+      "inserted": 0,
+      "moved": 0,
+      "skipped": 0,
+      "tagged": 0
+    },
+    "import_codex_sessions_json.thread_for": "thread-legacy",
+    "in_memory.info_for": {
+      "cumulative_tokens": 15,
+      "session_id": "t1",
+      "thread_total_input": 10,
+      "thread_total_output": 5,
+      "updated_at": "<ts>",
+      "user_id": 1,
+      "working_dir": "/a"
+    },
+    "in_memory.sessions_for_user": [
+      {
+        "cumulative_tokens": 15,
+        "session_id": "t1",
+        "thread_total_input": 10,
+        "thread_total_output": 5,
+        "updated_at": "<ts>",
+        "user_id": 1,
+        "working_dir": "/a"
+      }
+    ],
+    "in_memory.thread_for": "t1",
+    "in_memory.thread_for_after_clear": null,
+    "in_memory.thread_for_none": null,
+    "in_memory.thread_totals": [
+      10,
+      5
+    ],
+    "info_for": {
+      "cumulative_tokens": 150,
+      "session_id": "thread-a",
+      "thread_total_input": 100,
+      "thread_total_output": 50,
+      "updated_at": "<ts>",
+      "user_id": 902,
+      "working_dir": "/work/codexproj"
+    },
+    "sessions_for_user": [
+      {
+        "cumulative_tokens": 15,
+        "session_id": "thread-b",
+        "thread_total_input": 10,
+        "thread_total_output": 5,
+        "updated_at": "<ts>",
+        "user_id": 902,
+        "working_dir": "/work/codexproj"
+      }
+    ],
+    "thread_for.after_clear": null,
+    "thread_for.after_record": "thread-a",
+    "thread_for.after_second_thread_moves_head": "thread-b",
+    "thread_for.none": null,
+    "thread_totals": [
+      100,
+      50
+    ]
+  },
+  "deviz_board": {
+    "add_task.id_present": true,
+    "append_comment.missing": false,
+    "append_comment.ok": true,
+    "find_open_by_title.hit": {
+      "assignee": null,
+      "body": "Second task",
+      "created_at": "<ts>",
+      "created_by": "user",
+      "due_at": null,
+      "id": "<DV_ID_2>",
+      "labels": [],
+      "path": "<TMP>/deviz/tasks/<DV_ID_2>.md",
+      "priority": "medium",
+      "status": "in_progress",
+      "title": "Second task",
+      "updated_at": "<ts>"
+    },
+    "find_open_by_title.miss": null,
+    "get_task": {
+      "assignee": "devops",
+      "body": "full description",
+      "created_at": "<ts>",
+      "created_by": "devops",
+      "due_at": "2030-01-01T00:00:00+00:00",
+      "id": "<DV_ID_1>",
+      "labels": [
+        "bug",
+        "db"
+      ],
+      "path": "<TMP>/deviz/tasks/<DV_ID_1>.md",
+      "priority": "high",
+      "status": "todo",
+      "title": "Fix the thing",
+      "updated_at": "<ts>"
+    },
+    "get_task.after_comment": {
+      "assignee": null,
+      "body": "Second task",
+      "created_at": "<ts>",
+      "created_by": "user",
+      "due_at": null,
+      "id": "<DV_ID_2>",
+      "labels": [],
+      "path": "<TMP>/deviz/tasks/<DV_ID_2>.md",
+      "priority": "medium",
+      "status": "in_progress",
+      "title": "Second task",
+      "updated_at": "<ts>"
+    },
+    "get_task.after_done": {
+      "assignee": "devops",
+      "body": "full description",
+      "created_at": "<ts>",
+      "created_by": "devops",
+      "due_at": "2030-01-01T00:00:00+00:00",
+      "id": "<DV_ID_1>",
+      "labels": [
+        "bug",
+        "db"
+      ],
+      "path": "<TMP>/deviz/tasks/<DV_ID_1>.md",
+      "priority": "high",
+      "status": "done",
+      "title": "Fix the thing",
+      "updated_at": "<ts>"
+    },
+    "get_task.missing": null,
+    "list_tasks.all": [
+      {
+        "assignee": "devops",
+        "body": "full description",
+        "created_at": "<ts>",
+        "created_by": "devops",
+        "due_at": "2030-01-01T00:00:00+00:00",
+        "id": "<DV_ID_1>",
+        "labels": [
+          "bug",
+          "db"
+        ],
+        "path": "<TMP>/deviz/tasks/<DV_ID_1>.md",
+        "priority": "high",
+        "status": "done",
+        "title": "Fix the thing",
+        "updated_at": "<ts>"
+      },
+      {
+        "assignee": null,
+        "body": "Second task",
+        "created_at": "<ts>",
+        "created_by": "user",
+        "due_at": null,
+        "id": "<DV_ID_2>",
+        "labels": [],
+        "path": "<TMP>/deviz/tasks/<DV_ID_2>.md",
+        "priority": "medium",
+        "status": "in_progress",
+        "title": "Second task",
+        "updated_at": "<ts>"
+      }
+    ],
+    "list_tasks.done": [
+      {
+        "assignee": "devops",
+        "body": "full description",
+        "created_at": "<ts>",
+        "created_by": "devops",
+        "due_at": "2030-01-01T00:00:00+00:00",
+        "id": "<DV_ID_1>",
+        "labels": [
+          "bug",
+          "db"
+        ],
+        "path": "<TMP>/deviz/tasks/<DV_ID_1>.md",
+        "priority": "high",
+        "status": "done",
+        "title": "Fix the thing",
+        "updated_at": "<ts>"
+      }
+    ],
+    "list_tasks.open": [
+      {
+        "assignee": "devops",
+        "body": "full description",
+        "created_at": "<ts>",
+        "created_by": "devops",
+        "due_at": "2030-01-01T00:00:00+00:00",
+        "id": "<DV_ID_1>",
+        "labels": [
+          "bug",
+          "db"
+        ],
+        "path": "<TMP>/deviz/tasks/<DV_ID_1>.md",
+        "priority": "high",
+        "status": "todo",
+        "title": "Fix the thing",
+        "updated_at": "<ts>"
+      },
+      {
+        "assignee": null,
+        "body": "Second task",
+        "created_at": "<ts>",
+        "created_by": "user",
+        "due_at": null,
+        "id": "<DV_ID_2>",
+        "labels": [],
+        "path": "<TMP>/deviz/tasks/<DV_ID_2>.md",
+        "priority": "medium",
+        "status": "in_progress",
+        "title": "Second task",
+        "updated_at": "<ts>"
+      }
+    ],
+    "set_status.missing": false,
+    "set_status.ok": true
+  },
+  "facade": {
+    "bot_users.count_users": 1,
+    "bot_users.list_family_members": [
+      {
+        "added_by": null,
+        "created_at": "<ts>",
+        "family_id": 1,
+        "role": "guest",
+        "source": "admin",
+        "telegram_id": 1002
+      }
+    ],
+    "create_session": {
+      "backend": null,
+      "created_at": "<ts>",
+      "cumulative_tokens": 0,
+      "deactivated_at": null,
+      "deactivated_reason": null,
+      "is_active": true,
+      "last_used": "<ts>",
+      "message_count": 0,
+      "project_path": "/work/proj",
+      "session_id": "sess-1",
+      "thread_head": 0,
+      "thread_total_input": 0,
+      "thread_total_output": 0,
+      "total_cost": 0.0,
+      "total_turns": 0,
+      "user_id": 1001
+    },
+    "dump.agent_tasks": [
+      {
+        "assignee": null,
+        "body": null,
+        "created_at": "<ts>",
+        "created_by": "user",
+        "due_at": null,
+        "id": "<id>",
+        "status": "open",
+        "title": "legacy todo",
+        "updated_at": "<ts>"
+      }
+    ],
+    "dump.audit_log": [
+      {
+        "event_data": "{\"session_id\": \"sess-1\", \"cost\": 0.01, \"duration_ms\": 42, \"num_turns\": 1, \"is_error\": false, \"tools_used\": [\"Bash\"]}",
+        "event_type": "claude_interaction",
+        "id": "<id>",
+        "ip_address": null,
+        "success": 1,
+        "timestamp": "<ts>",
+        "user_id": 1001
+      },
+      {
+        "event_data": "{\"ip\": \"127.0.0.1\"}",
+        "event_type": "login",
+        "id": "<id>",
+        "ip_address": null,
+        "success": 1,
+        "timestamp": "<ts>",
+        "user_id": 1001
+      },
+      {
+        "event_data": "{\"reason\": \"deploy\"}",
+        "event_type": "restart",
+        "id": "<id>",
+        "ip_address": null,
+        "success": 1,
+        "timestamp": "<ts>",
+        "user_id": 1001
+      }
+    ],
+    "dump.bot_users": [
+      {
+        "added_by": null,
+        "created_at": "<ts>",
+        "display_name": null,
+        "family_id": 1,
+        "is_admin": 0,
+        "relation": null,
+        "role": "guest",
+        "source": "admin",
+        "telegram_id": 1002
+      }
+    ],
+    "dump.cost_tracking": [
+      {
+        "daily_cost": 0.01,
+        "date": "<today>",
+        "id": "<id>",
+        "request_count": 1,
+        "user_id": 1001
+      }
+    ],
+    "dump.families": [
+      {
+        "created_at": "<ts>",
+        "created_by": 1001,
+        "id": "<id>"
+      }
+    ],
+    "dump.memory_facts": [
+      {
+        "agent_id": "devops",
+        "conflict_group": null,
+        "content": "likes dark roast coffee",
+        "created_at": "<ts>",
+        "id": "<id>",
+        "invalid_at": null,
+        "invalidated_by": null,
+        "kind": "user_fact",
+        "label": null,
+        "recorded_at": "<ts>",
+        "source": "manual",
+        "source_ref": null,
+        "status": "active",
+        "superseded_by": null,
+        "tier": "general",
+        "updated_at": "<ts>",
+        "valid_from": "<ts>"
+      }
+    ],
+    "dump.messages": [
+      {
+        "cost": 0.01,
+        "duration_ms": 42,
+        "error": null,
+        "message_id": "<id>",
+        "prompt": "hi there",
+        "response": "hello",
+        "session_id": "sess-1",
+        "timestamp": "<ts>",
+        "user_id": 1001,
+        "window_id": null
+      }
+    ],
+    "dump.pinned_messages": [
+      {
+        "chat_id": 555,
+        "message_id": "<id>",
+        "pin_as": "status",
+        "updated_at": "<ts>"
+      }
+    ],
+    "dump.sent_messages": [
+      {
+        "created_at": "<ts>",
+        "id": "<id>",
+        "kind": "turn_reply",
+        "messages_message_id": 1,
+        "profile_slug": null,
+        "telegram_chat_id": 555,
+        "telegram_message_id": 777
+      }
+    ],
+    "dump.sessions": [
+      {
+        "backend": null,
+        "created_at": "<ts>",
+        "cumulative_tokens": 0,
+        "deactivated_at": null,
+        "deactivated_reason": null,
+        "is_active": 1,
+        "last_used": "<ts>",
+        "message_count": 1,
+        "project_path": "/work/proj",
+        "session_id": "sess-1",
+        "thread_head": 0,
+        "thread_total_input": 0,
+        "thread_total_output": 0,
+        "total_cost": 0.01,
+        "total_turns": 1,
+        "user_id": 1001
+      }
+    ],
+    "dump.tool_usage": [
+      {
+        "error_message": null,
+        "id": "<id>",
+        "message_id": "<id>",
+        "session_id": "sess-1",
+        "success": 1,
+        "timestamp": "<ts>",
+        "tool_input": "{\"command\": \"ls\"}",
+        "tool_name": "Bash"
+      }
+    ],
+    "dump.user_holds": [
+      {
+        "held_until": "<ts>",
+        "reason": "test hold",
+        "set_at": "<ts>",
+        "set_by": 0,
+        "user_id": 1001
+      }
+    ],
+    "dump.user_preferences": [
+      {
+        "active_profile": "devops",
+        "agent_backend": null,
+        "agent_model": null,
+        "pinned_switch_message_id": null,
+        "updated_at": "<ts>",
+        "user_id": 1001
+      }
+    ],
+    "dump.users": [
+      {
+        "first_seen": "<ts>",
+        "is_allowed": 0,
+        "last_active": "<ts>",
+        "message_count": 1,
+        "session_count": 1,
+        "telegram_username": "alice",
+        "total_cost": 0.01,
+        "user_id": 1001
+      }
+    ],
+    "get_admin_dashboard": {
+      "recent_audit": [
+        {
+          "event_data": "{\"reason\": \"deploy\"}",
+          "event_type": "restart",
+          "id": "<id>",
+          "ip_address": null,
+          "success": 1,
+          "timestamp": "<ts>",
+          "user_id": 1001
+        },
+        {
+          "event_data": "{\"ip\": \"127.0.0.1\"}",
+          "event_type": "login",
+          "id": "<id>",
+          "ip_address": null,
+          "success": 1,
+          "timestamp": "<ts>",
+          "user_id": 1001
+        },
+        {
+          "event_data": "{\"session_id\": \"sess-1\", \"cost\": 0.01, \"duration_ms\": 42, \"num_turns\": 1, \"is_error\": false, \"tools_used\": [\"Bash\"]}",
+          "event_type": "claude_interaction",
+          "id": "<id>",
+          "ip_address": null,
+          "success": 1,
+          "timestamp": "<ts>",
+          "user_id": 1001
+        }
+      ],
+      "system_stats": {
+        "daily_activity": [
+          {
+            "active_users": 1,
+            "date": "<today>",
+            "total_cost": 0.01,
+            "total_messages": 1
+          }
+        ],
+        "overall": {
+          "active_users_7d": 1,
+          "avg_duration": 42.0,
+          "total_cost": 0.01,
+          "total_messages": 1,
+          "total_sessions": 1,
+          "total_users": 1
+        },
+        "tool_stats": [
+          {
+            "sessions_used": 1,
+            "tool_name": "Bash",
+            "usage_count": 1
+          }
+        ],
+        "top_users": [
+          {
+            "telegram_username": "alice",
+            "total_cost": 0.01,
+            "total_messages": 1,
+            "user_id": 1001
+          }
+        ]
+      },
+      "tool_stats": [
+        {
+          "error_count": 0,
+          "sessions_used": 1,
+          "success_count": 1,
+          "tool_name": "Bash",
+          "usage_count": 1
+        }
+      ],
+      "total_costs": [
+        {
+          "active_users": 1,
+          "date": "<today>",
+          "total_cost": 0.01,
+          "total_requests": 1
+        }
+      ],
+      "users": [
+        {
+          "first_seen": "<ts>",
+          "is_allowed": 0,
+          "last_active": "<ts>",
+          "message_count": 1,
+          "session_count": 1,
+          "telegram_username": "alice",
+          "total_cost": 0.01,
+          "user_id": 1001
+        }
+      ]
+    },
+    "get_or_create_user": {
+      "first_seen": "<ts>",
+      "is_allowed": false,
+      "last_active": "<ts>",
+      "message_count": 0,
+      "session_count": 0,
+      "telegram_username": "alice",
+      "total_cost": 0.0,
+      "user_id": 1001
+    },
+    "get_session_history": {
+      "messages": [
+        {
+          "cost": 0.01,
+          "duration_ms": 42,
+          "error": null,
+          "message_id": "<id>",
+          "prompt": "hi there",
+          "response": "hello",
+          "session_id": "sess-1",
+          "timestamp": "<ts>",
+          "user_id": 1001,
+          "window_id": null
+        }
+      ],
+      "session": {
+        "backend": null,
+        "created_at": "<ts>",
+        "cumulative_tokens": 0,
+        "deactivated_at": null,
+        "deactivated_reason": null,
+        "is_active": 1,
+        "last_used": "<ts>",
+        "message_count": 1,
+        "project_path": "/work/proj",
+        "session_id": "sess-1",
+        "thread_head": 0,
+        "thread_total_input": 0,
+        "thread_total_output": 0,
+        "total_cost": 0.01,
+        "total_turns": 1,
+        "user_id": 1001
+      },
+      "tool_usage": [
+        {
+          "error_message": null,
+          "id": "<id>",
+          "message_id": "<id>",
+          "session_id": "sess-1",
+          "success": 1,
+          "timestamp": "<ts>",
+          "tool_input": "{\"command\": \"ls\"}",
+          "tool_name": "Bash"
+        }
+      ]
+    },
+    "get_user_dashboard": {
+      "daily_costs": [
+        {
+          "daily_cost": 0.01,
+          "date": "<today>",
+          "id": "<id>",
+          "request_count": 1,
+          "user_id": 1001
+        }
+      ],
+      "recent_audit": [
+        {
+          "event_data": "{\"reason\": \"deploy\"}",
+          "event_type": "restart",
+          "id": "<id>",
+          "ip_address": null,
+          "success": 1,
+          "timestamp": "<ts>",
+          "user_id": 1001
+        },
+        {
+          "event_data": "{\"ip\": \"127.0.0.1\"}",
+          "event_type": "login",
+          "id": "<id>",
+          "ip_address": null,
+          "success": 1,
+          "timestamp": "<ts>",
+          "user_id": 1001
+        },
+        {
+          "event_data": "{\"session_id\": \"sess-1\", \"cost\": 0.01, \"duration_ms\": 42, \"num_turns\": 1, \"is_error\": false, \"tools_used\": [\"Bash\"]}",
+          "event_type": "claude_interaction",
+          "id": "<id>",
+          "ip_address": null,
+          "success": 1,
+          "timestamp": "<ts>",
+          "user_id": 1001
+        }
+      ],
+      "recent_messages": [
+        {
+          "cost": 0.01,
+          "duration_ms": 42,
+          "error": null,
+          "message_id": "<id>",
+          "prompt": "hi there",
+          "response": "hello",
+          "session_id": "sess-1",
+          "timestamp": "<ts>",
+          "user_id": 1001,
+          "window_id": null
+        }
+      ],
+      "recent_sessions": [
+        {
+          "backend": null,
+          "created_at": "<ts>",
+          "cumulative_tokens": 0,
+          "deactivated_at": null,
+          "deactivated_reason": null,
+          "is_active": 1,
+          "last_used": "<ts>",
+          "message_count": 1,
+          "project_path": "/work/proj",
+          "session_id": "sess-1",
+          "thread_head": 0,
+          "thread_total_input": 0,
+          "thread_total_output": 0,
+          "total_cost": 0.01,
+          "total_turns": 1,
+          "user_id": 1001
+        }
+      ],
+      "stats": {
+        "daily_usage": [
+          {
+            "cost": 0.01,
+            "date": "<today>",
+            "messages": 1,
+            "sessions": 1
+          }
+        ],
+        "summary": {
+          "avg_cost": 0.01,
+          "avg_duration": 42.0,
+          "last_activity": "<ts>",
+          "total_cost": 0.01,
+          "total_messages": 1,
+          "total_sessions": 1
+        },
+        "top_tools": [
+          {
+            "tool_name": "Bash",
+            "usage_count": 1
+          }
+        ]
+      },
+      "user": {
+        "first_seen": "<ts>",
+        "is_allowed": 0,
+        "last_active": "<ts>",
+        "message_count": 1,
+        "session_count": 1,
+        "telegram_username": "alice",
+        "total_cost": 0.01,
+        "user_id": 1001
+      }
+    },
+    "get_user_session_summary": {
+      "active_sessions": 1,
+      "projects": [
+        "/work/proj"
+      ],
+      "total_cost": 0.01,
+      "total_messages": 1,
+      "total_sessions": 1
+    },
+    "health_check": true,
+    "holds.get_hold.reason": "test hold",
+    "is_user_allowed": 0,
+    "legacy_tasks.get_task": {
+      "assignee": null,
+      "body": null,
+      "created_at": "<ts>",
+      "created_by": "user",
+      "due_at": null,
+      "id": "<id>",
+      "status": "open",
+      "title": "legacy todo"
+    },
+    "memory.facts_snapshot": {
+      "conflicts": [],
+      "general": [
+        {
+          "agent_id": "devops",
+          "conflict_group": null,
+          "content": "likes dark roast coffee",
+          "id": "<id>",
+          "invalid_at": null,
+          "invalidated_by": null,
+          "kind": "user_fact",
+          "label": null,
+          "recorded_at": "<ts>",
+          "source": "manual",
+          "source_ref": null,
+          "status": "active",
+          "superseded_by": null,
+          "tier": "general",
+          "valid_from": "<ts>"
+        }
+      ],
+      "pinned": [],
+      "pointers": []
+    },
+    "memory.get_facts": [
+      {
+        "agent_id": "devops",
+        "conflict_group": null,
+        "content": "likes dark roast coffee",
+        "id": "<id>",
+        "invalid_at": null,
+        "invalidated_by": null,
+        "kind": "user_fact",
+        "label": null,
+        "recorded_at": "<ts>",
+        "source": "manual",
+        "source_ref": null,
+        "status": "active",
+        "superseded_by": null,
+        "tier": "general",
+        "valid_from": "<ts>"
+      }
+    ],
+    "pending_notes.consume": [
+      "a scheduled note"
+    ],
+    "pinned_messages.load_all": {
+      "555:status": 999
+    },
+    "preferences.get": {
+      "active_profile": "devops",
+      "agent_backend": null,
+      "agent_model": null,
+      "pinned_switch_message_id": null
+    },
+    "save_claude_interaction_message_id": "<id>",
+    "sent_messages.lookup": {
+      "created_at": "<ts>",
+      "id": "<id>",
+      "kind": "turn_reply",
+      "messages_message_id": 1,
+      "profile_slug": null,
+      "telegram_chat_id": 555,
+      "telegram_message_id": 777
+    }
+  },
+  "items": {
+    "activity_since": [
+      {
+        "assignee_id": 710002,
+        "created_at": "<ts>",
+        "creator_id": 710001,
+        "deadline": null,
+        "deliver": "message",
+        "done_at": null,
+        "done_by": 710002,
+        "due_at": null,
+        "ends_at": null,
+        "family_id": 1,
+        "id": "<id>",
+        "last_fired_at": null,
+        "profile_slug": null,
+        "recurrence": null,
+        "source_profile": null,
+        "status": "done",
+        "text": "buy milk",
+        "tz": "UTC",
+        "updated_at": "<ts>"
+      }
+    ],
+    "after_update": {
+      "assignee_id": 710002,
+      "created_at": "<ts>",
+      "creator_id": 710001,
+      "deadline": null,
+      "deliver": "message",
+      "done_at": null,
+      "done_by": 710002,
+      "due_at": null,
+      "ends_at": null,
+      "family_id": 1,
+      "id": "<id>",
+      "last_fired_at": null,
+      "profile_slug": null,
+      "recurrence": null,
+      "source_profile": null,
+      "status": "done",
+      "text": "buy milk",
+      "tz": "UTC",
+      "updated_at": "<ts>"
+    },
+    "count_cross_created_since": 1,
+    "count_notes": 1,
+    "dump.bot_users": [
+      {
+        "added_by": null,
+        "created_at": "<ts>",
+        "display_name": "Ivan",
+        "family_id": 1,
+        "is_admin": 1,
+        "relation": "husband",
+        "role": "owner",
+        "source": "env",
+        "telegram_id": 710001
+      },
+      {
+        "added_by": null,
+        "created_at": "<ts>",
+        "display_name": "Ann",
+        "family_id": 1,
+        "is_admin": 0,
+        "relation": "spouse",
+        "role": "owner",
+        "source": "env",
+        "telegram_id": 710002
+      }
+    ],
+    "dump.item_notes": [
+      {
+        "author_id": 710001,
+        "body": "thanks!",
+        "created_at": "<ts>",
+        "id": "<id>",
+        "item_id": 1,
+        "kind": "comment",
+        "path": null,
+        "source": "manual"
+      }
+    ],
+    "dump.item_seen": [
+      {
+        "profile_slug": "devops",
+        "seen_at": "2026-01-01T00:00:00",
+        "user_id": 710002
+      }
+    ],
+    "dump.items": [
+      {
+        "assignee_id": 710002,
+        "created_at": "<ts>",
+        "creator_id": 710001,
+        "deadline": null,
+        "deliver": "message",
+        "done_at": null,
+        "done_by": 710002,
+        "due_at": null,
+        "ends_at": null,
+        "family_id": 1,
+        "id": "<id>",
+        "last_fired_at": null,
+        "profile_slug": null,
+        "recurrence": null,
+        "source_profile": null,
+        "status": "done",
+        "text": "buy milk",
+        "tz": "UTC",
+        "updated_at": "<ts>"
+      }
+    ],
+    "family_members": [
+      {
+        "display_name": "Ivan",
+        "family_id": 1,
+        "is_admin": true,
+        "relation": "husband",
+        "role": "owner",
+        "telegram_id": 710001
+      },
+      {
+        "display_name": "Ann",
+        "family_id": 1,
+        "is_admin": false,
+        "relation": "wife",
+        "role": "owner",
+        "telegram_id": 710002
+      }
+    ],
+    "fill_display_name_noop": false,
+    "get_member": {
+      "display_name": "Ivan",
+      "family_id": 1,
+      "is_admin": true,
+      "relation": "husband",
+      "role": "owner",
+      "telegram_id": 710001
+    },
+    "get_member_after_fields": {
+      "display_name": "Ann",
+      "family_id": 1,
+      "is_admin": false,
+      "relation": "spouse",
+      "role": "owner",
+      "telegram_id": 710002
+    },
+    "get_seen": "2026-01-01T00:00:00",
+    "insert_and_get": {
+      "assignee_id": 710002,
+      "created_at": "<ts>",
+      "creator_id": 710001,
+      "deadline": null,
+      "deliver": "message",
+      "done_at": null,
+      "done_by": null,
+      "due_at": null,
+      "ends_at": null,
+      "family_id": 1,
+      "id": "<id>",
+      "last_fired_at": null,
+      "profile_slug": null,
+      "recurrence": null,
+      "source_profile": null,
+      "status": "open",
+      "text": "buy milk",
+      "tz": "UTC",
+      "updated_at": "<ts>"
+    },
+    "list_for_all": [
+      {
+        "assignee_id": 710002,
+        "created_at": "<ts>",
+        "creator_id": 710001,
+        "deadline": null,
+        "deliver": "message",
+        "done_at": null,
+        "done_by": 710002,
+        "due_at": null,
+        "ends_at": null,
+        "family_id": 1,
+        "id": "<id>",
+        "last_fired_at": null,
+        "profile_slug": null,
+        "recurrence": null,
+        "source_profile": null,
+        "status": "done",
+        "text": "buy milk",
+        "tz": "UTC",
+        "updated_at": "<ts>"
+      }
+    ],
+    "list_notes": [
+      {
+        "author_id": 710001,
+        "body": "thanks!",
+        "created_at": "<ts>",
+        "id": "<id>",
+        "item_id": 1,
+        "kind": "comment",
+        "path": null,
+        "source": "manual"
+      }
+    ]
+  },
+  "llm_analytics": {
+    "call_location": [
+      "<TMP>/la/llm/projects/-home-u-proj/aaaa0001-0000-0000-0000-000000000001.jsonl",
+      214
+    ],
+    "chain_detail": {
+      "annotations": {
+        "db_current_counter": 26,
+        "eval_threshold": 120000,
+        "refresh_threshold": 220000
+      },
+      "series": [
+        {
+          "bot_counter_cum": 13,
+          "cache_expiry": false,
+          "context_provided": 113,
+          "first_of_session": true,
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "ts": "<ts>",
+          "window_id": 1
+        },
+        {
+          "bot_counter_cum": 26,
+          "cache_expiry": false,
+          "context_provided": 113,
+          "first_of_session": false,
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "ts": "<ts>",
+          "window_id": 1
+        },
+        {
+          "bot_counter_cum": 13,
+          "cache_expiry": false,
+          "context_provided": 113,
+          "first_of_session": true,
+          "session_id": "aaaa0002-0000-0000-0000-000000000002",
+          "ts": "<ts>",
+          "window_id": 2
+        }
+      ],
+      "user_id": 111,
+      "working_dir": "/home/u/proj"
+    },
+    "chains": {
+      "chains": [
+        {
+          "current_window": null,
+          "rotations_observed": 0,
+          "sessions": [
+            {
+              "api_call_count": null,
+              "bot_formula_tokens": null,
+              "created_at": "<ts>",
+              "est_cost_usd": null,
+              "first_call_context": null,
+              "in_index": false,
+              "last_used": null,
+              "max_window": null,
+              "message_count": 1,
+              "min_window": null,
+              "rotated_into": null,
+              "seeded_start": null,
+              "session_id": "aaaa0007-0000-0000-0000-000000000007",
+              "total_cost": 0.1
+            },
+            {
+              "api_call_count": null,
+              "bot_formula_tokens": null,
+              "created_at": "<ts>",
+              "est_cost_usd": null,
+              "first_call_context": null,
+              "in_index": false,
+              "last_used": null,
+              "max_window": null,
+              "message_count": 3,
+              "min_window": null,
+              "rotated_into": null,
+              "seeded_start": null,
+              "session_id": "aaaa0006-0000-0000-0000-000000000006",
+              "total_cost": 0.2
+            }
+          ],
+          "user_id": 111,
+          "windows": [],
+          "working_dir": "/home/u/other"
+        },
+        {
+          "current_window": {
+            "active_backend": "claude",
+            "cumulative_tokens": 26,
+            "last_checkpoint_message_id": 3,
+            "last_eval_checkpoint": 50000,
+            "updated_at": "<ts>",
+            "user_id": 111,
+            "window_id": 2,
+            "working_dir": "/home/u/proj"
+          },
+          "rotations_observed": 1,
+          "sessions": [
+            {
+              "api_call_count": 4,
+              "bot_formula_tokens": 52,
+              "created_at": "<ts>",
+              "est_cost_usd": 0.00356,
+              "first_call_context": 113,
+              "in_index": true,
+              "last_used": null,
+              "max_window": 1,
+              "message_count": 2,
+              "min_window": 1,
+              "rotated_into": "aaaa0002-0000-0000-0000-000000000002",
+              "seeded_start": false,
+              "session_id": "aaaa0001-0000-0000-0000-000000000001",
+              "total_cost": 0.5
+            },
+            {
+              "api_call_count": 1,
+              "bot_formula_tokens": 13,
+              "created_at": "<ts>",
+              "est_cost_usd": 0.00089,
+              "first_call_context": 113,
+              "in_index": true,
+              "last_used": null,
+              "max_window": 2,
+              "message_count": 1,
+              "min_window": 2,
+              "rotated_into": null,
+              "seeded_start": true,
+              "session_id": "aaaa0002-0000-0000-0000-000000000002",
+              "total_cost": 0.001
+            }
+          ],
+          "user_id": 111,
+          "windows": [
+            {
+              "first_ts": "2026-08-01T09:59:30.000Z",
+              "last_ts": "2026-08-01T10:00:30.000Z",
+              "message_count": 2,
+              "total_cost": 0.5,
+              "window_id": 1
+            },
+            {
+              "first_ts": "2026-08-01T10:59:30.000Z",
+              "last_ts": "2026-08-01T10:59:30.000Z",
+              "message_count": 1,
+              "total_cost": 0.001,
+              "window_id": 2
+            }
+          ],
+          "working_dir": "/home/u/proj"
+        }
+      ]
+    },
+    "filters": {
+      "date_range": {
+        "from": "2026-08-01T10:00:00.000Z",
+        "to": "2026-08-01T14:00:00.000Z"
+      },
+      "entrypoints": [
+        "cli",
+        "sdk-cli",
+        "sdk-py"
+      ],
+      "models": [
+        "claude-fable-5"
+      ],
+      "profiles": [
+        "proj"
+      ],
+      "users": [
+        111,
+        "local"
+      ]
+    },
+    "get_call": {
+      "agent_id": null,
+      "cache_1h_tokens": 60,
+      "cache_5m_tokens": 0,
+      "cache_creation_tokens": 60,
+      "cache_read_tokens": 50,
+      "context_provided": 113,
+      "entry_offset": 214,
+      "entry_uuid": "uuid-req_s1_1",
+      "est_cost_usd": 0.00089,
+      "file_id": 1,
+      "file_missing_since": null,
+      "file_path": "<TMP>/la/llm/projects/-home-u-proj/aaaa0001-0000-0000-0000-000000000001.jsonl",
+      "input_tokens": 3,
+      "model": "claude-fable-5",
+      "output_tokens": 10,
+      "pricing_rule": "default",
+      "request_id": "req_s1_1",
+      "session_id": "aaaa0001-0000-0000-0000-000000000001",
+      "ts": "<ts>"
+    },
+    "health": {
+      "api_calls": 8,
+      "files": 7,
+      "last_scan_at": "<ts>",
+      "sessions": 5,
+      "status": "ok"
+    },
+    "overview": {
+      "by_model": [
+        {
+          "api_calls": 8,
+          "cache_creation_tokens": 480,
+          "cache_read_tokens": 400,
+          "est_cost_usd": 0.00712,
+          "input_tokens": 24,
+          "model": "claude-fable-5",
+          "output_tokens": 80
+        }
+      ],
+      "by_profile": [
+        {
+          "api_calls": 8,
+          "cache_creation_tokens": 480,
+          "cache_read_tokens": 400,
+          "est_cost_usd": 0.00712,
+          "input_tokens": 24,
+          "output_tokens": 80,
+          "profile": "proj"
+        }
+      ],
+      "daily": [
+        {
+          "api_calls": 8,
+          "cache_creation_tokens": 480,
+          "cache_read_tokens": 400,
+          "date": "2026-08-01",
+          "est_cost_usd": 0.00712,
+          "input_tokens": 24,
+          "output_tokens": 80
+        }
+      ],
+      "totals": {
+        "api_calls": 8,
+        "cache_creation_tokens": 480,
+        "cache_read_tokens": 400,
+        "est_cost_usd": 0.00712,
+        "input_tokens": 24,
+        "output_tokens": 80,
+        "sessions": 5,
+        "tool_calls": 1
+      }
+    },
+    "quality": {
+      "by_agent": [
+        {
+          "claimed_not_logged": 1,
+          "complaint_hits": 1,
+          "log_calls": 1,
+          "pinned_facts": 1,
+          "profile": "proj",
+          "user_id": 111,
+          "user_messages": 3
+        }
+      ],
+      "daily": [
+        {
+          "claimed_not_logged": 1,
+          "complaint_hits": 1,
+          "date": "2026-08-01",
+          "log_calls": 1,
+          "pinned_facts": 1,
+          "user_messages": 3
+        }
+      ],
+      "totals": {
+        "claimed_not_logged": 1,
+        "complaint_hits": 1,
+        "log_calls": 1,
+        "pinned_facts": 1,
+        "user_messages": 3
+      }
+    },
+    "reconciliation": {
+      "orphans": [
+        {
+          "api_call_count": 1,
+          "cwd": "/home/u/proj",
+          "entrypoint": "sdk-py",
+          "est_cost_usd": 0.00089,
+          "first_ts": "2026-08-01T12:00:00.000Z",
+          "last_ts": "2026-08-01T12:00:00.000Z",
+          "profile": "proj",
+          "session_id": "aaaa0003-0000-0000-0000-000000000003"
+        }
+      ],
+      "rows": [
+        {
+          "bot": {
+            "created_at": "<ts>",
+            "last_used": null,
+            "message_count": 1,
+            "total_cost": 0.1,
+            "total_turns": 1
+          },
+          "disk": {
+            "api_calls": null,
+            "est_cost": null,
+            "first_ts": null,
+            "last_ts": null,
+            "output_tokens": null,
+            "present": false,
+            "user_turns": 0
+          },
+          "flags": [
+            "missing_transcript_retention"
+          ],
+          "profile": "other",
+          "project_path": "/home/u/other",
+          "session_id": "aaaa0007-0000-0000-0000-000000000007",
+          "user_id": 111
+        },
+        {
+          "bot": {
+            "created_at": "<ts>",
+            "last_used": null,
+            "message_count": 2,
+            "total_cost": 0.5,
+            "total_turns": 2
+          },
+          "disk": {
+            "api_calls": 4,
+            "est_cost": 0.00356,
+            "first_ts": "2026-08-01T10:00:00.000Z",
+            "last_ts": "2026-08-01T10:01:00.000Z",
+            "output_tokens": 40,
+            "present": true,
+            "user_turns": 0
+          },
+          "flags": [
+            "cost_mismatch"
+          ],
+          "profile": "proj",
+          "project_path": "/home/u/proj",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "user_id": 111
+        },
+        {
+          "bot": {
+            "created_at": "<ts>",
+            "last_used": null,
+            "message_count": 1,
+            "total_cost": 0.001,
+            "total_turns": 1
+          },
+          "disk": {
+            "api_calls": 1,
+            "est_cost": 0.00089,
+            "first_ts": "2026-08-01T11:00:00.000Z",
+            "last_ts": "2026-08-01T11:00:00.000Z",
+            "output_tokens": 10,
+            "present": true,
+            "user_turns": 0
+          },
+          "flags": [],
+          "profile": "proj",
+          "project_path": "/home/u/proj",
+          "session_id": "aaaa0002-0000-0000-0000-000000000002",
+          "user_id": 111
+        },
+        {
+          "bot": {
+            "created_at": "<ts>",
+            "last_used": null,
+            "message_count": 3,
+            "total_cost": 0.2,
+            "total_turns": 3
+          },
+          "disk": {
+            "api_calls": null,
+            "est_cost": null,
+            "first_ts": null,
+            "last_ts": null,
+            "output_tokens": null,
+            "present": false,
+            "user_turns": 0
+          },
+          "flags": [
+            "turn_count_mismatch",
+            "missing_transcript"
+          ],
+          "profile": "other",
+          "project_path": "/home/u/other",
+          "session_id": "aaaa0006-0000-0000-0000-000000000006",
+          "user_id": 111
+        }
+      ],
+      "summary": {
+        "bot_cost_total": 0.801,
+        "bot_sessions": 4,
+        "disk_est_cost_total": 0.0044,
+        "flagged": 3,
+        "missing_transcript": 2,
+        "orphan_transcripts": 1,
+        "with_transcript": 2
+      }
+    },
+    "session_detail": {
+      "events": [
+        {
+          "agent_id": null,
+          "detail": {
+            "cur_cache_creation": 60,
+            "cur_cache_read": 50,
+            "gap_s": null,
+            "prev_context": null
+          },
+          "id": "<id>",
+          "kind": "partial_cache_hit",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "ts": "<ts>"
+        },
+        {
+          "agent_id": "abc",
+          "detail": {
+            "cur_cache_creation": 60,
+            "cur_cache_read": 50,
+            "gap_s": null,
+            "prev_context": null
+          },
+          "id": "<id>",
+          "kind": "partial_cache_hit",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "ts": "<ts>"
+        },
+        {
+          "agent_id": "def",
+          "detail": {
+            "cur_cache_creation": 60,
+            "cur_cache_read": 50,
+            "gap_s": null,
+            "prev_context": null
+          },
+          "id": "<id>",
+          "kind": "partial_cache_hit",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "ts": "<ts>"
+        },
+        {
+          "agent_id": null,
+          "detail": {
+            "cur_cache_creation": 60,
+            "cur_cache_read": 50,
+            "gap_s": 60.0,
+            "prev_context": 113
+          },
+          "id": "<id>",
+          "kind": "partial_cache_hit",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "ts": "<ts>"
+        }
+      ],
+      "missing_transcript": false,
+      "session": {
+        "api_call_count": 4,
+        "bot_formula_tokens": 52,
+        "cache_creation_tokens": 240,
+        "cache_read_tokens": 200,
+        "cli_version": "2.1.220",
+        "cwd": "/home/u/proj",
+        "entrypoint": "sdk-py",
+        "est_cost_usd": 0.00356,
+        "first_call_context": 113,
+        "first_ts": "2026-08-01T10:00:00.000Z",
+        "git_branch": null,
+        "in_bot_db": 1,
+        "input_tokens": 12,
+        "last_ts": "2026-08-01T10:01:00.000Z",
+        "output_tokens": 40,
+        "profile": "proj",
+        "seeded_start": 0,
+        "session_id": "aaaa0001-0000-0000-0000-000000000001",
+        "subagent_count": 2,
+        "tool_call_count": 1,
+        "turn_count": 2,
+        "user_id": 111
+      },
+      "subagents": [
+        {
+          "agent_id": "abc",
+          "api_call_count": 1,
+          "cache_creation_tokens": 60,
+          "cache_read_tokens": 50,
+          "description": null,
+          "ended_ts": "2026-08-01T10:00:30.000Z",
+          "est_cost_usd": 0.00089,
+          "input_tokens": 3,
+          "model_override": null,
+          "output_tokens": 10,
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "spawn_tool_use_id": null,
+          "started_ts": "2026-08-01T10:00:30.000Z",
+          "subagent_type": null
+        },
+        {
+          "agent_id": "def",
+          "api_call_count": 1,
+          "cache_creation_tokens": 60,
+          "cache_read_tokens": 50,
+          "description": null,
+          "ended_ts": "2026-08-01T10:00:40.000Z",
+          "est_cost_usd": 0.00089,
+          "input_tokens": 3,
+          "model_override": null,
+          "output_tokens": 10,
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "spawn_tool_use_id": null,
+          "started_ts": "2026-08-01T10:00:40.000Z",
+          "subagent_type": null
+        }
+      ],
+      "turns": [
+        {
+          "cost": 0.2,
+          "duration_ms": 900,
+          "id": "<id>",
+          "prompt_excerpt": "hi",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "source": "bot",
+          "ts": "<ts>",
+          "user_id": 111
+        },
+        {
+          "cost": 0.3,
+          "duration_ms": 900,
+          "id": "<id>",
+          "prompt_excerpt": "more",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "source": "bot",
+          "ts": "<ts>",
+          "user_id": 111
+        }
+      ]
+    },
+    "session_detail_s2": {
+      "events": [
+        {
+          "agent_id": null,
+          "detail": {
+            "cur_cache_creation": 60,
+            "cur_cache_read": 50,
+            "gap_s": null,
+            "prev_context": null
+          },
+          "id": "<id>",
+          "kind": "partial_cache_hit",
+          "session_id": "aaaa0002-0000-0000-0000-000000000002",
+          "ts": "<ts>"
+        }
+      ],
+      "missing_transcript": false,
+      "session": {
+        "api_call_count": 1,
+        "bot_formula_tokens": 13,
+        "cache_creation_tokens": 60,
+        "cache_read_tokens": 50,
+        "cli_version": "2.1.220",
+        "cwd": "/home/u/proj",
+        "entrypoint": "sdk-py",
+        "est_cost_usd": 0.00089,
+        "first_call_context": 113,
+        "first_ts": "2026-08-01T11:00:00.000Z",
+        "git_branch": null,
+        "in_bot_db": 1,
+        "input_tokens": 3,
+        "last_ts": "2026-08-01T11:00:00.000Z",
+        "output_tokens": 10,
+        "profile": "proj",
+        "seeded_start": 1,
+        "session_id": "aaaa0002-0000-0000-0000-000000000002",
+        "subagent_count": 0,
+        "tool_call_count": 0,
+        "turn_count": 1,
+        "user_id": 111
+      },
+      "subagents": [],
+      "turns": [
+        {
+          "cost": 0.001,
+          "duration_ms": 900,
+          "id": "<id>",
+          "prompt_excerpt": "\u0437\u0430\u0447\u0435\u043c \u0442\u044b \u044d\u0442\u043e \u0443\u0434\u0430\u043b\u0438\u043b",
+          "session_id": "aaaa0002-0000-0000-0000-000000000002",
+          "source": "bot",
+          "ts": "<ts>",
+          "user_id": 111
+        }
+      ]
+    },
+    "session_timeline": {
+      "agent_id": "",
+      "calls": [
+        {
+          "agent_id": null,
+          "cache_1h_tokens": 60,
+          "cache_5m_tokens": 0,
+          "cache_creation_tokens": 60,
+          "cache_read_tokens": 50,
+          "context_provided": 113,
+          "cum_est_cost_usd": 0.00089,
+          "cum_output_tokens": 10,
+          "entry_offset": 214,
+          "entry_uuid": "uuid-req_s1_1",
+          "est_cost_usd": 0.00089,
+          "file_id": 1,
+          "input_tokens": 3,
+          "model": "claude-fable-5",
+          "output_tokens": 10,
+          "pricing_rule": "default",
+          "request_id": "req_s1_1",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "ts": "<ts>"
+        },
+        {
+          "agent_id": null,
+          "cache_1h_tokens": 60,
+          "cache_5m_tokens": 0,
+          "cache_creation_tokens": 60,
+          "cache_read_tokens": 50,
+          "context_provided": 113,
+          "cum_est_cost_usd": 0.00178,
+          "cum_output_tokens": 20,
+          "entry_offset": 707,
+          "entry_uuid": "uuid-req_s1_2",
+          "est_cost_usd": 0.00089,
+          "file_id": 1,
+          "input_tokens": 3,
+          "model": "claude-fable-5",
+          "output_tokens": 10,
+          "pricing_rule": "default",
+          "request_id": "req_s1_2",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "ts": "<ts>"
+        }
+      ],
+      "events": [
+        {
+          "agent_id": null,
+          "detail": {
+            "cur_cache_creation": 60,
+            "cur_cache_read": 50,
+            "gap_s": null,
+            "prev_context": null
+          },
+          "id": "<id>",
+          "kind": "partial_cache_hit",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "ts": "<ts>"
+        },
+        {
+          "agent_id": null,
+          "detail": {
+            "cur_cache_creation": 60,
+            "cur_cache_read": 50,
+            "gap_s": 60.0,
+            "prev_context": 113
+          },
+          "id": "<id>",
+          "kind": "partial_cache_hit",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "ts": "<ts>"
+        }
+      ],
+      "session_id": "aaaa0001-0000-0000-0000-000000000001",
+      "subagents": [
+        {
+          "agent_id": "abc",
+          "api_call_count": 1,
+          "cache_creation_tokens": 60,
+          "cache_read_tokens": 50,
+          "description": null,
+          "ended_ts": "2026-08-01T10:00:30.000Z",
+          "est_cost_usd": 0.00089,
+          "input_tokens": 3,
+          "model_override": null,
+          "output_tokens": 10,
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "spawn_tool_use_id": null,
+          "started_ts": "2026-08-01T10:00:30.000Z",
+          "subagent_type": null
+        },
+        {
+          "agent_id": "def",
+          "api_call_count": 1,
+          "cache_creation_tokens": 60,
+          "cache_read_tokens": 50,
+          "description": null,
+          "ended_ts": "2026-08-01T10:00:40.000Z",
+          "est_cost_usd": 0.00089,
+          "input_tokens": 3,
+          "model_override": null,
+          "output_tokens": 10,
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "spawn_tool_use_id": null,
+          "started_ts": "2026-08-01T10:00:40.000Z",
+          "subagent_type": null
+        }
+      ],
+      "tools": [
+        {
+          "agent_id": null,
+          "assistant_uuid": "uuid-req_s1_2",
+          "duration_ms": null,
+          "input_summary": "list",
+          "is_error": null,
+          "name": "Bash",
+          "request_id": "req_s1_2",
+          "result_ts": null,
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "tool_use_id": "toolu_01",
+          "ts": "<ts>"
+        }
+      ],
+      "truncated": false,
+      "turns": [
+        {
+          "cost": 0.2,
+          "duration_ms": 900,
+          "id": "<id>",
+          "prompt_excerpt": "hi",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "source": "bot",
+          "ts": "<ts>",
+          "user_id": 111
+        },
+        {
+          "cost": 0.3,
+          "duration_ms": 900,
+          "id": "<id>",
+          "prompt_excerpt": "more",
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "source": "bot",
+          "ts": "<ts>",
+          "user_id": 111
+        }
+      ]
+    },
+    "sessions_page": {
+      "limit": 10,
+      "offset": 0,
+      "sessions": [
+        {
+          "api_call_count": 1,
+          "bot_formula_tokens": 13,
+          "cache_creation_tokens": 60,
+          "cache_read_tokens": 50,
+          "cli_version": "2.1.220",
+          "cwd": "/home/u/proj",
+          "entrypoint": "sdk-cli",
+          "est_cost_usd": 0.00089,
+          "first_call_context": 113,
+          "first_ts": "2026-08-01T14:00:00.000Z",
+          "git_branch": "main",
+          "in_bot_db": 0,
+          "input_tokens": 3,
+          "last_ts": "2026-08-01T14:00:00.000Z",
+          "output_tokens": 10,
+          "profile": "proj",
+          "seeded_start": 0,
+          "session_id": "aaaa0005-0000-0000-0000-000000000005",
+          "subagent_count": 0,
+          "tool_call_count": 0,
+          "turn_count": 0,
+          "user_id": null
+        },
+        {
+          "api_call_count": 1,
+          "bot_formula_tokens": 13,
+          "cache_creation_tokens": 60,
+          "cache_read_tokens": 50,
+          "cli_version": "2.1.220",
+          "cwd": "/home/u/proj",
+          "entrypoint": "cli",
+          "est_cost_usd": 0.00089,
+          "first_call_context": 113,
+          "first_ts": "2026-08-01T13:00:05.000Z",
+          "git_branch": null,
+          "in_bot_db": 0,
+          "input_tokens": 3,
+          "last_ts": "2026-08-01T13:00:05.000Z",
+          "output_tokens": 10,
+          "profile": "proj",
+          "seeded_start": 0,
+          "session_id": "aaaa0004-0000-0000-0000-000000000004",
+          "subagent_count": 0,
+          "tool_call_count": 0,
+          "turn_count": 1,
+          "user_id": null
+        },
+        {
+          "api_call_count": 1,
+          "bot_formula_tokens": 13,
+          "cache_creation_tokens": 60,
+          "cache_read_tokens": 50,
+          "cli_version": "2.1.220",
+          "cwd": "/home/u/proj",
+          "entrypoint": "sdk-py",
+          "est_cost_usd": 0.00089,
+          "first_call_context": 113,
+          "first_ts": "2026-08-01T12:00:00.000Z",
+          "git_branch": "main",
+          "in_bot_db": 0,
+          "input_tokens": 3,
+          "last_ts": "2026-08-01T12:00:00.000Z",
+          "output_tokens": 10,
+          "profile": "proj",
+          "seeded_start": 0,
+          "session_id": "aaaa0003-0000-0000-0000-000000000003",
+          "subagent_count": 0,
+          "tool_call_count": 0,
+          "turn_count": 0,
+          "user_id": null
+        },
+        {
+          "api_call_count": 1,
+          "bot_formula_tokens": 13,
+          "cache_creation_tokens": 60,
+          "cache_read_tokens": 50,
+          "cli_version": "2.1.220",
+          "cwd": "/home/u/proj",
+          "entrypoint": "sdk-py",
+          "est_cost_usd": 0.00089,
+          "first_call_context": 113,
+          "first_ts": "2026-08-01T11:00:00.000Z",
+          "git_branch": null,
+          "in_bot_db": 1,
+          "input_tokens": 3,
+          "last_ts": "2026-08-01T11:00:00.000Z",
+          "output_tokens": 10,
+          "profile": "proj",
+          "seeded_start": 1,
+          "session_id": "aaaa0002-0000-0000-0000-000000000002",
+          "subagent_count": 0,
+          "tool_call_count": 0,
+          "turn_count": 1,
+          "user_id": 111
+        },
+        {
+          "api_call_count": 4,
+          "bot_formula_tokens": 52,
+          "cache_creation_tokens": 240,
+          "cache_read_tokens": 200,
+          "cli_version": "2.1.220",
+          "cwd": "/home/u/proj",
+          "entrypoint": "sdk-py",
+          "est_cost_usd": 0.00356,
+          "first_call_context": 113,
+          "first_ts": "2026-08-01T10:00:00.000Z",
+          "git_branch": null,
+          "in_bot_db": 1,
+          "input_tokens": 12,
+          "last_ts": "2026-08-01T10:01:00.000Z",
+          "output_tokens": 40,
+          "profile": "proj",
+          "seeded_start": 0,
+          "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "subagent_count": 2,
+          "tool_call_count": 1,
+          "turn_count": 2,
+          "user_id": 111
+        }
+      ],
+      "total": 5
+    }
+  },
+  "model_calls": {
+    "dump.model_calls": [
+      {
+        "attended": 1,
+        "cache_creation_tokens": 5,
+        "cache_read_tokens": 10,
+        "cost_usd": 0.01,
+        "duration_ms": 250,
+        "error": null,
+        "harness": "claude",
+        "harness_version": "1.2.3",
+        "id": "<id>",
+        "input_tokens": 120,
+        "kind": "turn",
+        "model": "claude-sonnet-5",
+        "outcome": "ok",
+        "output_tokens": 40,
+        "profile": "devops",
+        "provider": "anthropic",
+        "purpose": "turn",
+        "session_id": "sess-mc",
+        "ts": "<ts>",
+        "user_id": 904
+      },
+      {
+        "attended": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "cost_usd": null,
+        "duration_ms": 5,
+        "error": "boom",
+        "harness": "openai_codex",
+        "harness_version": null,
+        "id": "<id>",
+        "input_tokens": 0,
+        "kind": "plain",
+        "model": null,
+        "outcome": "error",
+        "output_tokens": 0,
+        "profile": null,
+        "provider": "openai",
+        "purpose": "plain",
+        "session_id": null,
+        "ts": "<ts>",
+        "user_id": null
+      }
+    ]
+  },
+  "repo_gaps": {
+    "active_job_ids_for_item.after_deactivate": [],
+    "active_job_ids_for_item.before_deactivate": [
+      "job-gap-1"
+    ],
+    "already_extracted.after_success": true,
+    "already_extracted.before": false,
+    "already_extracted.failed_status_excluded": false,
+    "dump.memory_extractions_gap": [
+      {
+        "cumulative_tokens_at_run": 100,
+        "error_message": null,
+        "id": "<id>",
+        "op_stats": "{\"found\": 0}",
+        "parsed_insights": "{\"facts\": []}",
+        "prompt_hash": "hash-abc",
+        "raw_response": "raw",
+        "session_id": "sess-gap",
+        "target_files": "[]",
+        "timestamp": "<ts>",
+        "user_id": 907,
+        "validation_status": "success"
+      },
+      {
+        "cumulative_tokens_at_run": 50,
+        "error_message": "parse error",
+        "id": "<id>",
+        "op_stats": null,
+        "parsed_insights": null,
+        "prompt_hash": "hash-failed",
+        "raw_response": null,
+        "session_id": "sess-gap",
+        "target_files": null,
+        "timestamp": "<ts>",
+        "user_id": 907,
+        "validation_status": "failed"
+      }
+    ],
+    "dump.scheduled_jobs_gap": [
+      {
+        "created_at": "<ts>",
+        "created_by": 907,
+        "cron_expression": "0 8 * * *",
+        "delivery": "message",
+        "ends_at": null,
+        "is_active": 0,
+        "item_id": 1,
+        "job_id": "<opaque_id>",
+        "job_name": "water-plants",
+        "prompt": "water the plants",
+        "skill_name": null,
+        "target_chat_ids": "",
+        "timezone": "UTC",
+        "updated_at": "<ts>",
+        "working_directory": "/work"
+      }
+    ]
+  },
+  "session_storage": {
+    "dump.sessions_sqlss": [
+      {
+        "backend": null,
+        "created_at": "<ts>",
+        "cumulative_tokens": 0,
+        "deactivated_at": null,
+        "deactivated_reason": null,
+        "is_active": 1,
+        "last_used": "<ts>",
+        "message_count": 5,
+        "project_path": "/work/sqlssproj",
+        "session_id": "sqlss-1",
+        "thread_head": 0,
+        "thread_total_input": 0,
+        "thread_total_output": 0,
+        "total_cost": 0.5,
+        "total_turns": 3,
+        "user_id": 905
+      },
+      {
+        "backend": null,
+        "created_at": "<ts>",
+        "cumulative_tokens": 0,
+        "deactivated_at": "<ts>",
+        "deactivated_reason": "test_teardown",
+        "is_active": 0,
+        "last_used": "<ts>",
+        "message_count": 0,
+        "project_path": "/work/sqlssproj2",
+        "session_id": "sqlss-2",
+        "thread_head": 0,
+        "thread_total_input": 0,
+        "thread_total_output": 0,
+        "total_cost": 0.0,
+        "total_turns": 0,
+        "user_id": 905
+      }
+    ],
+    "get_all_sessions": [
+      {
+        "created_at": "<ts>",
+        "cumulative_tokens": 0,
+        "is_new_session": false,
+        "last_eval_checkpoint": 0,
+        "last_used": "<ts>",
+        "message_count": 5,
+        "project_path": "/work/sqlssproj",
+        "session_id": "sqlss-1",
+        "tools_used": [],
+        "total_cost": 0.5,
+        "total_turns": 3,
+        "user_id": 905
+      },
+      {
+        "created_at": "<ts>",
+        "cumulative_tokens": 0,
+        "is_new_session": false,
+        "last_eval_checkpoint": 0,
+        "last_used": "<ts>",
+        "message_count": 0,
+        "project_path": "/work/sqlssproj2",
+        "session_id": "sqlss-2",
+        "tools_used": [],
+        "total_cost": 0.0,
+        "total_turns": 0,
+        "user_id": 905
+      }
+    ],
+    "get_user_sessions": [
+      {
+        "created_at": "<ts>",
+        "cumulative_tokens": 0,
+        "is_new_session": false,
+        "last_eval_checkpoint": 0,
+        "last_used": "<ts>",
+        "message_count": 5,
+        "project_path": "/work/sqlssproj",
+        "session_id": "sqlss-1",
+        "tools_used": [],
+        "total_cost": 0.5,
+        "total_turns": 3,
+        "user_id": 905
+      },
+      {
+        "created_at": "<ts>",
+        "cumulative_tokens": 0,
+        "is_new_session": false,
+        "last_eval_checkpoint": 0,
+        "last_used": "<ts>",
+        "message_count": 0,
+        "project_path": "/work/sqlssproj2",
+        "session_id": "sqlss-2",
+        "tools_used": [],
+        "total_cost": 0.0,
+        "total_turns": 0,
+        "user_id": 905
+      }
+    ],
+    "get_user_sessions.after_delete": [
+      {
+        "created_at": "<ts>",
+        "cumulative_tokens": 0,
+        "is_new_session": false,
+        "last_eval_checkpoint": 0,
+        "last_used": "<ts>",
+        "message_count": 5,
+        "project_path": "/work/sqlssproj",
+        "session_id": "sqlss-1",
+        "tools_used": [],
+        "total_cost": 0.5,
+        "total_turns": 3,
+        "user_id": 905
+      }
+    ],
+    "load_session.after_insert": {
+      "created_at": "<ts>",
+      "cumulative_tokens": 0,
+      "is_new_session": false,
+      "last_eval_checkpoint": 0,
+      "last_used": "<ts>",
+      "message_count": 4,
+      "project_path": "/work/sqlssproj",
+      "session_id": "sqlss-1",
+      "tools_used": [],
+      "total_cost": 0.5,
+      "total_turns": 2,
+      "user_id": 905
+    },
+    "load_session.after_update": {
+      "created_at": "<ts>",
+      "cumulative_tokens": 0,
+      "is_new_session": false,
+      "last_eval_checkpoint": 0,
+      "last_used": "<ts>",
+      "message_count": 5,
+      "project_path": "/work/sqlssproj",
+      "session_id": "sqlss-1",
+      "tools_used": [],
+      "total_cost": 0.5,
+      "total_turns": 3,
+      "user_id": 905
+    },
+    "load_session.missing": null,
+    "load_session.wrong_user": null
+  },
+  "token_and_scheduler": {
+    "dump.memory_extractions": [
+      {
+        "cumulative_tokens_at_run": null,
+        "error_message": null,
+        "id": "<id>",
+        "op_stats": null,
+        "parsed_insights": null,
+        "prompt_hash": "hash1",
+        "raw_response": null,
+        "session_id": "sess-tok",
+        "target_files": null,
+        "timestamp": "<ts>",
+        "user_id": 42,
+        "validation_status": "success"
+      }
+    ],
+    "dump.scheduled_jobs": [
+      {
+        "created_at": "<ts>",
+        "created_by": 42,
+        "cron_expression": "0 9 * * *",
+        "delivery": "agent",
+        "ends_at": null,
+        "is_active": 1,
+        "item_id": null,
+        "job_id": "<opaque_id>",
+        "job_name": "daily-digest",
+        "prompt": "send the digest",
+        "skill_name": null,
+        "target_chat_ids": "",
+        "timezone": null,
+        "updated_at": "<ts>",
+        "working_directory": "<TMP>/tok"
+      }
+    ],
+    "dump.session_tracking": [
+      {
+        "cost": 0.002,
+        "cumulative_tokens": 150,
+        "id": "<id>",
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "session_id": "sess-tok",
+        "timestamp": "<ts>",
+        "user_id": 42
+      },
+      {
+        "cost": 0.0005,
+        "cumulative_tokens": 165,
+        "id": "<id>",
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "session_id": "sess-tok",
+        "timestamp": "<ts>",
+        "user_id": 42
+      }
+    ],
+    "lifecycle.recent": [
+      {
+        "detail": {
+          "pid": 123
+        },
+        "event": "started",
+        "profile": "devops",
+        "ts": "<ts>"
+      }
+    ],
+    "scheduler.job_id_present": true,
+    "scheduler.list_jobs": [
+      {
+        "created_at": "<ts>",
+        "created_by": 42,
+        "cron_expression": "0 9 * * *",
+        "delivery": "agent",
+        "ends_at": null,
+        "is_active": 1,
+        "item_id": null,
+        "job_id": "<opaque_id>",
+        "job_name": "daily-digest",
+        "prompt": "send the digest",
+        "skill_name": null,
+        "target_chat_ids": "",
+        "timezone": null,
+        "updated_at": "<ts>",
+        "working_directory": "<TMP>/tok"
+      }
+    ],
+    "scheduler.remove_jobs_for_item_none": 0,
+    "token.get_cumulative_for_session": 165,
+    "token.get_last_extraction": {
+      "cumulative_tokens_at_run": null,
+      "error_message": null,
+      "id": "<id>",
+      "op_stats": null,
+      "parsed_insights": null,
+      "prompt_hash": "hash1",
+      "raw_response": null,
+      "session_id": "sess-tok",
+      "target_files": null,
+      "timestamp": "<ts>",
+      "user_id": 42,
+      "validation_status": "success"
+    },
+    "token.get_session_totals": {
+      "input_tokens": 110,
+      "output_tokens": 55,
+      "total_tokens": 165
+    },
+    "token.get_usage_by_project": {
+      "/work/proj": {
+        "cost": 0.0025,
+        "tokens": 165,
+        "turns": 2
+      }
+    }
+  },
+  "user_data": {
+    "count_imported.after_delete_dinner": {
+      "docs": 0,
+      "issues": 0,
+      "logs_activity": 0,
+      "logs_food": 0,
+      "logs_sleep": 0,
+      "logs_train": 0
+    },
+    "count_imported.after_delete_imported": {
+      "docs": 0,
+      "issues": 0,
+      "logs_activity": 0,
+      "logs_food": 0,
+      "logs_sleep": 0,
+      "logs_train": 0
+    },
+    "count_imported.before_delete": {
+      "docs": 0,
+      "issues": 0,
+      "logs_activity": 0,
+      "logs_food": 0,
+      "logs_sleep": 0,
+      "logs_train": 0
+    },
+    "day_food_totals": {
+      "carb": 50.0,
+      "fat": 10.0,
+      "kcal": 1680.0,
+      "meals": 4,
+      "protein": 50.0
+    },
+    "day_summary": {
+      "activity": [
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "distance_km": null,
+          "duration_min": 35.0,
+          "exercise_min": null,
+          "id": "<id>",
+          "imported_from": null,
+          "intensity": null,
+          "kcal_active": 200.0,
+          "kcal_total": null,
+          "source": "measured",
+          "stand_h": null,
+          "steps": null,
+          "type": "run",
+          "updated_at": "<ts>",
+          "user_id": 1001
+        },
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "distance_km": null,
+          "duration_min": 15.0,
+          "exercise_min": null,
+          "id": "<id>",
+          "imported_from": null,
+          "intensity": "moderate",
+          "kcal_active": null,
+          "kcal_total": null,
+          "source": "user_reported",
+          "stand_h": null,
+          "steps": null,
+          "type": "walk",
+          "updated_at": "<ts>",
+          "user_id": 1001
+        }
+      ],
+      "date": "2026-01-10",
+      "food": [
+        {
+          "carb": 50.0,
+          "confidence": null,
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "fat": 10.0,
+          "id": "<id>",
+          "imported_from": null,
+          "kcal": 420.0,
+          "meal": "breakfast",
+          "protein": 20.0,
+          "source": null,
+          "time": null,
+          "updated_at": "<ts>",
+          "user_id": 1001
+        },
+        {
+          "carb": null,
+          "confidence": null,
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "fat": null,
+          "id": "<id>",
+          "imported_from": null,
+          "kcal": 610.0,
+          "meal": "lunch",
+          "protein": 30.0,
+          "source": null,
+          "time": null,
+          "updated_at": "<ts>",
+          "user_id": 1001
+        }
+      ],
+      "food_totals": {
+        "carb": 50.0,
+        "fat": 10.0,
+        "kcal": 1030.0,
+        "meals": 2,
+        "protein": 50.0
+      },
+      "sleep": {
+        "alcohol_u": null,
+        "bed": "23:00",
+        "created_at": "<ts>",
+        "date": "2026-01-10",
+        "hrv": null,
+        "id": "<id>",
+        "imported_from": null,
+        "onset_min": null,
+        "out_day": null,
+        "out_night": null,
+        "rhr": 55.0,
+        "room_temp": null,
+        "score": 90.0,
+        "sleep_min": 480.0,
+        "thc": null,
+        "updated_at": "<ts>",
+        "user_id": 1001,
+        "wake": "07:00",
+        "weight_kg": null,
+        "wellbeing": null
+      },
+      "train": [
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "exercise": "squat",
+          "id": "<id>",
+          "imported_from": null,
+          "reps": "5",
+          "rpe": null,
+          "session": "A",
+          "set_n": "1",
+          "updated_at": "<ts>",
+          "user_id": 1001,
+          "weight_kg": "105"
+        },
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "exercise": "bench",
+          "id": "<id>",
+          "imported_from": null,
+          "reps": "9",
+          "rpe": null,
+          "session": "A",
+          "set_n": "1",
+          "updated_at": "<ts>",
+          "user_id": 1001,
+          "weight_kg": "60"
+        }
+      ]
+    },
+    "delete_imported": 0,
+    "delete_log_entries.food": {
+      "days": {
+        "2026-01-10": {
+          "carb": 50.0,
+          "fat": 10.0,
+          "kcal": 1030.0,
+          "meals": 2,
+          "protein": 50.0
+        }
+      },
+      "deleted": 1,
+      "rows": [
+        {
+          "carb": null,
+          "confidence": null,
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "fat": null,
+          "id": "<id>",
+          "imported_from": "test.csv",
+          "kcal": 500.0,
+          "meal": "dinner",
+          "protein": null,
+          "source": null,
+          "time": null,
+          "updated_at": "<ts>",
+          "user_id": 1001
+        }
+      ]
+    },
+    "delete_log_entries.mixed": {
+      "days": {},
+      "deleted": 1,
+      "rows": [
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "distance_km": null,
+          "duration_min": 20.0,
+          "exercise_min": null,
+          "id": "<id>",
+          "imported_from": null,
+          "intensity": null,
+          "kcal_active": null,
+          "kcal_total": null,
+          "source": "estimated",
+          "stand_h": null,
+          "steps": null,
+          "type": "swim",
+          "updated_at": "<ts>",
+          "user_id": 1001
+        }
+      ]
+    },
+    "delete_log_entry.food": {
+      "day": {
+        "carb": 50.0,
+        "fat": 10.0,
+        "kcal": 1530.0,
+        "meals": 3,
+        "protein": 50.0
+      },
+      "deleted": true,
+      "row": {
+        "carb": null,
+        "confidence": null,
+        "created_at": "<ts>",
+        "date": "2026-01-10",
+        "fat": null,
+        "id": "<id>",
+        "imported_from": null,
+        "kcal": 150.0,
+        "meal": "snack",
+        "protein": null,
+        "source": null,
+        "time": null,
+        "updated_at": "<ts>",
+        "user_id": 1001
+      }
+    },
+    "delete_portion": {
+      "deleted": true,
+      "row": {
+        "created_at": "<ts>",
+        "grams": 150.0,
+        "id": "<id>",
+        "learned_from": null,
+        "phrase": "small plate",
+        "updated_at": "<ts>",
+        "updated_on": "<ts>",
+        "user_id": 1001
+      }
+    },
+    "delete_product": {
+      "deleted": true,
+      "row": {
+        "brand": "",
+        "carb": null,
+        "confirmed_on": null,
+        "created_at": "<ts>",
+        "created_by": null,
+        "fat": null,
+        "id": "<id>",
+        "kcal_100g": 250.0,
+        "kind": "product",
+        "name": "Bread",
+        "protein": null,
+        "provenance": "estimate",
+        "salt": null,
+        "updated_at": "<ts>"
+      }
+    },
+    "doc_get": {
+      "content": "Some notes",
+      "created_at": "<ts>",
+      "id": "<id>",
+      "imported_from": null,
+      "kind": "note",
+      "period": "2026-01",
+      "title": "Jan notes",
+      "updated_at": "<ts>",
+      "user_id": 1001
+    },
+    "doc_get.missing": null,
+    "doc_list": [
+      {
+        "content_chars": 10,
+        "created_at": "<ts>",
+        "id": "<id>",
+        "imported_from": null,
+        "kind": "note",
+        "period": "2026-01",
+        "title": "Jan notes",
+        "updated_at": "<ts>"
+      }
+    ],
+    "doc_save": {
+      "id": "<id>",
+      "kind": "note",
+      "period": "2026-01",
+      "title": "Jan notes"
+    },
+    "edit_activity": {
+      "edited": true,
+      "row": {
+        "created_at": "<ts>",
+        "date": "2026-01-10",
+        "distance_km": null,
+        "duration_min": 35.0,
+        "exercise_min": null,
+        "id": "<id>",
+        "imported_from": null,
+        "intensity": null,
+        "kcal_active": 200.0,
+        "kcal_total": null,
+        "source": "measured",
+        "stand_h": null,
+        "steps": null,
+        "type": "run",
+        "updated_at": "<ts>",
+        "user_id": 1001
+      }
+    },
+    "edit_activity_many": {
+      "edited": 1,
+      "rows": [
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "distance_km": null,
+          "duration_min": 15.0,
+          "exercise_min": null,
+          "id": "<id>",
+          "imported_from": null,
+          "intensity": "moderate",
+          "kcal_active": null,
+          "kcal_total": null,
+          "source": "user_reported",
+          "stand_h": null,
+          "steps": null,
+          "type": "walk",
+          "updated_at": "<ts>",
+          "user_id": 1001
+        }
+      ]
+    },
+    "edit_food": {
+      "day": {
+        "carb": 50.0,
+        "fat": 10.0,
+        "kcal": 1670.0,
+        "meals": 4,
+        "protein": 50.0
+      },
+      "edited": true,
+      "row": {
+        "carb": 50.0,
+        "confidence": null,
+        "created_at": "<ts>",
+        "date": "2026-01-10",
+        "fat": 10.0,
+        "id": "<id>",
+        "imported_from": null,
+        "kcal": 420.0,
+        "meal": "breakfast",
+        "protein": 20.0,
+        "source": null,
+        "time": null,
+        "updated_at": "<ts>",
+        "user_id": 1001
+      }
+    },
+    "edit_food_many": {
+      "days": {
+        "2026-01-10": {
+          "carb": 50.0,
+          "fat": 10.0,
+          "kcal": 1680.0,
+          "meals": 4,
+          "protein": 50.0
+        }
+      },
+      "edited": 1,
+      "rows": [
+        {
+          "carb": null,
+          "confidence": null,
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "fat": null,
+          "id": "<id>",
+          "imported_from": null,
+          "kcal": 610.0,
+          "meal": "lunch",
+          "protein": 30.0,
+          "source": null,
+          "time": null,
+          "updated_at": "<ts>",
+          "user_id": 1001
+        }
+      ]
+    },
+    "edit_sleep_day": {
+      "avg_7d": {
+        "hrv": null,
+        "rhr": 55.0,
+        "score": 90.0,
+        "sleep_min": 465.0,
+        "weight_kg": null
+      },
+      "cleared": [
+        "hrv"
+      ],
+      "date": "2026-01-10",
+      "edited": true,
+      "row": {
+        "alcohol_u": null,
+        "bed": "23:00",
+        "created_at": "<ts>",
+        "date": "2026-01-10",
+        "hrv": null,
+        "id": "<id>",
+        "imported_from": null,
+        "onset_min": null,
+        "out_day": null,
+        "out_night": null,
+        "rhr": 55.0,
+        "room_temp": null,
+        "score": 90.0,
+        "sleep_min": 480.0,
+        "thc": null,
+        "updated_at": "<ts>",
+        "user_id": 1001,
+        "wake": "07:00",
+        "weight_kg": null,
+        "wellbeing": null
+      }
+    },
+    "edit_sleep_days": {
+      "edited": 1,
+      "nights": [
+        {
+          "avg_7d": {
+            "hrv": null,
+            "rhr": 55.0,
+            "score": 90.0,
+            "sleep_min": 465.0,
+            "weight_kg": null
+          },
+          "cleared": [],
+          "date": "2026-01-11",
+          "edited": true,
+          "row": {
+            "alcohol_u": null,
+            "bed": "23:30",
+            "created_at": "<ts>",
+            "date": "2026-01-11",
+            "hrv": null,
+            "id": "<id>",
+            "imported_from": null,
+            "onset_min": null,
+            "out_day": null,
+            "out_night": null,
+            "rhr": null,
+            "room_temp": null,
+            "score": null,
+            "sleep_min": 465.0,
+            "thc": null,
+            "updated_at": "<ts>",
+            "user_id": 1001,
+            "wake": "07:15",
+            "weight_kg": null,
+            "wellbeing": "good"
+          }
+        }
+      ]
+    },
+    "edit_train": {
+      "edited": true,
+      "row": {
+        "created_at": "<ts>",
+        "date": "2026-01-10",
+        "exercise": "squat",
+        "id": "<id>",
+        "imported_from": null,
+        "reps": "5",
+        "rpe": null,
+        "session": "A",
+        "set_n": "1",
+        "updated_at": "<ts>",
+        "user_id": 1001,
+        "weight_kg": "105"
+      }
+    },
+    "edit_train_many": {
+      "edited": 1,
+      "rows": [
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "exercise": "bench",
+          "id": "<id>",
+          "imported_from": null,
+          "reps": "9",
+          "rpe": null,
+          "session": "A",
+          "set_n": "1",
+          "updated_at": "<ts>",
+          "user_id": 1001,
+          "weight_kg": "60"
+        }
+      ]
+    },
+    "export_rows.food": [
+      {
+        "carb": 50.0,
+        "confidence": null,
+        "created_at": "<ts>",
+        "date": "2026-01-10",
+        "fat": 10.0,
+        "id": "<id>",
+        "imported_from": null,
+        "kcal": 420.0,
+        "meal": "breakfast",
+        "protein": 20.0,
+        "source": null,
+        "time": null,
+        "updated_at": "<ts>",
+        "user_id": 1001
+      },
+      {
+        "carb": null,
+        "confidence": null,
+        "created_at": "<ts>",
+        "date": "2026-01-10",
+        "fat": null,
+        "id": "<id>",
+        "imported_from": null,
+        "kcal": 610.0,
+        "meal": "lunch",
+        "protein": 30.0,
+        "source": null,
+        "time": null,
+        "updated_at": "<ts>",
+        "user_id": 1001
+      }
+    ],
+    "export_rows.portions": [
+      {
+        "created_at": "<ts>",
+        "grams": 260.0,
+        "id": "<id>",
+        "learned_from": null,
+        "phrase": "\u041d\u043e\u0440\u043c\u0430\u043b\u044c\u043d\u0430\u044f \u043f\u043e\u0440\u0446\u0438\u044f",
+        "updated_at": "<ts>",
+        "updated_on": "<ts>",
+        "user_id": 1001
+      }
+    ],
+    "export_rows.products_shared": [
+      {
+        "brand": "",
+        "carb": null,
+        "confirmed_on": null,
+        "created_at": "<ts>",
+        "created_by": null,
+        "fat": null,
+        "id": "<id>",
+        "kcal_100g": 42.0,
+        "kind": "product",
+        "name": "Milk",
+        "protein": null,
+        "provenance": "official",
+        "salt": null,
+        "updated_at": "<ts>"
+      },
+      {
+        "brand": "ChocoCo",
+        "carb": null,
+        "confirmed_on": null,
+        "created_at": "<ts>",
+        "created_by": null,
+        "fat": null,
+        "id": "<id>",
+        "kcal_100g": 300.0,
+        "kind": "product",
+        "name": "\u0417\u0435\u0444\u0438\u0440",
+        "protein": null,
+        "provenance": "label_photo",
+        "salt": null,
+        "updated_at": "<ts>"
+      }
+    ],
+    "has_entries_on.false": false,
+    "has_entries_on.true": true,
+    "issue_list.all": [
+      {
+        "created_at": "<ts>",
+        "escalation": null,
+        "id": "<id>",
+        "imported_from": null,
+        "notes": null,
+        "resolved_on": "2026-01-10",
+        "restrictions": null,
+        "started_on": "2026-01-05",
+        "status": "RESOLVED",
+        "symptom": "ache",
+        "title": "Knee pain",
+        "updated_at": "<ts>",
+        "user_id": 1001
+      }
+    ],
+    "issue_list.resolved": [
+      {
+        "created_at": "<ts>",
+        "escalation": null,
+        "id": "<id>",
+        "imported_from": null,
+        "notes": null,
+        "resolved_on": "2026-01-10",
+        "restrictions": null,
+        "started_on": "2026-01-05",
+        "status": "RESOLVED",
+        "symptom": "ache",
+        "title": "Knee pain",
+        "updated_at": "<ts>",
+        "user_id": 1001
+      }
+    ],
+    "issue_open": {
+      "created_at": "<ts>",
+      "escalation": null,
+      "id": "<id>",
+      "imported_from": null,
+      "notes": null,
+      "resolved_on": null,
+      "restrictions": null,
+      "started_on": "2026-01-05",
+      "status": "ACTIVE",
+      "symptom": "ache",
+      "title": "Knee pain",
+      "updated_at": "<ts>",
+      "user_id": 1001
+    },
+    "issue_update": {
+      "created_at": "<ts>",
+      "escalation": null,
+      "id": "<id>",
+      "imported_from": null,
+      "notes": null,
+      "resolved_on": "2026-01-10",
+      "restrictions": null,
+      "started_on": "2026-01-05",
+      "status": "RESOLVED",
+      "symptom": "ache",
+      "title": "Knee pain",
+      "updated_at": "<ts>",
+      "user_id": 1001
+    },
+    "last_train_before": {
+      "date": "2026-01-05",
+      "session": null,
+      "sets": 1
+    },
+    "latest_weight": null,
+    "lift_history": [
+      {
+        "created_at": "<ts>",
+        "date": "2026-01-10",
+        "exercise": "squat",
+        "id": "<id>",
+        "imported_from": null,
+        "reps": "5",
+        "rpe": null,
+        "session": "A",
+        "set_n": "1",
+        "updated_at": "<ts>",
+        "user_id": 1001,
+        "weight_kg": "105"
+      },
+      {
+        "created_at": "<ts>",
+        "date": "2026-01-05",
+        "exercise": "squat",
+        "id": "<id>",
+        "imported_from": null,
+        "reps": "5",
+        "rpe": null,
+        "session": null,
+        "set_n": "1",
+        "updated_at": "<ts>",
+        "user_id": 1001,
+        "weight_kg": "90"
+      }
+    ],
+    "log_activities": {
+      "date": "2026-01-10",
+      "day": [
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "distance_km": null,
+          "duration_min": 30.0,
+          "exercise_min": null,
+          "id": "<id>",
+          "imported_from": null,
+          "intensity": null,
+          "kcal_active": 200.0,
+          "kcal_total": null,
+          "source": "measured",
+          "stand_h": null,
+          "steps": null,
+          "type": "run",
+          "updated_at": "<ts>",
+          "user_id": 1001
+        },
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "distance_km": null,
+          "duration_min": 15.0,
+          "exercise_min": null,
+          "id": "<id>",
+          "imported_from": null,
+          "intensity": null,
+          "kcal_active": null,
+          "kcal_total": null,
+          "source": "user_reported",
+          "stand_h": null,
+          "steps": null,
+          "type": "walk",
+          "updated_at": "<ts>",
+          "user_id": 1001
+        },
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "distance_km": null,
+          "duration_min": 20.0,
+          "exercise_min": null,
+          "id": "<id>",
+          "imported_from": null,
+          "intensity": null,
+          "kcal_active": null,
+          "kcal_total": null,
+          "source": "estimated",
+          "stand_h": null,
+          "steps": null,
+          "type": "swim",
+          "updated_at": "<ts>",
+          "user_id": 1001
+        }
+      ],
+      "ids": [
+        2,
+        3
+      ],
+      "written": 2
+    },
+    "log_activity": {
+      "day": [
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-10",
+          "distance_km": null,
+          "duration_min": 30.0,
+          "exercise_min": null,
+          "id": "<id>",
+          "imported_from": null,
+          "intensity": null,
+          "kcal_active": 200.0,
+          "kcal_total": null,
+          "source": "measured",
+          "stand_h": null,
+          "steps": null,
+          "type": "run",
+          "updated_at": "<ts>",
+          "user_id": 1001
+        }
+      ],
+      "id": "<id>"
+    },
+    "log_food": {
+      "date": "2026-01-10",
+      "day": {
+        "carb": 50.0,
+        "fat": 10.0,
+        "kcal": 400.0,
+        "meals": 1,
+        "protein": 20.0
+      },
+      "id": "<id>",
+      "meal": "breakfast"
+    },
+    "log_food_items": {
+      "date": "2026-01-10",
+      "day": {
+        "carb": 50.0,
+        "fat": 10.0,
+        "kcal": 1150.0,
+        "meals": 3,
+        "protein": 50.0
+      },
+      "ids": [
+        2,
+        3
+      ],
+      "meals": [
+        "lunch",
+        "snack"
+      ],
+      "written": 2
+    },
+    "log_sleep": {
+      "avg_7d": {
+        "hrv": 60.0,
+        "rhr": 55.0,
+        "score": 85.0,
+        "sleep_min": 480.0,
+        "weight_kg": null
+      },
+      "row": {
+        "alcohol_u": null,
+        "bed": "23:00",
+        "created_at": "<ts>",
+        "date": "2026-01-10",
+        "hrv": 60.0,
+        "id": "<id>",
+        "imported_from": null,
+        "onset_min": null,
+        "out_day": null,
+        "out_night": null,
+        "rhr": 55.0,
+        "room_temp": null,
+        "score": 85.0,
+        "sleep_min": 480.0,
+        "thc": null,
+        "updated_at": "<ts>",
+        "user_id": 1001,
+        "wake": "07:00",
+        "weight_kg": null,
+        "wellbeing": null
+      }
+    },
+    "log_sleep_nights": {
+      "nights": [
+        {
+          "avg_7d": {
+            "hrv": 60.0,
+            "rhr": 55.0,
+            "score": 85.0,
+            "sleep_min": 465.0,
+            "weight_kg": null
+          },
+          "date": "2026-01-11",
+          "row": {
+            "alcohol_u": null,
+            "bed": "23:30",
+            "created_at": "<ts>",
+            "date": "2026-01-11",
+            "hrv": null,
+            "id": "<id>",
+            "imported_from": null,
+            "onset_min": null,
+            "out_day": null,
+            "out_night": null,
+            "rhr": null,
+            "room_temp": null,
+            "score": null,
+            "sleep_min": 465.0,
+            "thc": null,
+            "updated_at": "<ts>",
+            "user_id": 1001,
+            "wake": "07:15",
+            "weight_kg": null,
+            "wellbeing": null
+          }
+        },
+        {
+          "avg_7d": {
+            "hrv": null,
+            "rhr": null,
+            "score": null,
+            "sleep_min": 450.0,
+            "weight_kg": null
+          },
+          "date": "2026-01-05",
+          "row": {
+            "alcohol_u": null,
+            "bed": "22:45",
+            "created_at": "<ts>",
+            "date": "2026-01-05",
+            "hrv": null,
+            "id": "<id>",
+            "imported_from": null,
+            "onset_min": null,
+            "out_day": null,
+            "out_night": null,
+            "rhr": null,
+            "room_temp": null,
+            "score": null,
+            "sleep_min": 450.0,
+            "thc": null,
+            "updated_at": "<ts>",
+            "user_id": 1001,
+            "wake": "06:30",
+            "weight_kg": null,
+            "wellbeing": null
+          }
+        }
+      ],
+      "written": 2
+    },
+    "log_train": {
+      "id": "<id>",
+      "previous_session": {
+        "date": null,
+        "sets": []
+      },
+      "today": [
+        {
+          "created_at": "<ts>",
+          "date": "2026-01-05",
+          "exercise": "squat",
+          "id": "<id>",
+          "imported_from": null,
+          "reps": "5",
+          "rpe": null,
+          "session": null,
+          "set_n": "1",
+          "updated_at": "<ts>",
+          "user_id": 1001,
+          "weight_kg": "90"
+        }
+      ]
+    },
+    "log_train_sets": {
+      "date": "2026-01-10",
+      "ids": [
+        2,
+        3
+      ],
+      "previous_session": {
+        "bench": {
+          "date": null,
+          "sets": []
+        },
+        "squat": {
+          "date": "2026-01-05",
+          "sets": [
+            {
+              "created_at": "<ts>",
+              "date": "2026-01-05",
+              "exercise": "squat",
+              "id": "<id>",
+              "imported_from": null,
+              "reps": "5",
+              "rpe": null,
+              "session": null,
+              "set_n": "1",
+              "updated_at": "<ts>",
+              "user_id": 1001,
+              "weight_kg": "90"
+            }
+          ]
+        }
+      },
+      "session": "A",
+      "today": {
+        "bench": [
+          {
+            "created_at": "<ts>",
+            "date": "2026-01-10",
+            "exercise": "bench",
+            "id": "<id>",
+            "imported_from": null,
+            "reps": "8",
+            "rpe": null,
+            "session": "A",
+            "set_n": "1",
+            "updated_at": "<ts>",
+            "user_id": 1001,
+            "weight_kg": "60"
+          }
+        ],
+        "squat": [
+          {
+            "created_at": "<ts>",
+            "date": "2026-01-10",
+            "exercise": "squat",
+            "id": "<id>",
+            "imported_from": null,
+            "reps": "5",
+            "rpe": null,
+            "session": "A",
+            "set_n": "1",
+            "updated_at": "<ts>",
+            "user_id": 1001,
+            "weight_kg": "100"
+          }
+        ]
+      },
+      "written": 2
+    },
+    "missing_entry_index.activity": 1,
+    "missing_entry_index.food": 1,
+    "missing_entry_index.train": 1,
+    "missing_sleep_date_index": 1,
+    "portion_find": [
+      {
+        "created_at": "<ts>",
+        "grams": 260.0,
+        "id": "<id>",
+        "learned_from": null,
+        "phrase": "\u041d\u043e\u0440\u043c\u0430\u043b\u044c\u043d\u0430\u044f \u043f\u043e\u0440\u0446\u0438\u044f",
+        "updated_at": "<ts>",
+        "updated_on": "<ts>",
+        "user_id": 1001
+      }
+    ],
+    "product_find.ascii_uppercase": [
+      {
+        "brand": "",
+        "carb": null,
+        "confirmed_on": null,
+        "created_at": "<ts>",
+        "created_by": null,
+        "fat": null,
+        "id": "<id>",
+        "kcal_100g": 42.0,
+        "kind": "product",
+        "name": "Milk",
+        "protein": null,
+        "provenance": "official",
+        "salt": null,
+        "updated_at": "<ts>"
+      }
+    ],
+    "product_find.cyrillic_casefold": [
+      {
+        "brand": "ChocoCo",
+        "carb": null,
+        "confirmed_on": null,
+        "created_at": "<ts>",
+        "created_by": null,
+        "fat": null,
+        "id": "<id>",
+        "kcal_100g": 300.0,
+        "kind": "product",
+        "name": "\u0417\u0435\u0444\u0438\u0440",
+        "protein": null,
+        "provenance": "label_photo",
+        "salt": null,
+        "updated_at": "<ts>"
+      }
+    ],
+    "save_portion.casefold_update": {
+      "created_at": "<ts>",
+      "grams": 260.0,
+      "id": "<id>",
+      "learned_from": null,
+      "phrase": "\u041d\u043e\u0440\u043c\u0430\u043b\u044c\u043d\u0430\u044f \u043f\u043e\u0440\u0446\u0438\u044f",
+      "updated_at": "<ts>",
+      "updated_on": "<ts>",
+      "user_id": 1001
+    },
+    "save_portions": {
+      "rows": [
+        {
+          "created_at": "<ts>",
+          "grams": 150.0,
+          "id": "<id>",
+          "learned_from": null,
+          "phrase": "small plate",
+          "updated_at": "<ts>",
+          "updated_on": "<ts>",
+          "user_id": 1001
+        }
+      ],
+      "written": 1
+    },
+    "save_product.authoritative": {
+      "row": {
+        "brand": "ChocoCo",
+        "carb": null,
+        "confirmed_on": null,
+        "created_at": "<ts>",
+        "created_by": null,
+        "fat": null,
+        "id": "<id>",
+        "kcal_100g": 300.0,
+        "kind": "product",
+        "name": "\u0417\u0435\u0444\u0438\u0440",
+        "protein": null,
+        "provenance": "label_photo",
+        "salt": null,
+        "updated_at": "<ts>"
+      },
+      "saved": true
+    },
+    "save_product.estimate_refused_via_casefold": {
+      "reason": "estimate_never_overwrites",
+      "row": {
+        "brand": "ChocoCo",
+        "carb": null,
+        "confirmed_on": null,
+        "created_at": "<ts>",
+        "created_by": null,
+        "fat": null,
+        "id": "<id>",
+        "kcal_100g": 300.0,
+        "kind": "product",
+        "name": "\u0417\u0435\u0444\u0438\u0440",
+        "protein": null,
+        "provenance": "label_photo",
+        "salt": null,
+        "updated_at": "<ts>"
+      },
+      "saved": false
+    },
+    "save_products": {
+      "refused": 0,
+      "results": [
+        {
+          "row": {
+            "brand": "",
+            "carb": null,
+            "confirmed_on": null,
+            "created_at": "<ts>",
+            "created_by": null,
+            "fat": null,
+            "id": "<id>",
+            "kcal_100g": 42.0,
+            "kind": "product",
+            "name": "Milk",
+            "protein": null,
+            "provenance": "official",
+            "salt": null,
+            "updated_at": "<ts>"
+          },
+          "saved": true
+        },
+        {
+          "row": {
+            "brand": "",
+            "carb": null,
+            "confirmed_on": null,
+            "created_at": "<ts>",
+            "created_by": null,
+            "fat": null,
+            "id": "<id>",
+            "kcal_100g": 250.0,
+            "kind": "product",
+            "name": "Bread",
+            "protein": null,
+            "provenance": "estimate",
+            "salt": null,
+            "updated_at": "<ts>"
+          },
+          "saved": true
+        }
+      ],
+      "written": 2
+    },
+    "sleep_last": [
+      {
+        "alcohol_u": null,
+        "bed": "23:30",
+        "created_at": "<ts>",
+        "date": "2026-01-11",
+        "hrv": null,
+        "id": "<id>",
+        "imported_from": null,
+        "onset_min": null,
+        "out_day": null,
+        "out_night": null,
+        "rhr": null,
+        "room_temp": null,
+        "score": null,
+        "sleep_min": 465.0,
+        "thc": null,
+        "updated_at": "<ts>",
+        "user_id": 1001,
+        "wake": "07:15",
+        "weight_kg": null,
+        "wellbeing": "good"
+      },
+      {
+        "alcohol_u": null,
+        "bed": "23:00",
+        "created_at": "<ts>",
+        "date": "2026-01-10",
+        "hrv": null,
+        "id": "<id>",
+        "imported_from": null,
+        "onset_min": null,
+        "out_day": null,
+        "out_night": null,
+        "rhr": 55.0,
+        "room_temp": null,
+        "score": 90.0,
+        "sleep_min": 480.0,
+        "thc": null,
+        "updated_at": "<ts>",
+        "user_id": 1001,
+        "wake": "07:00",
+        "weight_kg": null,
+        "wellbeing": null
+      },
+      {
+        "alcohol_u": null,
+        "bed": "22:45",
+        "created_at": "<ts>",
+        "date": "2026-01-05",
+        "hrv": null,
+        "id": "<id>",
+        "imported_from": null,
+        "onset_min": null,
+        "out_day": null,
+        "out_night": null,
+        "rhr": null,
+        "room_temp": null,
+        "score": null,
+        "sleep_min": 450.0,
+        "thc": null,
+        "updated_at": "<ts>",
+        "user_id": 1001,
+        "wake": "06:30",
+        "weight_kg": null,
+        "wellbeing": null
+      }
+    ],
+    "week_summary": {
+      "activity": [
+        {
+          "date": "2026-01-10",
+          "duration_min": 50.0,
+          "kcal_active_total": 200.0
+        }
+      ],
+      "activity_estimated_excluded": [],
+      "end_date": "2026-01-10",
+      "food": [
+        {
+          "date": "2026-01-10",
+          "kcal": 1030.0,
+          "meals": 2,
+          "protein": 50.0
+        }
+      ],
+      "train": [
+        {
+          "date": "2026-01-05",
+          "exercises": 1,
+          "sets": 1
+        },
+        {
+          "date": "2026-01-10",
+          "exercises": 2,
+          "sets": 2
+        }
+      ]
+    }
+  },
+  "webhook_and_window_bundle": {
+    "dump.webhook_events": [
+      {
+        "delivery_id": "delivery-1",
+        "event_id": "evt-1",
+        "event_type": "push",
+        "id": "<id>",
+        "payload": "{\"ref\": \"main\"}",
+        "processed": 1,
+        "provider": "github",
+        "received_at": "<ts>"
+      }
+    ],
+    "get.missing_window": null,
+    "get.present": {
+      "agent_id": "devops",
+      "bundle_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bundle_text": "<system prompt text>",
+      "created_at": "<ts>",
+      "facts_count": 3,
+      "family_count": 2,
+      "persona_chars": 100,
+      "pointers_count": 1,
+      "total_chars": 120,
+      "user_id": 906,
+      "window_id": 1,
+      "working_dir": "/work/bundleproj"
+    },
+    "put.conflicting_keeps_first": {
+      "agent_id": "devops",
+      "bundle_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bundle_text": "<system prompt text>",
+      "created_at": "<ts>",
+      "facts_count": 3,
+      "family_count": 2,
+      "persona_chars": 100,
+      "pointers_count": 1,
+      "total_chars": 120,
+      "user_id": 906,
+      "window_id": 1,
+      "working_dir": "/work/bundleproj"
+    },
+    "put.first": {
+      "agent_id": "devops",
+      "bundle_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bundle_text": "<system prompt text>",
+      "created_at": "<ts>",
+      "facts_count": 3,
+      "family_count": 2,
+      "persona_chars": 100,
+      "pointers_count": 1,
+      "total_chars": 120,
+      "user_id": 906,
+      "window_id": 1,
+      "working_dir": "/work/bundleproj"
+    },
+    "record_if_new.duplicate": false,
+    "record_if_new.first": true
+  },
+  "window_repository": {
+    "after_clear_pending_transition": {
+      "active_backend": "openai_codex",
+      "cumulative_tokens": 170,
+      "force_new_session": false,
+      "last_checkpoint_message_id": 10,
+      "last_context_tokens": 1500,
+      "last_eval_checkpoint": 1,
+      "pending_seed_window": null,
+      "user_id": 901,
+      "window_id": 1,
+      "working_dir": "/work/winproj"
+    },
+    "after_mark_evaluator_run": {
+      "active_backend": "openai_codex",
+      "cumulative_tokens": 170,
+      "force_new_session": false,
+      "last_checkpoint_message_id": 10,
+      "last_context_tokens": 1500,
+      "last_eval_checkpoint": 1,
+      "pending_seed_window": null,
+      "user_id": 901,
+      "window_id": 1,
+      "working_dir": "/work/winproj"
+    },
+    "after_roll": {
+      "active_backend": "openai_codex",
+      "cumulative_tokens": 200,
+      "force_new_session": false,
+      "last_checkpoint_message_id": 10,
+      "last_context_tokens": 200,
+      "last_eval_checkpoint": 0,
+      "pending_seed_window": null,
+      "user_id": 901,
+      "window_id": 2,
+      "working_dir": "/work/winproj"
+    },
+    "after_set_pending_transition": {
+      "active_backend": "openai_codex",
+      "cumulative_tokens": 170,
+      "force_new_session": true,
+      "last_checkpoint_message_id": 10,
+      "last_context_tokens": 1500,
+      "last_eval_checkpoint": 1,
+      "pending_seed_window": 3,
+      "user_id": 901,
+      "window_id": 1,
+      "working_dir": "/work/winproj"
+    },
+    "count_window_messages": 2,
+    "dump.conversation_windows": [
+      {
+        "active_backend": "openai_codex",
+        "cumulative_tokens": 200,
+        "force_new_session": 0,
+        "last_checkpoint_message_id": 10,
+        "last_context_tokens": 200,
+        "last_eval_checkpoint": 0,
+        "pending_seed_window": null,
+        "updated_at": "<ts>",
+        "user_id": 901,
+        "window_id": 2,
+        "working_dir": "/work/winproj"
+      }
+    ],
+    "get_or_create.initial": {
+      "active_backend": "claude",
+      "cumulative_tokens": 0,
+      "force_new_session": false,
+      "last_checkpoint_message_id": 0,
+      "last_context_tokens": 0,
+      "last_eval_checkpoint": 0,
+      "pending_seed_window": null,
+      "user_id": 901,
+      "window_id": 1,
+      "working_dir": "/work/winproj"
+    },
+    "list_for_user": [
+      {
+        "active_backend": "openai_codex",
+        "cumulative_tokens": 200,
+        "force_new_session": false,
+        "last_checkpoint_message_id": 10,
+        "last_context_tokens": 200,
+        "last_eval_checkpoint": 0,
+        "pending_seed_window": null,
+        "user_id": 901,
+        "window_id": 2,
+        "working_dir": "/work/winproj"
+      }
+    ],
+    "record_turn.claude_no_context_holds_level": {
+      "active_backend": "claude",
+      "cumulative_tokens": 150,
+      "force_new_session": false,
+      "last_checkpoint_message_id": 0,
+      "last_context_tokens": 1500,
+      "last_eval_checkpoint": 0,
+      "pending_seed_window": null,
+      "user_id": 901,
+      "window_id": 1,
+      "working_dir": "/work/winproj"
+    },
+    "record_turn.claude_with_context": {
+      "active_backend": "claude",
+      "cumulative_tokens": 100,
+      "force_new_session": false,
+      "last_checkpoint_message_id": 0,
+      "last_context_tokens": 1500,
+      "last_eval_checkpoint": 0,
+      "pending_seed_window": null,
+      "user_id": 901,
+      "window_id": 1,
+      "working_dir": "/work/winproj"
+    },
+    "record_turn.non_level_backend_uses_flow": {
+      "active_backend": "openai_codex",
+      "cumulative_tokens": 170,
+      "force_new_session": false,
+      "last_checkpoint_message_id": 0,
+      "last_context_tokens": 1500,
+      "last_eval_checkpoint": 0,
+      "pending_seed_window": null,
+      "user_id": 901,
+      "window_id": 1,
+      "working_dir": "/work/winproj"
+    },
+    "roll_window": {
+      "new": 2,
+      "old": 1
+    },
+    "should_refresh.custom_threshold": true,
+    "should_refresh.default_threshold": false,
+    "should_run_evaluator.after_turns": true,
+    "tail_messages": [
+      [
+        "hi",
+        "hello"
+      ],
+      [
+        "bye",
+        "later"
+      ]
+    ]
+  }
+}

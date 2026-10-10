@@ -3,20 +3,29 @@
 Provides simple interface for bot handlers.
 """
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-import aiosqlite
 import structlog
 
 from ..bot.window_seed import (
+    COLD_START_TAIL_DAYS,
+    COLD_START_TAIL_TURNS,
     SEED_TAIL_TURNS,
     SeedTail,
     build_seed_preamble,
+    select_history_tail,
     select_tail,
 )
 from ..config.settings import Settings
-from .exceptions import ClaudeStoppedError
+from ..storage.repositories import MessageRepository
+from .exceptions import (
+    ClaudeMCPError,
+    ClaudeParsingError,
+    ClaudeStoppedError,
+    ClaudeTimeoutError,
+)
 
 if TYPE_CHECKING:
     from ..activity.logger import ActivityLogger
@@ -29,8 +38,21 @@ if TYPE_CHECKING:
     from ..token.tracker import TokenTracker
 
     from .session import ClaudeSession
-from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
+from .sdk_integration import (
+    ClaudeResponse,
+    ClaudeSDKManager,
+    StreamUpdate,
+    _project_jsonl_dir,
+)
 from .session import SessionManager
+
+# Resume-turn failures that leave the backend transcript intact. The session
+# mapping must survive these (see _classify_resume_failure).
+_TRANSIENT_RESUME_ERRORS: Tuple[type, ...] = (
+    ClaudeTimeoutError,
+    ClaudeMCPError,
+    ClaudeParsingError,
+)
 
 logger = structlog.get_logger()
 
@@ -80,6 +102,13 @@ class ClaudeIntegration:
         self.profile_registry = profile_registry
         self.lifecycle_logger = lifecycle_logger
         self.digest_provider = digest_provider
+        # Optional ItemService (dv-752a), attached in main: per-turn
+        # <family_reminders> injection. None = no injection.
+        self.items_service: Any = None
+        # Every retirement inside the session manager (directory-cap eviction
+        # included) becomes a lifecycle event, not just a log line (dv-2a5a).
+        if hasattr(self.session_manager, "on_retire"):
+            self.session_manager.on_retire = self._on_session_retired
 
     async def _emit_lifecycle(
         self, working_directory: Path, event: str, detail: Dict[str, Any]
@@ -93,6 +122,66 @@ class ClaudeIntegration:
             if p:
                 slug = p.slug
         await self.lifecycle_logger.record(profile=slug, event=event, detail=detail)
+
+    async def _on_session_retired(
+        self, session_id: str, reason: str, project_path: Optional[Path]
+    ) -> None:
+        """SessionManager.on_retire hook: durable trace of a lost mapping."""
+        await self._emit_lifecycle(
+            project_path if project_path is not None else Path("."),
+            "session_retired",
+            {"session": session_id, "reason": reason},
+        )
+
+    def _classify_resume_failure(
+        self, error: BaseException, session_id: Optional[str], working_directory: Path
+    ) -> Tuple[bool, str]:
+        """Decide whether a failed resume turn means the session is DEAD.
+
+        Returns ``(dead, kind)``. Only a dead session justifies deleting the
+        resume mapping and retrying fresh; a transient failure must keep the
+        mapping so the next message resumes the same conversation.
+
+        Before dv-2a5a every exception was treated as dead. Observed
+        2026-09-10 10:46 UTC: a 600s SDK timeout on a 60-turn devops session
+        deleted the mapping, and the retry -- seeded with a 5-turn tail --
+        was all the user got back. dv-fbf1 had exempted only /stop.
+
+        * Timeout, MCP and stream-parsing errors are transient: the backend
+          transcript is intact, the turn simply did not complete. Re-raise.
+        * "No conversation found" from the CLI, or no transcript file on
+          disk for this id, is definitive: the session is gone.
+        * Anything else (generic process error with the transcript present)
+          keeps the historical behaviour -- treat as dead -- so a poisoned
+          transcript cannot wedge a profile into failing every turn. The kind
+          is recorded so the choice is auditable.
+        """
+        if isinstance(error, _TRANSIENT_RESUME_ERRORS):
+            return False, type(error).__name__
+        if "no conversation found" in str(error).lower():
+            return True, "transcript_missing"
+        if session_id:
+            try:
+                transcript = (
+                    _project_jsonl_dir(working_directory) / f"{session_id}.jsonl"
+                )
+                if not transcript.exists():
+                    return True, "transcript_missing"
+            except OSError:
+                pass
+        return True, "process_error"
+
+    def _prepend_current_time(self, prompt: str) -> str:
+        """Prefix the per-turn ``<current_time>`` line (dv-ca94).
+
+        Unconditional (every profile, every turn) — unlike the today-state
+        digest below, this has no ``profile.today_digest`` gate: any agent
+        that reasons about "today"/"now" for scheduling needs the right
+        zone, not just coach-style trackers.
+        """
+        from .turn_setup import current_time_context
+
+        return f"{current_time_context(self.config.user_timezone)}\n\n{prompt}"
 
     async def _prepend_today_state(
         self, prompt: str, working_directory: Path, user_id: int
@@ -183,7 +272,17 @@ class ClaudeIntegration:
             )
 
         prompt = augment_prompt_with_images(prompt, images)
+        prompt = self._prepend_current_time(prompt)
         prompt = await self._prepend_today_state(prompt, working_directory, user_id)
+        from .turn_setup import prepend_items_context
+
+        prompt = await prepend_items_context(
+            self.items_service,
+            self.profile_registry,
+            prompt,
+            working_directory,
+            user_id,
+        )
         # The retry-after-failed-resume path must seed from the raw prompt:
         # _heal_lost_prose may wrap `prompt` below, and seeding a wrapped
         # prompt would double-wrap <recent_conversation>.
@@ -230,11 +329,25 @@ class ClaudeIntegration:
             # For new sessions, don't pass session_id to Claude Code
             claude_session_id = session.session_id if should_continue else None
 
+            # Why THIS turn opened a fresh backend session, for the footer.
+            # None on a resumed turn (dv-2a5a).
+            fresh_reason: Optional[str] = None
+
             # Heal context if the resumed transcript dropped a prose-only turn.
             if should_continue and claude_session_id:
                 prompt = await self._heal_lost_prose(
                     claude_session_id, working_directory, prompt
                 )
+            elif not force_new:
+                # Cold start: nothing to resume for this workspace. Seed the
+                # fresh session from the workspace's stored history so a new
+                # session is never a blank slate the user cannot see (dv-300e).
+                # `force_new` (/new) is excluded: that is an explicit reset.
+                prompt, fresh_reason = await self._seed_cold_start(
+                    user_id, working_directory, prompt
+                )
+            else:
+                fresh_reason = "reset by /new"
 
             try:
                 response = await self._execute(
@@ -249,6 +362,8 @@ class ClaudeIntegration:
                     user_id=user_id,
                     role=role,
                 )
+                if fresh_reason:
+                    response.session_fresh_reason = fresh_reason
             except ClaudeStoppedError:
                 # The /stop killswitch is a deliberate pre-flight refusal, not
                 # evidence the session is dead — never let it fall into the
@@ -256,13 +371,27 @@ class ClaudeIntegration:
                 # that and wiped a healthy session's mapping).
                 raise
             except Exception as resume_error:
-                # If resume failed (e.g., session expired/missing on Claude's side),
-                # retry as a fresh session.  The CLI returns a generic exit-code-1
-                # when the session is gone, so we catch *any* error during resume.
+                # A failed resume turn is retried on a fresh session ONLY when
+                # the session is actually gone. The CLI returns a generic
+                # exit-code-1 for a missing transcript, so the classifier
+                # checks the error text and the transcript file rather than
+                # the exception type alone (dv-2a5a).
                 if should_continue:
+                    dead, failure_kind = self._classify_resume_failure(
+                        resume_error, claude_session_id, working_directory
+                    )
+                    if not dead:
+                        logger.warning(
+                            "Resume turn failed transiently; keeping session",
+                            session_id=claude_session_id,
+                            failure_kind=failure_kind,
+                            error=str(resume_error),
+                        )
+                        raise
                     logger.warning(
                         "Session resume failed, starting fresh session",
                         failed_session_id=claude_session_id,
+                        failure_kind=failure_kind,
                         error=str(resume_error),
                     )
                     # Seed the retry with the failed session's stored tail
@@ -292,17 +421,21 @@ class ClaudeIntegration:
                         )
 
                     # Clean up the stale session
-                    await self.session_manager.remove_session(session.session_id)
+                    await self.session_manager.remove_session(
+                        session.session_id,
+                        reason=f"resume_failed:{failure_kind}",
+                        project_path=working_directory,
+                    )
+                    shown = seed_tail.shown_turns if seed_tail and seed_tail.text else 0
                     await self._emit_lifecycle(
                         working_directory,
                         "fresh",
                         {
                             "reason": "resume_failed",
+                            "failure_kind": failure_kind,
                             "failed_session": claude_session_id,
-                            "seeded": bool(seed_tail.text) if seed_tail else False,
-                            "tail_messages": (
-                                seed_tail.shown_turns if seed_tail else 0
-                            ),
+                            "seeded": shown > 0,
+                            "tail_messages": shown,
                         },
                     )
 
@@ -323,6 +456,10 @@ class ClaudeIntegration:
                         role=role,
                     )
                     response.session_restarted = True
+                    response.session_fresh_reason = (
+                        f"resume failed ({failure_kind}), "
+                        + (f"{shown} turns seeded" if shown else "unseeded")
+                    )
                 else:
                     raise
 
@@ -459,8 +596,24 @@ class ClaudeIntegration:
     ) -> Optional["ClaudeSession"]:  # noqa: F821
         """Find the most recent resumable session for a user in a directory.
 
-        Returns the session if one exists that is non-expired and has a real
-        (non-temporary) session ID from Claude. Returns None otherwise.
+        Returns the session if one exists with a real session ID from Claude.
+        Returns None otherwise.
+
+        **No wall-clock filter.** Conversation lifetime is owned by the window
+        mechanism and measured in context size, not elapsed time (see
+        WindowRepository.should_refresh / docs/DECISIONS.md 2026-09-10). This
+        used to also require ``not s.is_expired(session_timeout_hours)``,
+        which silently started a brand-new, unseeded session whenever a
+        profile went unused longer than the timeout (12h under
+        ProductionConfig). Observed 2026-09-10 on the `chef` profile: a 51h
+        gap, session bfea649d dropped, the model answered from a blank
+        context while /status still showed a healthy window. The two other
+        fresh-session paths (window roll, resume failure) both carry a
+        continuity seed; this one carried nothing, so it was pure loss.
+
+        The outer bound is now the backend's own transcript retention: when
+        the CLI has garbage-collected a transcript the resume raises, and
+        run_command's resume-failure path retries fresh *with* a seeded tail.
         """
 
         sessions = await self.session_manager._get_user_sessions(user_id)
@@ -468,9 +621,7 @@ class ClaudeIntegration:
         matching_sessions = [
             s
             for s in sessions
-            if s.project_path == working_directory
-            and bool(s.session_id)
-            and not s.is_expired(self.config.session_timeout_hours)
+            if s.project_path == working_directory and bool(s.session_id)
         ]
 
         if not matching_sessions:
@@ -520,29 +671,99 @@ class ClaudeIntegration:
         """Last `limit` stored (prompt, response) pairs for a session,
         oldest-first. SQLite keeps these even when the backend transcript is
         gone — both heal and the resume-failed seed read from here."""
-        async with self.session_manager.storage.db_manager.get_connection() as conn:
-            conn.row_factory = aiosqlite.Row
-            rows = await (
-                await conn.execute(
-                    "SELECT prompt, response FROM messages "
-                    "WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
-                    (session_id, limit),
-                )
-            ).fetchall()
-        return [(r["prompt"], r["response"]) for r in reversed(rows)]
+        messages = MessageRepository(self.session_manager.storage.db_manager)
+        return await messages.get_recent_pairs(session_id, limit)
+
+    async def _recent_pairs_for_dir(
+        self, user_id: int, working_directory: Path, limit: int, days: int
+    ) -> List[Tuple[str, str]]:
+        """Last `limit` stored (prompt, response) pairs for a WORKSPACE within
+        the last `days`, oldest-first, across every session that workspace had.
+
+        Session-scoped history (`_recent_pairs`) is the wrong unit for a cold
+        start: what the user calls "the conversation" is the workspace, and
+        before dv-300e a profile's week could be spread over half a dozen
+        session rows. Timestamps are stored as ISO-8601 UTC strings, so the
+        cutoff compares lexicographically.
+        """
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        messages = MessageRepository(self.session_manager.storage.db_manager)
+        return await messages.get_recent_pairs_for_dir(
+            user_id, str(working_directory), cutoff, limit
+        )
+
+    async def _count_dir_messages(
+        self, user_id: int, working_directory: Path, days: int
+    ) -> Optional[int]:
+        """Total stored turns for a workspace inside the cold-start window,
+        for the seed's honest 'last N of TOTAL' label. None on any error."""
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        try:
+            messages = MessageRepository(self.session_manager.storage.db_manager)
+            return await messages.count_dir_messages(
+                user_id, str(working_directory), cutoff
+            )
+        except Exception:
+            return None
+
+    async def _seed_cold_start(
+        self, user_id: int, working_directory: Path, prompt: str
+    ) -> Tuple[str, str]:
+        """Wrap `prompt` with the workspace's recent stored history.
+
+        Returns ``(prompt, reason)`` where ``reason`` is the footer text for
+        this fresh session. The prompt comes back unchanged when there is no
+        history, when something already wrapped it, or on any storage error
+        — a seed is an improvement, never a reason to fail the turn.
+        """
+        if "<recent_conversation>" in prompt:
+            return prompt, "cold start, pre-seeded"
+        try:
+            pairs = await self._recent_pairs_for_dir(
+                user_id, working_directory, COLD_START_TAIL_TURNS, COLD_START_TAIL_DAYS
+            )
+            if not pairs:
+                return prompt, "cold start, no history"
+            total = await self._count_dir_messages(
+                user_id, working_directory, COLD_START_TAIL_DAYS
+            )
+            tail = select_history_tail(pairs, total_turns=total)
+            if not tail.text:
+                return prompt, "cold start, no history"
+            seeded = build_seed_preamble(tail, prompt, reason="cold_start")
+        except Exception as seed_error:
+            logger.warning(
+                "Cold-start seed build failed; starting unseeded",
+                working_directory=str(working_directory),
+                error=str(seed_error),
+            )
+            return prompt, "cold start, seed failed"
+
+        logger.info(
+            "Cold-start seed built",
+            working_directory=str(working_directory),
+            shown_turns=tail.shown_turns,
+            total_turns=tail.total_turns,
+            seed_chars=len(tail.text),
+        )
+        await self._emit_lifecycle(
+            working_directory,
+            "fresh",
+            {
+                "reason": "cold_start",
+                "seeded": True,
+                "tail_messages": tail.shown_turns,
+                "window_turns": tail.total_turns,
+            },
+        )
+        return seeded, f"cold start, {tail.shown_turns} turns seeded"
 
     async def _count_session_messages(self, session_id: str) -> Optional[int]:
         """Total stored turns for a session, for the seed's honest
         'last N of TOTAL' label. None on any error — the label degrades."""
         try:
-            async with self.session_manager.storage.db_manager.get_connection() as conn:
-                row = await (
-                    await conn.execute(
-                        "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-                        (session_id,),
-                    )
-                ).fetchone()
-            return int(row[0]) if row else None
+            messages = MessageRepository(self.session_manager.storage.db_manager)
+            return await messages.count_session_messages(session_id)
         except Exception:
             return None
 
@@ -603,22 +824,19 @@ class ClaudeIntegration:
         self, session: "ClaudeSession"
     ) -> str:  # noqa: F821
         """Get conversation text for evaluator extraction."""
-        async with self.session_manager.storage._db.get_connection() as conn:
-            conn.row_factory = aiosqlite.Row
-            rows = await (
-                await conn.execute(
-                    "SELECT prompt, response FROM messages "
-                    "WHERE session_id = ? ORDER BY timestamp ASC",
-                    (session.session_id,),
-                )
-            ).fetchall()
+        # dv-5e4f: this used to reach `self.session_manager.storage._db`,
+        # an attribute that does not exist on SQLiteSessionStorage (only
+        # `.db_manager` does) -- a live AttributeError bug, caught while
+        # moving this SQL into the repository layer.
+        messages = MessageRepository(self.session_manager.storage.db_manager)
+        pairs = await messages.get_conversation_chronological(session.session_id)
 
         parts: List[str] = []
-        for row in rows:
-            if row["prompt"]:
-                parts.append(f"User: {row['prompt']}")
-            if row["response"]:
-                parts.append(f"Assistant: {row['response']}")
+        for prompt, response in pairs:
+            if prompt:
+                parts.append(f"User: {prompt}")
+            if response:
+                parts.append(f"Assistant: {response}")
         return "\n\n".join(parts)
 
     async def continue_session(
@@ -681,14 +899,9 @@ class ClaudeIntegration:
                 "total_cost": s.total_cost,
                 "message_count": s.message_count,
                 "tools_used": s.tools_used,
-                "expired": s.is_expired(self.config.session_timeout_hours),
             }
             for s in sessions
         ]
-
-    async def cleanup_expired_sessions(self) -> int:
-        """Clean up expired sessions."""
-        return await self.session_manager.cleanup_expired_sessions()
 
     async def get_user_summary(self, user_id: int) -> Dict[str, Any]:
         """Get comprehensive user summary."""
@@ -703,6 +916,8 @@ class ClaudeIntegration:
         """Shutdown integration and cleanup resources."""
         logger.info("Shutting down Claude integration")
 
-        await self.cleanup_expired_sessions()
+        # Deliberately no session cleanup here: shutdown must not destroy
+        # resume mappings, or every restart costs the user context (see
+        # session.py, cleanup_expired_sessions removal note).
 
         logger.info("Claude integration shutdown complete")

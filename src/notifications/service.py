@@ -5,8 +5,7 @@ through the Telegram bot API with rate limiting (1 msg/sec per chat).
 """
 
 import asyncio
-import json
-from pathlib import Path
+import re
 from typing import Any, List, Optional
 
 import structlog
@@ -22,6 +21,17 @@ logger = structlog.get_logger()
 # Telegram rate limit: ~30 msgs/sec globally, ~1 msg/sec per chat
 SEND_INTERVAL_SECONDS = 1.1
 
+# Lone UTF-16 surrogate halves. A str that reached us still holding one came
+# from a byte cut mid-character upstream (decoded with surrogateescape); it
+# cannot be UTF-8 encoded, so the HTTP send fails and the message is lost
+# (dv-c9d1). Real pairs never survive into a Python str, so this is safe.
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _sanitize_text(text: str) -> str:
+    """Replace lone surrogates with U+FFFD so the text is always sendable."""
+    return _LONE_SURROGATE.sub("\ufffd", text)
+
 
 class NotificationService:
     """Delivers agent responses to Telegram chats with rate limiting."""
@@ -31,7 +41,7 @@ class NotificationService:
         event_bus: EventBus,
         bot: Bot,
         default_chat_ids: Optional[List[int]] = None,
-        pin_state_path: Optional[Path] = None,
+        pin_store: Optional[Any] = None,
         sent_messages: Optional[Any] = None,
     ) -> None:
         self.event_bus = event_bus
@@ -44,38 +54,35 @@ class NotificationService:
         self._send_queue: asyncio.Queue[AgentResponseEvent] = asyncio.Queue()
         self._last_send_per_chat: dict[int, float] = {}
         # (chat_id, pin_as) -> message_id of the live status post we maintain.
-        # Persisted to disk: without it a bot restart orphans the current pin
-        # (can never be edited/unpinned again) and the next job pins a second.
-        self._pin_state_path = pin_state_path
-        self._pinned_messages: dict[tuple[int, str], int] = self._load_pins()
+        # Persisted in bot.db (PinnedMessageRepository, dv-ebde): without it
+        # a bot restart orphans the current pin (can never be edited/unpinned
+        # again) and the next job pins a second. Loaded in start().
+        self._pin_store = pin_store
+        self._pinned_messages: dict[tuple[int, str], int] = {}
         self._running = False
         self._sender_task: Optional[asyncio.Task[None]] = None
 
-    def _load_pins(self) -> dict[tuple[int, str], int]:
-        if not self._pin_state_path or not self._pin_state_path.exists():
-            return {}
-        try:
-            raw = json.loads(self._pin_state_path.read_text(encoding="utf-8"))
-            out: dict[tuple[int, str], int] = {}
-            for key, message_id in raw.items():
-                chat_id, _, pin_as = key.partition(":")
-                out[(int(chat_id), pin_as)] = int(message_id)
-            return out
-        except (ValueError, OSError) as e:
-            logger.warning("pin state unreadable, starting empty", error=str(e))
-            return {}
-
-    def _save_pins(self) -> None:
-        if not self._pin_state_path:
+    async def _load_pins(self) -> None:
+        if self._pin_store is None:
             return
         try:
-            self._pin_state_path.parent.mkdir(parents=True, exist_ok=True)
-            raw = {
-                f"{chat_id}:{pin_as}": message_id
-                for (chat_id, pin_as), message_id in self._pinned_messages.items()
-            }
-            self._pin_state_path.write_text(json.dumps(raw), encoding="utf-8")
-        except OSError as e:
+            self._pinned_messages = await self._pin_store.load_all()
+        except Exception as e:
+            logger.warning("pin state unreadable, starting empty", error=str(e))
+            self._pinned_messages = {}
+
+    async def _save_pin(self, key: tuple[int, str]) -> None:
+        """Write one key's current state (present = upsert, absent = delete)."""
+        if self._pin_store is None:
+            return
+        chat_id, pin_as = key
+        try:
+            message_id = self._pinned_messages.get(key)
+            if message_id is None:
+                await self._pin_store.delete(chat_id, pin_as)
+            else:
+                await self._pin_store.set(chat_id, pin_as, message_id)
+        except Exception as e:
             logger.warning("pin state not saved", error=str(e))
 
     def register(self) -> None:
@@ -86,6 +93,7 @@ class NotificationService:
         """Start the send queue processor."""
         if self._running:
             return
+        await self._load_pins()
         self._running = True
         self._sender_task = asyncio.create_task(self._process_send_queue())
         logger.info("Notification service started")
@@ -107,6 +115,8 @@ class NotificationService:
         """Queue an agent response for delivery."""
         if not isinstance(event, AgentResponseEvent):
             return
+        # Once, at queue time: covers the plain and the pinned send paths.
+        event.text = _sanitize_text(event.text)
         await self._send_queue.put(event)
 
     async def _process_send_queue(self) -> None:
@@ -211,7 +221,7 @@ class NotificationService:
                 except TelegramError:
                     pass
                 self._pinned_messages.pop(key, None)
-                self._save_pins()
+                await self._save_pin(key)
             return
 
         if existing:
@@ -226,12 +236,12 @@ class NotificationService:
                 if "not modified" in str(e).lower():
                     return
                 self._pinned_messages.pop(key, None)
-                self._save_pins()
+                await self._save_pin(key)
 
         try:
             msg = await self.bot.send_message(chat_id=chat_id, text=text)
             self._pinned_messages[key] = msg.message_id
-            self._save_pins()
+            await self._save_pin(key)
             await self.bot.pin_chat_message(
                 chat_id=chat_id,
                 message_id=msg.message_id,

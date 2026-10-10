@@ -177,3 +177,64 @@ class TestBuildSeedPreamble:
         tail = SeedTail(text="User: q", shown_turns=1, total_turns=1)
         out = build_seed_preamble(tail, user_message="go", session_notes=notes)
         assert re.search(r"\[\d{2}\.\d{2}\.\d{2}\] height 185", out)
+
+
+class TestColdStartTail:
+    """select_history_tail: the cross-session cold-start seed (dv-300e)."""
+
+    def test_keeps_every_turn_when_within_budget(self):
+        from src.bot.window_seed import select_history_tail
+
+        rows = [(f"q{i}", f"a{i}") for i in range(10)]
+        tail = select_history_tail(rows, total_turns=10)
+        assert tail.shown_turns == 10
+        assert tail.truncated is False
+        assert "User: q0" in tail.text and "Assistant: a9" in tail.text
+
+    def test_caps_turn_count_and_marks_truncated(self):
+        from src.bot.window_seed import COLD_START_TAIL_TURNS, select_history_tail
+
+        rows = [(f"q{i}", f"a{i}") for i in range(COLD_START_TAIL_TURNS + 6)]
+        tail = select_history_tail(rows, total_turns=len(rows))
+        assert tail.shown_turns == COLD_START_TAIL_TURNS
+        assert tail.truncated is True
+        # The most recent turns survive, the oldest are dropped.
+        assert f"User: q{len(rows) - 1}" in tail.text
+        assert "User: q0\n" not in tail.text
+
+    def test_budget_trims_from_the_front(self):
+        from src.bot.window_seed import (
+            SEED_LABEL_OVERHEAD_CHARS,
+            select_history_tail,
+        )
+
+        rows = [("old" * 2000, "x" * 2000), ("recent-q", "recent-a")]
+        tail = select_history_tail(rows, total_turns=2, budget_tokens=1_000)
+        assert "recent-q" in tail.text
+        assert len(tail.text) <= 1_000 * 4 - SEED_LABEL_OVERHEAD_CHARS
+        assert tail.truncated is True
+
+    def test_deeper_than_a_rotation_seed(self):
+        """A cold start has no context to reclaim, so it carries more."""
+        from src.bot.window_seed import COLD_START_TAIL_TURNS, SEED_TAIL_TURNS
+
+        assert COLD_START_TAIL_TURNS > SEED_TAIL_TURNS
+
+    def test_preamble_labels_the_rebuild_honestly(self):
+        from src.bot.window_seed import build_seed_preamble, select_history_tail
+
+        tail = select_history_tail([("q1", "a1"), ("q2", "a2")], total_turns=20)
+        out = build_seed_preamble(tail, "now what?", reason="cold_start")
+        assert "CONTINUATION" in out
+        assert "rebuilt from this workspace's stored history" in out
+        assert "may span several earlier sessions" in out
+        assert "dropped deliberately" not in out  # that is the rotation wording
+        assert "<recent_conversation>" in out
+        assert out.rstrip().endswith("now what?")
+
+    def test_empty_history_yields_no_seed(self):
+        from src.bot.window_seed import build_seed_preamble, select_history_tail
+
+        tail = select_history_tail([], total_turns=0)
+        assert tail.text == ""
+        assert build_seed_preamble(tail, "hello", reason="cold_start") == "hello"

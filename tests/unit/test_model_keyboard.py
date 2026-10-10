@@ -1,6 +1,6 @@
 """`/model` renders the Codex buttons from the live catalog (dv-0c01).
 
-Before this, the menu hardcoded gpt-5.5 + gpt-5.4-mini while
+Before this, the menu hardcoded two model slugs while
 `codex debug models` reported four listable models on the owner's
 subscription — two of them unreachable from Telegram.
 """
@@ -19,10 +19,10 @@ from src.bot.orchestration.base import (
 from src.bot.orchestrator import MessageOrchestrator
 
 LIVE = [
+    CodexModel("gpt-5.6-sol", "GPT-5.6-Sol", 272000, 4),
     CodexModel("gpt-5.6-terra", "GPT-5.6-Terra", 272000, 7),
     CodexModel("gpt-5.6-luna", "GPT-5.6-Luna", 272000, 8),
     CodexModel("gpt-5.5", "GPT-5.5", 272000, 12),
-    CodexModel("gpt-5.4-mini", "GPT-5.4-Mini", 272000, 23),
 ]
 
 
@@ -40,11 +40,10 @@ def _orchestrator():
 def catalog(monkeypatch):
     from src.agent_backends import codex_catalog
 
+    get = AsyncMock(return_value=list(LIVE))
+    monkeypatch.setattr(codex_catalog.CODEX_CATALOG, "get", get)
     monkeypatch.setattr(
         codex_catalog.CODEX_CATALOG, "_models", list(LIVE), raising=False
-    )
-    monkeypatch.setattr(
-        codex_catalog.CODEX_CATALOG, "_fetched_at", float("inf"), raising=False
     )
     return codex_catalog.CODEX_CATALOG
 
@@ -60,15 +59,16 @@ async def test_model_keyboard_lists_every_live_codex_model(catalog):
     callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
     assert callbacks[:2] == ["model:claude:sonnet", "model:claude:opus"]
     assert [c for c in callbacks if c.startswith("model:codex:")] == [
+        "model:codex:gpt-5.6-sol",
         "model:codex:gpt-5.6-terra",
         "model:codex:gpt-5.6-luna",
         "model:codex:gpt-5.5",
-        "model:codex:gpt-5.4-mini",
     ]
     # The login/logout row is still last.
     assert callbacks[-2:] == ["model:codex_login", "model:codex_logout"]
     labels = [b.text for row in markup.inline_keyboard for b in row]
     assert "Codex GPT-5.6-Terra" in labels
+    catalog.get.assert_awaited_once_with(force=True)
 
 
 async def test_a_live_only_model_is_accepted_by_the_callback(catalog):
@@ -152,6 +152,12 @@ def test_pinned_constants_stay_valid_without_any_catalog(monkeypatch):
         bot_data={},
     )
     assert orch._selected_model(context) == _CODEX_HARD_MODEL
+
+    # Regression: before startup refreshed entitlements, a cold catalog did
+    # not know Sol and rewrote the persisted preference to gpt-5.4-mini.
+    context.user_data["agent_model"] = "openai-codex/gpt-5.6-sol"
+    assert orch._selected_model(context) == "openai-codex/gpt-5.6-sol"
+    assert context.user_data["agent_model"] == "openai-codex/gpt-5.6-sol"
 
 
 def test_an_unknown_model_ref_is_reset_to_the_default(monkeypatch):

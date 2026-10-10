@@ -27,6 +27,7 @@ from ...agent_backends.protocol import (  # noqa: F401 — re-exported
     policy_for,
 )
 from ...config.settings import Settings
+from ...model_router import ModelRouter
 from ...profiles.registry import agent_id_for_working_dir
 from ...security.auth import fallback_role
 from .routing import seed_prefs_into_user_data
@@ -190,6 +191,20 @@ class OrchestratorBase:
                 context.bot_data[key] = value
             context.bot_data["settings"] = self.settings
             context.user_data.pop("_thread_context", None)
+
+            if not context.user_data.get("_display_name_checked"):
+                # dv-752a: a family member's display name defaults to their
+                # Telegram first_name (only while still unset). Once per
+                # user per process; best-effort.
+                context.user_data["_display_name_checked"] = True
+                items = context.bot_data.get("item_service")
+                user = update.effective_user
+                first = getattr(user, "first_name", None) if user else None
+                if items is not None and user is not None and first:
+                    try:
+                        await items.repo.fill_display_name(user.id, str(first)[:60])
+                    except Exception as exc:  # best-effort
+                        logger.warning("display name fill failed", error=str(exc))
 
             if not context.user_data.get("_prefs_loaded"):
                 context.user_data["_prefs_loaded"] = True
@@ -400,6 +415,17 @@ class OrchestratorBase:
             if instance is not None:
                 legacy[backend_id] = instance
         return legacy
+
+    def _router(self, context: ContextTypes.DEFAULT_TYPE) -> ModelRouter:
+        """The model router every turn runs through (dv-11a5).
+
+        ``bot_data["model_router"]`` in the live bot; a recorder-less one
+        over the registry when a unit test wired only the backends.
+        """
+        router: Optional[ModelRouter] = context.bot_data.get("model_router")
+        if router is not None:
+            return router
+        return ModelRouter(backends=self._backends(context))
 
     def _active_backend(
         self, context: ContextTypes.DEFAULT_TYPE

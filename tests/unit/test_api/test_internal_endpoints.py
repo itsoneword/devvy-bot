@@ -204,6 +204,19 @@ class TestInternalSchedule:
         assert response.status_code == 200
         assert scheduler.add_job.call_args.kwargs["target_chat_ids"] == [111, 222]
 
+    def test_internal_delete_refused_no_caller_identity(self) -> None:
+        """dv-8c19: this path has no user identity to authorize a cancel
+        against -- any WEBHOOK_API_SECRET holder could cancel ANY user's
+        job. Refuse outright rather than fake-authorize it."""
+        scheduler = MagicMock()
+        scheduler.remove_job = AsyncMock(return_value=True)
+        client = self._client_with_scheduler(scheduler)
+
+        response = client.delete("/internal/schedule/some-job-id", headers=AUTH)
+
+        assert response.status_code == 403
+        scheduler.remove_job.assert_not_called()
+
     def test_single_target_allowed_on_personal_memory_profile(self, tmp_path) -> None:
         scheduler = MagicMock()
         scheduler.add_job = AsyncMock(return_value="job-1")
@@ -318,4 +331,93 @@ class TestInternalPrompt:
                 "/internal/prompt", json={"prompt": "x", "profile": "g"}
             ).status_code
             == 401
+        )
+
+
+class TestInternalPolicyAsk:
+    """A background job's ask rule (dv-ef90): the owner's button, one hour."""
+
+    def test_ask_goes_to_the_confirmation_manager_with_the_job_timeout(self) -> None:
+        from src.model_router.job import ASK_TIMEOUT_SECONDS
+
+        manager = MagicMock()
+        manager.request = AsyncMock(return_value=True)
+        app = create_api_app(EventBus(), make_settings(), confirmation_manager=manager)
+        client = TestClient(app)
+
+        response = client.post(
+            "/internal/policy/ask",
+            json={"reason": "rm outside tmp", "preview": "rm x", "source": "pump-1"},
+            headers=AUTH,
+        )
+
+        assert response.status_code == 200 and response.json() == {"approved": True}
+        manager.request.assert_awaited_once_with(
+            "rm outside tmp",
+            "rm x",
+            timeout_seconds=ASK_TIMEOUT_SECONDS,
+            source="pump-1",
+        )
+
+    def test_ask_without_a_manager_is_denied(self) -> None:
+        app = create_api_app(EventBus(), make_settings())
+        client = TestClient(app)
+        response = client.post(
+            "/internal/policy/ask", json={"reason": "r"}, headers=AUTH
+        )
+        assert response.status_code == 200 and response.json() == {"approved": False}
+
+    def test_ask_requires_auth(self) -> None:
+        app = create_api_app(EventBus(), make_settings())
+        assert (
+            TestClient(app)
+            .post("/internal/policy/ask", json={"reason": "r"})
+            .status_code
+            == 401
+        )
+
+
+class TestInternalModelCalls:
+    async def test_record_writes_a_row(self, db) -> None:
+        from src.storage.model_calls import ModelCallRepository
+
+        app = create_api_app(
+            EventBus(), make_settings(), model_calls=ModelCallRepository(db)
+        )
+        client = TestClient(app)
+        row = {
+            "purpose": "background_job",
+            "kind": "turn",
+            "harness": "claude",
+            "harness_version": "2.1.288",
+            "model": "sonnet",
+            "profile": "devops",
+            "input_tokens": 5,
+            "output_tokens": 7,
+            "cost_usd": 0.5,
+            "duration_ms": 1200,
+            "outcome": "ok",
+        }
+        response = client.post("/internal/model_calls", json=row, headers=AUTH)
+        assert response.status_code == 200, response.text
+
+        async with db.get_connection() as conn:
+            cur = await conn.execute("SELECT * FROM model_calls")
+            (stored,) = [dict(r) for r in await cur.fetchall()]
+        assert stored["purpose"] == "background_job" and stored["attended"] == 0
+        assert stored["provider"] == "anthropic" and stored["model"] == "sonnet"
+        assert stored["cost_usd"] == 0.5 and stored["outcome"] == "ok"
+
+    async def test_unknown_purpose_is_rejected(self, db) -> None:
+        from src.storage.model_calls import ModelCallRepository
+
+        app = create_api_app(
+            EventBus(), make_settings(), model_calls=ModelCallRepository(db)
+        )
+        row = {"purpose": "misc", "kind": "turn", "harness": "claude", "outcome": "ok"}
+        assert (
+            TestClient(app)
+            .post("/internal/model_calls", json=row, headers=AUTH)
+            .status_code
+            == 400
         )

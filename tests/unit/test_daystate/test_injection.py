@@ -136,3 +136,22 @@ class TestTodayStateInjection:
         # the caller's, never a default or a cached one.
         assert seen["user_id"] == 222222222
         assert seen["today"].count("-") == 2
+
+
+class TestCurrentTimeInjection:
+    """dv-ca94: unlike <today_state>, this has no profile.today_digest gate
+    -- every profile, every turn."""
+
+    def test_prepends_current_time_before_prompt(self, config) -> None:
+        integration = ClaudeIntegration(
+            config=config,
+            sdk_manager=MagicMock(),
+            profile_registry=_registry(),
+            digest_provider=None,
+        )
+
+        result = integration._prepend_current_time("привет")
+
+        assert result.startswith("<current_time>")
+        assert result.endswith("\n\nпривет")
+        assert "Europe/Lisbon" in result

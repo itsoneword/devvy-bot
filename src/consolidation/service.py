@@ -5,7 +5,8 @@ this offline pass is the pressure valve that later merges duplicates and
 expires long-invalid rows (dv-4c6f, Letta sleep-time pattern).
 
 **Zero writes to memory_facts.** The pass emits a markdown report under
-``data/consolidation/`` and notifies the owner; merges/expiries are executed
+``DataLayout.consolidation_dir`` (``<root>/workspaces/devops/reports/
+consolidation/``; legacy layout ``data/consolidation/``) and notifies the owner; merges/expiries are executed
 only by ``scripts/consolidation_apply.py`` from an owner-annotated report —
 a wrong merge is unrecoverable and invisible, so nothing is automatic.
 
@@ -25,8 +26,8 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional
 
 import structlog
 
-from src.evaluator.cli_invoke import invoke_claude_cli
 from src.evaluator.writer import normalize_fact
+from src.model_router import complete_text
 
 if TYPE_CHECKING:
     from src.storage.database import DatabaseManager
@@ -151,7 +152,7 @@ class ConsolidationService:
             logger.info("Consolidation task updated", task_id=existing.id, scope=scope)
             return
         body = detail + (
-            "\n\nReview the consolidation report in data/consolidation/ and "
+            f"\n\nReview the consolidation report in {self._report_dir}/ and "
             "apply approved actions with scripts/consolidation_apply.py."
         )
         task_id = await self._board.add_task(
@@ -207,12 +208,7 @@ class ConsolidationService:
         return path
 
     async def _active_scopes(self) -> List[str]:
-        async with self._db.get_connection() as conn:
-            cur = await conn.execute(
-                "SELECT DISTINCT agent_id FROM memory_facts "
-                "WHERE invalid_at IS NULL ORDER BY agent_id"
-            )
-            return [row[0] for row in await cur.fetchall()]
+        return await self._repo.active_scopes()
 
     async def _scope_section(self, scope: str) -> tuple[str, int, int]:
         facts = await self._repo.get_facts(scope)
@@ -297,8 +293,9 @@ class ConsolidationService:
             return []
         listing = "\n".join(f"{f.id} | {f.content}" for f in facts)
         try:
-            raw = await invoke_claude_cli(
+            raw = await complete_text(
                 SEMANTIC_PROMPT.format(facts=listing),
+                purpose="consolidation",
                 model=self._model,
                 system_prompt=SEMANTIC_SYSTEM_PROMPT,
             )
@@ -326,14 +323,5 @@ class ConsolidationService:
             return []
 
     async def _expiry_candidates(self, scope: str) -> List["MemoryFact"]:
-        from src.storage.memory_repository import MemoryFact, _fact_columns
-
         cutoff = datetime.now(UTC) - timedelta(days=EXPIRY_DAYS)
-        async with self._db.get_connection() as conn:
-            cur = await conn.execute(
-                f"SELECT {_fact_columns()} FROM memory_facts "
-                "WHERE agent_id=? AND invalid_at IS NOT NULL AND invalid_at < ? "
-                "AND status != 'expired' ORDER BY invalid_at",
-                (scope, cutoff.isoformat()),
-            )
-            return [MemoryFact(*row) for row in await cur.fetchall()]
+        return await self._repo.expiry_candidates(scope, cutoff)

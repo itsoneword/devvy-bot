@@ -1,5 +1,6 @@
 """Loopback HTTP MCP bridge that gives subprocess backends the agent tools."""
 
+from .policy_gate import POLICY_PATH, POLICY_URL_ENV_VAR, PolicyGate
 from .server import (
     DENIED_TOOLS,
     MCP_PATH,
@@ -16,6 +17,9 @@ __all__ = [
     "DENIED_TOOLS",
     "MCP_PATH",
     "NOT_EXPORTED",
+    "POLICY_PATH",
+    "POLICY_URL_ENV_VAR",
+    "PolicyGate",
     "TOKEN_ENV_VAR",
     "TokenRegistry",
     "build_app",

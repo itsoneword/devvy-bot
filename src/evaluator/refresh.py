@@ -61,7 +61,9 @@ class ContextRefreshService:
 
         # 2. Remove the old session
         try:
-            await self._session_manager.remove_session(session.session_id)
+            await self._session_manager.remove_session(
+                session.session_id, reason="context_refresh"
+            )
             logger.info("Session removed for refresh", session_id=session.session_id)
         except Exception as e:
             logger.error("Failed to remove session during refresh", error=str(e))

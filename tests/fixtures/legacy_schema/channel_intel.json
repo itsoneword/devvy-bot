@@ -1,0 +1,1466 @@
+{
+  "fts_tables": {
+    "images_fts": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "caption",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "tags",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 1,
+          "name": "images_fts",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 1,
+          "name": "rank",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE VIRTUAL TABLE images_fts USING fts5(caption, tags, content='place_images', content_rowid='id')"
+    },
+    "places_fts": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "name",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "my_notes",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "location",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 1,
+          "name": "places_fts",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 1,
+          "name": "rank",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE VIRTUAL TABLE places_fts USING fts5(name, my_notes, location, content='places', content_rowid='id')"
+    },
+    "refs_fts": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "text",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "notes",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 1,
+          "name": "refs_fts",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 1,
+          "name": "rank",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE VIRTUAL TABLE refs_fts USING fts5(text, notes, content='place_references', content_rowid='id')"
+    }
+  },
+  "indexes": {},
+  "tables": {
+    "comments": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": "'me'",
+          "hidden": 0,
+          "name": "owner",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "post_ref",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "text",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "topics",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "sentiment",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "user_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "kb_users",
+          "to": "id"
+        }
+      ],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE comments ( id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL DEFAULT 'me', user_id INTEGER, post_ref TEXT, text TEXT, topics TEXT, sentiment TEXT, created_at TIMESTAMP, FOREIGN KEY (user_id) REFERENCES kb_users(id) )"
+    },
+    "images_fts_config": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "k",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "v",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_images_fts_config_1": [
+          {
+            "cid": 0,
+            "name": "k",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_images_fts_config_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE 'images_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+    },
+    "images_fts_data": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "block",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE 'images_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+    },
+    "images_fts_docsize": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "sz",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE 'images_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+    },
+    "images_fts_idx": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "segid",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "term",
+          "notnull": 1,
+          "pk": 2,
+          "type": ""
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "pgno",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_images_fts_idx_1": [
+          {
+            "cid": 0,
+            "name": "segid",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "term",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_images_fts_idx_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE 'images_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+    },
+    "kb_users": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": "'me'",
+          "hidden": 0,
+          "name": "owner",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "tg_user_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "username",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "display_name",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "first_seen",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE kb_users ( id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL DEFAULT 'me', tg_user_id INTEGER, username TEXT, display_name TEXT, first_seen TIMESTAMP )"
+    },
+    "place_images": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": "'me'",
+          "hidden": 0,
+          "name": "owner",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "place_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "file_path",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "caption",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "tags",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "vision_model",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "confirmed",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "place_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "places",
+          "to": "id"
+        }
+      ],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE place_images ( id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL DEFAULT 'me', place_id INTEGER, file_path TEXT NOT NULL, caption TEXT, tags TEXT, vision_model TEXT, confirmed INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL, FOREIGN KEY (place_id) REFERENCES places(id) )"
+    },
+    "place_references": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": "'me'",
+          "hidden": 0,
+          "name": "owner",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source_channel",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "text",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "image_refs",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "tags",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "notes",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE place_references ( id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL DEFAULT 'me', source_channel TEXT, text TEXT, image_refs TEXT, tags TEXT, notes TEXT, created_at TIMESTAMP NOT NULL )"
+    },
+    "places": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": "'me'",
+          "hidden": 0,
+          "name": "owner",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "type",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "location",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "lat",
+          "notnull": 0,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "lon",
+          "notnull": 0,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "travel_time_from_home",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "price",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "opening_hours",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 10,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "features",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 11,
+          "dflt_value": "'idea'",
+          "hidden": 0,
+          "name": "status",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 12,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "liked",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 13,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "my_notes",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 14,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 15,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "enriched_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 16,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 17,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "updated_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE places ( id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL DEFAULT 'me', name TEXT NOT NULL, type TEXT, location TEXT, lat REAL, lon REAL, travel_time_from_home TEXT, price TEXT, opening_hours TEXT, features TEXT, status TEXT NOT NULL DEFAULT 'idea', liked INTEGER, my_notes TEXT, source TEXT, enriched_at TIMESTAMP, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL )"
+    },
+    "places_fts_config": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "k",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "v",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_places_fts_config_1": [
+          {
+            "cid": 0,
+            "name": "k",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_places_fts_config_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE 'places_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+    },
+    "places_fts_data": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "block",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE 'places_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+    },
+    "places_fts_docsize": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "sz",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE 'places_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+    },
+    "places_fts_idx": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "segid",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "term",
+          "notnull": 1,
+          "pk": 2,
+          "type": ""
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "pgno",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_places_fts_idx_1": [
+          {
+            "cid": 0,
+            "name": "segid",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "term",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_places_fts_idx_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE 'places_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+    },
+    "posts": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": "'me'",
+          "hidden": 0,
+          "name": "owner",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "place_ids",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "body",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "selected_image_refs",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "'draft'",
+          "hidden": 0,
+          "name": "status",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "updated_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE posts ( id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL DEFAULT 'me', place_ids TEXT, body TEXT, selected_image_refs TEXT, status TEXT NOT NULL DEFAULT 'draft', created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL )"
+    },
+    "preferences": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "owner",
+          "notnull": 0,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "liked_features",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "liked_place_ids",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "budget_norms",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "home_location",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "default_radius",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_preferences_1": [
+          {
+            "cid": 0,
+            "name": "owner",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_preferences_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE preferences ( owner TEXT PRIMARY KEY, liked_features TEXT, liked_place_ids TEXT, budget_norms TEXT, home_location TEXT, default_radius TEXT )"
+    },
+    "reference_places": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "reference_id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "place_id",
+          "notnull": 1,
+          "pk": 2,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "place_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "places",
+          "to": "id"
+        },
+        {
+          "from": "reference_id",
+          "id": 1,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "place_references",
+          "to": "id"
+        }
+      ],
+      "index_columns": {
+        "sqlite_autoindex_reference_places_1": [
+          {
+            "cid": 0,
+            "name": "reference_id",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "place_id",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_reference_places_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE reference_places ( reference_id INTEGER NOT NULL, place_id INTEGER NOT NULL, PRIMARY KEY (reference_id, place_id), FOREIGN KEY (reference_id) REFERENCES place_references(id), FOREIGN KEY (place_id) REFERENCES places(id) )"
+    },
+    "refs_fts_config": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "k",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "v",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_refs_fts_config_1": [
+          {
+            "cid": 0,
+            "name": "k",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_refs_fts_config_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE 'refs_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID"
+    },
+    "refs_fts_data": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "block",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE 'refs_fts_data'(id INTEGER PRIMARY KEY, block BLOB)"
+    },
+    "refs_fts_docsize": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "sz",
+          "notnull": 0,
+          "pk": 0,
+          "type": "BLOB"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE 'refs_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
+    },
+    "refs_fts_idx": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "segid",
+          "notnull": 1,
+          "pk": 1,
+          "type": ""
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "term",
+          "notnull": 1,
+          "pk": 2,
+          "type": ""
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "pgno",
+          "notnull": 0,
+          "pk": 0,
+          "type": ""
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_refs_fts_idx_1": [
+          {
+            "cid": 0,
+            "name": "segid",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "term",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_refs_fts_idx_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE 'refs_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
+    },
+    "visits": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": "'me'",
+          "hidden": 0,
+          "name": "owner",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "place_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "date",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "activities",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "costs",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "narrative",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "photo_refs",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TIMESTAMP"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "from": "place_id",
+          "id": 0,
+          "match": "NONE",
+          "on_delete": "NO ACTION",
+          "on_update": "NO ACTION",
+          "seq": 0,
+          "table": "places",
+          "to": "id"
+        }
+      ],
+      "index_columns": {},
+      "indexes": [],
+      "sql": "CREATE TABLE visits ( id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL DEFAULT 'me', place_id INTEGER NOT NULL, date TEXT, activities TEXT, costs TEXT, narrative TEXT, photo_refs TEXT, created_at TIMESTAMP NOT NULL, FOREIGN KEY (place_id) REFERENCES places(id) )"
+    }
+  },
+  "triggers": {
+    "place_images_ad": {
+      "sql": "CREATE TRIGGER place_images_ad AFTER DELETE ON place_images BEGIN INSERT INTO images_fts(images_fts, rowid, caption, tags) VALUES ('delete', old.id, old.caption, old.tags); END",
+      "tbl_name": "place_images"
+    },
+    "place_images_ai": {
+      "sql": "CREATE TRIGGER place_images_ai AFTER INSERT ON place_images BEGIN INSERT INTO images_fts(rowid, caption, tags) VALUES (new.id, new.caption, new.tags); END",
+      "tbl_name": "place_images"
+    },
+    "place_images_au": {
+      "sql": "CREATE TRIGGER place_images_au AFTER UPDATE ON place_images BEGIN INSERT INTO images_fts(images_fts, rowid, caption, tags) VALUES ('delete', old.id, old.caption, old.tags); INSERT INTO images_fts(rowid, caption, tags) VALUES (new.id, new.caption, new.tags); END",
+      "tbl_name": "place_images"
+    },
+    "place_references_ad": {
+      "sql": "CREATE TRIGGER place_references_ad AFTER DELETE ON place_references BEGIN INSERT INTO refs_fts(refs_fts, rowid, text, notes) VALUES ('delete', old.id, old.text, old.notes); END",
+      "tbl_name": "place_references"
+    },
+    "place_references_ai": {
+      "sql": "CREATE TRIGGER place_references_ai AFTER INSERT ON place_references BEGIN INSERT INTO refs_fts(rowid, text, notes) VALUES (new.id, new.text, new.notes); END",
+      "tbl_name": "place_references"
+    },
+    "place_references_au": {
+      "sql": "CREATE TRIGGER place_references_au AFTER UPDATE ON place_references BEGIN INSERT INTO refs_fts(refs_fts, rowid, text, notes) VALUES ('delete', old.id, old.text, old.notes); INSERT INTO refs_fts(rowid, text, notes) VALUES (new.id, new.text, new.notes); END",
+      "tbl_name": "place_references"
+    },
+    "places_ad": {
+      "sql": "CREATE TRIGGER places_ad AFTER DELETE ON places BEGIN INSERT INTO places_fts(places_fts, rowid, name, my_notes, location) VALUES ('delete', old.id, old.name, old.my_notes, old.location); END",
+      "tbl_name": "places"
+    },
+    "places_ai": {
+      "sql": "CREATE TRIGGER places_ai AFTER INSERT ON places BEGIN INSERT INTO places_fts(rowid, name, my_notes, location) VALUES (new.id, new.name, new.my_notes, new.location); END",
+      "tbl_name": "places"
+    },
+    "places_au": {
+      "sql": "CREATE TRIGGER places_au AFTER UPDATE ON places BEGIN INSERT INTO places_fts(places_fts, rowid, name, my_notes, location) VALUES ('delete', old.id, old.name, old.my_notes, old.location); INSERT INTO places_fts(rowid, name, my_notes, location) VALUES (new.id, new.name, new.my_notes, new.location); END",
+      "tbl_name": "places"
+    }
+  },
+  "views": {}
+}

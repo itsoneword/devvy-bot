@@ -46,7 +46,7 @@ async def test_run_reports_lexical_duplicates_without_writing(service, repo, db)
     await repo.add_fact("chef", "general", "allergic to walnuts")
 
     with patch(
-        "src.consolidation.service.invoke_claude_cli",
+        "src.consolidation.service.complete_text",
         AsyncMock(return_value="[]"),
     ):
         path = await service.run("chef")
@@ -62,7 +62,7 @@ async def test_run_includes_semantic_groups_from_model(service, repo):
     b = await repo.add_fact("chef", "general", "likes spicy food")
 
     with patch(
-        "src.consolidation.service.invoke_claude_cli",
+        "src.consolidation.service.complete_text",
         AsyncMock(return_value=f"[[{a},{b}]]"),
     ):
         path = await service.run("chef")
@@ -75,7 +75,7 @@ async def test_semantic_failure_still_produces_report(service, repo):
     await repo.add_fact("chef", "general", "different fact two")
 
     with patch(
-        "src.consolidation.service.invoke_claude_cli",
+        "src.consolidation.service.complete_text",
         AsyncMock(side_effect=RuntimeError("CLI down")),
     ):
         path = await service.run("chef")
@@ -94,7 +94,7 @@ async def test_expiry_candidates_by_age(service, repo, db):
         await conn.commit()
 
     with patch(
-        "src.consolidation.service.invoke_claude_cli",
+        "src.consolidation.service.complete_text",
         AsyncMock(return_value="[]"),
     ):
         path = await service.run("chef")
@@ -107,7 +107,7 @@ async def test_recently_invalidated_not_expiry_candidate(service, repo):
     await repo.invalidate_fact(fid, "chef")
 
     with patch(
-        "src.consolidation.service.invoke_claude_cli",
+        "src.consolidation.service.complete_text",
         AsyncMock(return_value="[]"),
     ):
         path = await service.run("chef")
@@ -118,7 +118,7 @@ async def test_recently_invalidated_not_expiry_candidate(service, repo):
 async def test_request_run_debounces_and_records_board_task(service, board, repo):
     await repo.add_fact("devops", "general", "some fact")
     with patch(
-        "src.consolidation.service.invoke_claude_cli",
+        "src.consolidation.service.complete_text",
         AsyncMock(return_value="[]"),
     ):
         service.request_run("devops", "snapshot over budget", snapshot_chars=13000)
@@ -142,7 +142,7 @@ async def test_repeat_trip_updates_the_open_task_instead_of_filing_another(
     budget trips daily. Eight duplicate rows on the old board came from this."""
     await repo.add_fact("devops", "general", "some fact")
     with patch(
-        "src.consolidation.service.invoke_claude_cli",
+        "src.consolidation.service.complete_text",
         AsyncMock(return_value="[]"),
     ):
         service.request_run("devops", "over budget", snapshot_chars=13000)
@@ -171,7 +171,7 @@ async def test_run_notifies_owner(repo, db, tmp_path):
     await repo.add_fact("chef", "general", "likes spicy foods!")
 
     with patch(
-        "src.consolidation.service.invoke_claude_cli",
+        "src.consolidation.service.complete_text",
         AsyncMock(return_value="[]"),
     ):
         await service.run("chef")

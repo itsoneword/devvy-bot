@@ -4,6 +4,13 @@ Mechanical (no-LLM) daily counters, full refresh each scan cycle like
 botdb.mirror_bot_db, source opened strictly read-only. Only per-day counts
 per (profile, user) cross into the index DB — never prompt/response text.
 
+(The sibling ``answer_scores`` table — Tier-2, dv-300d, written by
+``scripts/score_answers.py`` rather than this module — is a deliberate,
+narrower exception to that rule: it stores a capped ~300-char rationale per
+score, because a quality score with no rationale is undiagnosable. That
+table is local-only, same as this one; this module's own counters still
+carry no prompt/response text.)
+
 Signals:
 - pinned_facts:        new memory_facts rows with tier='pinned' (each new
                        standing instruction is a user-unhappiness proxy).
@@ -12,6 +19,10 @@ Signals:
                        with no log_* tool call in that turn.
 - complaint_hits:      user messages matching a complaint pattern.
 - user_messages:       all user turns (denominator for rates).
+- recipe_turns:        turns whose response looks like a written-out recipe
+                       (dv-5d5f Tier-1 mechanical check).
+- recipe_turns_unsearched: of those, the ones with no WebSearch/WebFetch
+                       call recorded against that message_id.
 """
 
 import re
@@ -43,12 +54,29 @@ _CLAIM_RE = re.compile("|".join(CLAIM_PATTERNS), re.IGNORECASE)
 # log_* tools: bare names or MCP-qualified ones (mcp__agent__log_food, ...).
 _LOG_TOOL_RE = re.compile(r"(?:^|__)log_")
 
+# dv-5d5f Tier-1 mechanical check: a response "looks like a written-out
+# recipe" if it has list structure (numbered or bulleted lines, >=2) AND
+# names at least a couple of quantities with units — one stray number isn't
+# a recipe, but ingredients almost always carry several unit-qualified
+# amounts. Covers RU and EN unit spellings since chef's traffic is mixed.
+_LIST_ITEM_RE = re.compile(r"(?m)^\s*(?:\d+[.)]|[-*])\s+\S")
+_QUANTITY_UNIT_RE = re.compile(
+    r"\d+[.,]?\d*\s*("
+    r"г|гр|кг|мл|л|ст\.?\s*л|ч\.?\s*л|шт|стакан|"
+    r"g|kg|ml|l|tbsp|tsp|cup|oz|lb"
+    r")\b",
+    re.IGNORECASE,
+)
+_WEB_SEARCH_TOOLS = frozenset({"WebSearch", "WebFetch"})
+
 _METRICS = (
     "pinned_facts",
     "log_calls",
     "claimed_not_logged",
     "complaint_hits",
     "user_messages",
+    "recipe_turns",
+    "recipe_turns_unsearched",
 )
 
 _Key = tuple[str, str | None, int | None]  # (date, profile, user_id)
@@ -56,6 +84,15 @@ _Key = tuple[str, str | None, int | None]  # (date, profile, user_id)
 
 def is_log_tool(name: str) -> bool:
     return _LOG_TOOL_RE.search(name) is not None
+
+
+def looks_like_recipe(response: str) -> bool:
+    """True if ``response`` has the shape of a written-out recipe: a list
+    (numbered or bulleted) plus at least two unit-qualified quantities.
+    Heuristic, not a parser — see dv-5d5f's mechanical enforcement check."""
+    if len(_LIST_ITEM_RE.findall(response)) < 2:
+        return False
+    return len(_QUANTITY_UNIT_RE.findall(response)) >= 2
 
 
 def agent_parts(agent_id: str) -> tuple[str | None, int | None]:
@@ -105,10 +142,13 @@ def compute_quality_daily(src: sqlite3.Connection) -> list[tuple]:
             )
 
     logged_message_ids: set[int] = set()
+    web_searched_message_ids: set[int] = set()
     if "tool_usage" in tables:
         for row in src.execute(
             "SELECT session_id, message_id, tool_name, timestamp FROM tool_usage"
         ):
+            if row["tool_name"] in _WEB_SEARCH_TOOLS and row["message_id"] is not None:
+                web_searched_message_ids.add(int(row["message_id"]))
             if not is_log_tool(row["tool_name"]):
                 continue
             if row["message_id"] is not None:
@@ -138,6 +178,10 @@ def compute_quality_daily(src: sqlite3.Connection) -> list[tuple]:
                 and int(row["message_id"]) not in logged_message_ids
             ):
                 bucket["claimed_not_logged"] += 1
+            if looks_like_recipe(response):
+                bucket["recipe_turns"] += 1
+                if int(row["message_id"]) not in web_searched_message_ids:
+                    bucket["recipe_turns_unsearched"] += 1
 
     if "memory_facts" in tables:
         for row in src.execute(
@@ -173,8 +217,9 @@ def mirror_quality(conn: sqlite3.Connection, bot_db_path: Path) -> bool:
         conn.execute("DELETE FROM quality_daily")
         conn.executemany(
             "INSERT INTO quality_daily (date, profile, user_id, pinned_facts,"
-            " log_calls, claimed_not_logged, complaint_hits, user_messages)"
-            " VALUES (?,?,?,?,?,?,?,?)",
+            " log_calls, claimed_not_logged, complaint_hits, user_messages,"
+            " recipe_turns, recipe_turns_unsearched)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
     logger.debug("quality_mirrored", rows=len(rows))

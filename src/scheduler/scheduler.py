@@ -18,6 +18,7 @@ from apscheduler.triggers.date import DateTrigger  # type: ignore[import-untyped
 from ..events.bus import EventBus
 from ..events.types import ScheduledEvent
 from ..storage.database import DatabaseManager
+from ..storage.scheduler_repository import SchedulerRepository
 
 logger = structlog.get_logger()
 
@@ -68,11 +69,70 @@ def _translate_dow_field(field: str) -> str:
     return ",".join(parts)
 
 
-def build_cron_trigger(cron_expression: str) -> CronTrigger:
+def _parse_chat_ids(value: Any) -> List[int]:
+    """``target_chat_ids`` as stored: a comma-separated string, or empty."""
+    if not value:
+        return []
+    return [int(x) for x in str(value).split(",") if str(x).strip()]
+
+
+def job_visible_to(
+    row: Dict[str, Any],
+    user_id: Optional[int],
+    role: Optional[str],
+    requester_chat_id: Optional[int] = None,
+) -> bool:
+    """May this user see or manage this ``scheduled_jobs`` row? (dv-8c19)
+
+    The single authorization rule for every read/write path on scheduled
+    jobs — the in-process agent tools (``schedule_list``/``schedule_remove``
+    in ``src/claude/agent_tools.py``, shared by both the Claude and Codex
+    backends), and the ``/schedules`` command — so one path's denial rule
+    cannot drift from another's. Neither `list_jobs()` nor `remove_job()`
+    filter by owner themselves; the gate lives here, one level up, and every
+    caller must apply it.
+
+    Rules, fail-closed:
+
+    * yours when you created it (``created_by`` matches ``user_id``);
+    * yours when it TARGETS you — your chat id is among ``target_chat_ids``
+      — covering a job one family member scheduled *for* another (e.g. the
+      live ``friday-weighin-reminder``, created by the husband, delivered to
+      the wife's chat: she must be able to see/cancel her own reminder);
+    * an unattributed legacy row (``created_by == 0``, written before
+      dv-3e91 taught ``schedule_add`` to stamp a creator) is visible to an
+      ``owner``-role caller only.
+
+    Deliberately NOT "owner sees everything": this deployment has two
+    owner-role people, and the whole point of the ticket is that one must
+    not read or cancel the other's personal jobs just because both are
+    owners.
+    """
+    created_by = int(row.get("created_by") or 0)
+    if created_by:
+        if user_id is not None and created_by == int(user_id):
+            return True
+        if requester_chat_id is not None:
+            if int(requester_chat_id) in _parse_chat_ids(row.get("target_chat_ids")):
+                return True
+        return False
+    return role == "owner"
+
+
+def build_cron_trigger(
+    cron_expression: str,
+    timezone: Optional[str] = None,
+    end_date: Optional[datetime] = None,
+) -> CronTrigger:
     """Build a CronTrigger from a standard 5-field crontab expression.
 
     Use this instead of ``CronTrigger.from_crontab`` — see the note on
     ``_CRONTAB_TO_APS_DOW`` for why.
+
+    ``timezone`` (IANA name) makes the fields local wall-clock time: without
+    it the scheduler runs UTC and a "17:00" routine drifts an hour at every
+    DST change (dv-752a). None keeps the historical UTC behaviour. An
+    unknown zone name raises ``ValueError``.
     """
     fields = cron_expression.split()
     if len(fields) == 5:
@@ -85,7 +145,33 @@ def build_cron_trigger(cron_expression: str) -> CronTrigger:
                 dow_out=translated,
             )
         fields = fields[:4] + [translated]
-    return CronTrigger.from_crontab(" ".join(fields))
+    if not timezone:
+        trigger = CronTrigger.from_crontab(" ".join(fields))
+    else:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            tz = ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown timezone {timezone!r}") from exc
+        trigger = CronTrigger.from_crontab(" ".join(fields), timezone=tz)
+    if end_date is not None:
+        trigger.end_date = end_date.astimezone(trigger.timezone)
+    return trigger
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    """An ISO timestamp column, tz-aware (naive = UTC), or None."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 class JobScheduler:
@@ -101,6 +187,7 @@ class JobScheduler:
         self.db_manager = db_manager
         self.default_working_directory = default_working_directory
         self._scheduler = AsyncIOScheduler()
+        self._repo = SchedulerRepository(db_manager)
 
     async def start(self) -> None:
         """Load persisted jobs and start the scheduler."""
@@ -136,6 +223,9 @@ class JobScheduler:
         created_by: int = 0,
         run_at: Optional[datetime] = None,
         delivery: str = "agent",
+        item_id: Optional[int] = None,
+        timezone: Optional[str] = None,
+        ends_at: Optional[datetime] = None,
     ) -> str:
         """Add a new scheduled job.
 
@@ -152,6 +242,10 @@ class JobScheduler:
                 Exactly one of cron_expression / run_at must be given.
             delivery: 'agent' runs an LLM turn with the prompt (default);
                 'message' delivers the prompt text to Telegram verbatim.
+            item_id: the ``items`` row this job fires (dv-752a); the handler
+                then reads the live item and runs as its assignee.
+            timezone: IANA zone the cron fields are read in (None = UTC).
+            ends_at: last instant a cron job may fire (None = forever).
 
         Returns:
             The job ID.
@@ -168,7 +262,9 @@ class JobScheduler:
             # One-shot jobs are persisted with an @at: marker in place of cron
             stored_expression = f"@at:{run_at.isoformat()}"
         else:
-            trigger = build_cron_trigger(cron_expression or "")
+            trigger = build_cron_trigger(
+                cron_expression or "", timezone=timezone, end_date=ends_at
+            )
             stored_expression = cron_expression or ""
         work_dir = working_directory or self.default_working_directory
 
@@ -189,6 +285,7 @@ class JobScheduler:
                 "one_shot": run_at is not None,
                 "delivery": delivery,
                 "created_by": created_by,
+                "item_id": item_id,
             },
             id=job_id,
             name=job_name,
@@ -205,6 +302,9 @@ class JobScheduler:
             skill_name=skill_name,
             created_by=created_by,
             delivery=delivery,
+            item_id=item_id,
+            timezone=timezone if run_at is None else None,
+            ends_at=ends_at if run_at is None else None,
         )
 
         logger.info(
@@ -250,14 +350,23 @@ class JobScheduler:
         logger.info("Scheduled job removed", job_id=job_id)
         return True
 
+    async def remove_jobs_for_item(self, item_id: int) -> int:
+        """Remove every active job that fires ``item_id``; returns the count."""
+        job_ids = await self._repo.active_job_ids_for_item(item_id)
+        for job_id in job_ids:
+            await self.remove_job(job_id)
+        return len(job_ids)
+
+    def next_run_time(self, job_id: str) -> Optional[datetime]:
+        """The live APScheduler next fire time for a job, if registered."""
+        job = self._scheduler.get_job(job_id)
+        if job is None:
+            return None
+        return getattr(job, "next_run_time", None)
+
     async def list_jobs(self) -> List[Dict[str, Any]]:
         """List all scheduled jobs from the database."""
-        async with self.db_manager.get_connection() as conn:
-            cursor = await conn.execute(
-                "SELECT * FROM scheduled_jobs WHERE is_active = 1 ORDER BY created_at"
-            )
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+        return await self._repo.list_active_jobs()
 
     async def _fire_event(
         self,
@@ -270,6 +379,7 @@ class JobScheduler:
         one_shot: bool = False,
         delivery: str = "agent",
         created_by: int = 0,
+        item_id: Optional[int] = None,
     ) -> None:
         """Called by APScheduler when a job triggers. Publishes a ScheduledEvent."""
         event = ScheduledEvent(
@@ -281,6 +391,7 @@ class JobScheduler:
             skill_name=skill_name,
             delivery=delivery,
             created_by=created_by,
+            item_id=item_id,
         )
 
         logger.info(
@@ -299,14 +410,9 @@ class JobScheduler:
     async def _load_jobs_from_db(self) -> None:
         """Load persisted jobs and re-register them with APScheduler."""
         try:
-            async with self.db_manager.get_connection() as conn:
-                cursor = await conn.execute(
-                    "SELECT * FROM scheduled_jobs WHERE is_active = 1"
-                )
-                rows = list(await cursor.fetchall())
+            rows = await self._repo.list_active_jobs()
 
-            for row in rows:
-                row_dict = dict(row)
+            for row_dict in rows:
                 try:
                     expression = row_dict["cron_expression"]
                     one_shot = expression.startswith("@at:")
@@ -323,7 +429,20 @@ class JobScheduler:
                             continue
                         trigger: Any = DateTrigger(run_date=run_at)
                     else:
-                        trigger = build_cron_trigger(expression)
+                        ends_at = _parse_iso(row_dict.get("ends_at"))
+                        if ends_at is not None and ends_at <= datetime.now(UTC):
+                            await self._delete_job(row_dict["job_id"])
+                            logger.info(
+                                "Dropped ended cron job",
+                                job_id=row_dict["job_id"],
+                                job_name=row_dict["job_name"],
+                            )
+                            continue
+                        trigger = build_cron_trigger(
+                            expression,
+                            timezone=row_dict.get("timezone") or None,
+                            end_date=ends_at,
+                        )
 
                     # Parse target_chat_ids from stored string
                     chat_ids_str = row_dict.get("target_chat_ids", "")
@@ -346,6 +465,7 @@ class JobScheduler:
                             "one_shot": one_shot,
                             "delivery": row_dict.get("delivery") or "agent",
                             "created_by": row_dict.get("created_by") or 0,
+                            "item_id": row_dict.get("item_id"),
                         },
                         id=row_dict["job_id"],
                         name=row_dict["job_name"],
@@ -378,36 +498,27 @@ class JobScheduler:
         skill_name: Optional[str],
         created_by: int,
         delivery: str = "agent",
+        item_id: Optional[int] = None,
+        timezone: Optional[str] = None,
+        ends_at: Optional[datetime] = None,
     ) -> None:
         """Persist a job definition to the database."""
         chat_ids_str = ",".join(str(cid) for cid in target_chat_ids)
-        async with self.db_manager.get_connection() as conn:
-            await conn.execute(
-                """
-                INSERT OR REPLACE INTO scheduled_jobs
-                (job_id, job_name, cron_expression, prompt, target_chat_ids,
-                 working_directory, skill_name, created_by, is_active, delivery)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-                """,
-                (
-                    job_id,
-                    job_name,
-                    cron_expression,
-                    prompt,
-                    chat_ids_str,
-                    working_directory,
-                    skill_name,
-                    created_by,
-                    delivery,
-                ),
-            )
-            await conn.commit()
+        await self._repo.save_job(
+            job_id=job_id,
+            job_name=job_name,
+            cron_expression=cron_expression,
+            prompt=prompt,
+            target_chat_ids_csv=chat_ids_str,
+            working_directory=working_directory,
+            skill_name=skill_name,
+            created_by=created_by,
+            delivery=delivery,
+            item_id=item_id,
+            timezone=timezone,
+            ends_at_iso=ends_at.astimezone(UTC).isoformat() if ends_at else None,
+        )
 
     async def _delete_job(self, job_id: str) -> None:
         """Soft-delete a job from the database."""
-        async with self.db_manager.get_connection() as conn:
-            await conn.execute(
-                "UPDATE scheduled_jobs SET is_active = 0 WHERE job_id = ?",
-                (job_id,),
-            )
-            await conn.commit()
+        await self._repo.deactivate_job(job_id)

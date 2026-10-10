@@ -34,7 +34,9 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
 import structlog
 
-from .cli_invoke import invoke_claude_cli
+from src.model_router import complete_text
+
+from ..storage.memory_repository import MemoryRepository
 from .episodic_guard import classify as classify_episodic
 
 if TYPE_CHECKING:
@@ -218,6 +220,7 @@ class FactQualityCheck:
         window_hours: int = WINDOW_HOURS,
     ) -> None:
         self._db = db
+        self._memory_repo = MemoryRepository(db)
         self._notify = notify_callback  # async fn(message)
         self._model = model
         self._window_hours = window_hours
@@ -305,21 +308,8 @@ class FactQualityCheck:
         ('T' sorts after ' ') — the trap already documented in
         ``get_agent_tool_facts``.
         """
-        from ..storage.memory_repository import MemoryFact, _fact_columns
-
         bound = since.astimezone(UTC).replace(tzinfo=None).isoformat(sep=" ")
-        sql = (
-            f"SELECT {_fact_columns()} FROM memory_facts "
-            "WHERE created_at > ? AND status='active'"
-        )
-        params: List[Any] = [bound]
-        if scope:
-            sql += " AND agent_id=?"
-            params.append(scope)
-        sql += " ORDER BY agent_id, id"
-        async with self._db.get_connection() as conn:
-            cur = await conn.execute(sql, tuple(params))
-            return [MemoryFact(*row) for row in await cur.fetchall()]
+        return await self._memory_repo.new_facts_since(bound, agent_id=scope)
 
     async def _judge(
         self, scope: str, verdicts: List[FactVerdict]
@@ -339,8 +329,9 @@ class FactQualityCheck:
             f"{v.fact_id} | {v.kind} | {_judge_excerpt(v.content)}" for v in batch
         )
         try:
-            raw = await invoke_claude_cli(
+            raw = await complete_text(
                 JUDGE_PROMPT.format(facts=listing, marker=TRUNCATION_MARKER.strip()),
+                purpose="fact_quality",
                 model=self._model,
                 system_prompt=JUDGE_SYSTEM_PROMPT,
             )

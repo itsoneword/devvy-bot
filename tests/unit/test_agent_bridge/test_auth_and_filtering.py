@@ -107,6 +107,7 @@ def services(registry: ProfileRegistry) -> AgentServices:
         message_repo=AsyncMock(),
         audit_memory_writer=AsyncMock(),
         user_data=AsyncMock(),
+        items=AsyncMock(),
     )
 
 
@@ -212,10 +213,16 @@ class TestToolFiltering:
 
     def test_owner_on_a_data_profile_sees_every_exported_tool(self, bridge) -> None:
         # `coach` declares logs/products/portions but not `export`, so
-        # export_my_data is the one exported tool this context may not see.
-        assert self._names(bridge, _ctx()) == set(exported_tool_names()) - {
-            "export_my_data"
+        # export_my_data is not visible; hireli_* need a client + `hireli: true`
+        # (tests/unit/test_hireli_tools.py covers their gating); exchange_*
+        # likewise (tests/unit/test_exchange_tools.py).
+        opt_in = {
+            n for n in exported_tool_names() if n.startswith(("hireli_", "exchange_"))
         }
+        assert (
+            self._names(bridge, _ctx())
+            == set(exported_tool_names()) - {"export_my_data"} - opt_in
+        )
 
     def test_no_memory_scope_means_no_memory_tools(self, bridge) -> None:
         names = self._names(bridge, _ctx(memory_agent_id=None))

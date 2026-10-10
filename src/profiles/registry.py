@@ -9,6 +9,8 @@ from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 import structlog
 import yaml
 
+from src.utils.paths import read_data_root
+
 logger = structlog.get_logger()
 
 # ``${VAR}`` references inside profile paths. Bare ``$VAR`` is deliberately not
@@ -18,6 +20,14 @@ _PATH_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # grandparent (``<root>/config/profiles.yaml`` -> ``<root>``) so a shipped
 # example resolves correctly from any checkout without anyone exporting it.
 ROOT_VAR = "DEVVY_ROOT"
+# Data-root variables (dv-c66a). ``${DEVVY_WORKSPACES}`` is always defined so
+# shipped templates work on both layouts: ``<DEVVY_DATA_ROOT>/workspaces`` when
+# the data root is set, else the legacy ``${DEVVY_ROOT}/workspaces``.
+# ``${DEVVY_DATA_ROOT}`` is defined only when the data root is set.
+DATA_ROOT_VAR = "DEVVY_DATA_ROOT"
+WORKSPACES_VAR = "DEVVY_WORKSPACES"
+
+_UNSET: Any = object()
 
 # Roles recognized by profile permission policies.
 VALID_PROFILE_ROLES = frozenset({"owner", "guest"})
@@ -91,6 +101,13 @@ class ProfileDefinition:
     # (meals, sleep, sessions) and meaningless outside a tracking profile.
     # Turning it off is the revert path — no code change, just YAML.
     today_digest: bool = False
+    # Mount the hireli_* tools (dv-9f02). Each call is scoped to the sender's
+    # own Hireli account via their Telegram id, so guest profiles are safe.
+    hireli: bool = False
+    # Mount the exchange_* tools (dv-8664): the owner's trading accounts
+    # (Aster, MEXC). Owner turns only; the loader refuses it on a
+    # guest-allowed profile.
+    exchange: bool = False
     # Extra directories a *sandboxed* profile may write to, beyond its own
     # workspace (dv-3103): an Obsidian vault, another project checkout. Wired
     # to the CLI ``--add-dir`` (bash inside the bwrap jail) and to the
@@ -104,6 +121,12 @@ class ProfileDefinition:
     # button, no routing target. Toggled from the /agents Manage menu; the
     # registry is boot-only, so a toggle takes effect on restart.
     enabled: bool = True
+    # Server-admin profile (dv-e38e): exempt from the data-root protected
+    # dirs (secrets/, archive/, db/ and the tree-read rule over their
+    # parents) on the Claude side, and runs Codex with danger-full-access.
+    # Baseline credential rules (.env, key files, ~/.ssh, ~/.claude) still
+    # apply. Requires sandbox: false and an owner-only profile.
+    unrestricted: bool = False
 
     def allows_role(self, role: str) -> bool:
         """Owners always pass; other roles must be explicitly allowed."""
@@ -394,13 +417,15 @@ def _expand_path_vars(
     def _sub(match: "re.Match[str]") -> str:
         name = match.group(1)
         value = extra.get(name)
-        if value is None:
+        if value is None and name != DATA_ROOT_VAR:
+            # DEVVY_DATA_ROOT comes only from the resolved data root: an env
+            # value the loader decided not to use (blank, or overridden by an
+            # explicit data_root=None) must not leak in.
             value = os.environ.get(name)
         if value is None:
             raise ValueError(
                 f"Profile '{slug}': {field_name} references undefined variable"
-                f" ${{{name}}} in {raw!r} — export it, or use a path relative"
-                f" to the profiles config file."
+                f" ${{{name}}} in {raw!r} — export it, or use a relative path."
             )
         return value
 
@@ -408,19 +433,26 @@ def _expand_path_vars(
 
 
 def _resolve_profile_path(
-    raw: Any, *, base: Path, root: Path, slug: str, field_name: str
+    raw: Any,
+    *,
+    base: Path,
+    root: Path,
+    slug: str,
+    field_name: str,
+    path_vars: Optional[Mapping[str, str]] = None,
 ) -> Path:
-    """Resolve one profile path: ``${VAR}`` -> ``~`` -> relative-to-config.
+    """Resolve one profile path: ``${VAR}`` -> ``~`` -> relative-to-``base``.
 
     Absolute paths pass through unchanged, so existing installs keep working.
-    Relative paths resolve against the profiles config file's directory, which
-    makes a checkout relocatable. Normalisation is lexical (``normpath``), not
-    ``resolve()``: symlink following would make a profile's ``working_dir`` stop
-    matching the path the rest of the system routes on.
+    Relative paths resolve against ``base``: ``<DEVVY_DATA_ROOT>/workspaces``
+    when the data root is set, else (legacy) the profiles config file's
+    directory. Normalisation is lexical (``normpath``), not ``resolve()``:
+    symlink following would make a profile's ``working_dir`` stop matching the
+    path the rest of the system routes on.
     """
-    expanded = _expand_path_vars(
-        str(raw), {ROOT_VAR: str(root)}, slug=slug, field_name=field_name
-    )
+    variables: Dict[str, str] = {ROOT_VAR: str(root)}
+    variables.update(path_vars or {})
+    expanded = _expand_path_vars(str(raw), variables, slug=slug, field_name=field_name)
     path = Path(expanded).expanduser()
     if not path.is_absolute():
         path = base / path
@@ -500,6 +532,7 @@ def load_profile_registry(
     *,
     sandbox_default: bool = True,
     validate_paths: bool = False,
+    data_root: Optional[Path] = _UNSET,
 ) -> ProfileRegistry:
     """Load and validate profile definitions from YAML.
 
@@ -511,8 +544,14 @@ def load_profile_registry(
     whatever the YAML says.
 
     Paths (``working_dir``, ``memory_dir``, ``persona``, ``mcp``) support
-    ``${VAR}`` expansion — ``${DEVVY_ROOT}`` is always defined — and resolve
-    relative paths against this config file's directory.
+    ``${VAR}`` expansion — ``${DEVVY_ROOT}`` and ``${DEVVY_WORKSPACES}`` are
+    always defined, ``${DEVVY_DATA_ROOT}`` when the data root is set.
+    Relative paths resolve against ``<data_root>/workspaces``, or against this
+    config file's directory when no data root is set (legacy layout).
+
+    ``data_root`` defaults to ``DEVVY_DATA_ROOT`` from the environment or the
+    repo ``.env`` (:func:`src.utils.paths.read_data_root`); pass ``None`` to
+    force the legacy layout.
 
     ``validate_paths`` checks those paths exist and are usable. It is off by
     default so parsing stays a pure function; ``src/main.py`` turns it on so a
@@ -534,10 +573,23 @@ def load_profile_registry(
     default_count = 0
     profiles: List[ProfileDefinition] = []
 
-    # Relative paths resolve against the config file's directory; ${DEVVY_ROOT}
-    # defaults to its grandparent (<root>/config/profiles.yaml -> <root>).
-    base_dir = config_path.parent.resolve()
-    root_dir = Path(os.environ.get(ROOT_VAR) or base_dir.parent)
+    # ${DEVVY_ROOT} defaults to the config file's grandparent
+    # (<root>/config/profiles.yaml -> <root>). Relative paths resolve against
+    # <data_root>/workspaces, or (legacy, no data root) the config file's dir.
+    config_dir = config_path.parent.resolve()
+    root_dir = Path(os.environ.get(ROOT_VAR) or config_dir.parent)
+    if data_root is _UNSET:
+        data_root = read_data_root()
+    path_vars: Dict[str, str] = {}
+    if data_root is not None:
+        data_root = Path(os.path.normpath(Path(data_root).expanduser().absolute()))
+        workspaces_dir = data_root / "workspaces"
+        base_dir = workspaces_dir
+        path_vars[DATA_ROOT_VAR] = str(data_root)
+    else:
+        workspaces_dir = root_dir / "workspaces"
+        base_dir = config_dir
+    path_vars[WORKSPACES_VAR] = str(workspaces_dir)
 
     for idx, item in enumerate(raw):
         if not isinstance(item, dict):
@@ -553,7 +605,12 @@ def load_profile_registry(
 
         def _resolve(value: Any, field_name: str) -> Path:
             return _resolve_profile_path(
-                value, base=base_dir, root=root_dir, slug=slug, field_name=field_name
+                value,
+                base=base_dir,
+                root=root_dir,
+                slug=slug,
+                field_name=field_name,
+                path_vars=path_vars,
             )
 
         working_dir = _resolve(raw_working_dir, "working_dir")
@@ -606,6 +663,29 @@ def load_profile_registry(
             logger.warning(
                 "extra_dirs has no effect on a full-access profile",
                 profile=slug,
+            )
+
+        exchange = item.get("exchange", False)
+        if not isinstance(exchange, bool):
+            raise ValueError(f"Profile '{slug}': exchange must be true or false")
+        # The owner's money: never on a profile a guest can reach.
+        if exchange and "guest" in allowed_roles:
+            raise ValueError(
+                f"Profile '{slug}': exchange is not allowed on a"
+                " guest-allowed profile"
+            )
+
+        unrestricted = item.get("unrestricted", False)
+        if not isinstance(unrestricted, bool):
+            raise ValueError(f"Profile '{slug}': unrestricted must be true or false")
+        # Same fail-closed shape as the sandbox invariant: the admin flag only
+        # makes sense on an unsandboxed, owner-only profile.
+        if unrestricted and resolved_sandbox:
+            raise ValueError(f"Profile '{slug}': unrestricted requires sandbox: false")
+        if unrestricted and "guest" in allowed_roles:
+            raise ValueError(
+                f"Profile '{slug}': unrestricted is not allowed on a"
+                " guest-allowed profile"
             )
 
         enabled = item.get("enabled", True)
@@ -666,8 +746,11 @@ def load_profile_registry(
             personal_memory=personal_memory,
             user_data_tools=_parse_user_data_tools(item, slug),
             today_digest=bool(item.get("today_digest", False)),
+            hireli=bool(item.get("hireli", False)),
+            exchange=exchange,
             extra_dirs=extra_dirs,
             enabled=enabled,
+            unrestricted=unrestricted,
         )
         if validate_paths:
             _validate_profile_paths(definition)
@@ -704,6 +787,17 @@ def _parse_extra_dirs(
             raise ValueError(
                 f"Profile '{slug}': extra_dirs entry '{entry}' is too broad"
             )
+        # dv-2c1c: `--add-dir` would re-expose a data-root area the bwrap jail
+        # hides (secrets/, archive/, db/). extra_dirs is sandbox-only, so the
+        # sandboxed set applies.
+        from src.security.denylist import protected_dirs
+
+        for area in protected_dirs().for_session(full_access=False):
+            if path == area or area in path.parents or path in area.parents:
+                raise ValueError(
+                    f"Profile '{slug}': extra_dirs entry '{entry}' overlaps "
+                    f"{area}, which no agent may read"
+                )
         if path not in resolved:
             resolved.append(path)
     return tuple(resolved)

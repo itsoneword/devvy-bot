@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 CLAUDE_BACKEND = "claude"
 CODEX_BACKEND = "openai_codex"
 
-_CODEX_DEFAULT_MODEL = "openai-codex/gpt-5.4-mini"
+_CODEX_DEFAULT_MODEL = "openai-codex/gpt-5.6-sol"
 _CODEX_HARD_MODEL = "openai-codex/gpt-5.5"
 # Kept as the floor of the accepted set, not as the whole set: the real list
 # comes from `codex debug models` via CODEX_CATALOG (dv-0c01). These two stay

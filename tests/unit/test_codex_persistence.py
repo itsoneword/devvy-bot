@@ -8,13 +8,15 @@ that `messages` references. These tests run against a real SQLite file with
 constraint is genuinely enforced rather than mocked away.
 """
 
+import json
+import shlex
 import stat
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from src.agent_backends.codex_cli import CodexCliIntegration, CodexSessionStore
+from src.agent_backends.codex_cli import CodexCliIntegration, InMemoryCodexSessionStore
 from src.claude.session import SessionManager
 from src.config.settings import Settings
 from src.storage.facade import Storage
@@ -71,7 +73,7 @@ def _integration(settings, storage, tmp_path, *, with_session_manager=True):
     return CodexCliIntegration(
         config=settings,
         codex_bin=str(_fake_codex(tmp_path)),
-        session_store=CodexSessionStore(tmp_path / "codex_sessions.json"),
+        session_store=InMemoryCodexSessionStore(),
         session_manager=manager,
     )
 
@@ -199,3 +201,80 @@ async def test_no_session_manager_keeps_old_behaviour(storage, settings, tmp_pat
     )
     assert response.session_id == THREAD_ID
     assert await storage.sessions.get_session(THREAD_ID) is None
+
+
+def _fake_codex_failed_mcp(tmp_path: Path) -> Path:
+    """A turn with one failed MCP call and one successful shell command."""
+    script = tmp_path / "codex_failed_mcp"
+    events = [
+        {"type": "thread.started", "thread_id": THREAD_ID},
+        {"type": "item.started", "item": {"id": "item_1", "type": "mcp_tool_call",
+            "server": "agent", "tool": "week_summary", "arguments": {},
+            "status": "in_progress"}},
+        {"type": "item.completed", "item": {"id": "item_1", "type": "mcp_tool_call",
+            "server": "agent", "tool": "week_summary", "arguments": {},
+            "result": None, "status": "failed", "error": {"message":
+            "MCP tool call requires approval, but approval policy is never"}}},
+        {"type": "item.started", "item": {"id": "item_2",
+            "type": "command_execution", "command": "ls", "status": "in_progress"}},
+        {"type": "item.completed", "item": {"id": "item_2",
+            "type": "command_execution", "command": "ls", "exit_code": 0,
+            "status": "completed"}},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 3}},
+    ]
+    body = "".join(f"echo {shlex.quote(json.dumps(e))}\n" for e in events)
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -e\n"
+        'outfile=""\n'
+        'args=("$@")\n'
+        "for ((i=0; i<${#args[@]}; i++)); do\n"
+        '  if [[ "${args[$i]}" == "-o" ]]; then outfile="${args[$((i+1))]}"; fi\n'
+        "done\n"
+        + body
+        + 'if [[ -n "$outfile" ]]; then echo -n "done" > "$outfile"; fi\n'
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
+    return script
+
+
+async def test_failed_mcp_call_is_stored_as_failure(storage, settings, tmp_path):
+    """dv-c7d1: a failed MCP item was stored success=1 (only item.started
+    was read)."""
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    integ = CodexCliIntegration(
+        config=settings,
+        codex_bin=str(_fake_codex_failed_mcp(tmp_path)),
+        session_store=InMemoryCodexSessionStore(),
+        session_manager=SessionManager(
+            settings, SQLiteSessionStorage(storage.db_manager)
+        ),
+    )
+    response = await integ.run_command(
+        prompt="week", working_directory=workdir, user_id=USER_ID, force_new=True
+    )
+    assert not response.is_error
+    message_id = await storage.save_claude_interaction(
+        user_id=USER_ID,
+        session_id=response.session_id,
+        prompt="week",
+        response=response,
+        window_id=1,
+    )
+    async with storage.db_manager.get_connection() as conn:
+        cur = await conn.execute(
+            "SELECT tool_name, success, error_message FROM tool_usage "
+            "WHERE message_id = ? ORDER BY id",
+            (message_id,),
+        )
+        rows = [tuple(r) for r in await cur.fetchall()]
+    assert rows == [
+        (
+            "week_summary",
+            0,
+            "MCP tool call requires approval, but approval policy is never",
+        ),
+        ("Bash", 1, None),
+    ]

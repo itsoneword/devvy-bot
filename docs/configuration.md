@@ -2,9 +2,26 @@
 
 This document provides comprehensive information about configuring Devvy.
 
-`src/config/settings.py` is the source of truth, and [`.env.example`](../.env.example) is
-generated from it — that file always lists every variable with its real default. If this
-page and the model disagree, the model wins; fix the page.
+`src/config/settings.py` is the source of truth for **defaults**, and
+[`.env.example`](../.env.example) is generated from it — that file always lists every
+variable with its real default. If this page and the model disagree, the model wins; fix
+the page.
+
+**Defaults are not live values.** The running bot uses the default overlaid by `.env`,
+the secrets file and the environment overrides below. To see what is actually in effect
+and where each value comes from:
+
+```bash
+poetry run python scripts/show_config.py              # every value that differs from its default
+poetry run python scripts/show_config.py window eval  # fields matching any substring
+poetry run python scripts/show_config.py --all        # everything
+```
+
+**Runtime choices are not config.** The model a user picks with `/model` (a DB
+prefs row, loaded into `user_data["agent_model"]`), per-profile selections and
+backend switches override these values per turn, and `show_config.py` cannot
+see them. For what actually ran, query usage: `llm_analytics.db` →
+`api_calls.model` joined to `sessions.profile` / `sessions.cwd`.
 
 ## Overview
 
@@ -20,9 +37,11 @@ The bot uses a configuration system built with Pydantic Settings v2 that provide
 Configuration is loaded in this order (later sources override earlier ones):
 
 1. **Default values** defined in the Settings class
-2. **Environment variables**
-3. **`.env` file** (if present)
-4. **Environment-specific overrides** (development/testing/production)
+2. **`.env` file** (if present)
+3. **Secrets file** (`<data root>/secrets/bot.env`; wins over `.env`)
+4. **Process environment variables** (win over both files)
+5. **Environment-specific overrides** in `src/config/loader.py`, chosen by
+   `ENVIRONMENT` (default `development`)
 
 ## Environment Variables
 
@@ -71,7 +90,10 @@ ANTHROPIC_API_KEY=sk-ant-api03-...    # Optional: API key for SDK (uses CLI auth
 # Maximum conversation turns before requiring new session
 CLAUDE_MAX_TURNS=10
 
-# Timeout for Claude operations in seconds
+# Idle timeout for one SDK turn: seconds of silence from the CLI before the
+# turn is killed. NOT a wall-clock cap on the turn — a turn that keeps
+# streaming tool calls (sub-agents included) runs as long as it needs. Only a
+# single tool call that produces nothing for this long trips it.
 CLAUDE_TIMEOUT_SECONDS=300
 
 # Max bytes for one stream-json message on the CLI's stdout. The SDK's own
@@ -99,8 +121,9 @@ CLAUDE_ALLOWED_TOOLS=Read,Write,Edit,Bash,Glob,Grep,LS,Task,TaskOutput,MultiEdit
 # Default backend for agentic text turns: claude or openai_codex
 AGENT_BACKEND=claude
 
-# Optional model override for the selected backend
-# Current live-tested Codex choices: openai-codex/gpt-5.5, openai-codex/gpt-5.4-mini
+# Optional model override for the selected backend. The /model menu is
+# populated dynamically by `codex debug models`; the cold fallback is
+# openai-codex/gpt-5.6-sol.
 AGENT_MODEL=
 
 # Timeout for non-Claude backend requests in seconds
@@ -141,15 +164,30 @@ AGENT_BRIDGE_TOKEN_TTL_SECONDS=1800
 
 #### Memory Evaluator
 
-The evaluator extracts memory ops from conversations at each window
-checkpoint. Its model is a separate setting from the conversation model.
+The evaluator extracts memory ops from conversations. Its model is a separate
+setting from the conversation model. Each run reads everything since the last
+checkpoint cursor and posts the "Memory: N found — …" report (or "Evaluator
+failed: …") to the owner. It runs on exactly these triggers, all in
+`src/bot/orchestration/windowing.py` (verified 2026-10-04):
+
+| Trigger | `memory_extractions.session_id` suffix | Condition |
+|---|---|---|
+| Window roll | `:refresh` | context reaches `WINDOW_REFRESH_THRESHOLD_TOKENS`; also any backend switch |
+| Token checkpoint | `:<window_id>` | **off by default** (`WINDOW_EVAL_INTERVAL_TOKENS=0`, 2026-10-04); when >0, context crosses another multiple of it (skipped if the same turn rolls) |
+| "Remember" message | `:<window_id>` | user text matches the remember regex («запомни», "remember"); skips the token gate |
+| `/new` | `:reset` | conversation text non-empty |
+
+There is no time/idle trigger and no scheduled run: a profile that never
+reaches the roll threshold is only evaluated on "remember" or `/new`.
+`cumulative_tokens_at_run` is 0 on `:refresh` rows and a flow sum (not the
+context level) on the others, so it cannot be compared with the thresholds.
 
 ```bash
 # Model alias for the evaluator's Claude CLI call (sonnet, haiku, or a full id)
 EVALUATOR_MODEL=sonnet
 
-# Strip the Claude Code harness from evaluator CLI calls
-EVALUATOR_LEAN_CONTEXT=true
+# Model for the extraction call when the active backend is Codex
+EVALUATOR_CODEX_MODEL=openai-codex/gpt-6-sol
 
 # Hard cap on the conversation slice one run may carry (chars)
 EVALUATOR_MAX_DELTA_CHARS=120000
@@ -180,14 +218,13 @@ timeouts at 120s, 20% op match vs ≥80%, 75% tier agreement vs ≥90%, pinned
 recall 0/3 vs 100%. Extraction stays on sonnet; only the *reconciler* (the
 second, small call of the dv-c5d9 pipeline) runs on haiku.
 
-`EVALUATOR_LEAN_CONTEXT` matters more than the model. An extraction is a bare
-`claude -p` in the bot's working directory, so by default it inherits that
-directory's whole Claude Code context — project `CLAUDE.md`, the skill
-listing, MCP tool definitions, the agent system prompt. Measured 2026-08-04,
-that floor was ~42k tokens on runs that returned `[]`. Lean mode passes
-`--system-prompt`, `--tools ""`, `--setting-sources ""`, `--strict-mcp-config`
-and `--disable-slash-commands`, leaving only the extraction prompt itself.
-Set it to `false` to reproduce the old invocation.
+Stripping the harness matters more than the model. A bare `claude -p` in the
+bot's working directory inherits that directory's whole Claude Code context:
+project `CLAUDE.md`, the skill listing, MCP tool definitions, the agent system
+prompt. Measured 2026-08-04, that floor was ~42k tokens on runs that returned
+`[]`. Extraction and reconcile calls go through the model router
+(`src/model_router/`), which always strips it: no tools, no settings, no MCP
+servers, no slash commands. The old `EVALUATOR_LEAN_CONTEXT` switch is gone.
 
 `EVALUATOR_MAX_DELTA_CHARS` is a runaway guard, not a cost lever: the
 checkpoint cursor only advances after a *successful* run, so a wedged
@@ -226,7 +263,32 @@ guard-only report that says so, rather than a clean-looking day. Every flagged
 fact is also logged with full content as `fact_quality_verdict`, which is the
 labeled corpus for that tuning.
 
-In agentic mode, `/model` can switch per user between Claude Code and OpenAI Codex without changing the global default. OpenAI Codex login uses device-code authentication and stores the resulting token JSON with user-only file permissions. Unsupported Codex model selections, including `*-pro` variants rejected by ChatGPT-account Codex auth, fall back to `openai-codex/gpt-5.4-mini`. Current limitation: Codex is wired for the agentic text path; document, photo, and voice workflows still use the Claude integration.
+#### Recipe search-retry (dv-300d / dv-5d5f)
+
+Mechanical (no-LLM) fix for the chef profile writing recipes from memory:
+measured at 78 of 81 historical chef recipe turns with zero
+WebSearch/WebFetch calls. After a normal turn is delivered, if the answer
+looks like a written-out recipe (`llm_analytics.quality.looks_like_recipe`)
+AND the turn made no Web* tool call, the bot silently runs one follow-up turn
+in the same profile session asking it to verify with a search, then delivers
+that as a second message prefixed `🔁 Попытка 2 из 2 — перепроверил с
+поиском:`. Never a third attempt. Off by default — each retry is a real SDK
+turn with its own cost.
+
+```bash
+# Enable the retry (default off)
+RECIPE_RETRY_ENABLED=false
+
+# Comma-separated profile slugs this applies to
+RECIPE_RETRY_PROFILES=chef
+```
+
+The trigger is deliberately mechanical rather than judge-scored: the dv-300d
+validation gate showed a blind LLM judge (no search of its own) scores a
+confidently wrong recipe as highly as a correct one, so it cannot be trusted
+to decide when a retry is warranted.
+
+In agentic mode, `/model` can switch per user between Claude Code and OpenAI Codex without changing the global default. OpenAI Codex login uses device-code authentication and stores the resulting token JSON with user-only file permissions. The entitled model catalog is refreshed at startup and whenever `/model` opens; unsupported selections fall back to `openai-codex/gpt-5.6-sol`. Current limitation: Codex is wired for the agentic text path; document, photo, and voice workflows still use the Claude integration. Codex sandbox (dv-e38e): profiles with `unrestricted: true` (devops) run `-s danger-full-access`; every other profile runs a codex permission profile that reads everywhere, writes only to its workspace, `extra_dirs` and tmp, and cannot see the data root's `secrets/`, `archive/`, `db/`, credential files, or other users' workspaces (`src/agent_backends/codex_sandbox.py`).
 
 #### Rate Limiting
 
@@ -266,6 +328,28 @@ WATCHDOG_MAX_TOKENS_PER_HOUR=5000000
 #### Storage & Database
 
 ```bash
+# One data root (dv-c66a). Unset = legacy layout: everything flat under the
+# checkout's data/ (the defaults below). Set it and every runtime path derives
+# from it — explicit per-path variables below still win:
+#   <root>/db/          bot.db, data.db, llm_analytics.db, channel_intel.db
+#   <root>/workspaces/  per-agent persona.md, memory/, users/, guests/
+#   <root>/secrets/     bot.env (0600: TELEGRAM_BOT_TOKEN, API keys, tokens),
+#                       model_auth/openai_codex.json
+# Secrets (dv-2976) are read into Settings only, never exported: with the
+# root set they come from <root>/secrets/bot.env (overrides this file),
+# unset from this .env. Either way the bot removes every secret-looking
+# name from its os.environ at startup, so agent CLIs never inherit them.
+# Check with scripts/agent_env_names.py (prints names only).
+# No state/ area (dv-ebde): Codex thread ids + token totals and pinned status
+# messages are bot.db tables, consolidation reports go to
+# <root>/workspaces/devops/reports/consolidation/, the taskpump counter and
+# outbox to <root>/workspaces/devops/taskpump/, and the taskpump tick lock
+# is $XDG_RUNTIME_DIR/devvy-taskpump.lock. data/codex_sessions.json is only
+# read once at startup (import into bot.db `sessions`), never written.
+# Read from the environment or this .env by the bot, the llm_analytics and
+# channel_intel daemons and scripts/taskpump (src/utils/paths.py).
+# DEVVY_DATA_ROOT=~/Devvybot/data
+
 # Database URL (SQLite by default)
 DATABASE_URL=sqlite:///data/bot.db
 
@@ -410,6 +494,12 @@ prefix (`@channel <msg>`). Pick one from a keyboard with `/agents`; inspect
 state with `/sessions`, `/diag`, `/identity`. (`/profiles` was deleted — it was
 a strict subset of `/agents`.)
 
+Profile paths: with `DEVVY_DATA_ROOT` set, a relative path resolves under
+`<root>/workspaces` (so `coach/persona.md` is that agent's persona) and
+`${DEVVY_WORKSPACES}` names the same directory; absolute paths are used as-is
+(devops' `working_dir` is the checkout, research's `extra_dirs` are outside).
+Unset, relative paths resolve against the config file's directory as before.
+
 Profiles work under both denylist (systemd) and allowlist (container) modes;
 each profile's `working_dir` must be reachable in whichever mode is active.
 Per-profile keys include `sandbox`, `max_turns`, `max_cost_per_request`,
@@ -476,7 +566,8 @@ CHANNEL_INTEL_TOKEN=            # if set, daemon requires Bearer auth
 `src/channel_intel/server.py` runs as the standalone `channel-intel.service`
 HTTP MCP daemon. The bot mounts it **only** for the `channel` profile, through
 that profile's `mcp` seam (`config/mcp/channel-intel.json`), which reads the
-same token env var and injects the header. Other profiles do not receive these
+same token env var (from Settings) and hands it to the agent CLI by
+environment, referenced as `${CHANNEL_INTEL_TOKEN}`, never in argv. Other profiles do not receive these
 tools unless their profile config explicitly points at an MCP seam.
 
 ## Cost Limits
@@ -509,40 +600,24 @@ and `docs/FINDINGS.md` 2026-08-03 for why silence there was a bug.
 
 ## Environment-Specific Configuration
 
-The bot automatically applies different settings based on the environment:
+`ENVIRONMENT` (set in `.env`; the live bot runs `development` on purpose, see
+`docs/DECISIONS.md` 2026-10-04) selects a class in `src/config/environments.py`
+whose values `load_config` applies with `setattr` **after** `.env` — they beat
+anything the files say. An unknown value logs a warning and applies nothing.
+`scripts/show_config.py` marks every value that came from this layer.
 
-### Development Environment
+| Setting | development | production | What it actually does |
+|---|---|---|---|
+| `claude_timeout_seconds` | 900 | — (default 300) | Idle timeout (seconds of silence), must stay above the 600s Bash tool ceiling. 300 kills turns with a quiet 5-min tool call. |
+| `rate_limit_requests` | 100 | 5 | Per 60s window. 5 blocks normal back-and-forth. |
+| `claude_max_cost_per_user` / `_per_request` | default 10 / 5 | 5.0 / 2.0 | Non-owner roles only; owners are uncapped per request. |
+| `development_mode` | true | false | Only gates the API server's `/docs` page. |
+| `debug` | true | false | Cosmetic (a log line, uvicorn level). |
+| `log_level` | DEBUG | INFO | Not read by the bot's logging. Log format and level come from the `--debug` CLI flag only (`src/main.py`); systemd runs without it, so logs are JSON/INFO in every environment. |
+| `enable_telemetry` | false | true | Has no consumer — only shown in the features summary. Anthropic CLI telemetry is controlled separately by `DISABLE_TELEMETRY` / `DISABLE_ERROR_REPORTING` in `.env`. |
 
-Activated when `ENVIRONMENT=development` or when `DEBUG=true`:
-
-- `debug = true`
-- `development_mode = true`
-- `log_level = "DEBUG"`
-- `rate_limit_requests = 100` (more lenient)
-- `claude_timeout_seconds = 600` (longer timeout)
-- `enable_telemetry = false`
-
-### Testing Environment
-
-Activated when `ENVIRONMENT=testing`:
-
-- `debug = true`
-- `database_url = "sqlite:///:memory:"` (in-memory database)
-- `approved_directory = "/tmp/test_projects"`
-- `claude_timeout_seconds = 30` (faster timeout)
-- `rate_limit_requests = 1000` (no effective rate limiting)
-
-### Production Environment
-
-Activated when `ENVIRONMENT=production`:
-
-- `debug = false`
-- `log_level = "INFO"`
-- `enable_telemetry = true`
-- `claude_max_cost_per_user = 5.0` (stricter cost limit)
-- `claude_max_cost_per_request = 2.0` (per-request SDK cap)
-- `rate_limit_requests = 5` (stricter rate limiting)
-- `session_timeout_hours = 12` (shorter session timeout)
+`testing` (unit tests only): in-memory DB, `/tmp/test_projects`, 30s timeout,
+1000 requests/min.
 
 ## Feature Flags
 

@@ -1,0 +1,1712 @@
+{
+  "fts_tables": {},
+  "indexes": {
+    "idx_answer_scores_profile_ts": {
+      "sql": "CREATE INDEX idx_answer_scores_profile_ts ON answer_scores(profile, ts)",
+      "tbl_name": "answer_scores"
+    },
+    "idx_bot_messages_chain": {
+      "sql": "CREATE INDEX idx_bot_messages_chain ON bot_messages(user_id, window_id)",
+      "tbl_name": "bot_messages"
+    },
+    "idx_bot_messages_session": {
+      "sql": "CREATE INDEX idx_bot_messages_session ON bot_messages(session_id)",
+      "tbl_name": "bot_messages"
+    },
+    "idx_calls_session": {
+      "sql": "CREATE INDEX idx_calls_session ON api_calls(session_id, agent_id, ts)",
+      "tbl_name": "api_calls"
+    },
+    "idx_calls_ts": {
+      "sql": "CREATE INDEX idx_calls_ts ON api_calls(ts)",
+      "tbl_name": "api_calls"
+    },
+    "idx_events_session": {
+      "sql": "CREATE INDEX idx_events_session ON derived_events(session_id, agent_id, ts)",
+      "tbl_name": "derived_events"
+    },
+    "idx_quality_daily_date": {
+      "sql": "CREATE INDEX idx_quality_daily_date ON quality_daily(date)",
+      "tbl_name": "quality_daily"
+    },
+    "idx_tools_session": {
+      "sql": "CREATE INDEX idx_tools_session ON tool_calls(session_id, agent_id, ts)",
+      "tbl_name": "tool_calls"
+    }
+  },
+  "tables": {
+    "answer_scores": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "message_id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "profile",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "ts",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "judge_model",
+          "notnull": 1,
+          "pk": 2,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "rubric_version",
+          "notnull": 1,
+          "pk": 3,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "scores_json",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "total",
+          "notnull": 1,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "rationale",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "flags",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 10,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "scored_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_answer_scores_profile_ts": [
+          {
+            "cid": 1,
+            "name": "profile",
+            "seqno": 0
+          },
+          {
+            "cid": 3,
+            "name": "ts",
+            "seqno": 1
+          }
+        ],
+        "sqlite_autoindex_answer_scores_1": [
+          {
+            "cid": 0,
+            "name": "message_id",
+            "seqno": 0
+          },
+          {
+            "cid": 4,
+            "name": "judge_model",
+            "seqno": 1
+          },
+          {
+            "cid": 5,
+            "name": "rubric_version",
+            "seqno": 2
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_answer_scores_profile_ts",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "sqlite_autoindex_answer_scores_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 1,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE answer_scores ( message_id INTEGER NOT NULL, profile TEXT, user_id INTEGER, ts TEXT, judge_model TEXT NOT NULL, rubric_version INTEGER NOT NULL, scores_json TEXT NOT NULL, total REAL NOT NULL, rationale TEXT, flags TEXT, scored_at TEXT NOT NULL, PRIMARY KEY (message_id, judge_model, rubric_version) )"
+    },
+    "api_calls": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "request_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "agent_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "ts",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "model",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "input_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "output_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "cache_read_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "cache_creation_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 9,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "cache_5m_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 10,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "cache_1h_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 11,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "est_cost_usd",
+          "notnull": 1,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 12,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "pricing_rule",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 13,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "entry_uuid",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 14,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "file_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 15,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "entry_offset",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_calls_session": [
+          {
+            "cid": 1,
+            "name": "session_id",
+            "seqno": 0
+          },
+          {
+            "cid": 2,
+            "name": "agent_id",
+            "seqno": 1
+          },
+          {
+            "cid": 3,
+            "name": "ts",
+            "seqno": 2
+          }
+        ],
+        "idx_calls_ts": [
+          {
+            "cid": 3,
+            "name": "ts",
+            "seqno": 0
+          }
+        ],
+        "sqlite_autoindex_api_calls_1": [
+          {
+            "cid": 0,
+            "name": "request_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_calls_ts",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_calls_session",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        },
+        {
+          "name": "sqlite_autoindex_api_calls_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 2,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE api_calls ( request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, agent_id TEXT, ts TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, cache_read_tokens INTEGER NOT NULL, cache_creation_tokens INTEGER NOT NULL, cache_5m_tokens INTEGER NOT NULL DEFAULT 0, cache_1h_tokens INTEGER NOT NULL DEFAULT 0, est_cost_usd REAL NOT NULL, pricing_rule TEXT NOT NULL, entry_uuid TEXT, file_id INTEGER NOT NULL, entry_offset INTEGER NOT NULL )"
+    },
+    "bot_messages": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "message_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "ts",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "cost",
+          "notnull": 0,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "duration_ms",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "window_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "prompt_chars",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "response_chars",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_bot_messages_chain": [
+          {
+            "cid": 2,
+            "name": "user_id",
+            "seqno": 0
+          },
+          {
+            "cid": 6,
+            "name": "window_id",
+            "seqno": 1
+          }
+        ],
+        "idx_bot_messages_session": [
+          {
+            "cid": 1,
+            "name": "session_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_bot_messages_chain",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "idx_bot_messages_session",
+          "origin": "c",
+          "partial": 0,
+          "seq": 1,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE bot_messages ( message_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, user_id INTEGER NOT NULL, ts TEXT NOT NULL, cost REAL, duration_ms INTEGER, window_id INTEGER, prompt_chars INTEGER, response_chars INTEGER )"
+    },
+    "bot_sessions": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "project_path",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "created_at",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "last_used",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "total_cost",
+          "notnull": 0,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "total_turns",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "message_count",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "is_active",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_bot_sessions_1": [
+          {
+            "cid": 0,
+            "name": "session_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_bot_sessions_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE bot_sessions ( session_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, project_path TEXT NOT NULL, created_at TEXT NOT NULL, last_used TEXT, total_cost REAL, total_turns INTEGER, message_count INTEGER, is_active INTEGER )"
+    },
+    "bot_windows": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 1,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "working_dir",
+          "notnull": 1,
+          "pk": 2,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "window_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "active_backend",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "cumulative_tokens",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "last_eval_checkpoint",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "last_checkpoint_message_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "updated_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_bot_windows_1": [
+          {
+            "cid": 0,
+            "name": "user_id",
+            "seqno": 0
+          },
+          {
+            "cid": 1,
+            "name": "working_dir",
+            "seqno": 1
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_bot_windows_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE bot_windows ( user_id INTEGER NOT NULL, working_dir TEXT NOT NULL, window_id INTEGER NOT NULL, active_backend TEXT, cumulative_tokens INTEGER, last_eval_checkpoint INTEGER, last_checkpoint_message_id INTEGER, updated_at TEXT, PRIMARY KEY (user_id, working_dir) )"
+    },
+    "derived_events": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "agent_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "ts",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "kind",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "detail",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_events_session": [
+          {
+            "cid": 1,
+            "name": "session_id",
+            "seqno": 0
+          },
+          {
+            "cid": 2,
+            "name": "agent_id",
+            "seqno": 1
+          },
+          {
+            "cid": 3,
+            "name": "ts",
+            "seqno": 2
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_events_session",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE derived_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, agent_id TEXT, ts TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('cache_expiry','partial_cache_hit','context_cliff')), detail TEXT NOT NULL )"
+    },
+    "files": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "path",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "kind",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "agent_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "byte_offset",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "mtime",
+          "notnull": 1,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "size",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "last_scanned_at",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "missing_since",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_files_1": [
+          {
+            "cid": 1,
+            "name": "path",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_files_1",
+          "origin": "u",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE files ( id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK (kind IN ('session','subagent')), session_id TEXT NOT NULL, agent_id TEXT, byte_offset INTEGER NOT NULL DEFAULT 0, mtime REAL NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0, last_scanned_at TEXT, missing_since TEXT )"
+    },
+    "meta": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "key",
+          "notnull": 0,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "value",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_meta_1": [
+          {
+            "cid": 0,
+            "name": "key",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_meta_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    },
+    "quality_daily": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "date",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "profile",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 3,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "pinned_facts",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 4,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "log_calls",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 5,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "claimed_not_logged",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 6,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "complaint_hits",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 7,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "user_messages",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 8,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "recipe_turns",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 9,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "recipe_turns_unsearched",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_quality_daily_date": [
+          {
+            "cid": 0,
+            "name": "date",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_quality_daily_date",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        }
+      ],
+      "sql": "CREATE TABLE quality_daily ( date TEXT NOT NULL, profile TEXT, user_id INTEGER, pinned_facts INTEGER NOT NULL DEFAULT 0, log_calls INTEGER NOT NULL DEFAULT 0, claimed_not_logged INTEGER NOT NULL DEFAULT 0, complaint_hits INTEGER NOT NULL DEFAULT 0, user_messages INTEGER NOT NULL DEFAULT 0, recipe_turns INTEGER NOT NULL DEFAULT 0, recipe_turns_unsearched INTEGER NOT NULL DEFAULT 0 )"
+    },
+    "sessions": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "cwd",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "profile",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "entrypoint",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "git_branch",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "cli_version",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "first_ts",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "last_ts",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 9,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "api_call_count",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 10,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "input_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 11,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "output_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 12,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "cache_read_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 13,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "cache_creation_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 14,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "est_cost_usd",
+          "notnull": 1,
+          "pk": 0,
+          "type": "REAL"
+        },
+        {
+          "cid": 15,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "tool_call_count",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 16,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "subagent_count",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 17,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "turn_count",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 18,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "in_bot_db",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 19,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "first_call_context",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 20,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "bot_formula_tokens",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 21,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "seeded_start",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_sessions_1": [
+          {
+            "cid": 0,
+            "name": "session_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_sessions_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE sessions ( session_id TEXT PRIMARY KEY, cwd TEXT, profile TEXT, entrypoint TEXT, user_id INTEGER, git_branch TEXT, cli_version TEXT, first_ts TEXT, last_ts TEXT, api_call_count INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0, est_cost_usd REAL NOT NULL DEFAULT 0, tool_call_count INTEGER NOT NULL DEFAULT 0, subagent_count INTEGER NOT NULL DEFAULT 0, turn_count INTEGER NOT NULL DEFAULT 0, in_bot_db INTEGER NOT NULL DEFAULT 0, first_call_context INTEGER, bot_formula_tokens INTEGER, seeded_start INTEGER NOT NULL DEFAULT 0 )"
+    },
+    "subagent_runs": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "agent_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "spawn_tool_use_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "description",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "subagent_type",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "model_override",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "started_ts",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "ended_ts",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "api_call_count",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 9,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "input_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 10,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "output_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 11,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "cache_read_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 12,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "cache_creation_tokens",
+          "notnull": 1,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 13,
+          "dflt_value": "0",
+          "hidden": 0,
+          "name": "est_cost_usd",
+          "notnull": 1,
+          "pk": 0,
+          "type": "REAL"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_subagent_runs_1": [
+          {
+            "cid": 0,
+            "name": "agent_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_subagent_runs_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE subagent_runs ( agent_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, spawn_tool_use_id TEXT, description TEXT, subagent_type TEXT, model_override TEXT, started_ts TEXT, ended_ts TEXT, api_call_count INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0, est_cost_usd REAL NOT NULL DEFAULT 0 )"
+    },
+    "tool_calls": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "tool_use_id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "TEXT"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "agent_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "name",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "ts",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "request_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "assistant_uuid",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "result_ts",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 8,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "duration_ms",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 9,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "is_error",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 10,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "input_summary",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "idx_tools_session": [
+          {
+            "cid": 1,
+            "name": "session_id",
+            "seqno": 0
+          },
+          {
+            "cid": 2,
+            "name": "agent_id",
+            "seqno": 1
+          },
+          {
+            "cid": 4,
+            "name": "ts",
+            "seqno": 2
+          }
+        ],
+        "sqlite_autoindex_tool_calls_1": [
+          {
+            "cid": 0,
+            "name": "tool_use_id",
+            "seqno": 0
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "idx_tools_session",
+          "origin": "c",
+          "partial": 0,
+          "seq": 0,
+          "unique": 0
+        },
+        {
+          "name": "sqlite_autoindex_tool_calls_1",
+          "origin": "pk",
+          "partial": 0,
+          "seq": 1,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE tool_calls ( tool_use_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, agent_id TEXT, name TEXT NOT NULL, ts TEXT NOT NULL, request_id TEXT, assistant_uuid TEXT, result_ts TEXT, duration_ms INTEGER, is_error INTEGER, input_summary TEXT )"
+    },
+    "turns": {
+      "columns": [
+        {
+          "cid": 0,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "id",
+          "notnull": 0,
+          "pk": 1,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 1,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "session_id",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 2,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "ts",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 3,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "source",
+          "notnull": 1,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 4,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "user_id",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 5,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "prompt_excerpt",
+          "notnull": 0,
+          "pk": 0,
+          "type": "TEXT"
+        },
+        {
+          "cid": 6,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "duration_ms",
+          "notnull": 0,
+          "pk": 0,
+          "type": "INTEGER"
+        },
+        {
+          "cid": 7,
+          "dflt_value": null,
+          "hidden": 0,
+          "name": "cost",
+          "notnull": 0,
+          "pk": 0,
+          "type": "REAL"
+        }
+      ],
+      "foreign_keys": [],
+      "index_columns": {
+        "sqlite_autoindex_turns_1": [
+          {
+            "cid": 1,
+            "name": "session_id",
+            "seqno": 0
+          },
+          {
+            "cid": 2,
+            "name": "ts",
+            "seqno": 1
+          },
+          {
+            "cid": 3,
+            "name": "source",
+            "seqno": 2
+          }
+        ]
+      },
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_turns_1",
+          "origin": "u",
+          "partial": 0,
+          "seq": 0,
+          "unique": 1
+        }
+      ],
+      "sql": "CREATE TABLE turns ( id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, ts TEXT NOT NULL, source TEXT NOT NULL CHECK (source IN ('bot','transcript')), user_id INTEGER, prompt_excerpt TEXT, duration_ms INTEGER, cost REAL, UNIQUE(session_id, ts, source) )"
+    }
+  },
+  "triggers": {},
+  "views": {}
+}

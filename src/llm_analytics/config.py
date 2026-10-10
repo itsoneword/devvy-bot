@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.utils.paths import data_layout
+
 
 @dataclass
 class AnalyticsConfig:
@@ -19,11 +21,15 @@ class AnalyticsConfig:
     def from_env(cls) -> "AnalyticsConfig":
         host = os.getenv("LLM_ANALYTICS_HOST", "127.0.0.1")
         port = int(os.getenv("LLM_ANALYTICS_PORT", "4790"))
-        db_path = Path(os.getenv("LLM_ANALYTICS_DB_PATH", "data/llm_analytics.db"))
+        # Unset DEVVY_DATA_ROOT = legacy data/*.db (dv-c66a).
+        layout = data_layout()
+        db_path = Path(
+            os.getenv("LLM_ANALYTICS_DB_PATH") or str(layout.llm_analytics_db)
+        )
         projects_dir = Path(
             os.getenv("LLM_ANALYTICS_PROJECTS_DIR", "~/.claude/projects")
         ).expanduser()
-        bot_db_path = Path(os.getenv("LLM_ANALYTICS_BOT_DB_PATH", "data/bot.db"))
+        bot_db_path = Path(os.getenv("LLM_ANALYTICS_BOT_DB_PATH") or str(layout.bot_db))
         pricing_path = Path(
             os.getenv("LLM_ANALYTICS_PRICING_PATH", "config/llm_pricing.json")
         )

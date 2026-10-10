@@ -1,6 +1,6 @@
 """Test ClaudeIntegration facade — force_new, activity logging."""
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -312,12 +312,14 @@ class TestActivityLogging:
                 user_id=user_id,
             )
 
-        activity_logger.log_activity.assert_awaited_once_with(
-            prompt="hello world",
-            response_content="response text",
-            working_directory=project,
-            num_turns=3,
-        )
+        # dv-ca94: run_command prepends a <current_time> line to every
+        # prompt, so the logged prompt carries it too.
+        activity_logger.log_activity.assert_awaited_once()
+        kwargs = activity_logger.log_activity.await_args.kwargs
+        assert kwargs["prompt"].endswith("\n\nhello world")
+        assert kwargs["response_content"] == "response text"
+        assert kwargs["working_directory"] == project
+        assert kwargs["num_turns"] == 3
 
     async def test_activity_logger_not_called_when_none(self, facade, session_manager):
         """run_command() does NOT call activity_logger when it is None."""
@@ -485,7 +487,8 @@ class TestResumeFailedSeed:
             )
 
         prompt = execute.call_args_list[1].kwargs["prompt"]
-        assert prompt == "hello"
+        # dv-ca94: every prompt carries a <current_time> prefix now.
+        assert prompt.endswith("\n\nhello")
         assert "<conversation_context>" not in prompt
 
     async def test_retry_seeds_from_pre_heal_prompt(self, facade, session_manager):
@@ -533,7 +536,8 @@ class TestResumeFailedSeed:
                 prompt="hello", working_directory=project, user_id=123
             )
 
-        assert execute.call_args_list[1].kwargs["prompt"] == "hello"
+        # dv-ca94: every prompt carries a <current_time> prefix now.
+        assert execute.call_args_list[1].kwargs["prompt"].endswith("\n\nhello")
         assert result.session_restarted is True
 
     async def test_lifecycle_event_records_seed_state(self, config, session_manager):
@@ -613,3 +617,381 @@ class TestResumeFailedSeed:
             content="ok", session_id="s", cost=0.0, duration_ms=1, num_turns=1
         )
         assert resp.session_restarted is False
+
+
+class TestResumeHasNoWallClockLimit:
+    """A conversation ends when its CONTEXT is full, never because time passed.
+
+    Regression for 2026-09-10: `_find_resumable_session` filtered on
+    `is_expired(session_timeout_hours)` (12h under ProductionConfig), so any
+    profile left alone for longer silently started an unseeded, empty session
+    — the `chef` profile lost 51h of context that way while /status still
+    reported a healthy window. See docs/DECISIONS.md.
+    """
+
+    @staticmethod
+    async def _seed_aged(session_manager, project: Path, *, days: int) -> str:
+        session = ClaudeSession(
+            session_id=f"aged-{days}d",
+            user_id=123,
+            project_path=project,
+            created_at=datetime.now(UTC) - timedelta(days=days),
+            last_used=datetime.now(UTC) - timedelta(days=days),
+        )
+        await session_manager.storage.save_session(session)
+        return session.session_id
+
+    @pytest.mark.parametrize("days", [1, 3, 30, 365])
+    async def test_old_session_is_resumable(self, facade, session_manager, days):
+        project = Path("/test/project")
+        session_id = await self._seed_aged(session_manager, project, days=days)
+
+        found = await facade._find_resumable_session(123, project)
+
+        assert found is not None, f"{days}d-old session must still resume"
+        assert found.session_id == session_id
+
+    async def test_run_command_continues_the_old_session(self, facade, session_manager):
+        """End to end: the aged session id is what gets handed to the SDK,
+        with continue_session=True — not a fresh unseeded run."""
+        project = Path("/test/project")
+        session_id = await self._seed_aged(session_manager, project, days=45)
+
+        with patch.object(
+            facade, "_execute", AsyncMock(return_value=_make_mock_response(session_id))
+        ) as execute:
+            await facade.run_command(
+                prompt="hello", working_directory=project, user_id=123
+            )
+
+        assert execute.await_args.kwargs["session_id"] == session_id
+        assert execute.await_args.kwargs["continue_session"] is True
+
+    async def test_newest_session_wins_among_several(self, facade, session_manager):
+        """With no expiry filter, selection is still 'most recently used'."""
+        project = Path("/test/project")
+        await self._seed_aged(session_manager, project, days=30)
+        await self._seed_aged(session_manager, project, days=2)
+
+        found = await facade._find_resumable_session(123, project)
+
+        assert found is not None
+        assert found.session_id == "aged-2d"
+
+
+class TestColdStartSeed:
+    """A fresh session for a workspace is seeded from that workspace's stored
+    history across sessions, not left blank (dv-300e)."""
+
+    async def test_cold_start_prompt_is_seeded(self, facade, session_manager):
+        project = Path("/test/project")
+        pairs = [("q1", "a1"), ("q2", "a2")]
+
+        with (
+            patch.object(
+                facade, "_recent_pairs_for_dir", AsyncMock(return_value=pairs)
+            ),
+            patch.object(facade, "_count_dir_messages", AsyncMock(return_value=20)),
+            patch.object(
+                facade, "_execute", AsyncMock(return_value=_make_mock_response())
+            ) as execute,
+        ):
+            await facade.run_command(
+                prompt="hello", working_directory=project, user_id=123
+            )
+
+        sent = execute.await_args.kwargs
+        assert sent["continue_session"] is False
+        assert sent["session_id"] is None
+        prompt = sent["prompt"]
+        assert prompt.startswith("<conversation_context>")
+        assert "rebuilt from this workspace's stored history" in prompt
+        assert "User: q1" in prompt and "Assistant: a2" in prompt
+        assert "last 2 of its 20 turns" in prompt
+        assert prompt.rstrip().endswith("hello")
+
+    async def test_force_new_is_never_seeded(self, facade, session_manager):
+        """/new means a clean slate; the seed must not resurrect history."""
+        project = Path("/test/project")
+
+        with (
+            patch.object(
+                facade,
+                "_recent_pairs_for_dir",
+                AsyncMock(return_value=[("q1", "a1")]),
+            ),
+            patch.object(
+                facade, "_execute", AsyncMock(return_value=_make_mock_response())
+            ) as execute,
+        ):
+            await facade.run_command(
+                prompt="hello",
+                working_directory=project,
+                user_id=123,
+                force_new=True,
+            )
+
+        # dv-ca94: every prompt carries a <current_time> prefix now.
+        assert execute.await_args.kwargs["prompt"].endswith("\n\nhello")
+
+    async def test_resumed_session_is_not_seeded(self, facade, session_manager):
+        """Resume carries its own context — no seed on top of it."""
+        project = Path("/test/project")
+        existing = ClaudeSession(
+            session_id="real-session-id",
+            user_id=123,
+            project_path=project,
+            created_at=datetime.utcnow(),
+            last_used=datetime.utcnow(),
+        )
+        await session_manager.storage.save_session(existing)
+        session_manager.active_sessions[existing.session_id] = existing
+
+        with (
+            patch.object(
+                facade, "_heal_lost_prose", AsyncMock(side_effect=lambda _s, _d, p: p)
+            ),
+            patch.object(
+                facade, "_recent_pairs_for_dir", AsyncMock(return_value=[("q", "a")])
+            ) as pairs,
+            patch.object(
+                facade,
+                "_execute",
+                AsyncMock(return_value=_make_mock_response("real-session-id")),
+            ) as execute,
+        ):
+            await facade.run_command(
+                prompt="hello", working_directory=project, user_id=123
+            )
+
+        assert execute.await_args.kwargs["continue_session"] is True
+        # dv-ca94: every prompt carries a <current_time> prefix now.
+        assert execute.await_args.kwargs["prompt"].endswith("\n\nhello")
+        pairs.assert_not_awaited()
+
+    async def test_no_history_leaves_prompt_untouched(self, facade, session_manager):
+        project = Path("/test/project")
+
+        with (
+            patch.object(facade, "_recent_pairs_for_dir", AsyncMock(return_value=[])),
+            patch.object(
+                facade, "_execute", AsyncMock(return_value=_make_mock_response())
+            ) as execute,
+        ):
+            await facade.run_command(
+                prompt="hello", working_directory=project, user_id=123
+            )
+
+        # dv-ca94: every prompt carries a <current_time> prefix now.
+        assert execute.await_args.kwargs["prompt"].endswith("\n\nhello")
+
+    async def test_seed_failure_is_not_fatal(self, facade, session_manager):
+        project = Path("/test/project")
+
+        with (
+            patch.object(
+                facade,
+                "_recent_pairs_for_dir",
+                AsyncMock(side_effect=RuntimeError("db gone")),
+            ),
+            patch.object(
+                facade, "_execute", AsyncMock(return_value=_make_mock_response())
+            ) as execute,
+        ):
+            result = await facade.run_command(
+                prompt="hello", working_directory=project, user_id=123
+            )
+
+        # dv-ca94: every prompt carries a <current_time> prefix now.
+        assert execute.await_args.kwargs["prompt"].endswith("\n\nhello")
+        assert result is not None
+
+    async def test_lifecycle_records_cold_start(self, config, session_manager):
+        project = Path("/test/project")
+        recorded = []
+
+        class _Lifecycle:
+            async def record(self, profile, event, detail):
+                recorded.append((event, detail))
+
+        facade = ClaudeIntegration(
+            config=config,
+            sdk_manager=MagicMock(),
+            session_manager=session_manager,
+            lifecycle_logger=_Lifecycle(),
+        )
+
+        with (
+            patch.object(
+                facade,
+                "_recent_pairs_for_dir",
+                AsyncMock(return_value=[("q1", "a1")]),
+            ),
+            patch.object(facade, "_count_dir_messages", AsyncMock(return_value=4)),
+            patch.object(
+                facade, "_execute", AsyncMock(return_value=_make_mock_response())
+            ),
+        ):
+            await facade.run_command(
+                prompt="hello", working_directory=project, user_id=123
+            )
+
+        events = [d for e, d in recorded if e == "fresh"]
+        assert events, f"no fresh event recorded: {recorded}"
+        assert events[0]["reason"] == "cold_start"
+        assert events[0]["seeded"] is True
+        assert events[0]["tail_messages"] == 1
+
+
+class TestResumeFailureClassification:
+    """A failed resume turn deletes the session mapping ONLY when the session
+    is actually gone (dv-2a5a). A 600s timeout on 2026-09-10 used to be
+    treated as a dead session and wiped a 60-turn conversation."""
+
+    async def _seed_session(self, session_manager: SessionManager) -> ClaudeSession:
+        existing = ClaudeSession(
+            session_id="old-session-id",
+            user_id=123,
+            project_path=Path("/test/project"),
+            created_at=datetime.now(UTC),
+            last_used=datetime.now(UTC),
+        )
+        await session_manager.storage.save_session(existing)
+        session_manager.active_sessions[existing.session_id] = existing
+        return existing
+
+    async def test_timeout_keeps_the_session(self, facade, session_manager):
+        from src.claude.exceptions import ClaudeTimeoutError
+
+        await self._seed_session(session_manager)
+        with patch.object(
+            facade,
+            "_execute",
+            AsyncMock(
+                side_effect=ClaudeTimeoutError("Claude SDK timed out after 600s")
+            ),
+        ) as execute:
+            with pytest.raises(ClaudeTimeoutError):
+                await facade.run_command(
+                    prompt="hello", working_directory=Path("/test/project"), user_id=123
+                )
+
+        assert execute.await_count == 1, "must not retry on a transient failure"
+        assert await session_manager.storage.load_session("old-session-id", 123)
+        assert getattr(session_manager.storage, "retired", []) == []
+
+    @pytest.mark.parametrize(
+        "error_text, kind",
+        [
+            (
+                "Claude process error: No conversation found with session ID: x",
+                "transcript_missing",
+            ),
+            ("exit 1", "transcript_missing"),  # no transcript file under tmp HOME
+        ],
+    )
+    async def test_dead_session_is_retired_with_reason(
+        self, facade, session_manager, error_text, kind
+    ):
+        await self._seed_session(session_manager)
+        with (
+            patch.object(facade, "_recent_pairs", AsyncMock(return_value=[("q", "a")])),
+            patch.object(facade, "_count_session_messages", AsyncMock(return_value=3)),
+            patch.object(
+                facade,
+                "_execute",
+                AsyncMock(
+                    side_effect=[RuntimeError(error_text), _make_mock_response()]
+                ),
+            ) as execute,
+        ):
+            result = await facade.run_command(
+                prompt="hello", working_directory=Path("/test/project"), user_id=123
+            )
+
+        assert execute.await_count == 2
+        assert result.session_restarted is True
+        assert result.session_fresh_reason == f"resume failed ({kind}), 1 turns seeded"
+        assert session_manager.storage.retired == [
+            ("old-session-id", f"resume_failed:{kind}")
+        ]
+
+    async def test_process_error_with_transcript_present_is_still_dead(
+        self, facade, session_manager, tmp_path, monkeypatch
+    ):
+        """Historical behaviour kept: a generic process error while the
+        transcript exists is treated as dead so a poisoned transcript
+        cannot wedge a profile. The kind says which branch fired."""
+        from src.claude import facade as facade_mod
+
+        monkeypatch.setattr(facade_mod, "_project_jsonl_dir", lambda wd: tmp_path)
+        (tmp_path / "old-session-id.jsonl").write_text("{}\n")
+        await self._seed_session(session_manager)
+        with (
+            patch.object(facade, "_recent_pairs", AsyncMock(return_value=[])),
+            patch.object(facade, "_count_session_messages", AsyncMock(return_value=0)),
+            patch.object(
+                facade,
+                "_execute",
+                AsyncMock(side_effect=[RuntimeError("exit 1"), _make_mock_response()]),
+            ),
+        ):
+            result = await facade.run_command(
+                prompt="hello", working_directory=Path("/test/project"), user_id=123
+            )
+
+        assert result.session_fresh_reason == "resume failed (process_error), unseeded"
+        assert session_manager.storage.retired == [
+            ("old-session-id", "resume_failed:process_error")
+        ]
+
+    async def test_cold_start_names_itself_in_the_response(self, facade):
+        with (
+            patch.object(
+                facade,
+                "_recent_pairs_for_dir",
+                AsyncMock(return_value=[("q1", "a1"), ("q2", "a2")]),
+            ),
+            patch.object(facade, "_count_dir_messages", AsyncMock(return_value=9)),
+            patch.object(
+                facade, "_execute", AsyncMock(return_value=_make_mock_response())
+            ),
+        ):
+            result = await facade.run_command(
+                prompt="hello", working_directory=Path("/test/project"), user_id=123
+            )
+
+        assert result.session_fresh_reason == "cold start, 2 turns seeded"
+
+    async def test_resumed_turn_has_no_fresh_reason(self, facade, session_manager):
+        await self._seed_session(session_manager)
+        resp = _make_mock_response()
+        resp.session_fresh_reason = None  # a MagicMock attribute is never None
+        with patch.object(facade, "_execute", AsyncMock(return_value=resp)):
+            result = await facade.run_command(
+                prompt="hello", working_directory=Path("/test/project"), user_id=123
+            )
+        assert result.session_fresh_reason is None
+
+    async def test_retirement_emits_lifecycle_event(self, config, session_manager):
+        recorded = []
+
+        class _Lifecycle:
+            async def record(self, profile, event, detail):
+                recorded.append((event, detail))
+
+        facade = ClaudeIntegration(
+            config=config,
+            sdk_manager=MagicMock(),
+            session_manager=session_manager,
+            lifecycle_logger=_Lifecycle(),
+        )
+        await self._seed_session(session_manager)
+        await session_manager.remove_session(
+            "old-session-id", reason="dir_cap:5", project_path=Path("/test/project")
+        )
+
+        assert (
+            "session_retired",
+            {"session": "old-session-id", "reason": "dir_cap:5"},
+        ) in recorded

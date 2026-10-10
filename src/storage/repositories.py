@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import structlog
 
@@ -246,23 +246,9 @@ class SessionRepository:
             rows = await cursor.fetchall()
             return [SessionModel.from_row(row) for row in rows]
 
-    async def cleanup_old_sessions(self, days: int = 30) -> int:
-        """Mark old sessions as inactive."""
-        async with self.db.get_connection() as conn:
-            cursor = await conn.execute(
-                """
-                UPDATE sessions
-                SET is_active = FALSE
-                WHERE last_used < datetime('now', '-' || ? || ' days')
-                  AND is_active = TRUE
-            """,
-                (days,),
-            )
-            await conn.commit()
-
-            affected = cursor.rowcount
-            logger.info("Cleaned up old sessions", count=affected, days=days)
-            return affected
+    # `cleanup_old_sessions(days)` was deleted 2026-09-10 (dv-2a5a). It was
+    # a second, uncalled age-based soft delete of resume mappings; see the
+    # note in SessionStorage (session_storage.py) for why none may exist.
 
     async def get_sessions_by_project(self, project_path: str) -> List[SessionModel]:
         """Get sessions for a specific project."""
@@ -512,6 +498,131 @@ class MessageRepository:
             )
             rows = await cursor.fetchall()
             return [MessageModel.from_row(row) for row in rows]
+
+    async def get_message_timestamp(self, message_id: int) -> Any:
+        """Raw ``timestamp`` value for one message, or None. The caller owns
+        normalizing it (PARSE_DECLTYPES usually hands back a ``datetime``
+        already, but the evaluator's checkpoint lookup defensively accepts
+        either -- see src/evaluator/service.py)."""
+        async with self.db.get_connection() as conn:
+            cur = await conn.execute(
+                "SELECT timestamp FROM messages WHERE message_id=?",
+                (message_id,),
+            )
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def get_recent_pairs(
+        self, session_id: str, limit: int
+    ) -> List[Tuple[Optional[str], Optional[str]]]:
+        """Last ``limit`` stored (prompt, response) pairs for a session,
+        oldest-first. Shared by the Claude facade's cold-start/heal seed and
+        the Codex backend's dead-thread seed (dv-5e4f Phase 0: both read the
+        identical shape, previously duplicated as raw SQL in each file)."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT prompt, response FROM messages "
+                "WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (session_id, limit),
+            )
+            rows = await cursor.fetchall()
+        return [(r[0], r[1]) for r in reversed(rows)]
+
+    async def get_recent_pairs_for_dir(
+        self, user_id: int, project_path: str, cutoff_iso: str, limit: int
+    ) -> List[Tuple[Optional[str], Optional[str]]]:
+        """Last ``limit`` stored (prompt, response) pairs for a WORKSPACE at
+        or after ``cutoff_iso`` (an ISO-8601 UTC string, compared
+        lexicographically), oldest-first, across every session that
+        workspace had. The unit here is the workspace, not one session."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT m.prompt, m.response FROM messages m "
+                "JOIN sessions s ON s.session_id = m.session_id "
+                "WHERE s.project_path = ? AND m.user_id = ? "
+                "AND m.timestamp >= ? "
+                "ORDER BY m.timestamp DESC LIMIT ?",
+                (project_path, user_id, cutoff_iso, limit),
+            )
+            rows = await cursor.fetchall()
+        return [(r[0], r[1]) for r in reversed(rows)]
+
+    async def count_dir_messages(
+        self, user_id: int, project_path: str, cutoff_iso: str
+    ) -> int:
+        """Total stored turns for a workspace at/after ``cutoff_iso``."""
+        async with self.db.get_connection() as conn:
+            row = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM messages m "
+                    "JOIN sessions s ON s.session_id = m.session_id "
+                    "WHERE s.project_path = ? AND m.user_id = ? "
+                    "AND m.timestamp >= ?",
+                    (project_path, user_id, cutoff_iso),
+                )
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    async def count_session_messages(self, session_id: str) -> int:
+        """Total stored turns for a session."""
+        async with self.db.get_connection() as conn:
+            row = await (
+                await conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    async def get_conversation_chronological(
+        self, session_id: str
+    ) -> List[Tuple[Optional[str], Optional[str]]]:
+        """Every (prompt, response) pair for a session, oldest-first -- the
+        evaluator's extraction input."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT prompt, response FROM messages "
+                "WHERE session_id = ? ORDER BY timestamp ASC",
+                (session_id,),
+            )
+            rows = await cursor.fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    async def get_window_messages(
+        self, user_id: int, project_path: str, window_id: int, after_message_id: int
+    ) -> List[Tuple[Optional[str], Optional[str]]]:
+        """(prompt, response) pairs for one profile's conversation window,
+        oldest-first, strictly after ``after_message_id``. Joined to
+        ``sessions`` and filtered on ``project_path`` -- ``window_id`` alone
+        is only unique within a (user_id, working_dir) pair, so a bare
+        window_id filter can pull another profile's messages into this
+        window's conversation text."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT m.prompt, m.response FROM messages m "
+                "JOIN sessions s ON m.session_id = s.session_id "
+                "WHERE m.user_id=? AND s.project_path=? AND m.window_id=? "
+                "AND m.message_id > ? "
+                "ORDER BY m.message_id ASC",
+                (user_id, project_path, window_id, after_message_id),
+            )
+            rows = await cursor.fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    async def max_message_id_for_project(self, user_id: int, project_path: str) -> int:
+        """Highest message_id stored for this (user, working_dir). Scoped,
+        not a global MAX(message_id) -- see windowing/turns callers for why
+        (the evaluator checkpoint cursor must never advance on another
+        profile's messages)."""
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT COALESCE(MAX(m.message_id), 0) FROM messages m "
+                "JOIN sessions s ON m.session_id = s.session_id "
+                "WHERE m.user_id=? AND s.project_path=?",
+                (user_id, project_path),
+            )
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
 
     async def search_fts(
         self,

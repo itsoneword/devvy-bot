@@ -111,7 +111,7 @@ Registered but unlisted — type them and they work: `/auth`, `/verbose`, `/memo
 it cannot drift. Owner-only commands (`/restart`, `/auth`, `/adduser`, …) are hidden from guests.
 
 `/verbose 0|1|2` controls how much of Claude's tool use is shown: quiet, normal, or detailed.
-`/model` switches between the Claude Code and OpenAI Codex backends.
+`/model` switches between the Claude Code and OpenAI Codex backends; Codex choices come from the account's live entitlement catalog.
 
 ## Profiles
 

@@ -207,29 +207,6 @@ class TestStorageFacade:
         assert not audit_logs[0].success
         assert audit_logs[0].event_data["reason"] == "invalid_token"
 
-    async def test_cleanup_old_data(self, storage):
-        """Test cleaning up old data."""
-        # Setup user and old session
-        await storage.get_or_create_user(12353, "cleanupuser")
-        await storage.create_session(12353, "/test/cleanup", "cleanup-session")
-
-        # Manually set old timestamp in database
-        async with storage.db_manager.get_connection() as conn:
-            await conn.execute(
-                "UPDATE sessions SET last_used = datetime('now', '-35 days') "
-                "WHERE session_id = ?",
-                ("cleanup-session",),
-            )
-            await conn.commit()
-
-        # Cleanup old data
-        result = await storage.cleanup_old_data(days=30)
-        assert result["sessions_cleaned"] == 1
-
-        # Verify session is inactive
-        session = await storage.sessions.get_session("cleanup-session")
-        assert not session.is_active
-
     async def test_get_user_dashboard(self, storage):
         """Test getting user dashboard data."""
         # Setup user with activity

@@ -13,6 +13,7 @@ import structlog
 
 from src import __version__
 from src.agent_backends import AgentBackend, CodexCliIntegration, CodexSessionStore
+from src.storage.model_calls import ModelCallRepository
 from src.bot.core import ClaudeCodeBot
 from src.bot.features.self_modify import SelfModificationGuard
 from src.claude import (
@@ -265,7 +266,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         token_tracker=token_tracker,
         db=storage.db_manager,
         model=config.evaluator_model,
-        lean_context=config.evaluator_lean_context,
+        codex_model=config.evaluator_codex_model,
         max_delta_chars=config.evaluator_max_delta_chars,
         timeout_seconds=config.evaluator_timeout_seconds,
         episodic_guard_enabled=config.evaluator_episodic_guard,
@@ -286,6 +287,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         profile_registry = load_profile_registry(
             config.profiles_config_path,
             sandbox_default=config.sandbox_enabled,
+            data_root=config.devvy_data_root,
         )
         # First run materialises each profile's working_dir, memory_dir and
         # persona from templates; re-runs never overwrite. Must precede
@@ -364,9 +366,29 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         digest_provider=digest_provider,
     )
 
+    # Populate account entitlements before synchronous model-policy reads can
+    # validate (and potentially repair) a persisted preference.  Without this
+    # boot refresh, the cold fallback catalog used to rewrite a saved Sol pick
+    # to the obsolete mini default before the first Codex turn.
+    from src.agent_backends.codex_catalog import CODEX_CATALOG
+
+    await CODEX_CATALOG.get(force=True)
+
+    # dv-ebde: Codex thread bookkeeping moved from data/codex_sessions.json
+    # onto the `sessions` row. One-shot, idempotent, read-only on the file
+    # (kept as the rollback copy for one release).
+    from src.storage.codex_sessions import import_codex_sessions_json
+
+    try:
+        await import_codex_sessions_json(
+            storage.db_manager, config.codex_session_store_path
+        )
+    except Exception as e:  # a failed import must not stop the bot
+        logger.warning("Codex session JSON import failed", error=str(e))
+
     codex_integration = CodexCliIntegration(
         config=config,
-        session_store=CodexSessionStore(config.codex_session_store_path),
+        session_store=CodexSessionStore(storage.db_manager),
         prompt_composer=prompt_composer,
         profile_registry=profile_registry,
         memory_retriever=memory_retriever,
@@ -437,6 +459,37 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         codex_integration.backend_id: codex_integration,
     }
 
+    # Model router (dv-11a5): every model call goes through it and leaves a
+    # `model_calls` row. It owns the registry above; plain calls made outside
+    # a handler (consolidation, fact-quality) reach it via get_router().
+    from src.model_router import HarnessVersions, ModelRouter, set_router
+    from src.model_router.claude_plain import ClaudePlainCaller
+    from src.model_router.codex_plain import CodexPlainCaller
+    from src.model_router.openrouter_plain import OpenRouterPlainCaller
+    from src.model_router.types import CLAUDE_HARNESS, CODEX_HARNESS, OPENROUTER_HARNESS
+
+    def _profile_slug_for(working_dir: Path) -> Optional[str]:
+        if profile_registry is None:
+            return None
+        profile = profile_registry.get_by_working_dir(working_dir)
+        return profile.slug if profile is not None else None
+
+    model_router = ModelRouter(
+        backends=backends,
+        plain_callers={
+            CLAUDE_HARNESS: ClaudePlainCaller(cli_path=config.claude_cli_path or None),
+            CODEX_HARNESS: CodexPlainCaller(codex_bin=codex_integration.codex_bin),
+            OPENROUTER_HARNESS: OpenRouterPlainCaller(),
+        },
+        recorder=ModelCallRepository(storage.db_manager),
+        versions=HarnessVersions(
+            claude_path=config.claude_cli_path or None,
+            codex_bin=codex_integration.codex_bin,
+        ),
+        profile_resolver=_profile_slug_for,
+    )
+    set_router(model_router)
+
     # Create bot with all dependencies
     dependencies = {
         "auth_manager": auth_manager,
@@ -444,6 +497,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "rate_limiter": rate_limiter,
         "audit_logger": audit_logger,
         "backends": backends,
+        "model_router": model_router,
         # Pre-registry keys, kept for the dv-5368 transition; orchestration
         # reads bot_data["backends"] and only falls back to these.
         "claude_integration": claude_integration,
@@ -660,7 +714,7 @@ async def run_application(app: Dict[str, Any]) -> None:
             event_bus=event_bus,
             bot=telegram_bot,
             default_chat_ids=config.notification_chat_ids or [],
-            pin_state_path=Path("data/pinned_messages.json"),
+            pin_store=storage.pinned_messages,
             sent_messages=storage.sent_messages,
         )
         notification_service.register()
@@ -698,6 +752,7 @@ async def run_application(app: Dict[str, Any]) -> None:
                 db=storage.db_manager,
                 notify_callback=_notify_owner,
                 board=storage.tasks,
+                report_dir=config.data_layout.consolidation_dir,
             )
             app["consolidation_service"] = consolidation_service
 
@@ -750,9 +805,49 @@ async def run_application(app: Dict[str, Any]) -> None:
                 message_repo=storage.messages,
                 audit_memory_writer=app.get("audit_memory_writer"),
                 user_data=storage.user_data,
+                user_timezone=config.user_timezone,
             )
+            if config.hireli_mcp_url and config.hireli_service_key:
+                from src.claude.hireli_tools import HireliClient
+
+                agent_services.hireli = HireliClient(
+                    config.hireli_mcp_url,
+                    config.hireli_service_key.get_secret_value(),
+                )
+            # exchange_* tools (dv-8664): run the owner's fetchcrypto /
+            # fetchmexc scripts. Same ~/tools root the Bash money-script gate
+            # watches (src/security/destructive.py).
+            from src.claude.exchange_tools import VENUES, ExchangeClient
+
+            exchange_root = Path.home() / "tools"
+            if any((exchange_root / v.directory).is_dir() for v in VENUES.values()):
+                agent_services.exchange = ExchangeClient(exchange_root)
         except Exception as e:  # pragma: no cover - defensive wiring guard
             logger.warning("Failed to build agent MCP services", error=str(e))
+
+        # Family todos & reminders (dv-752a): one ItemService shared by the
+        # item_* tools, the scheduler fire path, the per-turn injection on
+        # both backends, and /reminders.
+        if agent_services is not None:
+            try:
+                from src.items.repository import ItemRepository
+                from src.items.service import ItemService
+
+                _user_store = bot.deps.get("user_store")
+                item_service = ItemService(
+                    ItemRepository(storage.db_manager),
+                    scheduler=scheduler,
+                    profile_registry=bot.deps.get("profile_registry"),
+                    default_tz=config.user_timezone,
+                    role_lookup=(_user_store.get_role_cached if _user_store else None),
+                )
+                agent_services.items = item_service
+                bot.deps["item_service"] = item_service
+                app["agent_handler"].items = item_service
+                for backend in app.get("backends", {}).values():
+                    backend.items_service = item_service
+            except Exception as e:  # pragma: no cover - defensive wiring guard
+                logger.warning("Failed to build item service", error=str(e))
 
         # The same tools, second transport (dv-ffcb): a loopback HTTP MCP
         # endpoint so the out-of-process Codex backend can reach them. Started
@@ -841,6 +936,25 @@ async def run_application(app: Dict[str, Any]) -> None:
         except Exception as e:  # pragma: no cover - defensive wiring guard
             logger.warning("Failed to attach confirmation manager", error=str(e))
 
+        # One tool-call policy for both backends (dv-1601): Codex's
+        # PreToolUse hook reaches the rules the Claude hook runs in-process
+        # through the bridge. Attached even when the confirmation manager
+        # failed to wire: denies still hold, and an "ask" is then denied.
+        if agent_bridge is not None:
+            from src.security.policy import turn_policy_for
+
+            policy_registry = bot.deps.get("profile_registry")
+            agent_bridge.attach_policy(
+                lambda ctx: turn_policy_for(
+                    policy_registry,
+                    config.sandbox_enabled,
+                    ctx.working_dir,
+                    user_id=ctx.user_id,
+                    role=ctx.role,
+                ),
+                bot.deps.get("confirmation_manager"),
+            )
+
         # Session watchdog alert (dv-8bb5). Same reasons as the confirmation
         # gate above for wiring here: needs the Telegram bot instance, and
         # prompts go to the owner chat(s).
@@ -905,6 +1019,8 @@ async def run_application(app: Dict[str, Any]) -> None:
                     storage.db_manager,
                     scheduler=scheduler,
                     profile_registry=bot.deps.get("profile_registry"),
+                    confirmation_manager=bot.deps.get("confirmation_manager"),
+                    model_calls=ModelCallRepository(storage.db_manager),
                 )
             )
             tasks.append(api_task)
@@ -980,6 +1096,11 @@ async def main() -> None:
         from src.config import FeatureFlags, load_config
 
         config = load_config(config_file=args.config_file)
+        # Settings now holds the secrets; no child process may inherit them
+        # (dv-2976). Before create_application: nothing has spawned yet.
+        from src.config.loader import scrub_secrets_from_environ
+
+        scrub_secrets_from_environ(config, args.config_file)
         features = FeatureFlags(config)
 
         logger.info(

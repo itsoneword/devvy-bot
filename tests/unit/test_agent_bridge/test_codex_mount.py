@@ -13,7 +13,7 @@ from typing import Optional
 
 import pytest
 
-from src.agent_backends.codex_cli import CodexCliIntegration, CodexSessionStore
+from src.agent_backends.codex_cli import CodexCliIntegration, InMemoryCodexSessionStore
 from src.agent_bridge import TOKEN_ENV_VAR
 from src.agent_bridge.tokens import TokenRegistry
 from src.claude.tool_context import TurnContext
@@ -122,7 +122,7 @@ class TestMount:
     def test_bridge_is_mounted_on_every_profile(self, tmp_path, settings) -> None:
         integ = CodexCliIntegration(
             config=settings,
-            session_store=CodexSessionStore(tmp_path / "s.json"),
+            session_store=InMemoryCodexSessionStore(),
             profile_registry=_FakeRegistry([_FakeProfile(working_dir=tmp_path)]),
             agent_bridge=FakeBridge(),
         )
@@ -151,7 +151,7 @@ class TestMount:
         channel_dir = tmp_path / "channel"
         integ = CodexCliIntegration(
             config=settings,
-            session_store=CodexSessionStore(tmp_path / "s.json"),
+            session_store=InMemoryCodexSessionStore(),
             profile_registry=_FakeRegistry(
                 [_FakeProfile(working_dir=channel_dir, mcp=seam)]
             ),
@@ -169,7 +169,7 @@ class TestMount:
     def test_no_bridge_no_mount(self, tmp_path, settings) -> None:
         integ = CodexCliIntegration(
             config=settings,
-            session_store=CodexSessionStore(tmp_path / "s.json"),
+            session_store=InMemoryCodexSessionStore(),
             profile_registry=_FakeRegistry([_FakeProfile(working_dir=tmp_path)]),
         )
         argv = integ._build_argv(
@@ -203,7 +203,7 @@ class TestStdioMcpMount:
     def _integration(self, tmp_path: Path, settings) -> CodexCliIntegration:
         return CodexCliIntegration(
             config=settings,
-            session_store=CodexSessionStore(tmp_path / "s.json"),
+            session_store=InMemoryCodexSessionStore(),
             profile_registry=_FakeRegistry([_FakeProfile(working_dir=tmp_path)]),
         )
 
@@ -270,7 +270,7 @@ class TestTokenLifecycle:
     def _integration(self, tmp_path, settings, bridge, binary=None):
         return CodexCliIntegration(
             config=settings,
-            session_store=CodexSessionStore(tmp_path / "s.json"),
+            session_store=InMemoryCodexSessionStore(),
             codex_bin=str(binary or _env_dumping_codex(tmp_path)),
             profile_registry=_real_registry(tmp_path),
             agent_bridge=bridge,
@@ -353,3 +353,62 @@ class TestTokenLifecycle:
         assert ctx.working_dir == tmp_path
         assert ctx.memory_agent_id and ctx.family_agent_id
         assert ctx.family_agent_id.startswith("f7:")
+
+
+class PolicyBridge(FakeBridge):
+    """A bridge that also serves the tool-call policy (dv-1601)."""
+
+    policy_url = "http://127.0.0.1:8770/policy/check"
+
+
+class TestPolicyHookMount:
+    def _argv(self, tmp_path, settings, bridge, resume_id=None):
+        integ = CodexCliIntegration(
+            config=settings,
+            session_store=InMemoryCodexSessionStore(),
+            profile_registry=_FakeRegistry([_FakeProfile(working_dir=tmp_path)]),
+            agent_bridge=bridge,
+        )
+        return integ._build_argv(
+            model="openai-codex/gpt-5.4-mini",
+            cwd=tmp_path,
+            out_file=tmp_path / "o.txt",
+            resume_id=resume_id,
+        )
+
+    def test_the_hook_is_mounted_when_the_bridge_serves_policy(
+        self, tmp_path, settings
+    ) -> None:
+        argv = self._argv(tmp_path, settings, PolicyBridge())
+        assert "--dangerously-bypass-hook-trust" in argv
+        (hooks,) = [a for a in argv if a.startswith("hooks.PreToolUse=")]
+        # every tool call, the bot's own script, room for the owner's answer
+        assert 'matcher=""' in hooks
+        assert "codex_policy_hook.py" in hooks
+        assert "timeout=300" in hooks
+        script = hooks.split("codex_policy_hook.py")[0].split(" ")[-1]
+        assert Path(script + "codex_policy_hook.py").is_file()
+
+    def test_the_hook_precedes_the_resume_subcommand(self, tmp_path, settings) -> None:
+        argv = self._argv(tmp_path, settings, PolicyBridge(), resume_id="thread-1")
+        assert argv.index("--dangerously-bypass-hook-trust") < argv.index("resume")
+
+    def test_no_policy_no_hook(self, tmp_path, settings) -> None:
+        for bridge in (FakeBridge(), None):
+            argv = self._argv(tmp_path, settings, bridge)
+            assert "--dangerously-bypass-hook-trust" not in argv
+            assert not any(a.startswith("hooks.") for a in argv)
+
+    async def test_the_policy_url_reaches_the_child_env(
+        self, tmp_path, settings
+    ) -> None:
+        integ = CodexCliIntegration(
+            config=settings,
+            session_store=InMemoryCodexSessionStore(),
+            codex_bin=str(_env_dumping_codex(tmp_path)),
+            profile_registry=_real_registry(tmp_path),
+            agent_bridge=PolicyBridge(),
+        )
+        await integ.run_command("hi", tmp_path, user_id=111, role="owner")
+        child_env = (tmp_path / "child_env.txt").read_text()
+        assert "DEVVY_POLICY_URL=http://127.0.0.1:8770/policy/check" in child_env

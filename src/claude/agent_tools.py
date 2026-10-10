@@ -20,14 +20,18 @@ import asyncio
 import json
 import os
 from datetime import UTC, datetime
+from datetime import tzinfo as _tzinfo
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
 from claude_agent_sdk import create_sdk_mcp_server
 
 from ..evaluator.validator import MAX_CONTENT_LENGTH, VALID_TIERS
 from ..events.types import AgentResponseEvent
+from .exchange_tools import EXCHANGE_SPECS
+from .hireli_tools import HIRELI_SPECS
+from .item_tools import ITEM_SPECS
 from .tool_context import (
     AgentServices,
     ToolPredicate,
@@ -39,6 +43,9 @@ from .tool_context import (
 from .tool_schema import tool_schema
 from .user_data_tools import USER_DATA_READ_SPECS, USER_DATA_WRITE_SPECS
 from .weather_tool import get_weather_for
+
+if TYPE_CHECKING:
+    from zoneinfo import ZoneInfo
 
 logger = structlog.get_logger()
 
@@ -141,41 +148,48 @@ def _id_arg(args: Dict[str, Any], key: str) -> Optional[int]:
     return n if n > 0 else None
 
 
-def _parse_dt(value: str) -> datetime:
-    """Parse an ISO datetime; assume UTC when no offset is given."""
+def _resolve_tz(name: str) -> "ZoneInfo":
+    """The configured local zone, falling back to UTC for a bad name.
+
+    A misconfigured ``USER_TIMEZONE`` must not break every ``schedule_add``
+    call (dv-ca94).
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        return ZoneInfo(name or "UTC")
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
+
+
+def _parse_dt(value: str, local_tz: _tzinfo) -> datetime:
+    """Parse an ISO datetime.
+
+    A naive value (no UTC offset) is interpreted in ``local_tz`` — the
+    install's configured user timezone — not UTC (dv-ca94): an agent that
+    types "today at 17:00" as a bare ISO string means the user's local
+    17:00, and silently treating that as UTC fired reminders an hour+ late
+    for a Lisbon user. A value WITH an explicit offset (``Z``, ``+01:00``,
+    ...) is left exactly as given — the caller already disambiguated it.
+    """
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
+        dt = dt.replace(tzinfo=local_tz)
     return dt
 
 
 def _owns_scheduled_job(ctx: TurnContext, row: Dict[str, Any]) -> bool:
     """May this turn see/remove this ``scheduled_jobs`` row?
 
-    ``JobScheduler.list_jobs()`` is ``SELECT * FROM scheduled_jobs WHERE
-    is_active = 1`` and ``remove_job()`` takes only an id — neither has ever
-    had an owner filter (dv-8c19). Exposing ``schedule_list`` over the bridge
-    without one would hand any Codex turn every other user's reminder prompts
-    and target chat ids, so the gate lives HERE, in the shared handler, rather
-    than in the bridge: papering over it in one transport would leave the
-    Claude path exactly as leaky as it is today.
-
-    Rules, fail-closed:
-
-    * a row is yours when ``created_by`` equals this turn's ``user_id``;
-    * ``created_by == 0`` means *unattributed* — every row written before
-      dv-3e91 taught ``schedule_add`` to stamp the creator. Those are visible
-      to an ``owner``-role turn only, so the four live legacy jobs stay
-      manageable from chat and a guest still sees none of them.
-
-    Deliberately NOT "owner sees everything": this deployment has two
-    owner-role people, and the whole point of the ticket is that one of them
-    must not read the other's jobs.
+    Thin wrapper over :func:`src.scheduler.scheduler.job_visible_to` — THE
+    authorization rule (dv-8c19), shared with the ``/schedules`` command so
+    the two paths can't drift. Exposing ``schedule_list``/``schedule_remove``
+    over the bridge without it would hand any Codex turn every other user's
+    reminder prompts and target chat ids.
     """
-    created_by = int(row.get("created_by") or 0)
-    if created_by:
-        return ctx.user_id is not None and created_by == int(ctx.user_id)
-    return ctx.role == "owner"
+    from ..scheduler.scheduler import job_visible_to
+
+    return job_visible_to(row, ctx.user_id, ctx.role, ctx.requester_chat_id)
 
 
 def _job_tools_allowed(role: Optional[str]) -> bool:
@@ -285,16 +299,23 @@ async def notify(
 @_spec(
     "schedule_add",
     "Register a scheduled job that survives restarts. Provide exactly one of "
-    "'cron' (crontab syntax, server time is UTC) or 'at' (ISO datetime, UTC "
-    "unless offset given). Two delivery modes: deliver='message' sends the "
-    "prompt text to the user VERBATIM when it fires — no agent turn, so "
-    "write the final user-facing message in the user's language, as if you "
-    "were sending it yourself at that moment. deliver='agent' (default) "
-    "runs the prompt as an agent turn in the target profile first. Prefer "
-    "'at' + deliver='message' for one-shot reminders (cheap, keeps the "
-    "conversation cache warm); use deliver='agent' only when the firing "
-    "turn must look at fresh data before writing to the user. 'cron' for "
-    "routines.",
+    "'cron' (crontab syntax, server time is UTC) or 'at' (ISO datetime). "
+    "For 'at': give a bare local time/date with NO UTC offset ('2026-09-27T"
+    "17:00:00') and it is interpreted in the user's local timezone (see the "
+    "<current_time> line in this turn) — do not convert it to UTC yourself, "
+    "that is how reminders end up an hour off. Give an explicit offset only "
+    "when you mean UTC or another zone on purpose. The reply echoes back "
+    "both the local and UTC time actually stored — check it. Two delivery "
+    "modes: deliver='message' sends the prompt text to the user VERBATIM "
+    "when it fires — no agent turn, so write the final user-facing message "
+    "in the user's language, as if you were sending it yourself at that "
+    "moment. deliver='agent' (default) runs the prompt as an agent turn in "
+    "the target profile first. Prefer 'at' + deliver='message' for one-shot "
+    "reminders (cheap, keeps the conversation cache warm); use "
+    "deliver='agent' only when the firing turn must look at fresh data "
+    "before writing to the user. 'cron' for routines. For a reminder to the "
+    "user or a family member use item_add instead — it is visible to both "
+    "sides and runs in local time.",
     # cron/at are deliberately BOTH optional: the handler rejects the call
     # when neither or both are supplied, so requiring either here would
     # make the schema demand exactly what the handler refuses.
@@ -327,10 +348,11 @@ async def schedule_add(
     deliver = (args.get("deliver") or "agent").strip()
     if deliver not in ("agent", "message"):
         return _err("deliver must be 'agent' or 'message'")
+    local_tz = _resolve_tz(services.user_timezone)
     run_at: Optional[datetime] = None
     if at_raw:
         try:
-            run_at = _parse_dt(at_raw)
+            run_at = _parse_dt(at_raw, local_tz)
         except ValueError:
             return _err(f"could not parse 'at' datetime: {at_raw!r}")
         if run_at <= datetime.now(UTC):
@@ -354,7 +376,14 @@ async def schedule_add(
     except ValueError as exc:
         return _err(str(exc))
     logger.info("agent tool schedule_add", profile=ctx.profile_slug, job_id=job_id)
-    return _text({"status": "scheduled", "job_id": job_id})
+    result: Dict[str, Any] = {"status": "scheduled", "job_id": job_id}
+    if run_at is not None:
+        # Unambiguous: what got stored (UTC) alongside what it means for the
+        # user (local) — so a confirmation the model relays states the right
+        # time even if it never reasoned about the offset itself (dv-ca94).
+        result["at_local"] = run_at.astimezone(local_tz).isoformat()
+        result["at_utc"] = run_at.astimezone(UTC).isoformat()
+    return _text(result)
 
 
 @_spec(
@@ -369,7 +398,15 @@ async def schedule_list(
     if not services.scheduler:
         return _err("scheduler not enabled")
     rows = await services.scheduler.list_jobs()
-    return _text([row for row in rows if _owns_scheduled_job(ctx, row)])
+    # Item-linked jobs are managed through item_* (dv-752a): the item is the
+    # source of truth, removing its job alone would leave a zombie item.
+    return _text(
+        [
+            row
+            for row in rows
+            if not row.get("item_id") and _owns_scheduled_job(ctx, row)
+        ]
+    )
 
 
 @_spec(
@@ -392,6 +429,11 @@ async def schedule_remove(
     row = next((r for r in rows if str(r.get("job_id")) == job_id), None)
     if row is None:
         return _text({"status": "not_found", "job_id": job_id})
+    if row.get("item_id"):
+        return _err(
+            f"job {job_id} fires item #{row['item_id']}; use item_cancel "
+            "with that id instead"
+        )
     if not _owns_scheduled_job(ctx, row):
         # A distinct message rather than a silent no-op (dv-6dbc: a denial the
         # agent can relay). Job ids are uuid4 hex, so saying "not yours"
@@ -426,7 +468,10 @@ async def task_add(
     due_raw = (args.get("due") or "").strip() or None
     if due_raw:
         try:
-            due_at = _parse_dt(due_raw)
+            # Task due dates stay UTC-default (unlike schedule_add's 'at',
+            # dv-ca94 is scoped to reminders) — the tool schema already
+            # documents 'due' as "ISO, UTC unless offset given".
+            due_at = _parse_dt(due_raw, UTC)
         except ValueError:
             return _err(f"could not parse 'due' datetime: {due_raw!r}")
     task_id = await services.task_repo.add_task(
@@ -1198,10 +1243,15 @@ async def memory_correct(
 
 
 # Every tool both transports can offer, in mount order: platform + jobs +
-# memory first, then the profile's data.db tools. Built at import time, after
-# every decorator above has run.
+# memory first, then the profile's data.db tools, then Hireli, then the
+# exchange tools. Built at import time, after every decorator above has run.
 ALL_TOOL_SPECS: List[ToolSpec] = (
-    AGENT_TOOL_SPECS + USER_DATA_READ_SPECS + USER_DATA_WRITE_SPECS
+    AGENT_TOOL_SPECS
+    + ITEM_SPECS
+    + USER_DATA_READ_SPECS
+    + USER_DATA_WRITE_SPECS
+    + HIRELI_SPECS
+    + EXCHANGE_SPECS
 )
 
 

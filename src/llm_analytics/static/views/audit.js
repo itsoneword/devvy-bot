@@ -235,7 +235,7 @@ export async function renderAudit(view, state) {
     // beside it only to expose how far it under-reads.
     const counterPeak = Math.max(...series.map((p) => p.bot_counter_cum));
     const contextPeak = Math.max(...series.map((p) => p.context_provided));
-    const threshold = ann.refresh_threshold || 320000;
+    const threshold = ann.refresh_threshold || 220000;
     const counterNote = `context peak ${fmtCompact(contextPeak)} of ${fmtCompact(threshold)}` +
       ` · flow counter peak ${fmtCompact(counterPeak)}` +
       (ann.db_current_counter != null ? ` (bot.db counter now ${fmtCompact(ann.db_current_counter)})` : "");
@@ -315,7 +315,7 @@ export async function renderAudit(view, state) {
     container.append(node);
 
     const n = series.length;
-    const refresh = ann.refresh_threshold || 320000;
+    const refresh = ann.refresh_threshold || 220000;
     let maxY = refresh * 1.08;
     for (const p of series) maxY = Math.max(maxY, p.context_provided, p.bot_counter_cum);
     const x = linScale(0, Math.max(1, n - 1), pad.l, pad.l + plotW);

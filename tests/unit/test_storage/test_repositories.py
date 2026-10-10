@@ -219,47 +219,6 @@ class TestSessionRepository:
         assert len(sessions) == 3
         assert all(s.user_id == 12350 for s in sessions)
 
-    async def test_cleanup_old_sessions(self, session_repo, user_repo):
-        """Test cleaning up old sessions."""
-        # Create user
-        user = UserModel(
-            user_id=12351,
-            telegram_username="cleanupuser",
-            first_seen=datetime.now(UTC),
-            last_active=datetime.now(UTC),
-            is_allowed=True,
-        )
-        await user_repo.create_user(user)
-
-        # Create old session
-        old_session = SessionModel(
-            session_id="old-session",
-            user_id=12351,
-            project_path="/test/old",
-            created_at=datetime.now(UTC) - timedelta(days=35),
-            last_used=datetime.now(UTC) - timedelta(days=35),
-        )
-        await session_repo.create_session(old_session)
-
-        # Create recent session
-        recent_session = SessionModel(
-            session_id="recent-session",
-            user_id=12351,
-            project_path="/test/recent",
-            created_at=datetime.now(UTC),
-            last_used=datetime.now(UTC),
-        )
-        await session_repo.create_session(recent_session)
-
-        # Cleanup old sessions
-        cleaned = await session_repo.cleanup_old_sessions(days=30)
-        assert cleaned == 1
-
-        # Check that only recent session is active
-        active_sessions = await session_repo.get_user_sessions(12351, active_only=True)
-        assert len(active_sessions) == 1
-        assert active_sessions[0].session_id == "recent-session"
-
 
 class TestMessageRepository:
     """Test message repository."""
@@ -756,6 +715,9 @@ class TestToolUsageRepository:
         assert read_stats["success_count"] == 3
         assert read_stats["error_count"] == 0
 
+
+class TestAuditLogRepository:
+    """Test audit log repository."""
 
 class TestAnalyticsRepository:
     """Test analytics repository."""

@@ -50,14 +50,12 @@ class CodexModel:
         return f"{CODEX_MODEL_PREFIX}{self.slug}"
 
 
-# Last-resort catalog: the two slugs the menu hardcoded before dv-0c01. Used
+# Last-resort catalog: stable, currently entitled slugs. Used
 # when `codex debug models` is unavailable (CLI missing, logged out, network
 # down) so /model never renders an empty backend section.
 FALLBACK_MODELS: Tuple[CodexModel, ...] = (
+    CodexModel(slug="gpt-5.6-sol", display_name="gpt-5.6-sol", context_window=272_000),
     CodexModel(slug="gpt-5.5", display_name="gpt-5.5", context_window=272_000),
-    CodexModel(
-        slug="gpt-5.4-mini", display_name="gpt-5.4-mini", context_window=272_000
-    ),
 )
 
 

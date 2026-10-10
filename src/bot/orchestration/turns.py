@@ -26,6 +26,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from ...profiles.registry import user_media_root
+from ...storage.repositories import MessageRepository
 from ..utils.draft_streamer import DraftStreamer, generate_draft_id
 from ..utils.formatting import FormattedMessage
 from ..utils.image_extractor import (
@@ -45,6 +46,7 @@ from .windowing import (
     _context_tokens_of,
     account_turn_and_maybe_eval,
     consume_pending_seed,
+    effective_refresh_threshold,
     mentions_remember_trigger,
     refresh_window,
     window_conversation_text,
@@ -160,6 +162,9 @@ class TurnState:
     # Set by ``_account_window``; read by ``_render_footer``.
     window_state_for_footer: Any = None
     window_rotated_for_footer: bool = False
+    # A backend switch's full-window rebuild opened this turn's session (dv-168e).
+    switch_rebuild_for_footer: bool = False
+    window_refresh_threshold_for_footer: Optional[int] = None
 
     @property
     def trigger_text(self) -> str:
@@ -266,15 +271,8 @@ class TurnsMixin(OrchestratorBase):
         if not storage:
             return 0
         wd = str(Path(working_dir))
-        async with storage.db_manager.get_connection() as conn:
-            cur = await conn.execute(
-                "SELECT COALESCE(MAX(m.message_id), 0) FROM messages m "
-                "JOIN sessions s ON m.session_id = s.session_id "
-                "WHERE m.user_id=? AND s.project_path=?",
-                (user_id, wd),
-            )
-            row = await cur.fetchone()
-            return int(row[0]) if row else 0
+        messages = MessageRepository(storage.db_manager)
+        return await messages.max_message_id_for_project(user_id, wd)
 
     def _media_working_dir(
         self, context: ContextTypes.DEFAULT_TYPE, user_id: int
@@ -574,12 +572,24 @@ class TurnsMixin(OrchestratorBase):
         # window row, not just user_data, so a restart between the roll
         # and this turn cannot cancel the rotation (dv-9f31).
         _wstate = await window_repo.get_or_create(user_id, current_dir)
+        refresh_threshold = effective_refresh_threshold(
+            window_repo.refresh_threshold_tokens,
+            backend=state.selected_backend,
+            model_ref=self._selected_model(context),
+        )
+        state.window_refresh_threshold_for_footer = refresh_threshold
+        # A switch arms a seed from the CURRENT window; a roll seeds from the
+        # previous one.
+        state.switch_rebuild_for_footer = (
+            _wstate.pending_seed_window is not None
+            and _wstate.pending_seed_window == _wstate.window_id
+        )
         force_new = (
             force_new
             or _wstate.force_new_session
             or bool(context.user_data.get("force_new_session"))
         )
-        if not force_new and window_repo.should_refresh(_wstate):
+        if not force_new and window_repo.should_refresh(_wstate, refresh_threshold):
             # Backstop: the window is already over the roll threshold and
             # nothing armed a transition (older build, lost flag, threshold
             # lowered under a running window, manual DB edit). Run the SAME
@@ -597,6 +607,7 @@ class TurnsMixin(OrchestratorBase):
                 user_id=user_id,
                 working_dir=str(current_dir),
                 context_tokens=_wstate.last_context_tokens,
+                refresh_threshold_tokens=refresh_threshold,
             )
             await refresh_window(
                 window_repo,
@@ -711,9 +722,15 @@ class TurnsMixin(OrchestratorBase):
             from .save_honesty import check_turn
 
             trigger_fired = mentions_remember_trigger(state.trigger_text)
+            # dv-73e2: a failed/denied tool call (now carries an "error", see
+            # sdk_integration/codex_cli) must not count as satisfying a write
+            # claim -- the name alone used to be enough.
+            successful_tool_names = [
+                t["name"] for t in claude_response.tools_used if not t.get("error")
+            ]
             honesty = check_turn(
                 claude_response.content,
-                [t["name"] for t in claude_response.tools_used],
+                successful_tool_names,
                 trigger_fired=trigger_fired,
                 force_eval_scheduled=(
                     trigger_fired
@@ -779,11 +796,248 @@ class TurnsMixin(OrchestratorBase):
         except Exception as e:
             logger.warning("Save-honesty check failed", error=str(e))
 
+    async def _run_recipe_search_retry(
+        self,
+        state: TurnState,
+        claude_response: "ClaudeResponse",
+        delivered_messages: List[FormattedMessage],
+    ) -> None:
+        """Recipe search-retry (dv-300d / dv-5d5f follow-up): if the answer
+        just delivered looks like a recipe and the turn made zero Web* tool
+        calls, run ONE follow-up turn in the same profile session asking it
+        to verify with a search, then deliver the verdict (dv-e7fa).
+
+        Called from ``_run_turn`` AFTER ``_deliver_reply`` -- the user sees
+        the original answer first, exactly as it was produced, before any
+        retry runs. ``delivered_messages`` is the exact list of
+        ``FormattedMessage`` that run just sent (post badge-prefix, post
+        footer), used to edit the original answer in place when the retry
+        confirms or corrects it instead of sending a second message.
+        Mechanical trigger only (``recipe_retry.needs_search_retry``):
+        an LLM judge cannot be trusted to decide this, see the dv-300d
+        validation gate (a blind judge scored a confidently wrong recipe as
+        highly as a correct one). Never raises -- telemetry + a best-effort
+        extra answer, not something that may break the primary turn.
+
+        No additional turn-lock acquisition here: ``_run_turn`` always runs
+        inside the caller's per-user turn lock -- both ``agentic_text`` and
+        ``_begin_media_turn`` wrap the *entire* ``_run_turn`` call in
+        ``async with lock:`` (see ``self._turn_lock``). This method executes
+        before that lock is released, so the retry's own ``run_command`` is
+        already serialized against another turn for the same user; taking
+        the same ``asyncio.Lock`` again here would deadlock (it is not
+        reentrant).
+        """
+        context = state.context
+        if not self.settings.recipe_retry_enabled:
+            return
+        storage = context.bot_data.get("storage")
+        if storage is None:
+            return
+        try:
+            from ...events.types import AgentResponseEvent
+            from .recipe_retry import (
+                RECIPE_RETRY_PROMPT,
+                RETRY_ATTEMPT_LABEL,
+                needs_search_retry,
+                parse_retry_verdict,
+            )
+
+            # "chef#u123" -> "chef": recipe_retry_profiles names bare slugs,
+            # not the per-user-scoped agent id (same split _agentic_text_turn
+            # uses for the profile badge lookup).
+            profile_slug = self._agent_id_for(
+                context, state.current_dir, state.user_id
+            ).split("#", 1)[0]
+            allowed_profiles = {
+                slug.strip()
+                for slug in self.settings.recipe_retry_profiles.split(",")
+                if slug.strip()
+            }
+            if profile_slug not in allowed_profiles:
+                return
+
+            tool_names = [t["name"] for t in claude_response.tools_used]
+            if not needs_search_retry(claude_response.content, tool_names):
+                return
+
+            active_integration = self._active_backend(context)
+            if active_integration is None:
+                return
+
+            await storage.log_bot_event(
+                state.user_id,
+                "recipe_retry_fired",
+                {
+                    "message_id": state.saved_message_id,
+                    "profile": profile_slug,
+                    "tools_used": tool_names,
+                },
+            )
+
+            chat = state.request.chat
+            retry_response = await self._router(context).run_turn(
+                active_integration,
+                purpose="chat",
+                prompt=RECIPE_RETRY_PROMPT,
+                working_directory=state.current_dir,
+                user_id=state.user_id,
+                requester_chat_id=chat.id,
+                role=state.request.role,
+            )
+
+            retry_tools = [t["name"] for t in retry_response.tools_used]
+            searched = any(name.startswith("Web") for name in retry_tools)
+
+            verdict, summary_line, body = parse_retry_verdict(
+                retry_response.content or ""
+            )
+
+            delivery = await self._deliver_recipe_retry_verdict(
+                state, verdict, summary_line, body, delivered_messages
+            )
+            if delivery == "separate":
+                # Fallback: today's behaviour. Covers a missing/unknown tag,
+                # no original message to edit, or the edit attempt itself
+                # failing (BadRequest, message too old, not found) -- never
+                # lose the retry content silently. Delivered via the event
+                # bus (like _run_save_honesty's owner alert) rather than
+                # reusing _deliver_reply directly: that helper needs the
+                # original telegram.Update (reply_to_message_id, the
+                # HTML->plain fallback, the sent_messages ledger call) which
+                # this hook does not have -- only TurnState/ClaudeResponse,
+                # by design, so it stays decoupled from the text/media
+                # Update shape. The NotificationService consumer already
+                # does the two things that matter for a second, unsolicited
+                # message: 4096-char chunking and rate limiting.
+                # parse_mode=None (plain text), matching
+                # _run_save_honesty's raw-content alerts -- the retry's
+                # content is unformatted model output, not HTML-escaped.
+                if retry_response.content:
+                    event_bus = context.bot_data.get("event_bus")
+                    if event_bus is not None:
+                        await event_bus.publish(
+                            AgentResponseEvent(
+                                chat_id=chat.id,
+                                text=(
+                                    f"{RETRY_ATTEMPT_LABEL}\n\n"
+                                    f"{retry_response.content}"
+                                ),
+                                parse_mode=None,
+                                source="recipe_retry",
+                            )
+                        )
+
+            await storage.log_bot_event(
+                state.user_id,
+                "recipe_retry_done",
+                {
+                    "message_id": state.saved_message_id,
+                    "profile": profile_slug,
+                    "searched": searched,
+                    "retry_tools_used": retry_tools,
+                    "verdict": verdict,
+                    "delivery": delivery,
+                },
+            )
+        except Exception as e:
+            logger.warning("Recipe search-retry failed", error=str(e))
+
+    async def _deliver_recipe_retry_verdict(
+        self,
+        state: TurnState,
+        verdict: Optional[str],
+        summary_line: Optional[str],
+        body: Optional[str],
+        delivered_messages: List[FormattedMessage],
+    ) -> str:
+        """Act on a parsed retry verdict; return "edited"/"appended"/"separate".
+
+        Never raises -- any failure (missing ledger rows, a Telegram edit
+        error) is reported as "separate" so the caller falls back to
+        sending the retry as a new message rather than losing it.
+        """
+        if verdict is None or not summary_line:
+            return "separate"
+        storage = state.context.bot_data.get("storage")
+        if storage is None or state.saved_message_id is None or not delivered_messages:
+            return "separate"
+        try:
+            sent_rows = await storage.sent_messages.list_for_message(
+                state.saved_message_id
+            )
+        except Exception as e:
+            logger.warning("recipe_retry: sent_messages lookup failed", error=str(e))
+            return "separate"
+        if not sent_rows:
+            return "separate"
+        if len(sent_rows) != len(delivered_messages):
+            # The ledger is best-effort; a missed row would point the edit at
+            # the wrong part of a split answer.
+            return "separate"
+        last_row = sent_rows[-1]
+        multi_part = len(sent_rows) > 1
+        last_formatted = delivered_messages[-1]
+
+        from telegram.error import TelegramError
+
+        from ..utils.html_format import escape_html
+
+        bot = state.context.bot
+
+        if verdict == "ok":
+            safe_summary = (
+                escape_html(summary_line)
+                if last_formatted.parse_mode == "HTML"
+                else summary_line
+            )
+            new_text = f"{last_formatted.text}\n\n✅ Проверено: {safe_summary}"
+            if len(new_text) > 4096:
+                return "separate"
+            try:
+                await bot.edit_message_text(
+                    chat_id=last_row.telegram_chat_id,
+                    message_id=last_row.telegram_message_id,
+                    text=new_text,
+                    parse_mode=last_formatted.parse_mode,
+                )
+            except TelegramError as e:
+                logger.warning("recipe_retry: edit (ok) failed", error=str(e))
+                return "separate"
+            return "appended"
+
+        # verdict == "corrected": rebuild through the SAME formatting path
+        # the original answer used (markdown -> Telegram HTML), so the
+        # replacement message doesn't break HTML even though the header
+        # line and "what changed" summary are raw model output.
+        if multi_part:
+            return "separate"
+        from ..utils.formatting import ResponseFormatter
+
+        raw_text = f"✏️ v2 — исправлено после проверки: {summary_line}"
+        if body:
+            raw_text += f"\n\n{body}"
+        rebuilt = ResponseFormatter(self.settings).format_claude_response(raw_text)
+        if len(rebuilt) != 1 or len(rebuilt[0].text) > 4096:
+            return "separate"
+        new_message = rebuilt[0]
+        try:
+            await bot.edit_message_text(
+                chat_id=last_row.telegram_chat_id,
+                message_id=last_row.telegram_message_id,
+                text=new_message.text,
+                parse_mode=new_message.parse_mode,
+            )
+        except TelegramError as e:
+            logger.warning("recipe_retry: edit (corrected) failed", error=str(e))
+            return "separate"
+        return "edited"
+
     async def _account_window(
         self, state: TurnState, claude_response: "ClaudeResponse"
     ) -> None:
-        """Backend-agnostic token accounting + 50k evaluator checkpoint,
-        then the 150k compaction roll on the SAME backend.
+        """Backend-agnostic token accounting + evaluator checkpoint,
+        then a model-aware context roll on the SAME backend.
 
         Leaves ``window_state_for_footer`` / ``window_rotated_for_footer``
         on the state for ``_render_footer``. Never raises.
@@ -796,6 +1050,12 @@ class TurnsMixin(OrchestratorBase):
         current_dir = state.current_dir
         try:
             evaluator = context.bot_data.get("evaluator_service")
+            refresh_threshold = effective_refresh_threshold(
+                window_repo.refresh_threshold_tokens,
+                backend=state.selected_backend,
+                model_ref=self._selected_model(context),
+            )
+            state.window_refresh_threshold_for_footer = refresh_threshold
             # Resolve the active profile slug so facts are scoped to
             # *this* agent's memory, not the global default.
             agent_id = self._agent_id_for(context, current_dir, user_id)
@@ -823,12 +1083,13 @@ class TurnsMixin(OrchestratorBase):
                 # «запомнил» in the reply envelope cannot force an
                 # eval (dv-7783, msg-766).
                 force_eval=mentions_remember_trigger(state.trigger_text),
+                refresh_threshold_tokens=refresh_threshold,
             )
-            # 150k compaction: roll the window on the SAME backend and
-            # arm the seed so the next turn continues fresh.
+            # Model-aware context roll on the SAME backend; arm the seed so
+            # the next turn continues fresh.
             state_after = await window_repo.get_or_create(user_id, current_dir)
             state.window_state_for_footer = state_after
-            if window_repo.should_refresh(state_after):
+            if window_repo.should_refresh(state_after, refresh_threshold):
                 state.window_rotated_for_footer = True
                 await refresh_window(
                     window_repo,
@@ -890,7 +1151,16 @@ class TurnsMixin(OrchestratorBase):
             ]
             if cost_str:
                 footer_parts.append(cost_str)
-        if getattr(claude_response, "session_restarted", False):
+        # A fresh backend session is named as such, with its cause. Before
+        # dv-2a5a a silent context loss and a healthy window roll rendered
+        # as the same drop in the gauge; the 12h session expiry went
+        # unnoticed for two months behind that ambiguity (dv-6f1c).
+        fresh_reason = getattr(claude_response, "session_fresh_reason", None)
+        if state.switch_rebuild_for_footer and fresh_reason:
+            footer_parts.append("🆕 new session (model switch, history rebuilt)")
+        elif isinstance(fresh_reason, str) and fresh_reason:
+            footer_parts.append(f"🆕 new session ({fresh_reason})")
+        elif getattr(claude_response, "session_restarted", False):
             footer_parts.append("↻ session restarted (resume failed)")
         if state.window_rotated_for_footer:
             footer_parts.append("🔄 window rotated")
@@ -898,10 +1168,12 @@ class TurnsMixin(OrchestratorBase):
             # Real context vs the roll threshold. Was cumulative_tokens
             # (a flow sum measured on uncached input only), which read
             # ~2.5x low and made the gauge agree with the bug rather
-            # than with reality (dv-9f31).
+            # than with reality (dv-9f31). The window id follows so a
+            # level reset without an id change is visibly wrong.
             footer_parts.append(
                 f"win {state.window_state_for_footer.last_context_tokens // 1000}k/"
-                f"{state.window_repo.refresh_threshold_tokens // 1000}k"
+                f"{(state.window_refresh_threshold_for_footer or state.window_repo.refresh_threshold_tokens) // 1000}k"
+                f" #{state.window_state_for_footer.window_id}"
             )
 
         if footer_parts:
@@ -1133,6 +1405,12 @@ class TurnsMixin(OrchestratorBase):
                 force_new=force_new,
                 prompt_text=prompt_text,
             )
+        if force_new:
+            # A fresh session is owed: never hand the backend an explicit id
+            # to resume. Without a profile registry this is the user_data id,
+            # which after a backend switch-back is the stale session that
+            # lacks the other model's turns (dv-168e).
+            session_id = None
 
         # One-shot pending notes for this workspace (e.g. a verbatim
         # scheduled reminder delivered since the last turn): prepend so the
@@ -1194,7 +1472,9 @@ class TurnsMixin(OrchestratorBase):
             extra_kwargs: Dict[str, Any] = (
                 {"images": request.images} if request.pass_images_kwarg else {}
             )
-            claude_response = await active_integration.run_command(
+            claude_response = await self._router(context).run_turn(
+                active_integration,
+                purpose="chat",
                 prompt=prompt_text,
                 working_directory=current_dir,
                 user_id=user_id,
@@ -1301,6 +1581,16 @@ class TurnsMixin(OrchestratorBase):
 
         # Use MCP-collected images (from send_image_to_user tool calls)
         await self._deliver_reply(state, update, formatted_messages, mcp_images)
+
+        # Recipe search-retry (dv-300d / dv-5d5f follow-up): AFTER delivery,
+        # so the user sees the original answer first. Only runs when the
+        # primary turn actually produced a response (the except branch above
+        # replaces formatted_messages with an error notice, not a real
+        # answer, and claude_response may be unset there).
+        if success:
+            await self._run_recipe_search_retry(
+                state, claude_response, formatted_messages
+            )
 
         # Audit log (text path only — media turns never logged one).
         if request.audit_command is not None:

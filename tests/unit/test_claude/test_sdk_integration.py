@@ -436,6 +436,14 @@ class TestClaudeSandboxSettings:
 
     async def test_sandbox_settings_passed_to_options(self, sdk_manager, tmp_path):
         """Test that sandbox settings are set on ClaudeAgentOptions."""
+        from src.security.denylist import ProtectedDirs
+
+        secrets = tmp_path / "root" / "secrets"
+        archive = tmp_path / "archive"
+        db = tmp_path / "root" / "db"
+        for d in (secrets, archive, db):
+            d.mkdir(parents=True)
+        dirs = ProtectedDirs(everyone=(secrets, archive), tenant=(db,))
         captured_options = []
         mock_factory = _mock_client_factory(
             _make_assistant_message("Test response"),
@@ -443,8 +451,11 @@ class TestClaudeSandboxSettings:
             capture_options=captured_options,
         )
 
-        with patch(
-            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        with (
+            patch(
+                "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+            ),
+            patch("src.security.denylist.protected_dirs", return_value=dirs),
         ):
             await sdk_manager.execute_command(
                 prompt="Test prompt",
@@ -460,6 +471,8 @@ class TestClaudeSandboxSettings:
             "enabled": True,
             "autoAllowBashIfSandboxed": False,
             "excludedCommands": ["git", "npm"],
+            # dv-2c1c: bwrap hides the data-root areas from sandboxed bash.
+            "filesystem": {"denyRead": [str(secrets), str(archive), str(db)]},
         }
 
     async def test_system_prompt_set_with_working_directory(

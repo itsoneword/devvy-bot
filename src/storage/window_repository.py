@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import structlog
 
@@ -25,7 +25,10 @@ logger = structlog.get_logger()
 # uncached input only, which on a cache-hitting deployment is ~7 tokens a
 # call, so they actually fired at a real ~125k/~300k. These values reproduce
 # that observed cadence honestly. See dv-9f31.
-EVAL_INTERVAL_TOKENS = 120_000
+# 0 = no mid-window checkpoint (default since 2026-10-04): the roll-time
+# extraction re-reads the whole window anyway, so a checkpoint ~30k before it
+# was a second, mostly redundant run.
+EVAL_INTERVAL_TOKENS = 0
 REFRESH_THRESHOLD_TOKENS = 200_000
 
 # Backends that can report the conversation's real size per turn, so a missing
@@ -190,16 +193,22 @@ class WindowRepository:
         # zero (system prompt + persona + facts + tool schemas + seed, ~35-
         # 90k in this deployment) could have its very first turn's quotient
         # exceed a checkpoint that was wrongly reset to 0 (dv-r3c1 item 1).
-        return (
-            state.last_context_tokens // self.eval_interval_tokens
-        ) > state.last_eval_checkpoint
+        if self.eval_interval_tokens <= 0:
+            return False
+        return self._bucket(state.last_context_tokens) > state.last_eval_checkpoint
+
+    def _bucket(self, tokens: int) -> int:
+        """Checkpoint quotient; always 0 when checkpoints are off."""
+        if self.eval_interval_tokens <= 0:
+            return 0
+        return int(tokens) // self.eval_interval_tokens
 
     async def mark_evaluator_run(
         self, user_id: int, working_dir: PathLike, max_message_id: int
     ) -> None:
         wd = self._key(working_dir)
         st = await self.get_or_create(user_id, working_dir)
-        checkpoint = st.last_context_tokens // self.eval_interval_tokens
+        checkpoint = self._bucket(st.last_context_tokens)
         async with self._db.get_connection() as conn:
             await conn.execute(
                 "UPDATE conversation_windows SET last_eval_checkpoint=?, "
@@ -208,8 +217,22 @@ class WindowRepository:
             )
             await conn.commit()
 
-    def should_refresh(self, state: WindowState) -> bool:
-        return state.last_context_tokens >= self.refresh_threshold_tokens
+    def should_refresh(
+        self, state: WindowState, threshold_tokens: Optional[int] = None
+    ) -> bool:
+        """Whether ``state`` reached the caller's effective roll threshold.
+
+        ``threshold_tokens`` lets orchestration clamp the configured value to
+        the selected model's real context window without putting model-catalog
+        knowledge into this storage class.  Existing callers retain the
+        repository-wide configured threshold.
+        """
+        threshold = (
+            self.refresh_threshold_tokens
+            if threshold_tokens is None
+            else int(threshold_tokens)
+        )
+        return state.last_context_tokens >= threshold
 
     async def set_pending_transition(
         self,
@@ -285,6 +308,40 @@ class WindowRepository:
             )
             return [(r[0], r[1]) for r in await cur.fetchall()]
 
+    async def window_turns_with_tools(
+        self,
+        user_id: int,
+        working_dir: PathLike,
+        window_id: int,
+    ) -> List[Tuple[str, str, List[str]]]:
+        """EVERY turn of a window as [(prompt, response, tool_names)],
+        oldest first -- the backend-switch rebuild (dv-168e). ``tool_names``
+        are the tools that turn called, in call order (names only: no inputs,
+        outputs or thinking). Same join discipline as tail_messages: window_id
+        is only unique within a (user_id, working_dir) pair."""
+        wd = self._key(working_dir)
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(
+                "SELECT m.message_id, m.prompt, m.response FROM messages m "
+                "JOIN sessions s ON m.session_id = s.session_id "
+                "WHERE m.user_id=? AND s.project_path=? AND m.window_id=? "
+                "ORDER BY m.message_id ASC",
+                (user_id, wd, window_id),
+            )
+            messages = await cur.fetchall()
+            cur = await conn.execute(
+                "SELECT t.message_id, t.tool_name FROM tool_usage t "
+                "JOIN messages m ON t.message_id = m.message_id "
+                "JOIN sessions s ON m.session_id = s.session_id "
+                "WHERE m.user_id=? AND s.project_path=? AND m.window_id=? "
+                "ORDER BY t.id ASC",
+                (user_id, wd, window_id),
+            )
+            tools: Dict[int, List[str]] = {}
+            for message_id, tool_name in await cur.fetchall():
+                tools.setdefault(message_id, []).append(tool_name)
+        return [(r[1], r[2], tools.get(r[0], [])) for r in messages]
+
     async def count_window_messages(
         self,
         user_id: int,
@@ -331,7 +388,7 @@ class WindowRepository:
         st = await self.get_or_create(user_id, working_dir)
         old = st.window_id
         new = old + 1
-        baseline_checkpoint = int(initial_tokens) // self.eval_interval_tokens
+        baseline_checkpoint = self._bucket(initial_tokens)
         async with self._db.get_connection() as conn:
             await conn.execute(
                 "UPDATE conversation_windows SET window_id=?, active_backend=?, "

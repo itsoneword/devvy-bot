@@ -311,10 +311,10 @@ async def test_cd_with_only_codex_registered_clears_nothing_else(orch, settings)
 
 
 async def test_codex_sessions_for_user_maps_the_store(tmp_path):
-    from src.agent_backends import CodexSessionStore
+    from src.agent_backends import InMemoryCodexSessionStore
 
-    store = CodexSessionStore(tmp_path / "codex.json")
-    store.record(7, tmp_path / "wd", "thread-7", 100, 50)
+    store = InMemoryCodexSessionStore()
+    await store.record(7, tmp_path / "wd", "thread-7", 100, 50)
     integ = CodexCliIntegration(
         config=create_test_config(approved_directory=str(tmp_path)),
         session_store=store,
@@ -330,7 +330,8 @@ async def test_codex_sessions_for_user_maps_the_store(tmp_path):
         "openai_codex",
     )
     # Round-trips the store's ISO string exactly (what /sessions prints).
-    assert s.last_used.isoformat() == store.info_for(7, tmp_path / "wd")["updated_at"]
+    info = await store.info_for(7, tmp_path / "wd")
+    assert s.last_used.isoformat() == info["updated_at"]
 
 
 def test_attach_tools_each_backend_takes_its_transport(tmp_path):
@@ -341,10 +342,10 @@ def test_attach_tools_each_backend_takes_its_transport(tmp_path):
     claude.attach_tools(services, bridge)
     claude.sdk_manager.attach_agent_services.assert_called_once_with(services)
 
-    from src.agent_backends import CodexSessionStore
+    from src.agent_backends import InMemoryCodexSessionStore
 
     codex = CodexCliIntegration(
-        config=config, session_store=CodexSessionStore(tmp_path / "s.json")
+        config=config, session_store=InMemoryCodexSessionStore()
     )
     codex.attach_tools(services, None)
     assert codex.agent_bridge is None

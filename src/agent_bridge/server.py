@@ -46,7 +46,14 @@ from src.claude import agent_tools
 from src.claude.agent_tools import available_tool_specs
 from src.claude.tool_context import AgentServices, ToolSpec, TurnContext
 
-from .tokens import DEFAULT_TTL_SECONDS, TokenRegistry
+from .policy_gate import (
+    POLICY_PATH,
+    PolicyGate,
+    PolicyResolver,
+    check_tool_call,
+    gate_for,
+)
+from .tokens import DEFAULT_TTL_SECONDS, TokenRegistry, _hash
 
 logger = structlog.get_logger()
 
@@ -211,6 +218,25 @@ class AgentBridgeMcp(FastMCP):
             # Same answer for "no such tool" and "not yours": a caller must
             # not be able to probe what other sessions can do.
             return _error(f"tool {name!r} is not available in this session")
+        # The hook asked the owner before this call; the call itself runs only
+        # if decide() allows it or that approval exists (policy_gate rule 4).
+        request = self._request()
+        token = bearer_token(request.headers.get("authorization")) if request else None
+        refused = check_tool_call(
+            gate_for(request.app.state) if request is not None else None,
+            _hash(token) if token else "",
+            ctx,
+            name,
+            arguments or {},
+        )
+        if refused:
+            logger.warning(
+                "agent bridge refused tool call",
+                tool=name,
+                profile=ctx.profile_slug,
+                reason=refused,
+            )
+            return _error(f"{name} refused: {refused}")
         try:
             payload = await spec.handler(self._services, ctx, arguments or {})
         except Exception as exc:  # a tool must not take the turn down
@@ -247,8 +273,32 @@ def build_app(
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
             return await call_next(request)  # type: ignore[no-any-return]
 
+    async def policy_check(request: Request) -> Response:
+        """A backend's PreToolUse hook asking: may this tool call run?"""
+        token = bearer_token(request.headers.get("authorization"))
+        ctx = tokens.resolve(token)
+        if ctx is None or token is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        gate = gate_for(request.app.state)
+        if gate is None:
+            # Fail closed: a hook is installed but nothing can judge its calls.
+            return JSONResponse(
+                {"decision": "deny", "reason": "the policy service is not ready"}
+            )
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"decision": "deny", "reason": "unreadable policy request"}
+            )
+        return JSONResponse(await gate.check(_hash(token), ctx, body))
+
+    app.add_route(POLICY_PATH, policy_check, methods=["POST"])
     app.add_middleware(Auth)
     app.state.agent_bridge_mcp = mcp
+    app.state.policy_gate = None
     return app
 
 
@@ -281,6 +331,19 @@ class AgentBridge:
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}{MCP_PATH}"
+
+    @property
+    def policy_url(self) -> Optional[str]:
+        """The endpoint a backend's PreToolUse hook calls, once a gate is attached."""
+        if gate_for(self.app.state) is None:
+            return None
+        return f"http://{self.host}:{self.port}{POLICY_PATH}"
+
+    def attach_policy(
+        self, resolver: PolicyResolver, confirmation_manager: Any = None
+    ) -> None:
+        """Serve the shared tool-call policy to subprocess backends (dv-1601)."""
+        self.app.state.policy_gate = PolicyGate(resolver, confirmation_manager)
 
     async def start(self) -> None:
         """Bind the loopback socket and serve on it.

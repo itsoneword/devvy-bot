@@ -5,6 +5,7 @@ validates each path via :func:`validate_image_path` and collects
 :class:`ImageAttachment` objects for later Telegram delivery.
 """
 
+import mimetypes
 import os
 import tempfile
 from dataclasses import dataclass
@@ -85,8 +86,12 @@ def validate_image_path(
     file_path: str,
     approved_directory: Union[Path, Sequence[Path]],
     caption: str = "",
+    any_file: bool = False,
 ) -> Optional[ImageAttachment]:
     """Validate a single image path from an MCP ``send_image_to_user`` call.
+
+    With ``any_file=True`` (``send_file_to_user``) any extension is accepted;
+    non-image files are delivered as Telegram documents.
 
     ``approved_directory`` accepts a single root or a sequence of roots; the
     path must resolve inside at least one of them.
@@ -115,6 +120,15 @@ def validate_image_path(
             )
             return None
 
+        # Data-root areas no agent may read (dv-2c1c): an approved root that
+        # is an ancestor (e.g. APPROVED_DIRECTORY=~/Devvybot) must not make
+        # secrets/ or archive/ deliverable. Lazy: keeps this module light.
+        from src.security.denylist import protected_dirs
+
+        if any(_is_within(resolved, d) for d in protected_dirs().everyone):
+            logger.warning("MCP image path in a protected dir", path=str(resolved))
+            return None
+
         if not resolved.is_file():
             return None
 
@@ -125,6 +139,10 @@ def validate_image_path(
 
         ext = resolved.suffix.lower()
         mime_type = IMAGE_EXTENSIONS.get(ext)
+        if not mime_type and any_file:
+            mime_type = (
+                mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+            )
         if not mime_type:
             return None
 

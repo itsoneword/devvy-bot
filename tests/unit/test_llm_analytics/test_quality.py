@@ -8,6 +8,7 @@ from src.llm_analytics.quality import (
     agent_parts,
     compute_quality_daily,
     is_log_tool,
+    looks_like_recipe,
 )
 
 
@@ -48,6 +49,18 @@ class TestPatterns:
         assert agent_parts("f1:chef") == ("f1:chef", None)
         assert agent_parts("general#weird") == ("general", None)
 
+    def test_looks_like_recipe_positive(self) -> None:
+        response = "1. 200 г муки\n2. 300 мл молока\n3. 2 яйца, взбить"
+        assert looks_like_recipe(response)
+
+    def test_looks_like_recipe_needs_list_and_quantities(self) -> None:
+        # Quantities but no list structure.
+        assert not looks_like_recipe("Возьми 200 г муки и 300 мл молока, смешай.")
+        # List structure but no unit-qualified quantities.
+        assert not looks_like_recipe("1. Разогрей духовку\n2. Смешай ингредиенты")
+        # One quantity only isn't enough.
+        assert not looks_like_recipe("1. 200 г муки\n2. немного соли по вкусу")
+
 
 def _bot_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
@@ -71,6 +84,22 @@ def _bot_db() -> sqlite3.Connection:
             (1, "s1", 7, "2026-08-10T09:00:00+00:00", "обед 500", "Записал."),
             (2, "s1", 7, "2026-08-10T10:00:00+00:00", "ужин", "записано!"),
             (3, "s1", 7, "2026-08-11T09:00:00+00:00", "зачем ты убрал это", "ок"),
+            (
+                4,
+                "s1",
+                7,
+                "2026-08-10T11:00:00+00:00",
+                "рецепт блинов",
+                "1. 200 г муки\n2. 300 мл молока\n3. 2 яйца",
+            ),
+            (
+                5,
+                "s1",
+                7,
+                "2026-08-10T12:00:00+00:00",
+                "рецепт омлета",
+                "1. 150 г яиц\n2. 50 мл молока\n3. соль",
+            ),
         ],
     )
     conn.executemany(
@@ -78,6 +107,7 @@ def _bot_db() -> sqlite3.Connection:
         [
             (1, "s1", 1, "mcp__agent__log_food", "2026-08-10T09:00:01+00:00"),
             (2, "s1", 3, "Bash", "2026-08-11T09:00:01+00:00"),
+            (3, "s1", 5, "WebSearch", "2026-08-10T12:00:01+00:00"),
         ],
     )
     conn.execute(
@@ -90,10 +120,10 @@ def _bot_db() -> sqlite3.Connection:
 def test_compute_quality_daily() -> None:
     rows = compute_quality_daily(_bot_db())
     # (date, profile, user_id, pinned, log_calls, claimed_not_logged,
-    #  complaints, user_messages)
+    #  complaints, user_messages, recipe_turns, recipe_turns_unsearched)
     assert rows == [
-        ("2026-08-10", "coach", 7, 0, 1, 1, 0, 2),
-        ("2026-08-11", "coach", 7, 1, 0, 0, 1, 1),
+        ("2026-08-10", "coach", 7, 0, 1, 1, 0, 4, 2, 1),
+        ("2026-08-11", "coach", 7, 1, 0, 0, 1, 1, 0, 0),
     ]
 
 
