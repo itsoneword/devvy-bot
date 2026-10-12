@@ -1913,7 +1913,7 @@ class ClaudeSDKManager:
             logger.error("Claude CLI not found", error=str(e))
             error_msg = (
                 "Claude Code not found. Please ensure Claude is installed:\n"
-                "  npm install -g @anthropic-ai/claude-code\n\n"
+                "  curl -fsSL https://claude.ai/install.sh | bash\n\n"
                 "If already installed, try one of these:\n"
                 "  1. Add Claude to your PATH\n"
                 "  2. Create a symlink: ln -s $(which claude) /usr/local/bin/claude\n"

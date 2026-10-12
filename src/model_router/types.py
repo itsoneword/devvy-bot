@@ -23,6 +23,7 @@ PURPOSES = frozenset(
         "scorer",
         "background_job",
         "monitor",
+        "onboarding",
     }
 )
 

@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""withkeys — run a tool with keys from the key store in its env (dv-0202).
+
+Usage:
+  withkeys <service>[,<service>...] -- <command> [args...]
+
+Keys stored with ``/setkey <service> NAME value`` are added to the command's
+environment (they override an inherited variable of the same name). Output
+(stdout + stderr, merged) is streamed with every stored value replaced by
+``<redacted>``, so an agent running this never sees a key even if the tool
+prints one. Exit code is the command's.
+
+Standard library only: the store module is loaded by file path so this does
+not pull in the bot's dependencies.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from src.utils.paths import data_layout  # noqa: E402
+
+
+def _load_keystore():  # type: ignore[no-untyped-def]
+    spec = importlib.util.spec_from_file_location(
+        "_keystore", REPO / "src" / "security" / "keystore.py"
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3 or argv[1] != "--":
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    services = [s for s in argv[0].split(",") if s]
+    cmd = argv[2:]
+    layout = data_layout()
+    if layout.root is None:
+        print("withkeys: no data root configured", file=sys.stderr)
+        return 2
+    ks = _load_keystore()
+    store = ks.KeyStore(layout.secrets_dir / "tools")
+    env = dict(os.environ)
+    values: list[str] = []
+    for service in services:
+        try:
+            stored = store.env(service)
+        except ks.KeyStoreError as e:
+            print(f"withkeys: {e}", file=sys.stderr)
+            return 2
+        if not stored:
+            print(f"withkeys: no keys stored for '{service}'", file=sys.stderr)
+        env.update(stored)
+        values += store.secret_values(service)
+    values.sort(key=len, reverse=True)
+
+    def scrub(line: str) -> str:
+        for v in values:
+            line = line.replace(v, "<redacted>")
+        return line
+
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        sys.stdout.write(scrub(line))
+        sys.stdout.flush()
+    return proc.wait()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

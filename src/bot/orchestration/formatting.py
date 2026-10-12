@@ -416,7 +416,7 @@ def _format_error_message(error: Exception | str) -> str:
             f"{escape_html(error_str)}\n\n"
             "<b>What you can do:</b>\n"
             "• Ensure Claude Code is installed: "
-            "<code>npm install -g @anthropic-ai/claude-code</code>\n"
+            "<code>curl -fsSL https://claude.ai/install.sh | bash</code>\n"
             "• Set the <code>CLAUDE_CLI_PATH</code> environment variable"
         )
 

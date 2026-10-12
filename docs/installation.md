@@ -30,7 +30,7 @@ authority.
 | **git** | required | The bot updates itself from git | `sudo apt-get install -y git` |
 | **Poetry** | required | Dependency install, and the service's `ExecStart` | `curl -sSL https://install.python-poetry.org \| python3 -` |
 | **Node ≥ 18** | required | The `claude` CLI is a Node application | `curl -fsSL https://deb.nodesource.com/setup_22.x \| sudo -E bash - && sudo apt-get install -y nodejs` |
-| **claude CLI** | required | Every agent turn runs through it | `npm install -g @anthropic-ai/claude-code` |
+| **claude CLI** | required | Every agent turn runs through it | `curl -fsSL https://claude.ai/install.sh \| bash` |
 | **sudo** | required | Installs the unit and the `/restart` sudoers rule | Install the two files by hand as root — `--dry-run` prints them |
 | **bubblewrap** | optional | `scripts/bgjob` refuses to start background jobs without it | `sudo apt-get install -y bubblewrap` |
 | **visudo** | optional | Validates the sudoers rule before installing it | `sudo apt-get install -y sudo` |

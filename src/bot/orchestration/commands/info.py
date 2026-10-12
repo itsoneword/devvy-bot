@@ -31,6 +31,21 @@ class InfoCommandsMixin(OrchestratorBase):
     ) -> None:
         """Brief welcome, no buttons."""
         user = update.effective_user
+        from .setup import unconfigured
+
+        if (
+            unconfigured(context, self.settings)
+            and self._resolve_role(user.id, context) == "owner"
+        ):
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            await update.message.reply_text(
+                "Бот ещё не настроен.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⚙️ Настроить", callback_data="onb:go")]]
+                ),
+            )
+            return
         sync_line = ""
         if (
             self.settings.enable_project_threads

@@ -14,14 +14,15 @@ async def bootstrap_memory(
     soul_md_path: Path,
     templates_dir: Path,
 ) -> None:
-    """Bootstrap soul and memory files from templates.
+    """Bootstrap agent.md and memory files from templates.
 
     Copies template files to their runtime locations if they do not already
     exist. Existing files are never overwritten.
 
     Args:
         memory_path: Runtime directory for memory files (e.g. data/memory).
-        soul_md_path: Runtime path for soul.md (e.g. data/soul.md).
+        soul_md_path: Anchor path; agent.md is created in its parent directory.
+            soul.md itself is no longer seeded (dv-c6be: it was never read).
         templates_dir: Directory containing committed templates.
     """
     if not templates_dir.is_dir():
@@ -30,26 +31,6 @@ async def bootstrap_memory(
             templates_dir=str(templates_dir),
         )
         return
-
-    # Bootstrap soul.md
-    soul_template = templates_dir / "soul.md"
-    if not soul_template.is_file():
-        logger.warning(
-            "Soul template not found, skipping soul.md bootstrap",
-            expected=str(soul_template),
-        )
-    elif soul_md_path.exists():
-        logger.info(
-            "soul.md already exists, skipping",
-            path=str(soul_md_path),
-        )
-    else:
-        soul_md_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(soul_template, soul_md_path)
-        logger.info(
-            "Created soul.md from template",
-            path=str(soul_md_path),
-        )
 
     # Bootstrap agent.md
     agent_template = templates_dir / "agent.md"
@@ -70,27 +51,6 @@ async def bootstrap_memory(
         logger.info(
             "Created agent.md from template",
             path=str(agent_target),
-        )
-
-    # Bootstrap user.md
-    user_template = templates_dir / "user.md"
-    user_target = soul_md_path.parent / "user.md"
-    if not user_template.is_file():
-        logger.warning(
-            "User template not found, skipping user.md bootstrap",
-            expected=str(user_template),
-        )
-    elif user_target.exists():
-        logger.info(
-            "user.md already exists, skipping",
-            path=str(user_target),
-        )
-    else:
-        user_target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(user_template, user_target)
-        logger.info(
-            "Created user.md from template",
-            path=str(user_target),
         )
 
     # Bootstrap memory directory

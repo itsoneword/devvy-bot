@@ -110,6 +110,11 @@ DEFAULT_CLAUDE_OUTPUT_FORMAT = "stream-json"
 # Soul & Memory defaults
 DEFAULT_MEMORY_PATH = "data/memory"
 DEFAULT_SOUL_MD_PATH = "data/soul.md"
+
+# First line of the shipped default persona (data/templates/agent.md) until the
+# owner configures one (dv-c6be). The onboarding gate (dv-bf1e) checks the
+# default profile's persona for it; rewriting the persona removes it.
+PERSONA_UNCONFIGURED_MARKER = "<!-- devvy:unconfigured -->"
 DEFAULT_ACTIVITY_LOG_MAX_LINES = 200
 
 # Logging

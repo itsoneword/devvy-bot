@@ -226,7 +226,9 @@ offer_autofixes() {
     # Ask, one dependency at a time, before running anything. An installer that
     # apt-installs on its own is one people are right to refuse to run.
     local fixes
-    fixes="$(python3 scripts/preflight.py --json 2>/dev/null | python3 -c '
+    # preflight exits 1 when something is missing; under pipefail that would
+    # fail the whole pipeline and skip every offer.
+    fixes="$( { python3 scripts/preflight.py --json 2>/dev/null || true; } | python3 -c '
 import json, sys
 for item in json.load(sys.stdin):
     if not item["ok"] and item["autofix"]:
@@ -234,7 +236,8 @@ for item in json.load(sys.stdin):
 ')" || return 0
     [ -z "$fixes" ] && return 0
     local key label cmd
-    while IFS=$'\t' read -r key label cmd; do
+    # Read the list on fd 3 so confirm() still reads the answer from the terminal.
+    while IFS=$'\t' read -r -u 3 key label cmd; do
         [ -z "$key" ] && continue
         say ""
         info "$label is missing. Suggested fix:"
@@ -244,7 +247,7 @@ for item in json.load(sys.stdin):
         else
             info "Skipped. Install $label yourself, then re-run ./install.sh."
         fi
-    done <<<"$fixes"
+    done 3<<<"$fixes"
     # Poetry's installer lands in ~/.local/bin, which a non-login shell may not
     # have on PATH -- the single most common "it installed but is not found".
     case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac

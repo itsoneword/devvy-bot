@@ -207,6 +207,8 @@ def test_callback_pattern_covers_every_prefix(agentic_settings, deps):
         "auth:refresh",
         "auth:login:codex",
         "auth:login:claude",
+        "vset:whisper",
+        "vset:off",
         "confirm:yes",
         "watchdog:hold",
     ]

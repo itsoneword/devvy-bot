@@ -37,10 +37,15 @@ FIRST_LINE_MARKER = "rendered by scripts/render_deploy.py"
 def _detect_user() -> str:
     # SUDO_USER first: `sudo ./install.sh` must configure the invoking user,
     # not root. Running the bot as root is never what anyone wants.
-    for env in ("SERVICE_USER", "SUDO_USER"):
-        value = os.environ.get(env)
-        if value and value != "root":
-            return value
+    # SUDO_USER only counts when we actually run as root: after
+    # `sudo -iu someone` it still names the *previous* user, and trusting it
+    # would install the service as the wrong account.
+    override = os.environ.get("SERVICE_USER")
+    if override and override != "root":
+        return override
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.getuid() == 0 and sudo_user and sudo_user != "root":
+        return sudo_user
     return pwd.getpwuid(os.getuid()).pw_name
 
 

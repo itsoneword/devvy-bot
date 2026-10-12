@@ -51,6 +51,11 @@ OWNER_ONLY_COMMANDS = frozenset(
         "limits",
         "adduser",
         "rmuser",
+        "setkey",
+        "keys",
+        "delkey",
+        "voice",
+        "setup",
     }
 )
 
@@ -106,6 +111,8 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
     CommandSpec("repo", "List repos / switch workspace", "session"),
     CommandSpec("schedules", "List scheduled agent jobs", "session"),
     CommandSpec("reminders", "Your reminders & todos: list, cancel", "session"),
+    CommandSpec("voice", "Voice input: pick speech-to-text or text only", "session"),
+    CommandSpec("setup", "First-run setup interview (re-run any time)", "session"),
     CommandSpec(
         "sessions", "Show each profile's last activity", "session", requires="profiles"
     ),
@@ -122,6 +129,9 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
         "diagnostics",
         requires="profiles",
     ),
+    CommandSpec("setkey", "Store a tool API key (message auto-deleted)", "safety"),
+    CommandSpec("keys", "List stored tool key names", "safety"),
+    CommandSpec("delkey", "Delete a stored tool key", "safety"),
     CommandSpec("adduser", "Grant a Telegram user guest access", "people"),
     CommandSpec("rmuser", "Revoke a user's access", "people"),
     CommandSpec(
@@ -156,7 +166,7 @@ class MessageOrchestrator(
         runtime KeyError.
         """
         from .features import server_monitor
-        from .orchestration.commands import auth, reminders, system
+        from .orchestration.commands import auth, keys, reminders, setup, system, voice
 
         return {
             "start": self.agentic_start,
@@ -185,6 +195,11 @@ class MessageOrchestrator(
             "adduser": self.agentic_adduser,
             "rmuser": self.agentic_rmuser,
             "sync_threads": system.sync_threads,
+            "setkey": keys.setkey_command,
+            "keys": keys.keys_command,
+            "delkey": keys.delkey_command,
+            "voice": voice.voice_command,
+            "setup": setup.setup_command,
         }
 
     def _available_commands(self) -> List[CommandSpec]:
@@ -272,7 +287,7 @@ class MessageOrchestrator(
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
-                pattern=r"^(cd:|model:|agent:|agents:|auth:|rem:)",
+                pattern=r"^(cd:|model:|agent:|agents:|auth:|rem:|vset:|onb:)",
             )
         )
 

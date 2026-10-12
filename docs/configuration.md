@@ -554,6 +554,18 @@ locally through `faster-whisper` (CPU, `compute_type=int8`, `vad_filter` on).
 install` pulls it in; on the first transcription it downloads model weights
 (~480 MB for `small`) into the HuggingFace cache before returning a result.
 
+**Changing it from Telegram: `/voice`** (owner-only, dv-6b6c). Buttons
+ElevenLabs / OpenAI / Mistral / Local Whisper / Только текст. A cloud provider
+without a key asks for `/setkey <provider> <PROVIDER>_API_KEY <key>` (e.g.
+`/setkey elevenlabs ELEVENLABS_API_KEY …`). The choice is checked with one ~1 s
+transcription of silence (`VoiceHandler.probe`), then switched live (no
+restart) and written to the config `.env` as `VOICE_PROVIDER` /
+`ENABLE_VOICE_MESSAGES`. A rejected key is not kept; the previous provider
+keeps running. Keys are resolved by `src/config/voice.py`: the tool key store
+first, then the secrets file. Check a provider for real with
+`scripts/voice_smoke.py <file.ogg> --provider <p>` (cloud keys from the key
+store: prefix `scripts/withkeys <provider> --`).
+
 #### Channel Knowledge Base (MCP)
 
 ```bash

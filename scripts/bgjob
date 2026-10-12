@@ -59,31 +59,49 @@ def _env() -> dict:
     return env
 
 
-def load_profiles() -> dict:
-    """slug -> working_dir, parsed from config/profiles.yaml."""
-    text = PROFILES_YAML.read_text(encoding="utf-8") if PROFILES_YAML.exists() else ""
-    try:
-        import yaml  # type: ignore
+_REGISTRY_DUMP = """
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from src.profiles import load_profile_registry
+reg = load_profile_registry(Path(sys.argv[2]))
+print(json.dumps({
+    p.slug: {"working_dir": str(p.working_dir),
+             "extra_dirs": [str(d) for d in p.extra_dirs]}
+    for p in reg.profiles
+}))
+"""
 
-        data = yaml.safe_load(text) or {}
-        return {
-            p["slug"]: p["working_dir"]
-            for p in data.get("profiles", [])
-            if p.get("slug") and p.get("working_dir")
-        }
-    except Exception:
-        # Dependency-free fallback: the file is a flat list of simple scalars.
-        out, slug = {}, None
-        for line in text.splitlines():
-            m = re.match(r"\s*-?\s*slug:\s*(\S+)", line)
-            if m:
-                slug = m.group(1)
-                continue
-            m = re.match(r"\s*working_dir:\s*(\S+)", line)
-            if m and slug:
-                out[slug] = m.group(1)
-                slug = None
-        return out
+
+def _registry() -> dict:
+    """slug -> {working_dir, extra_dirs}, resolved by the bot's own registry
+    loader (${DEVVY_WORKSPACES}, relative dirs, data root). A private YAML
+    parser here used to miss variable expansion, so jobs for template-created
+    profiles failed with "working dir does not exist: ${DEVVY_WORKSPACES}/..".
+    """
+    if not PROFILES_YAML.exists():
+        return {}
+    proc = subprocess.run(
+        [_venv_python(), "-c", _REGISTRY_DUMP, str(REPO), str(PROFILES_YAML)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr.strip().splitlines() or ["?"])[-1]
+        sys.exit(f"error: cannot load profiles registry: {err}")
+    # The loader logs to stdout too; the JSON is always the last line.
+    return json.loads((proc.stdout.strip().splitlines() or ["{}"])[-1])
+
+
+def load_profiles() -> dict:
+    """slug -> working_dir."""
+    return {s: p["working_dir"] for s, p in _registry().items()}
+
+
+def load_extra_dirs(slug: str) -> list:
+    """The profile's ``extra_dirs`` (owner-only, dv-3103). A job runs with the
+    owner's authority, so it may write where the profile's turns may."""
+    return list(_registry().get(slug, {}).get("extra_dirs", []))
 
 
 def job_dir(job_id: str) -> Path:
@@ -261,7 +279,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         sys.exit("error: bwrap not found; refusing to run a job unconfined")
 
     write_paths = [str(d), cwd, str(Path.home() / ".claude")]
-    for extra in args.allow_dir or []:
+    allow_dirs = list(args.allow_dir or [])
+    if not getattr(args, "cwd", None):
+        # --cwd jobs (taskpump worktrees) keep their explicit write set.
+        allow_dirs += load_extra_dirs(args.profile)
+    for extra in allow_dirs:
         p = Path(extra).expanduser().resolve()
         if not p.is_dir():
             sys.exit(f"error: --allow-dir does not exist: {p}")

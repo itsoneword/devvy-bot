@@ -59,15 +59,9 @@ class FeatureFlags:
     @property
     def voice_messages_enabled(self) -> bool:
         """Check if voice message transcription is enabled."""
-        if not self.settings.enable_voice_messages:
-            return False
-        if self.settings.voice_provider == "whisper":
-            return True  # local — no API key needed
-        if self.settings.voice_provider == "openai":
-            return self.settings.openai_api_key is not None
-        if self.settings.voice_provider == "elevenlabs":
-            return self.settings.elevenlabs_api_key is not None
-        return self.settings.mistral_api_key is not None
+        from .voice import boot_keystore, voice_available
+
+        return voice_available(self.settings, boot_keystore())
 
     @property
     def soul_memory_enabled(self) -> bool:

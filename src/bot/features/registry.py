@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional
 import structlog
 
 from src.config.settings import Settings
+from src.config.voice import boot_keystore, voice_api_key, voice_available
+from src.security.keystore import KeyStore
 from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
 
@@ -20,10 +22,19 @@ logger = structlog.get_logger(__name__)
 class FeatureRegistry:
     """Manage all bot features"""
 
-    def __init__(self, config: Settings, storage: Storage, security: SecurityValidator):
+    def __init__(
+        self,
+        config: Settings,
+        storage: Storage,
+        security: SecurityValidator,
+        keystore: Optional[KeyStore] = None,
+    ):
         self.config = config
         self.storage = storage
         self.security = security
+        # Voice keys set with /setkey live here; boot must see them too, or a
+        # restart silently drops a provider chosen through /voice (dv-6b6c).
+        self.keystore = keystore if keystore is not None else boot_keystore()
         self.features: Dict[str, Any] = {}
 
         # Initialize features based on config
@@ -51,18 +62,12 @@ class FeatureRegistry:
             logger.error("Failed to initialize image handler", error=str(e))
 
         # Voice transcription - requires provider-specific API key (whisper is keyless)
-        voice_key_available = (
-            (self.config.voice_provider == "whisper")
-            or (self.config.voice_provider == "openai" and self.config.openai_api_key)
-            or (self.config.voice_provider == "mistral" and self.config.mistral_api_key)
-            or (
-                self.config.voice_provider == "elevenlabs"
-                and self.config.elevenlabs_api_key
-            )
-        )
-        if self.config.enable_voice_messages and voice_key_available:
+        if voice_available(self.config, self.keystore):
             try:
-                self.features["voice_handler"] = VoiceHandler(config=self.config)
+                self.features["voice_handler"] = VoiceHandler(
+                    config=self.config,
+                    api_key=voice_api_key(self.config, keystore=self.keystore),
+                )
                 logger.info("Voice handler feature enabled")
             except Exception as e:
                 logger.error("Failed to initialize voice handler", error=str(e))
@@ -91,6 +96,18 @@ class FeatureRegistry:
     def get_voice_handler(self) -> Optional[VoiceHandler]:
         """Get voice handler feature"""
         return self.get_feature("voice_handler")
+
+    def set_voice_handler(self, handler: Optional[VoiceHandler]) -> None:
+        """Swap the live voice handler (None = voice off) — no restart.
+
+        Handlers read ``features`` per message, so the next voice note uses
+        the new one. The caller closes the old handler's client.
+        """
+        if handler is None:
+            self.features.pop("voice_handler", None)
+        else:
+            self.features["voice_handler"] = handler
+        logger.info("Voice handler replaced", enabled=handler is not None)
 
     def get_enabled_features(self) -> Dict[str, Any]:
         """Get all enabled features"""

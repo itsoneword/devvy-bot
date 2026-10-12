@@ -5,6 +5,7 @@ import asyncio
 import io
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -12,6 +13,7 @@ import structlog
 from telegram import Voice
 
 from src.config.settings import Settings
+from src.config.voice import voice_api_key
 
 logger = structlog.get_logger(__name__)
 
@@ -29,9 +31,14 @@ class VoiceHandler:
     """Transcribe Telegram voice messages via Mistral, OpenAI, ElevenLabs or local whisper."""
 
     ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
+    # ~1 s of silent Opus: what ``probe`` transcribes to check a provider.
+    PROBE_CLIP = Path(__file__).parent / "assets" / "voice_probe.ogg"
 
-    def __init__(self, config: Settings):
+    def __init__(self, config: Settings, api_key: Optional[str] = None):
+        """``api_key`` comes from :func:`src.config.voice.voice_api_key` (key
+        store or secrets file); without it the Settings secret is used."""
         self.config = config
+        self._api_key = api_key
         self._mistral_client: Optional[Any] = None
         self._openai_client: Optional[Any] = None
         self._whisper_model: Optional[Any] = None
@@ -87,14 +94,7 @@ class VoiceHandler:
             file_size=initial_file_size or resolved_file_size or len(voice_bytes),
         )
 
-        if self.config.voice_provider == "openai":
-            transcription = await self._transcribe_openai(voice_bytes)
-        elif self.config.voice_provider == "whisper":
-            transcription = await self._transcribe_whisper(voice_bytes)
-        elif self.config.voice_provider == "elevenlabs":
-            transcription = await self._transcribe_elevenlabs(voice_bytes)
-        else:
-            transcription = await self._transcribe_mistral(voice_bytes)
+        transcription = await self.transcribe_bytes(voice_bytes)
 
         logger.info(
             "Voice transcription complete",
@@ -114,6 +114,58 @@ class VoiceHandler:
             transcription=transcription,
             duration=duration_secs,
         )
+
+    async def transcribe_bytes(self, voice_bytes: bytes) -> str:
+        """Transcribe audio bytes with the configured provider.
+
+        Raises ``ValueError`` when the audio held no speech (empty result) and
+        ``RuntimeError`` (or the provider's own error) when the call failed.
+        """
+        if self.config.voice_provider == "openai":
+            return await self._transcribe_openai(voice_bytes)
+        if self.config.voice_provider == "whisper":
+            return await self._transcribe_whisper(voice_bytes)
+        if self.config.voice_provider == "elevenlabs":
+            return await self._transcribe_elevenlabs(voice_bytes)
+        return await self._transcribe_mistral(voice_bytes)
+
+    async def probe(self) -> None:
+        """Check the provider with one tiny call: transcribe ~1 s of silence.
+
+        A transcription call tests exactly the permission voice needs (a
+        restricted ElevenLabs key can have STT without ``user_read``). For
+        whisper it also loads — on first use downloads — the model. An empty
+        transcript is success: silence has no words. Any other failure raises.
+        """
+        try:
+            await self.transcribe_bytes(self.PROBE_CLIP.read_bytes())
+        except ValueError:
+            return  # reached the provider; it found no speech in silence
+        except RuntimeError as exc:
+            # A provider may refuse 1 s of silence as a bad payload. That
+            # still means the key passed: auth is checked first — a bogus
+            # ElevenLabs key gets 401 on this very clip (2026-10-11).
+            cause = exc.__cause__
+            status = getattr(cause, "status_code", None) or getattr(
+                getattr(cause, "response", None), "status_code", None
+            )
+            if status in (400, 422):
+                logger.info("Voice probe: key accepted, clip refused", status=status)
+                return
+            raise
+
+    def _key(self, provider: str) -> Optional[str]:
+        return self._api_key or voice_api_key(self.config, provider)
+
+    async def aclose(self) -> None:
+        """Close the HTTP client a cloud provider opened, if any."""
+        client = self._elevenlabs_client
+        self._elevenlabs_client = None
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
     async def _transcribe_mistral(self, voice_bytes: bytes) -> str:
         """Transcribe audio using the Mistral API (Voxtral)."""
@@ -157,7 +209,7 @@ class VoiceHandler:
                 "Install voice extras: poetry install --extras voice"
             ) from exc
 
-        api_key = self.config.mistral_api_key_str
+        api_key = self._key("mistral")
         if not api_key:
             raise RuntimeError("Mistral API key is not configured.")
 
@@ -171,7 +223,9 @@ class VoiceHandler:
         thread. faster-whisper decodes the OGG/Opus bytes in-memory via PyAV,
         and ``vad_filter`` skips non-speech so silence doesn't hallucinate.
         """
-        model = self._get_whisper_model()
+        # Off the event loop: the first load can download the model (~0.5 GB
+        # for "small"), which would otherwise freeze the whole bot.
+        model = await asyncio.to_thread(self._get_whisper_model)
         hotwords = (
             ", ".join(self.config.voice_vocabulary_hints)
             if self.config.voice_vocabulary_hints
@@ -313,7 +367,7 @@ class VoiceHandler:
         if self._elevenlabs_client is not None:
             return self._elevenlabs_client
 
-        api_key = self.config.elevenlabs_api_key_str
+        api_key = self._key("elevenlabs")
         if not api_key:
             raise RuntimeError("ElevenLabs API key is not configured.")
 
@@ -337,7 +391,7 @@ class VoiceHandler:
                 "Install voice extras: poetry install --extras voice"
             ) from exc
 
-        api_key = self.config.openai_api_key_str
+        api_key = self._key("openai")
         if not api_key:
             raise RuntimeError("OpenAI API key is not configured.")
 

@@ -2,6 +2,45 @@
 
 Release notes for Devvy. Newest first.
 
+## 1.3 — 2026-10-12
+
+### First-run onboarding
+- A fresh install is now configured through a short conversation in Telegram
+  instead of hand-editing files. Until it is done, every owner message goes to
+  the onboarding interview; `/start` offers a "Настроить" button.
+- Step 0 sets up voice input (speech-to-text only): local Whisper or a cloud
+  provider, via `/voice`.
+- At most 8 questions, every one skippable. Pick a scenario (developer/server,
+  personal assistant/family, food and sport) or just describe what you want
+  in free text or voice; the bot shows a summary and waits for confirmation.
+- Results go to the existing places: tone and identity to the profile
+  persona, facts about you to memory, your timezone to settings, chosen
+  agents to `config/profiles.yaml` (with a Restart button to activate them).
+- `/setup` reruns it at any time; a tuned persona is backed up first.
+- Family members and guests inherit the owner's setup.
+- Release templates are neutral and carry an anti-sycophancy baseline; the old
+  `soul.md` / `user.md` templates are gone.
+
+### Keys for your tools
+- `/setkey <service> NAME value`, `/keys`, `/delkey`: store API keys for tools
+  the agents run. The message with the key is deleted before the model sees
+  it; `scripts/withkeys <service> -- <command>` runs a tool with those keys
+  in its environment and redacts their values from all output.
+
+### Installer
+- Missing Poetry / claude CLI are offered and installed again (the offer was
+  silently skipped before).
+- The claude CLI is installed with Anthropic's native installer, which needs
+  no root (`npm install -g` failed for non-root users).
+- Running the installer after `sudo -iu <user>` no longer renders the service
+  for the previous account.
+
+### Fixes
+- Confirmation buttons show their result as a toast, and previews with
+  special characters no longer swallow the feedback.
+- Background jobs resolve profiles through the registry and get the profile's
+  `extra_dirs`.
+
 ## 1.2 — 2026-10-10
 
 ### Database: SQLAlchemy + Alembic

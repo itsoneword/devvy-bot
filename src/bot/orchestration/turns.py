@@ -349,6 +349,15 @@ class TurnsMixin(OrchestratorBase):
             return
 
         user_id = update.effective_user.id
+        # First-run gate (dv-bf1e): an unconfigured bot sends every owner
+        # message into the onboarding interview instead of a model turn.
+        from .commands.setup import gate_text
+
+        gated = override_text if override_text is not None else update.message.text
+        if await gate_text(
+            update, context, gated or "", self._resolve_role(user_id, context)
+        ):
+            return
         lock = self._turn_lock(user_id)
         queued_ack = None
         if lock.locked():
@@ -1608,6 +1617,10 @@ class TurnsMixin(OrchestratorBase):
     ) -> None:
         """Process file upload -> Claude, minimal chrome."""
         user_id = update.effective_user.id
+        from .commands.setup import gate_media
+
+        if await gate_media(update, context, self._resolve_role(user_id, context)):
+            return
         document = update.message.document
 
         logger.info(
@@ -1733,6 +1746,10 @@ class TurnsMixin(OrchestratorBase):
     ) -> None:
         """Process photo -> Claude, minimal chrome."""
         user_id = update.effective_user.id
+        from .commands.setup import gate_media
+
+        if await gate_media(update, context, self._resolve_role(user_id, context)):
+            return
 
         features = context.bot_data.get("features")
         image_handler = features.get_image_handler() if features else None
@@ -1816,6 +1833,19 @@ class TurnsMixin(OrchestratorBase):
                 processed_voice = await voice_handler.process_voice_message(
                     voice, update.message.caption
                 )
+
+                from .commands.setup import gate_text
+
+                if await gate_text(
+                    update,
+                    context,
+                    processed_voice.transcription,
+                    self._resolve_role(user_id, context),
+                ):
+                    # Onboarding answers by voice (dv-bf1e): transcript in,
+                    # no model turn.
+                    await progress_msg.delete()
+                    return
 
                 await progress_msg.edit_text("Working...")
                 await self._run_agentic_media_turn(
@@ -1919,9 +1949,10 @@ class TurnsMixin(OrchestratorBase):
 
     def _voice_unavailable_message(self) -> str:
         """Return provider-aware guidance when voice feature is unavailable."""
+        if not self.settings.enable_voice_messages:
+            return "🔇 Voice is off — text only. Turn it on: /voice"
         return (
-            "Voice processing is not available. "
-            f"Set {self.settings.voice_provider_api_key_env} "
-            f"for {self.settings.voice_provider_display_name} and install "
-            "voice extras with: poetry install --extras voice"
+            "Voice processing is not available: "
+            f"{self.settings.voice_provider_display_name} has no "
+            f"{self.settings.voice_provider_api_key_env}. Set it up: /voice"
         )

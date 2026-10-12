@@ -112,7 +112,16 @@ def test_sudo_user_wins_over_root(monkeypatch):
     """`sudo ./install.sh` must configure the invoking user, never root."""
     monkeypatch.delenv("SERVICE_USER", raising=False)
     monkeypatch.setenv("SUDO_USER", "realperson")
+    monkeypatch.setattr(render_deploy.os, "getuid", lambda: 0)
     assert render_deploy._detect_user() == "realperson"
+
+
+def test_stale_sudo_user_ignored_when_not_root(monkeypatch):
+    """After `sudo -iu svc`, SUDO_USER still names the previous account."""
+    monkeypatch.delenv("SERVICE_USER", raising=False)
+    monkeypatch.setenv("SUDO_USER", "previous")
+    me = render_deploy.pwd.getpwuid(render_deploy.os.getuid()).pw_name
+    assert render_deploy._detect_user() == me
 
 
 def test_root_sudo_user_is_ignored(monkeypatch):

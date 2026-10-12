@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import structlog
 
+from ..security.keystore import KeyStore
 from .tool_context import AgentServices, ToolSpec, TurnContext
 
 logger = structlog.get_logger()
@@ -97,15 +98,27 @@ _PRIVATE_KEY_HEX = re.compile(r"0x[0-9a-fA-F]{64}")
 class ExchangeClient:
     """Runs the venue scripts. Holds no keys; reads ``.env`` names only."""
 
-    def __init__(self, root: Path, node: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        node: Optional[str] = None,
+        keystore: Optional[KeyStore] = None,
+    ) -> None:
         self.root = Path(root)
         self.node = node or shutil.which("node") or "node"
+        # Key store (dv-0202): keys set via /setkey under service = venue
+        # name. Passed as env, which wins over the script's own dotenv file
+        # (dotenv never overrides an existing variable).
+        self.keystore = keystore
+
+    def _stored(self, venue: str) -> Dict[str, str]:
+        return self.keystore.env(venue) if self.keystore else {}
 
     def venue_dir(self, venue: str) -> Path:
         return self.root / VENUES[venue].directory
 
     def _env(self, venue: str) -> Dict[str, str]:
-        return _parse_env(self.venue_dir(venue) / ".env")
+        return {**_parse_env(self.venue_dir(venue) / ".env"), **self._stored(venue)}
 
     def accounts(self) -> Dict[str, List[str]]:
         """``{venue: [account names]}`` for every configured account."""
@@ -131,6 +144,8 @@ class ExchangeClient:
         for key, value in self._env(venue).items():
             if _SECRET_KEY.search(key) and len(value) >= 8:
                 text = text.replace(value, "<redacted>")
+        if self.keystore:
+            text = self.keystore.redact(text, venue)
         return _PRIVATE_KEY_HEX.sub("<redacted>", text)
 
     async def run(self, venue: str, inv: Invocation, timeout: float) -> Tuple[int, str]:
@@ -144,6 +159,7 @@ class ExchangeClient:
             "HOME": os.environ.get("HOME", str(Path.home())),
             "LANG": "C.UTF-8",
             "DOTENV_CONFIG_QUIET": "true",  # drop dotenv's ad line
+            **self._stored(venue),
         }
         proc = await asyncio.create_subprocess_exec(
             self.node,
@@ -773,7 +789,10 @@ _SPECS: List[Tuple[str, str, Dict[str, Any], Any]] = [
                     "type": "integer",
                     "description": "daily candles, default 500; must exceed window",
                 },
-                "window": {"type": "integer", "description": "stddev window, default 30"},
+                "window": {
+                    "type": "integer",
+                    "description": "stddev window, default 30",
+                },
             }
         ),
         _run_action("analytics"),

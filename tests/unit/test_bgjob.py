@@ -188,3 +188,24 @@ class TestOutputTailIsCharacterSafe:
         out = _run_tail_block(run_sh, content.encode("utf-8"))
 
         assert out.decode("utf-8") == content
+
+
+class TestProfileResolution:
+    """Jobs resolve profiles through the bot's registry loader: a private YAML
+    parser left ${DEVVY_WORKSPACES} unexpanded, so every job for a
+    template-created profile failed, and extra_dirs never reached the job."""
+
+    def test_extra_dirs_become_writable_binds(self, bgjob, tmp_path, monkeypatch):
+        extra = tmp_path / "project"
+        extra.mkdir()
+        monkeypatch.setattr(bgjob, "load_extra_dirs", lambda slug: [str(extra)])
+        run_sh = _write_run_sh(bgjob, tmp_path, monkeypatch).read_text()
+        assert f"--bind {extra} {extra}" in run_sh
+
+    def test_registry_dump_resolves_workspace_variable(self, bgjob):
+        """The real loader, on the real config: no unexpanded ${...} left."""
+        if not bgjob.PROFILES_YAML.exists():
+            pytest.skip("no config/profiles.yaml in this checkout")
+        dirs = bgjob.load_profiles()
+        assert dirs, "no profiles resolved"
+        assert all("${" not in d and d.startswith("/") for d in dirs.values())

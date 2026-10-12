@@ -413,6 +413,27 @@ class CallbacksMixin(OrchestratorBase):
             await handle_reminders_callback(query, context, data)
             return
 
+        if data.startswith("vset:"):
+            # /voice is owner-only; its buttons must be too — a callback
+            # bypasses the command gate (dv-6b6c).
+            if self._resolve_role(query.from_user.id, context) != "owner":
+                await query.edit_message_text("🚫 Owner only.")
+                return
+            from .commands.voice import handle_voice_callback
+
+            await handle_voice_callback(query, context, data)
+            return
+
+        if data.startswith("onb:"):
+            # Same reason as vset: a button bypasses the owner-only command gate.
+            if self._resolve_role(query.from_user.id, context) != "owner":
+                await query.edit_message_text("🚫 Owner only.")
+                return
+            from .commands.setup import handle_callback
+
+            await handle_callback(update, context, data)
+            return
+
         if data.startswith("auth:"):
             from .commands.auth import handle_auth_callback
 

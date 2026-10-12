@@ -821,7 +821,11 @@ async def run_application(app: Dict[str, Any]) -> None:
 
             exchange_root = Path.home() / "tools"
             if any((exchange_root / v.directory).is_dir() for v in VENUES.values()):
-                agent_services.exchange = ExchangeClient(exchange_root)
+                from src.security.keystore import default_keystore
+
+                agent_services.exchange = ExchangeClient(
+                    exchange_root, keystore=default_keystore()
+                )
         except Exception as e:  # pragma: no cover - defensive wiring guard
             logger.warning("Failed to build agent MCP services", error=str(e))
 
@@ -1112,6 +1116,8 @@ async def main() -> None:
 
         # Initialize bot and Claude integration
         app = await create_application(config)
+        # The config file /voice persists its choice into (dv-6b6c).
+        app["bot"].deps["env_file"] = args.config_file or Path(".env")
         await run_application(app)
 
     except ConfigurationError as e:

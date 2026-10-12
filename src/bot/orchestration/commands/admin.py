@@ -465,18 +465,22 @@ class AdminCommandsMixin(OrchestratorBase):
                 logger.debug("Failed to answer stale confirmation callback query")
             return
 
+        verdict = "✅ Approved" if approved else "⛔ Denied"
+        # Toast first: it is the feedback that cannot fail on message content.
         try:
-            await query.answer()
+            await query.answer(verdict)
         except Exception:
             logger.debug("Failed to answer confirmation callback query")
-        verdict = "✅ Approved" if approved else "⛔ Denied"
         try:
-            base = query.message.text if query.message else ""
+            # text_html, not text: the prompt is HTML with an escaped command
+            # preview; re-sending the plain .text as HTML broke on any "<"/"&"
+            # in the command and the edit failed silently (no visible verdict).
+            base = query.message.text_html if query.message else ""
             await query.edit_message_text(
                 f"{base}\n\n<b>{verdict}</b>", parse_mode="HTML"
             )
         except Exception:
-            logger.debug("Failed to edit confirmation message")
+            logger.warning("Failed to edit confirmation message", exc_info=True)
 
     async def _watchdog_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

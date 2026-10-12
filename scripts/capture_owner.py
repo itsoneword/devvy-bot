@@ -22,8 +22,8 @@ Usage:
 """
 
 import argparse
+import importlib.util
 import json
-import re
 import sys
 import time
 import urllib.error
@@ -153,46 +153,25 @@ def describe(sender: Dict[str, Any]) -> str:
 # --- .env writing -------------------------------------------------------
 
 
-def upsert_env(text: str, key: str, value: str) -> str:
-    """Set ``key`` in a .env body, preserving everything else.
+def _load_env_file_module() -> Any:
+    """``src/config/env_file.py`` by path — the one .env writer (dv-6b6c).
 
-    Replaces the last uncommented assignment (that is the one dotenv honours),
-    or appends. A commented-out ``# KEY=`` line is left as documentation and
-    the real assignment is appended below it.
+    Loaded by path, not imported as ``src.config.env_file``: the package
+    import would run ``src/config/__init__`` (pydantic), which is not
+    installed yet when install.sh runs this script. The module itself is
+    standard library only.
     """
-    pattern = re.compile(rf"^(\s*){re.escape(key)}\s*=.*$")
-    lines = text.splitlines()
-    target = None
-    for idx, line in enumerate(lines):
-        if pattern.match(line):
-            target = idx
-    if target is None:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.append(f"{key}={value}")
-    else:
-        lines[target] = f"{key}={value}"
-    return "\n".join(lines) + "\n"
+    path = Path(__file__).resolve().parent.parent / "src" / "config" / "env_file.py"
+    spec = importlib.util.spec_from_file_location("_devvy_env_file", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def write_env(env_path: Path, values: Dict[str, str]) -> Path:
-    """Apply ``values`` to ``env_path``, backing up an existing file first.
-
-    Returns the backup path, or the env path itself when it was created fresh.
-    """
-    if env_path.exists():
-        backup = env_path.with_suffix(env_path.suffix + f".bak-{int(time.time())}")
-        backup.write_text(env_path.read_text(encoding="utf-8"), encoding="utf-8")
-        backup.chmod(0o600)
-        text = env_path.read_text(encoding="utf-8")
-    else:
-        backup = env_path
-        text = ""
-    for key, value in values.items():
-        text = upsert_env(text, key, value)
-    env_path.write_text(text, encoding="utf-8")
-    env_path.chmod(0o600)
-    return backup
+_env_file = _load_env_file_module()
+upsert_env = _env_file.upsert_env
+write_env = _env_file.write_env
 
 
 # --- CLI ----------------------------------------------------------------

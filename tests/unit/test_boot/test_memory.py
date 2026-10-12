@@ -9,16 +9,12 @@ from src.boot.memory import bootstrap_memory, bootstrap_project_stubs
 
 @pytest.fixture()
 def templates_dir(tmp_path: Path) -> Path:
-    """Create a templates directory with soul.md and memory files."""
+    """Create a templates directory with agent.md and memory files."""
     tpl = tmp_path / "templates"
     tpl.mkdir()
 
-    # soul.md template
-    (tpl / "soul.md").write_text("# Soul\nI am Atlas.\n")
-
-    # agent.md and user.md templates
+    # agent.md template
     (tpl / "agent.md").write_text("# Agent Identity\n\n**Name:** Atlas\n")
-    (tpl / "user.md").write_text("# User Profile\n\nPrimary languages: Python\n")
 
     # memory templates
     mem = tpl / "memory"
@@ -41,9 +37,13 @@ def templates_dir(tmp_path: Path) -> Path:
 class TestBootstrapMemoryCreatesFiles:
     """bootstrap_memory creates missing files from templates."""
 
-    async def test_creates_soul_md_from_template(
+    async def test_does_not_seed_soul_or_user_md(
         self, tmp_path: Path, templates_dir: Path
     ) -> None:
+        # dv-c6be: soul.md/user.md were copied but never read; even a stale
+        # template left in templates_dir is no longer seeded.
+        (templates_dir / "soul.md").write_text("# Soul\n")
+        (templates_dir / "user.md").write_text("# User Profile\n")
         soul_path = tmp_path / "runtime" / "soul.md"
         memory_path = tmp_path / "runtime" / "memory"
 
@@ -53,8 +53,9 @@ class TestBootstrapMemoryCreatesFiles:
             templates_dir=templates_dir,
         )
 
-        assert soul_path.exists()
-        assert "Atlas" in soul_path.read_text()
+        assert (soul_path.parent / "agent.md").exists()
+        assert not soul_path.exists()
+        assert not (soul_path.parent / "user.md").exists()
 
     async def test_creates_all_memory_files(
         self, tmp_path: Path, templates_dir: Path
@@ -91,23 +92,6 @@ class TestBootstrapMemoryCreatesFiles:
 class TestBootstrapMemoryPreservesExisting:
     """bootstrap_memory does NOT overwrite existing files."""
 
-    async def test_does_not_overwrite_existing_soul_md(
-        self, tmp_path: Path, templates_dir: Path
-    ) -> None:
-        soul_path = tmp_path / "runtime" / "soul.md"
-        memory_path = tmp_path / "runtime" / "memory"
-
-        soul_path.parent.mkdir(parents=True, exist_ok=True)
-        soul_path.write_text("# My Custom Soul\n")
-
-        await bootstrap_memory(
-            memory_path=memory_path,
-            soul_md_path=soul_path,
-            templates_dir=templates_dir,
-        )
-
-        assert soul_path.read_text() == "# My Custom Soul\n"
-
     async def test_does_not_overwrite_existing_memory_files(
         self, tmp_path: Path, templates_dir: Path
     ) -> None:
@@ -137,9 +121,10 @@ class TestBootstrapMemoryPartialState:
         soul_path = tmp_path / "runtime" / "soul.md"
         memory_path = tmp_path / "runtime" / "memory"
 
-        # Pre-create soul and index only
-        soul_path.parent.mkdir(parents=True, exist_ok=True)
-        soul_path.write_text("# Existing Soul\n")
+        # Pre-create agent.md and index only
+        agent_path = soul_path.parent / "agent.md"
+        agent_path.parent.mkdir(parents=True, exist_ok=True)
+        agent_path.write_text("# Existing Agent\n")
         memory_path.mkdir(parents=True, exist_ok=True)
         (memory_path / "index.md").write_text("# Existing Index\n")
 
@@ -150,7 +135,7 @@ class TestBootstrapMemoryPartialState:
         )
 
         # Existing files unchanged
-        assert soul_path.read_text() == "# Existing Soul\n"
+        assert agent_path.read_text() == "# Existing Agent\n"
         assert (memory_path / "index.md").read_text() == "# Existing Index\n"
         # Missing files created
         assert (memory_path / "projects.md").exists()
@@ -176,11 +161,11 @@ class TestBootstrapMemoryGracefulDegradation:
         assert not soul_path.exists()
         assert not memory_path.exists()
 
-    async def test_handles_missing_soul_template(
+    async def test_handles_missing_agent_template(
         self, tmp_path: Path, templates_dir: Path
     ) -> None:
-        # Remove the soul.md template
-        (templates_dir / "soul.md").unlink()
+        # Remove the agent.md template
+        (templates_dir / "agent.md").unlink()
 
         soul_path = tmp_path / "runtime" / "soul.md"
         memory_path = tmp_path / "runtime" / "memory"
@@ -192,13 +177,13 @@ class TestBootstrapMemoryGracefulDegradation:
             templates_dir=templates_dir,
         )
 
-        assert not soul_path.exists()
+        assert not (soul_path.parent / "agent.md").exists()
         # Memory files should still be created
         assert (memory_path / "index.md").exists()
 
 
-class TestBootstrapAgentAndUserMd:
-    """bootstrap_memory provisions agent.md and user.md alongside soul.md."""
+class TestBootstrapAgentMd:
+    """bootstrap_memory provisions agent.md next to soul_md_path."""
 
     async def test_bootstrap_creates_agent_md(
         self, tmp_path: Path, templates_dir: Path
@@ -215,22 +200,6 @@ class TestBootstrapAgentAndUserMd:
         agent_path = soul_path.parent / "agent.md"
         assert agent_path.exists()
         assert "Atlas" in agent_path.read_text()
-
-    async def test_bootstrap_creates_user_md(
-        self, tmp_path: Path, templates_dir: Path
-    ) -> None:
-        soul_path = tmp_path / "runtime" / "soul.md"
-        memory_path = tmp_path / "runtime" / "memory"
-
-        await bootstrap_memory(
-            memory_path=memory_path,
-            soul_md_path=soul_path,
-            templates_dir=templates_dir,
-        )
-
-        user_path = soul_path.parent / "user.md"
-        assert user_path.exists()
-        assert "User Profile" in user_path.read_text()
 
     async def test_bootstrap_does_not_overwrite_agent_md(
         self, tmp_path: Path, templates_dir: Path
