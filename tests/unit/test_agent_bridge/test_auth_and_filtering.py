@@ -66,7 +66,7 @@ PLATFORM_TOOLS = frozenset(
         "schedule_remove",
         "task_add",
         "task_list",
-        "task_done",
+        "task_comment",
         "get_weather",
     }
 )
@@ -215,13 +215,17 @@ class TestToolFiltering:
         # `coach` declares logs/products/portions but not `export`, so
         # export_my_data is not visible; hireli_* need a client + `hireli: true`
         # (tests/unit/test_hireli_tools.py covers their gating); exchange_*
-        # likewise (tests/unit/test_exchange_tools.py).
+        # likewise (tests/unit/test_exchange_tools.py); onchain_activity is
+        # mounted with the exchange tools, so it is hidden with them.
         opt_in = {
-            n for n in exported_tool_names() if n.startswith(("hireli_", "exchange_"))
+            n
+            for n in exported_tool_names()
+            if n.startswith(("hireli_", "exchange_")) or n == "onchain_activity"
         }
+        # task_done is devops-only (dv-535b): other agents create + comment.
         assert (
             self._names(bridge, _ctx())
-            == set(exported_tool_names()) - {"export_my_data"} - opt_in
+            == set(exported_tool_names()) - {"export_my_data", "task_done"} - opt_in
         )
 
     def test_no_memory_scope_means_no_memory_tools(self, bridge) -> None:
@@ -243,6 +247,14 @@ class TestToolFiltering:
         )
         assert not (names & DATA_TOOLS)
         assert MEMORY_TOOLS | {"recall_conversation"} <= names
+        assert "task_done" in names  # devops alone changes task status
+
+    def test_task_done_is_not_offered_to_other_agents(self, bridge) -> None:
+        """dv-535b: non-devops agents may only create and comment."""
+        for slug in ("coach", "coach#u111", "general", "devops#u5"):
+            names = self._names(bridge, _ctx(profile_slug=slug))
+            assert "task_done" not in names, slug
+            assert {"task_add", "task_comment"} <= names, slug
 
     def test_per_user_profile_suffix_still_resolves_capabilities(self, bridge) -> None:
         """'coach#u111' must read its groups off the base 'coach' profile."""

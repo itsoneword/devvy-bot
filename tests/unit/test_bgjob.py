@@ -209,3 +209,178 @@ class TestProfileResolution:
         dirs = bgjob.load_profiles()
         assert dirs, "no profiles resolved"
         assert all("${" not in d and d.startswith("/") for d in dirs.values())
+
+
+class TestSummary:
+    """dv-dfb1: <summary> extraction with a tail fallback."""
+
+    def test_last_summary_block_wins(self, bgjob):
+        text = "x\n<summary>old</summary>\nmore\n<summary>\nA\nB\n</summary>\n"
+        assert bgjob.extract_summary(text) == "A\nB"
+
+    def test_summary_capped_to_15_lines(self, bgjob):
+        body = "\n".join(f"l{i}" for i in range(40))
+        out = bgjob.extract_summary(f"<summary>{body}</summary>")
+        assert out.splitlines() == [f"l{i}" for i in range(15)]
+
+    def test_fallback_is_last_15_lines(self, bgjob):
+        text = "\n".join(f"l{i}" for i in range(40))
+        out = bgjob.extract_summary(text).splitlines()
+        assert out[0].startswith("(no summary block")
+        assert out[1:] == [f"l{i}" for i in range(25, 40)]
+
+    def test_write_summary_empty_output(self, bgjob, tmp_path, monkeypatch):
+        monkeypatch.setattr(bgjob, "JOBS_ROOT", tmp_path)
+        (tmp_path / "j").mkdir()
+        (tmp_path / "j" / "output.md").write_text("")
+        assert bgjob.write_summary("j").startswith("(no output)")
+        assert (tmp_path / "j" / "summary.md").exists()
+
+    def test_output_default_is_summary_full_is_everything(
+        self, bgjob, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(bgjob, "JOBS_ROOT", tmp_path)
+        d = tmp_path / "j"
+        d.mkdir()
+        (d / "output.md").write_text("long\nstuff\n<summary>short</summary>\n")
+        (d / "exit_code").write_text("0")
+        ns = type("A", (), {"id": "j", "tail": 0, "full": False})()
+        bgjob.cmd_output(ns)
+        out = capsys.readouterr().out
+        assert "short" in out and "long" not in out
+        ns.full = True
+        bgjob.cmd_output(ns)
+        assert "long" in capsys.readouterr().out
+
+
+class TestListLimit:
+    def test_running_first_then_newest_n_finished(
+        self, bgjob, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(bgjob, "JOBS_ROOT", tmp_path)
+        for i in range(12):
+            d = tmp_path / f"2026010{i % 10}-1200{i:02d}-j{i}"
+            d.mkdir(exist_ok=True)
+            (d / "meta.json").write_text(json.dumps({"unit": f"u{i}"}))
+            (d / "exit_code").write_text("0")
+        monkeypatch.setattr(bgjob, "unit_active", lambda u: u == "u0")
+        monkeypatch.setattr(bgjob, "job_progress", lambda u: "")
+        ns = type("A", (), {"limit": 3, "compact": True})()
+        bgjob.cmd_list(ns)
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1 + 3 + 1  # running + 3 finished + footer
+        assert "RUNNING" in lines[0]
+        assert lines[-1].startswith("+") and "all=true" in lines[-1]
+
+
+def test_run_prepends_preamble_and_ticket(bgjob, tmp_path, monkeypatch):
+    monkeypatch.setattr(bgjob, "JOBS_ROOT", tmp_path)
+    monkeypatch.setattr(bgjob, "load_profiles", lambda: {"general": str(tmp_path)})
+    monkeypatch.setattr(bgjob, "live_jobs", lambda: [])
+    monkeypatch.setattr(bgjob.shutil, "which", lambda name: "/bin/sh")
+
+    class R:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, out):
+            self.stdout = out
+
+    monkeypatch.setattr(
+        bgjob.subprocess,
+        "run",
+        lambda cmd, **kw: R("/x/dv-aaaa.md\n" if "path" in cmd else "{}"),
+    )
+    args = type(
+        "A",
+        (),
+        {
+            "prompt": "do it",
+            "profile": "general",
+            "name": "t",
+            "allow_dir": None,
+            "model": "sonnet",
+            "task": "dv-aaaa",
+        },
+    )()
+    bgjob.cmd_run(args)
+    prompt = next(tmp_path.glob("*/prompt.txt")).read_text()
+    assert "<summary>" in prompt
+    assert "Ticket: /x/dv-aaaa.md" in prompt
+    assert prompt.rstrip().endswith("do it")
+    assert "summarize" in next(tmp_path.glob("*/run.sh")).read_text()
+
+
+class TestCmdJobs:
+    def _args(self, **kw):
+        base = {
+            "prompt": None,
+            "cmd": "echo hi",
+            "profile": "general",
+            "name": "full-tests",
+            "allow_dir": None,
+            "model": "sonnet",
+        }
+        base.update(kw)
+        return type("A", (), base)()
+
+    def _setup(self, bgjob, tmp_path, monkeypatch):
+        monkeypatch.setattr(bgjob, "JOBS_ROOT", tmp_path)
+        monkeypatch.setattr(bgjob, "load_profiles", lambda: {"general": str(tmp_path)})
+        monkeypatch.setattr(bgjob, "live_jobs", lambda: [])
+        calls = []
+
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        monkeypatch.setattr(
+            bgjob.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or R()
+        )
+        monkeypatch.setattr(bgjob.subprocess, "Popen", lambda *a, **k: None)
+        return calls
+
+    def test_run_sh_runs_command_without_model_and_pings_with_job_ref(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        calls = self._setup(bgjob, tmp_path, monkeypatch)
+        assert bgjob.cmd_run(self._args()) == 0
+        run_sh = next(tmp_path.glob("*/run.sh"))
+        text = run_sh.read_text()
+        job_id = run_sh.parent.name
+        assert "agentjob" not in text and "bwrap" not in text
+        assert "cmd.txt" in text
+        assert f"--ref job:{job_id}" in text
+        assert "--profile general" in text
+        assert (run_sh.parent / "cmd.txt").read_text() == "echo hi"
+        assert any(c[:2] == ["systemd-run", "--user"] for c in calls)
+
+    def test_cmd_rejects_prompt_and_missing_prompt(self, bgjob, tmp_path, monkeypatch):
+        self._setup(bgjob, tmp_path, monkeypatch)
+        with pytest.raises(SystemExit):
+            bgjob.cmd_run(self._args(prompt="x"))
+        with pytest.raises(SystemExit):
+            bgjob.cmd_run(self._args(cmd=None))
+
+    def test_run_sh_executes_and_summarizes(self, bgjob, tmp_path, monkeypatch):
+        import subprocess
+
+        self._setup(bgjob, tmp_path, monkeypatch)
+        bgjob.cmd_run(self._args(cmd="echo '= 3 passed in 1s ='; exit 2", quiet=True))
+        d = next(tmp_path.glob("*/run.sh")).parent
+        # Run the real script (summarize step uses this bgjob file + sys.executable).
+        monkeypatch.undo()
+        monkeypatch.setenv("BGJOB_ROOT", str(tmp_path))
+        proc = subprocess.Popen(["bash", str(d / "run.sh")])
+        proc.communicate(timeout=60)
+        assert (d / "exit_code").read_text().strip() == "2"
+        summary = (d / "summary.md").read_text()
+        assert summary.startswith("exit code: 2")
+        assert "3 passed" in summary
+
+    def test_oneline_prefers_pytest_line(self, bgjob):
+        text = "...\n=== 2 failed, 10 passed in 5.1s ===\n"
+        assert bgjob.cmd_oneline_text(text) == "2 failed, 10 passed in 5.1s"
+        assert bgjob.cmd_oneline_text("a\nlast one\n") == "last one"
+        assert bgjob.cmd_oneline_text("") == "(no output)"

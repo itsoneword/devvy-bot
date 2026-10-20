@@ -11,7 +11,7 @@ in `CLAUDE.md`.
 ## Development setup
 
 ```bash
-git clone https://github.com/itsoneword/Devvy.git
+git clone https://github.com/itsoneword/devvy-bot.git
 cd Devvy
 poetry install          # dependencies, including dev tools
 cp .env.example .env    # fill in TELEGRAM_BOT_TOKEN, TELEGRAM_BOT_USERNAME, ALLOWED_USERS

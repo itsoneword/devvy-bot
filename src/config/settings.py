@@ -21,14 +21,15 @@ from src.utils.constants import (
     DEFAULT_CLAUDE_MAX_COST_PER_USER,
     DEFAULT_CLAUDE_MAX_COST_PER_USER_GUEST,
     DEFAULT_CLAUDE_MAX_TURNS,
+    CONFIRMATION_MARGIN_SECONDS,
     DEFAULT_CLAUDE_TIMEOUT_SECONDS,
     DEFAULT_DATABASE_URL,
     DEFAULT_MAX_SESSIONS_PER_USER,
     DEFAULT_MEMORY_PATH,
-    DEFAULT_PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS,
     DEFAULT_RATE_LIMIT_BURST,
     DEFAULT_RATE_LIMIT_REQUESTS,
     DEFAULT_RATE_LIMIT_WINDOW,
+    DEFAULT_REPORTS_ROUTES,
     DEFAULT_SESSION_TIMEOUT_HOURS,
     DEFAULT_SOUL_MD_PATH,
     DEFAULT_UNMETERED_MAX_TOKENS_PER_USER,
@@ -40,6 +41,11 @@ from src.utils.constants import (
     DEFAULT_WATCHDOG_MAX_TURNS_PER_HOUR,
 )
 from src.utils.paths import DataLayout, sqlite_url
+
+
+# Single source of the window-refresh default; window_repository, llm_analytics
+# and the session state import it instead of repeating the literal.
+DEFAULT_WINDOW_REFRESH_THRESHOLD_TOKENS = 150_000
 
 
 class Settings(BaseSettings):
@@ -108,6 +114,16 @@ class Settings(BaseSettings):
     )
     claude_max_turns: int = Field(
         DEFAULT_CLAUDE_MAX_TURNS, description="Max conversation turns"
+    )
+    confirmation_timeout_seconds: float = Field(
+        600.0,
+        ge=10,
+        description=(
+            "How long the owner has to tap Approve/Deny on a risky tool call "
+            "before it is auto-denied. Every timeout that must outlive the "
+            "wait (PreToolUse hook, Codex hook, turn idle limits) derives "
+            "from this value."
+        ),
     )
     claude_timeout_seconds: int = Field(
         DEFAULT_CLAUDE_TIMEOUT_SECONDS,
@@ -300,6 +316,97 @@ class Settings(BaseSettings):
             "before reconciliation (EVALUATOR_EPISODIC_GUARD)."
         ),
     )
+    # Jev gate in front of the reconciler (dv-7e11 phase 3, owner decisions
+    # 2026-10-17): per candidate one typed decide() call on TypeSafe Jev;
+    # confident new/duplicate are accepted, everything else (every
+    # contradicts, low confidence, Jev down) goes to the haiku reconciler in
+    # one batch. Default OFF until reviewed; thresholds per label so each can
+    # be tuned from the op_stats.reconcile_gate data.
+    reconcile_jev_gate_enabled: bool = Field(
+        False,
+        description=(
+            "Gate reconciler candidates through Jev before the haiku call "
+            "(RECONCILE_JEV_GATE_ENABLED). Off = every candidate to haiku."
+        ),
+    )
+    # Defaults from the labelled re-run (dv-7e11 ticket, 2026-10-17).
+    reconcile_jev_min_conf_new: float = Field(
+        0.8,
+        ge=0.0,
+        le=1.0,
+        description="Min Jev confidence to accept 'new' without haiku.",
+    )
+    # No reliable duplicate band yet: above 1.0 = duplicates always escalate.
+    reconcile_jev_min_conf_duplicate: float = Field(
+        1.01,
+        ge=0.0,
+        le=1.01,
+        description=(
+            "Min Jev confidence to accept 'duplicate' without haiku; the "
+            "related_fact answer must clear it too. Above 1.0 = never."
+        ),
+    )
+    # Jev's systematic miss: a state change (open -> resolved, newer value)
+    # answered "new". A yes/no question in the same call; above this, escalate.
+    reconcile_jev_max_state_change: float = Field(
+        0.55,
+        ge=0.0,
+        le=1.01,
+        description=(
+            "Escalate when Jev's P(candidate updates/resolves a saved fact) "
+            "is above this (RECONCILE_JEV_MAX_STATE_CHANGE)."
+        ),
+    )
+    # Jev's context overflows at ~165 facts (shadow test), so the prefilter
+    # is mandatory; the cited fact was in the top 15 in 90% of cases.
+    reconcile_jev_top_k: int = Field(
+        15,
+        ge=1,
+        le=100,
+        description="Saved facts shown to Jev per candidate (lexical top-k).",
+    )
+    # TypeSafe Jev key (dv-e690). Primary source for the bot process: the
+    # dotenv / secrets file, handed to the router at startup. The
+    # TYPESAFE_API_KEY env var overrides it (jobs get it from `withkeys`).
+    typesafe_api_key: Optional[SecretStr] = Field(
+        None,
+        description=(
+            "TypeSafe Jev API key (TYPESAFE_API_KEY). Unset = router decide() "
+            "falls back to its LLM leg."
+        ),
+    )
+    # Jev screen in front of memory extraction (dv-7e11 step c). Jev picks
+    # which saved facts Sonnet sees; it is never a skip gate.
+    memory_screen_mode: Literal["off", "shadow", "on"] = Field(
+        "shadow",
+        description=(
+            "off = today's extraction only. shadow = today's extraction writes "
+            "memory as before; the screen runs beside it, writes no facts and "
+            "records its proposed ops in op_stats.screen. on = reserved for the "
+            "cutover step (currently behaves as shadow)."
+        ),
+    )
+    memory_screen_chunk_tokens: int = Field(
+        12_000,
+        ge=2_000,
+        le=30_000,
+        description="Jev-token estimate per screened chunk (MEMORY_SCREEN_CHUNK_TOKENS).",
+    )
+    memory_screen_fact_send_min: float = Field(
+        0.3,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "A saved fact scoring at least this on Jev's touched or mentioned "
+            "question goes to Sonnet (MEMORY_SCREEN_FACT_SEND_MIN)."
+        ),
+    )
+    memory_screen_fact_send_max: int = Field(
+        40,
+        ge=1,
+        le=200,
+        description="Cap on score-selected facts per chunk (pinned/remember facts are extra).",
+    )
     # Daily fact-quality check (dv-404f): report-only review of the facts
     # saved in the last 24h — the episodic guard plus one cheap LLM judge call
     # per scope, delivered to the owner in Telegram. Default OFF: it costs a
@@ -365,6 +472,63 @@ class Settings(BaseSettings):
         description=(
             "Comma-separated profile slugs the recipe search-retry applies "
             "to (RECIPE_RETRY_PROFILES)."
+        ),
+    )
+    # Verification budget (dv-9f41): how much searching one turn may do.
+    # Both poles measured on coach — zero data reads (dv-7a3c) and a 20-call
+    # literature review for one chest session (turn 1817). Counted per turn in
+    # the PreToolUse hook (src/claude/verification_budget.py). Ships
+    # count-only (owner, 2026-10-13): over-budget turns are logged and show up
+    # in quality_daily.deep_research_turns; set ENFORCE once those counters
+    # show capping costs no quality. The 1/3 budgets are untuned starting
+    # points — calibrate from the counters, not from feel.
+    verification_budget_enforce: bool = Field(
+        False,
+        description=(
+            "Deny search-class tool calls (WebSearch/WebFetch, subagent = 2) "
+            "past the per-turn budget instead of only logging them "
+            "(VERIFICATION_BUDGET_ENFORCE)."
+        ),
+    )
+    verification_budget_profiles: str = Field(
+        "coach,chef",
+        description=(
+            "Comma-separated profile slugs the per-turn verification budget "
+            "applies to (VERIFICATION_BUDGET_PROFILES)."
+        ),
+    )
+    verification_budget_draft_max: int = Field(
+        1,
+        description=(
+            "Search-class budget units for an ordinary turn "
+            "(VERIFICATION_BUDGET_DRAFT_MAX)."
+        ),
+    )
+    verification_budget_confirm_max: int = Field(
+        3,
+        description=(
+            "WebSearch calls allowed in the follow-up confirm turn; WebFetch "
+            "and subagents are not part of it (VERIFICATION_BUDGET_CONFIRM_MAX)."
+        ),
+    )
+    # Confirm/escalate follow-up (dv-9f41): the coach-side twin of
+    # recipe_retry. A training-programme answer grounded in nothing (no data
+    # read, no search) gets ONE cheap confirm turn; only a contradiction it
+    # reports earns ONE deeper escalate turn. Default OFF for the same reason
+    # as recipe_retry: each follow-up is a real extra SDK turn.
+    verification_check_enabled: bool = Field(
+        False,
+        description=(
+            "Run a capped confirm turn after an unchecked training-programme "
+            "answer, escalating once on a reported contradiction "
+            "(VERIFICATION_CHECK_ENABLED)."
+        ),
+    )
+    verification_check_profiles: str = Field(
+        "coach",
+        description=(
+            "Comma-separated profile slugs the confirm/escalate follow-up "
+            "applies to (VERIFICATION_CHECK_PROFILES)."
         ),
     )
     openai_codex_credentials_path: Path = Field(
@@ -617,7 +781,7 @@ class Settings(BaseSettings):
         ),
     )
     window_refresh_threshold_tokens: int = Field(
-        150_000,
+        DEFAULT_WINDOW_REFRESH_THRESHOLD_TOKENS,
         ge=20_000,
         description=(
             "Roll the conversation window (fresh backend session seeded with "
@@ -729,6 +893,49 @@ class Settings(BaseSettings):
     notification_chat_ids: Optional[List[int]] = Field(
         None, description="Default Telegram chat IDs for proactive notifications"
     )
+    # Reports group (dv-e215). Out-of-band messages (NotificationService) whose
+    # `source` matches a key of reports_routes go to a topic of this forum
+    # supergroup instead of the DM. Unset = everything stays in the DM.
+    reports_chat_id: Optional[int] = Field(
+        None,
+        description=(
+            "Forum supergroup (bot is admin with Manage Topics) that receives "
+            "report-type notifications, one topic per source type. Unset = off."
+        ),
+    )
+    # NoDecode: accept 'prefix=Topic,prefix=Topic' as well as JSON.
+    reports_routes: Annotated[Dict[str, str], NoDecode] = Field(
+        default_factory=lambda: dict(DEFAULT_REPORTS_ROUTES),
+        description=(
+            "Source prefix -> topic name ('server-monitor=Monitoring,...' or a "
+            "JSON object). A source matches a key when equal to it or starting "
+            "with '<key>:'; longest key wins. Replaces the defaults entirely."
+        ),
+    )
+    # Inbound side of the reports group (dv-e215 v2): topic name -> profile slug.
+    # A message in a bound topic is a turn with that profile (same (user, agent)
+    # conversation as in the DM). Empty = the group stays read-only.
+    reports_bindings: Annotated[Dict[str, str], NoDecode] = Field(
+        default_factory=dict,
+        description=(
+            "Topic name -> profile slug ('Monitoring=devops,Coach=coach' or a "
+            "JSON object). Bound topics are created on startup."
+        ),
+    )
+    reports_reply_only: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Bound topics that only accept a reply to a job message "
+            "(owner only, whatever REPORTS_INBOUND_POLICY says)."
+        ),
+    )
+    reports_inbound_policy: str = Field(
+        "owner",
+        description=(
+            "Who may write to bound topics: 'owner' (default) or 'allowed' "
+            "(any authenticated user; profile access rules still apply)."
+        ),
+    )
     health_export_profile_slug: str = Field(
         "coach",
         description=(
@@ -745,30 +952,12 @@ class Settings(BaseSettings):
             "Unset falls back to the first ALLOWED_USERS entry."
         ),
     )
-    enable_project_threads: bool = Field(
-        False,
-        description="Enable strict routing by Telegram forum project threads",
-    )
-    project_threads_mode: Literal["private", "group"] = Field(
-        "private",
-        description="Project thread mode: private chat topics or group forum topics",
-    )
-    project_threads_chat_id: Optional[int] = Field(
-        None, description="Telegram forum chat ID where project topics are managed"
-    )
     projects_config_path: Optional[Path] = Field(
         None, description="Path to YAML project registry for thread mode"
     )
     profiles_config_path: Optional[Path] = Field(
         default=None,
         description="Path to profiles YAML registry. If unset, single-profile mode.",
-    )
-    project_threads_sync_action_interval_seconds: float = Field(
-        DEFAULT_PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS,
-        description=(
-            "Minimum delay between Telegram API calls during project topic sync"
-        ),
-        ge=0.0,
     )
 
     model_config = SettingsConfigDict(
@@ -790,6 +979,42 @@ class Settings(BaseSettings):
         if isinstance(v, list):
             return [int(uid) for uid in v]
         return v  # type: ignore[no-any-return]
+
+    @field_validator("reports_routes", mode="before")
+    @classmethod
+    def parse_reports_routes(cls, v: Any) -> Any:
+        """Parse JSON or 'prefix=Topic,prefix=Topic' into a dict."""
+        if isinstance(v, str):
+            v = v.strip()
+            if v.startswith("{"):
+                return json.loads(v)
+            out: Dict[str, str] = {}
+            for pair in v.split(","):
+                key, _, topic = pair.partition("=")
+                if key.strip() and topic.strip():
+                    out[key.strip().lower()] = topic.strip()
+            return out
+        if isinstance(v, dict):
+            return {str(k).strip().lower(): str(t).strip() for k, t in v.items()}
+        return v
+
+    @field_validator("reports_bindings", mode="before")
+    @classmethod
+    def parse_reports_bindings(cls, v: Any) -> Any:
+        """Parse JSON or 'Topic=slug,Topic=slug' into a dict."""
+        if isinstance(v, str):
+            v = v.strip()
+            if v.startswith("{"):
+                return json.loads(v)
+            out: Dict[str, str] = {}
+            for pair in v.split(","):
+                topic, _, slug = pair.partition("=")
+                if topic.strip() and slug.strip():
+                    out[topic.strip()] = slug.strip().lower()
+            return out
+        if isinstance(v, dict):
+            return {str(k).strip(): str(t).strip().lower() for k, t in v.items()}
+        return v
 
     @field_validator("claude_cost_limit_overrides", mode="before")
     @classmethod
@@ -910,17 +1135,6 @@ class Settings(BaseSettings):
             raise ValueError(f"Projects config path is not a file: {v}")
         return v  # type: ignore[no-any-return]
 
-    @field_validator("project_threads_mode", mode="before")
-    @classmethod
-    def validate_project_threads_mode(cls, v: Any) -> str:
-        """Validate project thread mode."""
-        if v is None:
-            return "private"
-        mode = str(v).strip().lower()
-        if mode not in {"private", "group"}:
-            raise ValueError("project_threads_mode must be one of ['private', 'group']")
-        return mode
-
     @field_validator("voice_provider", mode="before")
     @classmethod
     def validate_voice_provider(cls, v: Any) -> str:
@@ -934,21 +1148,6 @@ class Settings(BaseSettings):
                 "['mistral', 'openai', 'whisper', 'elevenlabs']"
             )
         return provider
-
-    @field_validator("project_threads_chat_id", mode="before")
-    @classmethod
-    def validate_project_threads_chat_id(cls, v: Any) -> Optional[int]:
-        """Allow empty chat ID for private mode by treating blank values as None."""
-        if v is None:
-            return None
-        if isinstance(v, str):
-            value = v.strip()
-            if not value:
-                return None
-            return int(value)
-        if isinstance(v, int):
-            return v
-        return v  # type: ignore[no-any-return]
 
     @field_validator("log_level")
     @classmethod
@@ -971,20 +1170,6 @@ class Settings(BaseSettings):
         # Check MCP requirements
         if self.enable_mcp and not self.mcp_config_path:
             raise ValueError("mcp_config_path required when enable_mcp is True")
-
-        if self.enable_project_threads:
-            if (
-                self.project_threads_mode == "group"
-                and self.project_threads_chat_id is None
-            ):
-                raise ValueError(
-                    "project_threads_chat_id required when "
-                    "project_threads_mode is 'group'"
-                )
-            if not self.projects_config_path:
-                raise ValueError(
-                    "projects_config_path required when enable_project_threads is True"
-                )
 
         return self
 
@@ -1018,6 +1203,27 @@ class Settings(BaseSettings):
             if attr not in self.model_fields_set:
                 object.__setattr__(self, attr, value)
         return self
+
+    @property
+    def confirmation_hook_timeout_seconds(self) -> int:
+        """Timeout for a PreToolUse hook that may wait on the owner."""
+        return int(self.confirmation_timeout_seconds) + CONFIRMATION_MARGIN_SECONDS
+
+    @property
+    def claude_idle_limit_seconds(self) -> int:
+        """Claude turn idle limit; never shorter than a confirmation wait."""
+        return max(
+            self.claude_timeout_seconds,
+            self.confirmation_hook_timeout_seconds + CONFIRMATION_MARGIN_SECONDS,
+        )
+
+    @property
+    def agent_idle_limit_seconds(self) -> int:
+        """Codex stdout-silence limit; never shorter than a confirmation wait."""
+        return max(
+            self.agent_timeout_seconds,
+            self.confirmation_hook_timeout_seconds + CONFIRMATION_MARGIN_SECONDS,
+        )
 
     @property
     def data_layout(self) -> DataLayout:

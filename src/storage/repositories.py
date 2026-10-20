@@ -823,6 +823,43 @@ class CostTrackingRepository:
         """Initialize repository."""
         self.db = db_manager
 
+    async def apply_correction(
+        self,
+        *,
+        user_id: int,
+        session_id: Optional[str],
+        message_id: Optional[int],
+        delta: float,
+        date: str,
+    ) -> None:
+        """Shift one turn's already-booked cost by ``delta`` USD in every
+        ledger it was written to (dv-d2f6: estimate -> OpenRouter's exact
+        cost, ~6 s after the turn). One transaction; counts untouched."""
+        async with self.db.get_connection() as conn:
+            if message_id is not None:
+                await conn.execute(
+                    "UPDATE messages SET cost = MAX(COALESCE(cost, 0) + ?, 0) "
+                    "WHERE message_id = ?",
+                    (delta, message_id),
+                )
+            await conn.execute(
+                "UPDATE cost_tracking SET daily_cost = MAX(daily_cost + ?, 0) "
+                "WHERE user_id = ? AND date = ?",
+                (delta, user_id, date),
+            )
+            await conn.execute(
+                "UPDATE users SET total_cost = MAX(COALESCE(total_cost, 0) + ?, 0) "
+                "WHERE user_id = ?",
+                (delta, user_id),
+            )
+            if session_id:
+                await conn.execute(
+                    "UPDATE sessions SET total_cost = "
+                    "MAX(COALESCE(total_cost, 0) + ?, 0) WHERE session_id = ?",
+                    (delta, session_id),
+                )
+            await conn.commit()
+
     async def update_daily_cost(self, user_id: int, cost: float, date: str = None):
         """Update daily cost for user."""
         if not date:

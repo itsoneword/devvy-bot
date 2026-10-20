@@ -351,3 +351,6 @@ table.data tr.muted td { color: var(--muted); }
 .chain-sessions h3 { margin: 0; font-size: 13px; font-weight: 600; }
 .chain-sessions .card-sub { margin-bottom: 8px; }
 .chain-sessions .badge + .badge { margin-left: 4px; }
+
+.btn.active { background: var(--page); color: var(--ink); font-weight: 600; }
+.chain-select input[type="date"] { font: inherit; padding: 3px 6px; border: 1px solid var(--axis); border-radius: 6px; background: var(--surface); color: var(--ink); }

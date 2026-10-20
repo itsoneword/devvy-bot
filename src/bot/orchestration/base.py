@@ -61,8 +61,65 @@ class OrchestratorBase:
 
         self._turn_locks: TurnLocks = deps.get("turn_locks") or TurnLocks()
 
-    def _turn_lock(self, user_id: int) -> asyncio.Lock:
-        return self._turn_locks.get(user_id)
+    def _turn_lock(
+        self, user_id: int, profile_id: Optional[str] = None
+    ) -> asyncio.Lock:
+        return self._turn_locks.get(user_id, profile_id)
+
+    async def _stop_scoped_turns(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: int, slug: str
+    ) -> int:
+        """Stop the in-flight turns of ONE user on ONE agent, on every backend.
+        Shared by scoped /stop and the queued-message interrupt button."""
+        backends = dict(context.bot_data.get("backends") or {})
+        if not backends:  # transitional fallback keys
+            for key in ("claude_integration", "codex_integration"):
+                if context.bot_data.get(key) is not None:
+                    backends[key] = context.bot_data[key]
+        stopped = 0
+        for backend in backends.values():
+            stop = getattr(backend, "stop_turns", None)
+            if not callable(stop):
+                continue
+            try:
+                stopped += int(await stop(user_id, slug))
+            except Exception as exc:
+                logger.warning("scoped stop failed", profile=slug, error=str(exc))
+        return stopped
+
+    async def _turn_profile_slug(
+        self,
+        update: Any,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: Optional[str] = None,
+    ) -> Optional[str]:
+        """Profile slug the chat's next turn runs on, without mutating state.
+
+        Bound forum topic -> the topic's profile; else the text's one-shot
+        ``/slug`` / ``@slug`` directive; else the user's active profile.
+        The key for the per-(user, agent) turn lock and for scoped ``/stop``.
+        None when there is no profile registry (single-profile mode).
+        """
+        try:
+            router = context.bot_data.get("reports_router")
+            registry = context.bot_data.get("profile_registry")
+            if not registry:
+                return None
+            message = update.message
+            if router is not None and message is not None:
+                slug = await router.profile_for_message(message)
+                if isinstance(slug, str) and slug:
+                    return slug
+            from .routing import resolve_route
+
+            active = context.user_data.get("active_profile") or (
+                registry.get_default().slug
+            )
+            valid = {p.slug for p in registry.enabled_profiles}
+            target = resolve_route(text or "", active=active, valid_slugs=valid).target
+            return str(target) if target else None
+        except Exception:
+            return None
 
     def _workspace_base(self, context: ContextTypes.DEFAULT_TYPE) -> Path:
         """Root directory that /repo lists and switches within.
@@ -190,7 +247,6 @@ class OrchestratorBase:
             for key, value in self.deps.items():
                 context.bot_data[key] = value
             context.bot_data["settings"] = self.settings
-            context.user_data.pop("_thread_context", None)
 
             if not context.user_data.get("_display_name_checked"):
                 # dv-752a: a family member's display name defaults to their
@@ -219,169 +275,9 @@ class OrchestratorBase:
                             "prefs load failed", user_id=user.id, error=str(exc)
                         )
 
-            is_sync_bypass = handler.__name__ == "sync_threads"
-            is_start_bypass = handler.__name__ in {"start_command", "agentic_start"}
-            message_thread_id = self._extract_message_thread_id(update)
-            should_enforce = self.settings.enable_project_threads
-
-            if should_enforce:
-                if self.settings.project_threads_mode == "private":
-                    should_enforce = not is_sync_bypass and not (
-                        is_start_bypass and message_thread_id is None
-                    )
-                else:
-                    should_enforce = not is_sync_bypass
-
-            if should_enforce:
-                allowed = await self._apply_thread_routing_context(update, context)
-                if not allowed:
-                    return
-
-            try:
-                await handler(update, context)
-            finally:
-                if should_enforce:
-                    self._persist_thread_state(context)
+            await handler(update, context)
 
         return wrapped
-
-    async def _apply_thread_routing_context(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> bool:
-        """Enforce strict project-thread routing and load thread-local state."""
-        manager = context.bot_data.get("project_threads_manager")
-        if manager is None:
-            await self._reject_for_thread_mode(
-                update,
-                "❌ <b>Project Thread Mode Misconfigured</b>\n\n"
-                "Thread manager is not initialized.",
-            )
-            return False
-
-        chat = update.effective_chat
-        message = update.effective_message
-        if not chat or not message:
-            return False
-
-        if self.settings.project_threads_mode == "group":
-            if chat.id != self.settings.project_threads_chat_id:
-                await self._reject_for_thread_mode(
-                    update,
-                    manager.guidance_message(mode=self.settings.project_threads_mode),
-                )
-                return False
-        else:
-            if getattr(chat, "type", "") != "private":
-                await self._reject_for_thread_mode(
-                    update,
-                    manager.guidance_message(mode=self.settings.project_threads_mode),
-                )
-                return False
-
-        message_thread_id = self._extract_message_thread_id(update)
-        if not message_thread_id:
-            await self._reject_for_thread_mode(
-                update,
-                manager.guidance_message(mode=self.settings.project_threads_mode),
-            )
-            return False
-
-        project = await manager.resolve_project(chat.id, message_thread_id)
-        if not project:
-            await self._reject_for_thread_mode(
-                update,
-                manager.guidance_message(mode=self.settings.project_threads_mode),
-            )
-            return False
-
-        state_key = f"{chat.id}:{message_thread_id}"
-        thread_states = context.user_data.setdefault("thread_state", {})
-        state = thread_states.get(state_key, {})
-
-        project_root = project.absolute_path
-        current_dir_raw = state.get("current_directory")
-        current_dir = (
-            Path(current_dir_raw).resolve() if current_dir_raw else project_root
-        )
-        if not self._is_within(current_dir, project_root) or not current_dir.is_dir():
-            current_dir = project_root
-
-        context.user_data["current_directory"] = current_dir
-        context.user_data["claude_session_id"] = state.get("claude_session_id")
-        context.user_data["_thread_context"] = {
-            "chat_id": chat.id,
-            "message_thread_id": message_thread_id,
-            "state_key": state_key,
-            "project_slug": project.slug,
-            "project_root": str(project_root),
-            "project_name": project.name,
-        }
-        return True
-
-    def _persist_thread_state(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Persist compatibility keys back into per-thread state."""
-        thread_context = context.user_data.get("_thread_context")
-        if not thread_context:
-            return
-
-        project_root = Path(thread_context["project_root"])
-        current_dir = context.user_data.get("current_directory", project_root)
-        if not isinstance(current_dir, Path):
-            current_dir = Path(str(current_dir))
-        current_dir = current_dir.resolve()
-        if not self._is_within(current_dir, project_root) or not current_dir.is_dir():
-            current_dir = project_root
-
-        thread_states = context.user_data.setdefault("thread_state", {})
-        thread_states[thread_context["state_key"]] = {
-            "current_directory": str(current_dir),
-            "claude_session_id": context.user_data.get("claude_session_id"),
-            "project_slug": thread_context["project_slug"],
-        }
-
-    @staticmethod
-    def _is_within(path: Path, root: Path) -> bool:
-        """Return True if path is within root."""
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False
-
-    @staticmethod
-    def _extract_message_thread_id(update: Update) -> Optional[int]:
-        """Extract topic/thread id from update message for forum/direct topics."""
-        message = update.effective_message
-        if not message:
-            return None
-        message_thread_id = getattr(message, "message_thread_id", None)
-        if isinstance(message_thread_id, int) and message_thread_id > 0:
-            return message_thread_id
-        dm_topic = getattr(message, "direct_messages_topic", None)
-        topic_id = getattr(dm_topic, "topic_id", None) if dm_topic else None
-        if isinstance(topic_id, int) and topic_id > 0:
-            return topic_id
-        # Telegram omits message_thread_id for the General topic in forum
-        # supergroups; its canonical thread ID is 1.
-        chat = update.effective_chat
-        if chat and getattr(chat, "is_forum", False):
-            return 1
-        return None
-
-    async def _reject_for_thread_mode(self, update: Update, message: str) -> None:
-        """Send a guidance response when strict thread routing rejects an update."""
-        query = update.callback_query
-        if query:
-            try:
-                await query.answer()
-            except Exception:
-                pass
-            if query.message:
-                await query.message.reply_text(message, parse_mode="HTML")
-            return
-
-        if update.effective_message:
-            await update.effective_message.reply_text(message, parse_mode="HTML")
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""
@@ -458,9 +354,11 @@ class OrchestratorBase:
             user_data[policy_for(selected).session_key] = None
         return resumed
 
-    def _selected_model(self, context: ContextTypes.DEFAULT_TYPE) -> str:
+    def _selected_model(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int] = None
+    ) -> str:
         """What ``/status`` and ``/model`` print for the user's current pick."""
-        resolved = self._model_override(context)
+        resolved = self._model_override(context, user_id)
         if resolved is not None:
             return resolved
         configured = context.user_data.get("agent_model") or self.settings.agent_model
@@ -468,7 +366,23 @@ class OrchestratorBase:
 
     _CLAUDE_TIERS = _CLAUDE_TIERS
 
-    def _model_override(self, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    def _active_profile(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int]
+    ) -> Optional[Any]:
+        """The profile this conversation runs on, or None (single-profile mode)."""
+        registry = context.bot_data.get("profile_registry")
+        if not registry:
+            return None
+        try:
+            return registry.get_by_working_dir(
+                self._routed_working_dir(context, user_id)
+            )
+        except Exception:
+            return None
+
+    def _model_override(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int] = None
+    ) -> Optional[str]:
         """The ``model=`` kwarg for this turn's ``run_command``, any backend.
 
         ``BackendPolicy.resolve_model`` decides: Codex returns the
@@ -481,6 +395,15 @@ class OrchestratorBase:
         """
         policy = self._backend_policy(context)
         configured = context.user_data.get("agent_model") or self.settings.agent_model
+        # A profile on another provider (dv-d2f6) offers its own model list; a
+        # pick inside it passes through, anything else is the resolver's call.
+        profile = self._active_profile(context, user_id)
+        if (
+            profile is not None
+            and profile.allowed_models
+            and configured in profile.allowed_models
+        ):
+            return str(configured)
         resolved = policy.resolve_model(configured)
         if configured and resolved is not None and resolved != configured:
             context.user_data["agent_model"] = resolved

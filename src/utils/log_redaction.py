@@ -15,7 +15,10 @@ import re
 from typing import Any, Pattern
 
 #: Telegram bot tokens look like ``123456789:AA...`` and appear in API paths.
-_TELEGRAM_TOKEN: Pattern[str] = re.compile(r"(?<=/bot)\d{5,}:[A-Za-z0-9_-]{20,}")
+#: File downloads (``/file/bot<token>/...``) URL-encode the colon as ``%3A``.
+_TELEGRAM_TOKEN: Pattern[str] = re.compile(
+    r"(?<=/bot)\d{5,}(?::|%3[Aa])[A-Za-z0-9_-]{20,}"
+)
 
 #: Generic ``?key=...``/``&token=...`` style query credentials.
 _QUERY_SECRET: Pattern[str] = re.compile(

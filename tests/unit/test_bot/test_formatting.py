@@ -5,9 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from src.bot.utils.formatting import (
-    CodeHighlighter,
     FormattedMessage,
-    ProgressIndicator,
     ResponseFormatter,
 )
 from src.bot.utils.html_format import escape_html, markdown_to_telegram_html
@@ -319,112 +317,6 @@ class TestMarkdownToTelegramHtml:
         assert "<b>Bold</b>" in result
         assert "<code>code</code>" in result
         assert "<i>italic</i>" in result
-
-
-class TestProgressIndicator:
-    """Test ProgressIndicator utility functions."""
-
-    def test_create_progress_bar(self):
-        """Test progress bar creation."""
-        bar = ProgressIndicator.create_bar(50, 10)
-
-        assert len(bar) == 10
-        assert "▓" in bar
-        assert "░" in bar
-
-    def test_create_progress_bar_full(self):
-        """Test full progress bar."""
-        bar = ProgressIndicator.create_bar(100, 10)
-
-        assert bar == "▓" * 10
-
-    def test_create_progress_bar_empty(self):
-        """Test empty progress bar."""
-        bar = ProgressIndicator.create_bar(0, 10)
-
-        assert bar == "░" * 10
-
-    def test_create_spinner(self):
-        """Test spinner creation."""
-        spinner1 = ProgressIndicator.create_spinner(0)
-        spinner2 = ProgressIndicator.create_spinner(1)
-
-        assert len(spinner1) == 1
-        assert len(spinner2) == 1
-        assert spinner1 != spinner2
-
-    def test_create_dots(self):
-        """Test dots indicator."""
-        dots0 = ProgressIndicator.create_dots(0)
-        dots1 = ProgressIndicator.create_dots(1)
-        dots3 = ProgressIndicator.create_dots(3)
-
-        assert dots0 == ""
-        assert dots1 == "."
-        assert dots3 == "..."
-
-
-class TestCodeHighlighter:
-    """Test CodeHighlighter utility functions."""
-
-    def test_detect_language_python(self):
-        """Test Python language detection."""
-        lang = CodeHighlighter.detect_language("test.py")
-        assert lang == "python"
-
-    def test_detect_language_javascript(self):
-        """Test JavaScript language detection."""
-        lang = CodeHighlighter.detect_language("test.js")
-        assert lang == "javascript"
-
-    def test_detect_language_unknown(self):
-        """Test unknown file extension."""
-        lang = CodeHighlighter.detect_language("test.unknown")
-        assert lang == ""
-
-    def test_format_code_with_language(self):
-        """Test code formatting with language."""
-        code = "print('hello')"
-        formatted = CodeHighlighter.format_code(code, "python")
-
-        assert formatted.startswith('<pre><code class="language-python">')
-        assert formatted.endswith("</code></pre>")
-        assert "print" in formatted
-
-    def test_format_code_without_language(self):
-        """Test code formatting without language."""
-        code = "some code"
-        formatted = CodeHighlighter.format_code(code)
-
-        assert formatted.startswith("<pre><code>")
-        assert formatted.endswith("</code></pre>")
-        assert code in formatted
-
-    def test_format_code_with_filename(self):
-        """Test code formatting with filename detection."""
-        code = "console.log('hello')"
-        formatted = CodeHighlighter.format_code(code, filename="test.js")
-
-        assert 'class="language-javascript"' in formatted
-
-    def test_format_code_escapes_html(self):
-        """Test that code formatting escapes HTML characters."""
-        code = "if (a < b && c > d) {}"
-        formatted = CodeHighlighter.format_code(code, "javascript")
-        assert "&lt;" in formatted
-        assert "&gt;" in formatted
-        assert "&amp;" in formatted
-
-    def test_language_extensions_coverage(self):
-        """Test that language extensions are properly mapped."""
-        # Test a few key extensions
-        assert CodeHighlighter.detect_language("test.py") == "python"
-        assert CodeHighlighter.detect_language("test.js") == "javascript"
-        assert CodeHighlighter.detect_language("test.ts") == "typescript"
-        assert CodeHighlighter.detect_language("test.java") == "java"
-        assert CodeHighlighter.detect_language("test.cpp") == "cpp"
-        assert CodeHighlighter.detect_language("test.go") == "go"
-        assert CodeHighlighter.detect_language("test.rs") == "rust"
 
 
 TELEGRAM_HARD_LIMIT = 4096

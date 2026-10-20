@@ -117,7 +117,7 @@ def _text_update(text: str = "so did you fix it?") -> MagicMock:
     update.message.message_thread_id = None
     update.message.reply_to_message = None
     update.message.chat.id = 999
-    update.message.chat.type = "group"
+    update.message.chat.type = "private"
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock(return_value=AsyncMock())
     return update

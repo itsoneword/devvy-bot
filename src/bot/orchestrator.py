@@ -45,7 +45,6 @@ OWNER_ONLY_COMMANDS = frozenset(
         "repo",
         "model",
         "servercheck",
-        "sync_threads",
         "diag",
         "identity",
         "limits",
@@ -77,7 +76,7 @@ class CommandSpec:
     #: Roles whose Telegram menu shows it. Empty = registered but unlisted.
     #: TABLE ORDER IS MENU ORDER — setMyCommands preserves send order.
     menu_roles: FrozenSet[str] = field(default_factory=frozenset)
-    #: ``"profiles"`` or ``"project_threads"``: only exists when configured.
+    #: ``"profiles"``: only exists when configured.
     requires: Optional[str] = None
 
 
@@ -92,7 +91,9 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
     CommandSpec(
         "agents", "Pick active agent (keyboard)", "core", _EVERYONE, requires="profiles"
     ),
-    CommandSpec("stop", "Killswitch: halt runs + pause scheduler", "safety", _OWNER),
+    CommandSpec(
+        "stop", "Stop this chat's agent (/stop all = killswitch)", "safety", _OWNER
+    ),
     CommandSpec(
         "resume", "Clear killswitch: resume runs + scheduler", "safety", _OWNER
     ),
@@ -134,9 +135,6 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
     CommandSpec("delkey", "Delete a stored tool key", "safety"),
     CommandSpec("adduser", "Grant a Telegram user guest access", "people"),
     CommandSpec("rmuser", "Revoke a user's access", "people"),
-    CommandSpec(
-        "sync_threads", "Sync project topics", "people", requires="project_threads"
-    ),
 )
 
 _HELP_SECTIONS: tuple[tuple[str, str], ...] = (
@@ -194,7 +192,6 @@ class MessageOrchestrator(
             "identity": self.agentic_identity,
             "adduser": self.agentic_adduser,
             "rmuser": self.agentic_rmuser,
-            "sync_threads": system.sync_threads,
             "setkey": keys.setkey_command,
             "keys": keys.keys_command,
             "delkey": keys.delkey_command,
@@ -205,12 +202,9 @@ class MessageOrchestrator(
     def _available_commands(self) -> List[CommandSpec]:
         """COMMAND_TABLE filtered by what this deployment actually has."""
         have_profiles = bool(self.deps.get("profile_registry"))
-        have_threads = bool(self.settings.enable_project_threads)
         available = []
         for spec in COMMAND_TABLE:
             if spec.requires == "profiles" and not have_profiles:
-                continue
-            if spec.requires == "project_threads" and not have_threads:
                 continue
             available.append(spec)
         return available
@@ -287,7 +281,7 @@ class MessageOrchestrator(
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
-                pattern=r"^(cd:|model:|agent:|agents:|auth:|rem:|vset:|onb:)",
+                pattern=r"^(cd:|model:|agent:|agents:|auth:|rem:|vset:|onb:|qi:)",
             )
         )
 

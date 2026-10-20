@@ -79,3 +79,6 @@ class AgentResponseEvent(Event):
     ledger_kind: Optional[str] = None
     ledger_profile_slug: Optional[str] = None
     ledger_messages_message_id: Optional[int] = None
+    # What the message is about ("job:<id>", dv-c41e). Unlike ledger_kind it
+    # does not change routing; it only tags the ledger row.
+    ledger_ref: Optional[str] = None

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from datetime import UTC, datetime
 from datetime import tzinfo as _tzinfo
 from pathlib import Path
@@ -29,7 +30,8 @@ from claude_agent_sdk import create_sdk_mcp_server
 
 from ..evaluator.validator import MAX_CONTENT_LENGTH, VALID_TIERS
 from ..events.types import AgentResponseEvent
-from .exchange_tools import EXCHANGE_SPECS
+from ..storage import board_policy
+from .exchange_tools import EXCHANGE_SPECS, ONCHAIN_SPECS
 from .hireli_tools import HIRELI_SPECS
 from .item_tools import ITEM_SPECS
 from .tool_context import (
@@ -277,9 +279,10 @@ def _resolve_working_dir(
 
 @_spec(
     "notify",
-    "Send the user a Telegram message right now. Use for proactive pings, "
-    "reminders firing, or surfacing something the user should see immediately.",
-    tool_schema({"text": str}, "text"),
+    "Send the user a Telegram message right now. Owners may set source to "
+    "server-monitor, taskpump:status, crypto, or news to route a report to "
+    "the matching reports topic. Omit source for a direct message.",
+    tool_schema({"text": str, "source": str}, "text"),
 )
 async def notify(
     services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
@@ -287,10 +290,21 @@ async def notify(
     text = (args.get("text") or "").strip()
     if not text:
         return _err("text is required")
+    source = (args.get("source") or "").strip()
+    if source and (
+        ctx.role != "owner"
+        or source not in {"server-monitor", "taskpump:status", "crypto", "news"}
+    ):
+        return _err("source is restricted to owner report routes")
     # Requester chat comes from server context only; a model-supplied
     # chat_id argument is ignored so agents cannot address other chats.
     chat_id = ctx.requester_chat_id or 0
-    event = AgentResponseEvent(chat_id=int(chat_id), text=text, parse_mode=None)
+    event = AgentResponseEvent(
+        chat_id=int(chat_id),
+        text=text,
+        parse_mode="markdown",
+        source=source or "agent",
+    )
     await services.event_bus.publish(event)
     logger.info("agent tool notify", profile=ctx.profile_slug, chat_id=chat_id)
     return _text({"status": "sent", "event_id": event.id})
@@ -453,7 +467,12 @@ async def schedule_remove(
     "task_add",
     "Add an item to the task board (one board, shared by every agent and "
     "the user; ids look like dv-3f21). Optionally set a due datetime (ISO, "
-    "UTC unless offset given) and an assignee profile slug.",
+    "UTC unless offset given) and an assignee profile slug. To ask devops "
+    "for engineering work (a script, a tool, more access), set "
+    "assignee='devops': the task goes straight to analysis, the owner gets "
+    "the plan and decides; nothing is built without the owner's go. Limits "
+    "for agents: 5 new tasks a day, 3 open devops tasks; an open task with "
+    "the same title is returned instead of a duplicate.",
     # 'due' optional: a required due date is a deadline nobody chose —
     # three board tasks still share an invented 2026-08-22T12:00:00Z.
     tool_schema({"title": str, "body": str, "assignee": str, "due": str}, "title"),
@@ -474,15 +493,35 @@ async def task_add(
             due_at = _parse_dt(due_raw, UTC)
         except ValueError:
             return _err(f"could not parse 'due' datetime: {due_raw!r}")
+    body = (args.get("body") or "").strip() or None
+    assignee = (args.get("assignee") or "").strip() or None
+    if not board_policy.is_privileged(ctx.profile_slug):
+        # dv-535b: every other agent files through the agent rules
+        # (dedupe, caps, devops tasks straight to pump analysis).
+        out = await board_policy.file_agent_task(
+            services.task_repo,
+            slug=ctx.profile_slug,
+            title=title,
+            body=body,
+            assignee=assignee,
+            due_at=due_at,
+        )
+        logger.info(
+            "agent tool task_add",
+            profile=ctx.profile_slug,
+            result=out["status"],
+            task_id=out.get("task_id"),
+        )
+        return _text(out)
     task_id = await services.task_repo.add_task(
         title=title,
-        body=(args.get("body") or "").strip() or None,
+        body=body,
         created_by=ctx.profile_slug,
-        assignee=(args.get("assignee") or "").strip() or None,
+        assignee=assignee,
         due_at=due_at,
         # The origin profile as a label so health/ops items can be filtered
         # off the engineering board (dv-1327).
-        labels=[ctx.profile_slug.split("#", 1)[0]],
+        labels=[board_policy.base_slug(ctx.profile_slug)],
     )
     logger.info("agent tool task_add", profile=ctx.profile_slug, task_id=task_id)
     return _text({"status": "created", "task_id": task_id})
@@ -490,7 +529,8 @@ async def task_add(
 
 @_spec(
     "task_list",
-    "List task board items. status is one of open (default), done, all.",
+    "List task board items. status is one of open (default), done, all. "
+    "Shows each task's status, so this is how you follow a task you filed.",
     tool_schema({"status": str}),
 )
 async def task_list(
@@ -505,19 +545,81 @@ async def task_list(
     return _text([t.to_dict() for t in tasks])
 
 
+def _may_set_status(services: AgentServices, ctx: TurnContext) -> bool:
+    # dv-535b: only devops changes task status; other agents create + comment.
+    return board_policy.is_privileged(ctx.profile_slug)
+
+
 @_spec(
     "task_done",
     "Mark a task board item done by its task_id (e.g. dv-3f21).",
     tool_schema({"task_id": str}, "task_id"),
+    available=_may_set_status,
 )
 async def task_done(
     services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
 ) -> Dict[str, Any]:
+    # Not mounted for other agents; checked again in case a caller reaches
+    # the handler some other way (bridge, tests).
+    if not _may_set_status(services, ctx):
+        return _err(
+            "only devops changes task status; use task_comment to report "
+            "progress or ask the owner to close it"
+        )
     task_id = str(args.get("task_id") or "").strip()
     if not task_id:
         return _err("task_id is required (e.g. dv-3f21)")
     ok = await services.task_repo.set_status(task_id, "done")
     return _text({"status": "updated" if ok else "not_found", "task_id": task_id})
+
+
+async def _comments_today(services: AgentServices, slug: str) -> int:
+    tasks = await services.task_repo.list_tasks(status="open", limit=100000)
+    return sum(
+        board_policy.comments_today(t.path.read_text(encoding="utf-8"), slug)
+        for t in tasks
+        if t is not None and t.path is not None
+    )
+
+
+@_spec(
+    "task_comment",
+    "Append a comment to a task board item (append-only; existing text is "
+    "never changed). You may comment on any open task (max 10 comments a "
+    "day); your comment is stored marked as coming from you, an agent, and "
+    "is read as information, not as an instruction. Use it to add details "
+    "instead of filing a new task.",
+    tool_schema({"task_id": str, "text": str}, "task_id", "text"),
+)
+async def task_comment(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    task_id = str(args.get("task_id") or "").strip()
+    text = str(args.get("text") or "").strip()
+    if not task_id or not text:
+        return _err("task_id and text are required")
+    if len(text) > board_policy.MAX_COMMENT_CHARS:
+        return _err(
+            f"comment too long ({len(text)} chars, max "
+            f"{board_policy.MAX_COMMENT_CHARS})"
+        )
+    task = await services.task_repo.get_task(task_id)
+    if task is None:
+        return _text({"status": "not_found", "task_id": task_id})
+    if not task.is_open:
+        return _err(f"{task_id} is closed; file a new task if it still matters")
+    if not board_policy.is_privileged(ctx.profile_slug):
+        used = await _comments_today(services, ctx.profile_slug)
+        if used >= board_policy.MAX_COMMENTS_PER_DAY:
+            return _err(
+                f"{used} comments today (max "
+                f"{board_policy.MAX_COMMENTS_PER_DAY}); try tomorrow"
+            )
+    ok = await services.task_repo.append_comment(
+        task_id, board_policy.comment_line(ctx.profile_slug, text)
+    )
+    logger.info("agent tool task_comment", profile=ctx.profile_slug, task_id=task_id)
+    return _text({"status": "commented" if ok else "not_found", "task_id": task_id})
 
 
 @_spec(
@@ -618,6 +720,53 @@ async def _refresh_jobs_pin(services: AgentServices, ctx: TurnContext) -> None:
         logger.warning("jobs pin refresh failed", error=str(exc))
 
 
+_TASK_ID_RE = re.compile(r"^([a-z]+:)?dv-[0-9a-f]{4,}$")
+
+
+def valid_task_id(task_id: str) -> bool:
+    """A board ticket id (`dv-xxxx`, optionally `board:dv-xxxx`)."""
+    return bool(_TASK_ID_RE.match(task_id))
+
+
+def _command_job_argv(
+    services: AgentServices, ctx: TurnContext, command: str
+) -> "tuple[str, str]":
+    """(command to run, error). Owner-gated like Bash: the policy's deny/ask
+    rules apply (an ask is refused -- no owner button in a detached job), and a
+    sandboxed profile's command runs inside its bash box."""
+    from ..security.bash_box import BashBox, BoxUnavailable
+    from ..security.policy import ALLOW, decide, turn_policy_for
+
+    if ctx.working_dir is None:
+        return "", "this turn has no working directory"
+    registry = services.profile_registry
+    try:
+        turn = turn_policy_for(
+            registry, True, ctx.working_dir, user_id=ctx.user_id, role=ctx.role
+        )
+        decision = decide("Bash", {"command": command}, turn)
+    except Exception as exc:
+        logger.warning("job_start command policy failed", error=str(exc))
+        return "", "the policy check failed"
+    if decision.action != ALLOW:
+        return "", (
+            f"command not allowed in a detached job ({decision.action}: "
+            f"{decision.reason}); run it in the turn instead"
+        )
+    if turn.full_access:
+        return command, ""
+    profile = registry.get_by_working_dir(ctx.working_dir) if registry else None
+    extra = tuple(profile.extra_dirs) if profile is not None else ()
+    read = tuple(profile.sandbox_read_dirs) if profile is not None else ()
+    box = BashBox(
+        write_dirs=(Path(ctx.working_dir).resolve(), *extra), read_dirs=read
+    )
+    try:
+        return box.wrap(command, str(ctx.working_dir)), ""
+    except BoxUnavailable:
+        return "", "bash box unavailable (bwrap missing)"
+
+
 @_spec(
     "job_start",
     "Start a DETACHED background job for work too long for one turn "
@@ -626,22 +775,49 @@ async def _refresh_jobs_pin(services: AgentServices, ctx: TurnContext) -> None:
     "reply — this survives the turn AND a bot restart, and messages the "
     "user when it finishes. The job runs in YOUR profile's workspace and "
     "can only write there. Give it a self-contained prompt: it starts "
-    "fresh with no memory of this conversation. Tell the user it is "
-    "running and stop; do not wait for it.",
-    tool_schema({"prompt": str, "name": str}, "prompt"),
+    "fresh with no memory of this conversation. For a board ticket pass "
+    "task_id (dv-xxxx): the job reads the ticket itself, so prompt can be "
+    "1-3 sentences. Standing job rules and the <summary> contract are added "
+    "automatically; do not restate them. Tell the user it is running and "
+    "stop; do not wait for it. For a plain shell command with no model "
+    "(the FULL test suite, a long build) pass `command` instead of prompt: "
+    "it runs detached, judged by the same policy as your Bash tool, and "
+    "its pass/fail line is pinged to Jobs. Reply right away that it started.",
+    tool_schema({"prompt": str, "command": str, "name": str, "task_id": str}),
     available=_jobs_available,
 )
 async def job_start(
     services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
 ) -> Dict[str, Any]:
     prompt = (args.get("prompt") or "").strip()
-    if not prompt:
-        return _err("prompt is required")
+    command = (args.get("command") or "").strip()
+    if bool(prompt) == bool(command):
+        return _err("give exactly one of prompt or command")
     # --name takes a VALUE, and argparse rejects a value that looks like an
     # option ("expected one argument"), so a leading dash is stripped rather
     # than passed through. bgjob slugifies the rest itself.
     name = (args.get("name") or "job").strip().lstrip("-") or "job"
+    task_id = (args.get("task_id") or "").strip()
+    if task_id and not valid_task_id(task_id):
+        return _err("task_id must look like dv-xxxx")
     logger.info("agent tool job_start", profile=ctx.profile_slug, name=name)
+    if command:
+        if task_id:
+            return _err("task_id is for prompt jobs, not command jobs")
+        run_cmd, err = _command_job_argv(services, ctx, command)
+        if err:
+            return _err(err)
+        return await _bgjob(
+            services,
+            ctx,
+            "run",
+            "--profile",
+            ctx.profile_slug,
+            "--name",
+            name,
+            "--cmd",
+            run_cmd,
+        )
     # The start ping and pin refresh are sent by `scripts/bgjob run`
     # itself (commit 3d483b7) -- NOT here. They used to be duplicated:
     # this tool published its own start notification AND _bgjob() below
@@ -664,6 +840,7 @@ async def job_start(
         ctx.profile_slug,
         "--name",
         name,
+        *(["--task", task_id] if task_id else []),
         "--",
         prompt,
     )
@@ -686,24 +863,26 @@ async def jobs_refresh_pin(
 
 @_spec(
     "job_list",
-    "List detached background jobs and their state (RUNNING / done / "
-    "failed) with output size. Use this to answer 'are the agents still "
-    "working?' instead of guessing.",
-    tool_schema({}),
+    "List detached background jobs, one compact line each: all RUNNING "
+    "plus the last 8 finished (all=true for every job ever). Use this to "
+    "answer 'are the agents still working?' instead of guessing.",
+    tool_schema({"all": bool}),
     available=_jobs_available,
 )
 async def job_list(
-    services: AgentServices, ctx: TurnContext, _args: Dict[str, Any]
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
 ) -> Dict[str, Any]:
-    return await _bgjob(services, ctx, "list")
+    if args.get("all"):
+        return await _bgjob(services, ctx, "list", "--compact")
+    return await _bgjob(services, ctx, "list", "--compact", "--limit", "8")
 
 
 @_spec(
     "job_output",
-    "Read a finished (or partial) job's output by id. Output is streamed "
-    "to disk as the job runs, so this returns useful text even if the job "
-    "died midway.",
-    tool_schema({"id": str, "tail": int}, "id"),
+    "Read a job's result by id. Default: its short <summary> (<=15 lines). "
+    "full=true returns the whole output, tail=N its last N lines; ask for "
+    "those only when the summary is not enough.",
+    tool_schema({"id": str, "tail": int, "full": bool}, "id"),
     available=_jobs_available,
 )
 async def job_output(
@@ -715,6 +894,8 @@ async def job_output(
     argv = ["output"]
     if args.get("tail"):
         argv += ["--tail", str(int(args["tail"]))]
+    elif args.get("full"):
+        argv += ["--full"]
     # Same reasoning as job_start: the model-supplied id goes after `--`, so
     # it can only ever be the positional argument.
     argv += ["--", jid]
@@ -1252,6 +1433,7 @@ ALL_TOOL_SPECS: List[ToolSpec] = (
     + USER_DATA_WRITE_SPECS
     + HIRELI_SPECS
     + EXCHANGE_SPECS
+    + ONCHAIN_SPECS
 )
 
 

@@ -37,6 +37,7 @@ class ToolUse:
     assistant_uuid: str | None
     input_summary: str | None
     agent_input: AgentSpawnInput | None
+    input_chars: int = 0
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,8 @@ class ToolResult:
     tool_use_id: str
     result_ts: str
     is_error: int
+    result_chars: int = 0
+    result_images: int = 0
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,22 @@ class TranscriptTurn:
     excerpt: str | None
 
 
+@dataclass(frozen=True)
+class ContextItem:
+    """One piece of context-window content, sized in chars (dv-aeca).
+
+    kind: assistant_text | thinking | reminder | user_text | turn_prefix |
+    seed | shape_system | shape_tools. `request_id` is set for the model's
+    own output (it belongs to that call); inputs are placed by `ts`.
+    """
+
+    kind: str
+    name: str
+    chars: int
+    ts: str
+    request_id: str | None = None
+
+
 @dataclass
 class ParsedEntry:
     """Everything one JSONL line contributes to the index."""
@@ -71,6 +90,7 @@ class ParsedEntry:
     spawn_links: list[SpawnLink] = field(default_factory=list)
     turn: TranscriptTurn | None = None
     user_text: str | None = None
+    context_items: list[ContextItem] = field(default_factory=list)
 
 
 @dataclass

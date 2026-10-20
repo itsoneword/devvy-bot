@@ -25,6 +25,8 @@ from typing import Any, Optional, Tuple
 
 import structlog
 
+from .job_context import job_envelope, job_id_from_ref
+
 logger = structlog.get_logger()
 
 
@@ -34,6 +36,9 @@ async def build_reply_context(
     ledger: Any,
     user_text: str,
     current_agent_id: Optional[str] = None,
+    viewer_user_id: Optional[int] = None,
+    viewer_is_owner: bool = False,
+    reports_chat_id: Optional[int] = None,
 ) -> Tuple[str, str]:
     """Return ``(prompt_text, user_text)``.
 
@@ -47,6 +52,11 @@ async def build_reply_context(
     ``profile_slug`` matches it. Another profile's reply keeps its quoted
     text and an honest label — the calling agent cannot see that message
     any other way (recall_conversation is scoped to its own profile).
+
+    ``viewer_user_id`` enables the addressee check (dv-e215 v2): a ledgered
+    message is only context for the user it was addressed to. A private chat
+    is addressed to that chat's user; the reports group's reports are the
+    owner's. Anything else is quoted as plain text from another recipient.
     """
     message = getattr(update, "message", None)
     quoted = getattr(message, "reply_to_message", None) if message else None
@@ -65,6 +75,20 @@ async def build_reply_context(
             entry = await ledger.lookup(quoted.chat.id, quoted.message_id)
         except Exception as e:
             logger.warning("Reply-context ledger lookup failed", error=str(e))
+
+    not_addressed = False
+    if entry is not None and viewer_user_id is not None:
+        chat = quoted.chat
+        if getattr(chat, "type", None) == "private":
+            not_addressed = chat.id != viewer_user_id
+        elif reports_chat_id is not None and chat.id == reports_chat_id:
+            not_addressed = not viewer_is_owner
+    if not_addressed:
+        return (
+            "[replied-to message, sent by the bot to another recipient (not "
+            f'to you):\n"{quoted_text}"]\n\n{user_text}',
+            user_text,
+        )
 
     entry_slug = getattr(entry, "profile_slug", None)
     if (
@@ -111,6 +135,14 @@ async def build_reply_context(
                 "without an agent turn, so it is not in your transcript. "
                 f'The reminder said:\n"{quoted_text}"]'
             )
+    elif (
+        is_own_bot
+        and entry is not None
+        and (job_id := job_id_from_ref(getattr(entry, "ref", None)))
+    ):
+        # A reply to a job notification (dv-c41e): the label carries the
+        # job's facts and only the HEAD of its output, never the full tail.
+        envelope = job_envelope(job_id)
     elif is_own_bot and entry is not None:
         envelope = (
             "[replied-to message, from: a system notification (not written "
@@ -144,3 +176,24 @@ def _origin_label(quoted: Any) -> str:
     sender = quoted.from_user
     first_name = getattr(sender, "first_name", None) if sender else None
     return f"the user {first_name}" if first_name else "another user"
+
+
+def build_source_tag(update: Any, topic_name: Optional[str] = None) -> str:
+    """``[via: group "X" › topic "Y"]`` for a turn that is not a DM, else "".
+
+    One conversation spans the DM and bound forum topics (dv-e215), so the
+    agent cannot otherwise tell where a message was written (dv-1dda). DM
+    turns stay untagged: DM is the default and a tag on every turn is noise.
+    The tag is prepended to the prompt and stored with it, ahead of any
+    ``[replied-to ...]`` envelope.
+    """
+    message = getattr(update, "message", None)
+    chat = getattr(message, "chat", None)
+    if chat is None or getattr(chat, "type", None) not in ("group", "supergroup"):
+        return ""
+    title = getattr(chat, "title", None) or "group"
+    tag = f'[via: group "{title}"'
+    thread_id = getattr(message, "message_thread_id", None)
+    if getattr(message, "is_topic_message", False) and thread_id:
+        tag += f' › topic "{topic_name or f"thread {thread_id}"}"'
+    return tag + "]"

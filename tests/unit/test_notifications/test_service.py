@@ -2,6 +2,8 @@
 
 from unittest.mock import AsyncMock
 
+from telegram.error import BadRequest
+
 import pytest
 
 from src.events.bus import EventBus
@@ -211,6 +213,7 @@ class TestLedgeredDelivery:
             kind="scheduled_reminder",
             messages_message_id=901,
             profile_slug="coach#u42",
+            ref=None,
         )
 
     async def test_unledgered_event_not_recorded(
@@ -340,3 +343,48 @@ class TestLoneSurrogates:
         text = mock_bot.send_message.call_args.kwargs["text"]
         text.encode("utf-8")
         assert text and set(text) == {"�"}
+
+
+class TestMarkdownMode:
+    async def test_bold_becomes_html(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        ev = AgentResponseEvent(chat_id=1, text="**hi** there", parse_mode="markdown")
+        await service._rate_limited_send(1, ev)
+        kw = mock_bot.send_message.call_args.kwargs
+        assert kw["text"] == "<b>hi</b> there"
+        assert str(kw["parse_mode"]).lower().endswith("html")
+
+    async def test_parse_error_falls_back_to_plain_original(
+        self, service: NotificationService, mock_bot: AsyncMock
+    ) -> None:
+        mock_bot.send_message.side_effect = [
+            BadRequest("Can't parse entities: bad tag"),
+            AsyncMock(),
+        ]
+        ev = AgentResponseEvent(chat_id=1, text="**hi**", parse_mode="markdown")
+        await service._rate_limited_send(1, ev)
+        assert mock_bot.send_message.call_count == 2
+        last = mock_bot.send_message.call_args.kwargs
+        assert last["text"] == "**hi**" and "parse_mode" not in last
+
+    async def test_long_text_splits_before_conversion(
+        self, service: NotificationService, mock_bot: AsyncMock, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("src.notifications.service.SEND_INTERVAL_SECONDS", 0)
+        text = "\n\n".join(f"**para {i}** " + "x" * 300 for i in range(30))
+        ev = AgentResponseEvent(chat_id=1, text=text, parse_mode="markdown")
+        await service._rate_limited_send(1, ev)
+        sent = [c.kwargs["text"] for c in mock_bot.send_message.call_args_list]
+        assert len(sent) > 1
+        for t in sent:
+            assert len(t) <= 4096
+            assert t.count("<b>") == t.count("</b>")
+
+    def test_open_fence_is_closed_and_reopened(
+        self, service: NotificationService
+    ) -> None:
+        text = "```\n" + "\n".join("line %d" % i for i in range(40))
+        parts = service._split_markdown(text, 100)
+        assert len(parts) > 1
+        assert all(p.count("```") % 2 == 0 for p in parts)

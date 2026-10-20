@@ -116,6 +116,17 @@ class ProfileDefinition:
     # extra folder; this is the narrow grant. Owner-only profiles only: the
     # loader refuses the key on a guest-allowed profile.
     extra_dirs: Tuple[Path, ...] = ()
+    # Directories a *sandboxed* profile's bash may READ (not write), beyond its
+    # workspace (dv-98f2): shared tool checkouts such as ~/tools/fetchcrypto.
+    # Mounted read-only into the bash box (src/security/bash_box.py). Owner-only
+    # profiles only, like extra_dirs.
+    sandbox_read_dirs: Tuple[Path, ...] = ()
+    # Outbound hosts a *sandboxed* profile's bash is meant to reach (dv-98f2).
+    # NOT ENFORCED: the box shares the host network (no egress proxy yet), so
+    # bash can reach any host. Kept so the list is ready for the proxy task.
+    # Owner-only profiles only: the loader refuses the key on a guest-allowed
+    # profile.
+    sandbox_allowed_domains: Tuple[str, ...] = ()
     # Disabled profiles (dv-ffb4) stay in the YAML — persona, memory, and
     # workspace intact — but are invisible: no ``/slug`` command, no keyboard
     # button, no routing target. Toggled from the /agents Manage menu; the
@@ -127,6 +138,16 @@ class ProfileDefinition:
     # Baseline credential rules (.env, key files, ~/.ssh, ~/.claude) still
     # apply. Requires sandbox: false and an owner-only profile.
     unrestricted: bool = False
+    # Model provider for this profile's chat turns (dv-d2f6). None = the
+    # Claude subscription, unchanged. "openrouter" = the Claude Code CLI
+    # pointed at OpenRouter's Anthropic-compatible endpoint; sandboxed,
+    # owner-only profiles, never devops, until the tool loop is proven.
+    provider: Optional[str] = None
+    # Model slug the profile runs on under a provider (e.g. ``z-ai/glm-5.3``).
+    model: Optional[str] = None
+    # Slugs a user's ``/model`` pick may choose on this profile; a pick outside
+    # the list is ignored. Empty = no per-profile list.
+    allowed_models: Tuple[str, ...] = ()
 
     def allows_role(self, role: str) -> bool:
         """Owners always pass; other roles must be explicitly allowed."""
@@ -250,13 +271,6 @@ def guest_working_dir(profile: ProfileDefinition, user_id: int) -> Path:
     return profile.working_dir / GUESTS_DIRNAME / str(user_id)
 
 
-def ensure_guest_working_dir(profile: ProfileDefinition, user_id: int) -> Path:
-    """Guest workspace path, created (parents included) on first use."""
-    path = guest_working_dir(profile, user_id)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def user_working_dir(profile: ProfileDefinition, user_id: int) -> Path:
     """Per-user workspace under a profile root: ``<root>/users/<user_id>``."""
     return profile.working_dir / USERS_DIRNAME / str(user_id)
@@ -377,6 +391,84 @@ def _parse_user_data_tools(item: Dict[str, Any], slug: str) -> FrozenSet[str]:
             f" {sorted(unknown)} (valid: {sorted(VALID_USER_DATA_TOOL_GROUPS)})"
         )
     return parsed
+
+
+def _parse_provider(
+    item: Dict[str, Any],
+    slug: str,
+    *,
+    resolved_sandbox: bool,
+    unrestricted: bool,
+    allowed_roles: FrozenSet[str],
+    max_cost_per_request: Optional[float],
+    exchange: bool,
+) -> Tuple[Optional[str], Optional[str], Tuple[str, ...]]:
+    """Parse ``provider`` / ``model`` / ``allowed_models`` (dv-d2f6).
+
+    ``provider: openrouter`` fails closed: sandboxed, not ``unrestricted``, not
+    the ``devops`` admin profile, no exchange tools, an explicit
+    ``max_cost_per_request`` > 0, and a ``model``. The non-Anthropic model's
+    adherence to tool-use rules is untested, so it gets the narrow profiles.
+    """
+    from src.model_router.routes import VALID_PROVIDERS, pricing_rule_for
+
+    provider = item.get("provider")
+    model = item.get("model")
+    raw_allowed = item.get("allowed_models")
+    if provider is not None and (not isinstance(provider, str) or not provider):
+        raise ValueError(f"Profile '{slug}': provider must be a string")
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise ValueError(f"Profile '{slug}': model must be a non-empty string")
+    allowed: Tuple[str, ...] = ()
+    if raw_allowed is not None:
+        if not isinstance(raw_allowed, list) or not all(
+            isinstance(m, str) and m.strip() for m in raw_allowed
+        ):
+            raise ValueError(
+                f"Profile '{slug}': allowed_models must be a list of model names"
+            )
+        allowed = tuple(m.strip() for m in raw_allowed)
+    if provider is None:
+        if model is not None or allowed:
+            raise ValueError(
+                f"Profile '{slug}': model / allowed_models need a provider"
+            )
+        return None, None, ()
+    if provider not in VALID_PROVIDERS:
+        raise ValueError(
+            f"Profile '{slug}': unknown provider {provider!r}"
+            f" (valid: {sorted(VALID_PROVIDERS)})"
+        )
+    if model is None:
+        raise ValueError(f"Profile '{slug}': provider {provider} needs a model")
+    model = model.strip()
+    if not resolved_sandbox or unrestricted:
+        raise ValueError(
+            f"Profile '{slug}': provider {provider} requires a sandboxed profile"
+        )
+    if slug == DEFAULT_AGENT_ID:
+        raise ValueError(
+            f"Profile '{slug}': provider {provider} is not allowed on devops"
+        )
+    if exchange:
+        raise ValueError(
+            f"Profile '{slug}': provider {provider} is not allowed with exchange"
+        )
+    if not max_cost_per_request:
+        raise ValueError(
+            f"Profile '{slug}': provider {provider} needs max_cost_per_request > 0"
+        )
+    if allowed and model not in allowed:
+        raise ValueError(f"Profile '{slug}': model must be in allowed_models")
+    # The per-request cap is checked against tokens x this rule until the
+    # provider's exact cost arrives, so a model without one is uncapped.
+    unpriced = [m for m in (model, *allowed) if pricing_rule_for(m) is None]
+    if unpriced:
+        raise ValueError(
+            f"Profile '{slug}': no pricing rule for {unpriced} in"
+            " config/llm_pricing.json (scripts/gen_openrouter_pricing.py)"
+        )
+    return provider, model, allowed
 
 
 def _parse_allowed_roles(item: Dict[str, Any], slug: str) -> FrozenSet[str]:
@@ -659,6 +751,23 @@ def load_profile_registry(
                 f"Profile '{slug}': extra_dirs is not allowed on a"
                 " guest-allowed profile"
             )
+        read_dirs = _parse_extra_dirs(item, slug, _resolve, key="sandbox_read_dirs")
+        if read_dirs and "guest" in allowed_roles:
+            raise ValueError(
+                f"Profile '{slug}': sandbox_read_dirs is not allowed on a"
+                " guest-allowed profile"
+            )
+        allowed_domains = _parse_allowed_domains(item, slug)
+        if allowed_domains and "guest" in allowed_roles:
+            raise ValueError(
+                f"Profile '{slug}': sandbox_allowed_domains is not allowed on"
+                " a guest-allowed profile"
+            )
+        if allowed_domains and not resolved_sandbox:
+            logger.warning(
+                "sandbox_allowed_domains has no effect on a full-access profile",
+                profile=slug,
+            )
         if extra_dirs and not resolved_sandbox:
             logger.warning(
                 "extra_dirs has no effect on a full-access profile",
@@ -729,6 +838,16 @@ def load_profile_registry(
                 raise ValueError(f"Profile '{slug}': max_cost_per_request must be >= 0")
             max_cost_per_request = float(max_cost_per_request)
 
+        provider, model, allowed_models = _parse_provider(
+            item,
+            slug,
+            resolved_sandbox=resolved_sandbox,
+            unrestricted=unrestricted,
+            allowed_roles=allowed_roles,
+            max_cost_per_request=max_cost_per_request,
+            exchange=exchange,
+        )
+
         definition = ProfileDefinition(
             slug=slug,
             name=name,
@@ -749,8 +868,13 @@ def load_profile_registry(
             hireli=bool(item.get("hireli", False)),
             exchange=exchange,
             extra_dirs=extra_dirs,
+            sandbox_read_dirs=read_dirs,
+            sandbox_allowed_domains=allowed_domains,
             enabled=enabled,
             unrestricted=unrestricted,
+            provider=provider,
+            model=model,
+            allowed_models=allowed_models,
         )
         if validate_paths:
             _validate_profile_paths(definition)
@@ -771,22 +895,50 @@ def load_profile_registry(
     return ProfileRegistry(profiles)
 
 
-def _parse_extra_dirs(
-    item: Dict[str, Any], slug: str, resolve: Any
-) -> Tuple[Path, ...]:
-    """Parse `extra_dirs: [/path, ...]` for one profile (dv-3103)."""
-    raw = item.get("extra_dirs")
+def _parse_allowed_domains(item: Dict[str, Any], slug: str) -> Tuple[str, ...]:
+    """Parse `sandbox_allowed_domains: [host, ...]` for one profile (dv-98f2)."""
+    raw = item.get("sandbox_allowed_domains")
     if raw is None:
         return ()
     if not isinstance(raw, list) or not all(isinstance(x, str) and x for x in raw):
-        raise ValueError(f"Profile '{slug}': extra_dirs must be a list of paths")
+        raise ValueError(
+            f"Profile '{slug}': sandbox_allowed_domains must be a list of hostnames"
+        )
+    out: List[str] = []
+    for entry in raw:
+        host = entry.strip().lower()
+        # Bare hosts (optionally `*.example.com` / `host:port`): a scheme or
+        # path means the owner pasted a URL, and a bare `*` is no allowlist.
+        if (
+            not host
+            or host == "*"
+            or "://" in host
+            or "/" in host
+            or any(c.isspace() for c in host)
+        ):
+            raise ValueError(
+                f"Profile '{slug}': sandbox_allowed_domains entry '{entry}' must"
+                " be a bare hostname (no scheme, path or lone '*')"
+            )
+        if host not in out:
+            out.append(host)
+    return tuple(out)
+
+
+def _parse_extra_dirs(
+    item: Dict[str, Any], slug: str, resolve: Any, key: str = "extra_dirs"
+) -> Tuple[Path, ...]:
+    """Parse `extra_dirs: [/path, ...]` (or `sandbox_read_dirs`) for one profile."""
+    raw = item.get(key)
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(x, str) and x for x in raw):
+        raise ValueError(f"Profile '{slug}': {key} must be a list of paths")
     resolved: List[Path] = []
     for entry in raw:
-        path = resolve(entry, "extra_dirs").resolve()
+        path = resolve(entry, key).resolve()
         if path == Path("/") or path == Path.home():
-            raise ValueError(
-                f"Profile '{slug}': extra_dirs entry '{entry}' is too broad"
-            )
+            raise ValueError(f"Profile '{slug}': {key} entry '{entry}' is too broad")
         # dv-2c1c: `--add-dir` would re-expose a data-root area the bwrap jail
         # hides (secrets/, archive/, db/). extra_dirs is sandbox-only, so the
         # sandboxed set applies.
@@ -795,7 +947,7 @@ def _parse_extra_dirs(
         for area in protected_dirs().for_session(full_access=False):
             if path == area or area in path.parents or path in area.parents:
                 raise ValueError(
-                    f"Profile '{slug}': extra_dirs entry '{entry}' overlaps "
+                    f"Profile '{slug}': {key} entry '{entry}' overlaps "
                     f"{area}, which no agent may read"
                 )
         if path not in resolved:

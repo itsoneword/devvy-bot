@@ -23,6 +23,8 @@ from telegram.ext import (
 
 from ..config.settings import Settings
 from ..exceptions import ClaudeCodeTelegramError
+from ..security.auth import fallback_role
+from ..notifications.routing import JOBS_HINT
 from .features.registry import FeatureRegistry
 from .orchestrator import MessageOrchestrator
 
@@ -172,7 +174,116 @@ class ClaudeCodeBot:
             group=-1,
         )
 
+        self._add_reports_chat_handlers()
+
         logger.info("Middleware added to bot")
+
+    def _add_reports_chat_handlers(self) -> None:
+        """Reports group (dv-e215): record membership changes, ignore chatter.
+
+        * my_chat_member (bot added/removed/promoted in any chat) -> structured
+          log line + audit entry carrying the chat id, so setup never needs a
+          web client. Always on.
+        * With REPORTS_CHAT_ID set, every message in that chat is dropped before
+          auth and the agent handlers: the group is read-only output, and an
+          allowed user typing there must not start an agent turn that shares
+          the DM session. Other groups and project threads are untouched.
+        """
+        from telegram.ext import ApplicationHandlerStop, ChatMemberHandler
+
+        app = self.app
+        assert app is not None
+
+        async def on_my_chat_member(
+            update: Update, context: ContextTypes.DEFAULT_TYPE
+        ) -> None:
+            change = update.my_chat_member
+            if change is None:
+                return
+            chat = change.chat
+            audit = self.deps.get("audit_logger")
+            try:
+                if audit is not None:
+                    await audit.log_chat_membership(
+                        user_id=change.from_user.id,
+                        chat_id=chat.id,
+                        chat_type=chat.type,
+                        title=chat.title,
+                        old_status=change.old_chat_member.status,
+                        new_status=change.new_chat_member.status,
+                    )
+                else:
+                    logger.info(
+                        "Bot chat membership changed",
+                        chat_id=chat.id,
+                        chat_type=chat.type,
+                        title=chat.title,
+                        new_status=change.new_chat_member.status,
+                    )
+            except Exception:
+                logger.warning("chat membership audit failed", exc_info=True)
+
+        app.add_handler(
+            ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER),
+            group=-4,
+        )
+
+        reports_chat_id = self.settings.reports_chat_id
+        if reports_chat_id:
+
+            async def reports_chat_gate(
+                update: Update, context: ContextTypes.DEFAULT_TYPE
+            ) -> None:
+                """Drop everything except text/voice/photo/document in a bound
+                topic from an allowed sender."""
+                router = self.deps.get("reports_router")
+                message = update.effective_message
+                user = update.effective_user
+                if (
+                    router is not None
+                    and message is not None
+                    and user is not None
+                    and (
+                        (message.text and not message.text.startswith("/"))
+                        or getattr(message, "voice", None)
+                        or getattr(message, "photo", None)
+                        or getattr(message, "document", None)
+                    )
+                ):
+                    slug = await router.profile_for_message(message)
+                    role = None
+                    auth = self.deps.get("auth_manager")
+                    if auth is not None:
+                        role = auth.get_user_role(user.id)
+                    if role is None:
+                        role = fallback_role(user.id, self.settings)
+                    topic = await router.topic_name_for_thread(
+                        message.chat_id,
+                        message.message_thread_id if message.is_topic_message else None,
+                    )
+                    if topic is not None and topic in router.reply_only:
+                        # Jobs: owner only, whatever the inbound policy says.
+                        # A reply to a job message (text, voice, photo or
+                        # document — the outer filter already limits the
+                        # kinds) goes through; anything else gets a hint.
+                        if role == "owner":
+                            if slug is not None:
+                                return
+                            if router.hint_due(topic):
+                                await message.reply_text(JOBS_HINT)
+                    elif slug is not None and router.sender_allowed(role):
+                        return  # continue to auth + the text handler
+                logger.debug(
+                    "Ignoring message in reports chat", chat_id=reports_chat_id
+                )
+                raise ApplicationHandlerStop
+
+            app.add_handler(
+                MessageHandler(
+                    filters.Chat(chat_id=reports_chat_id), reports_chat_gate
+                ),
+                group=-4,
+            )
 
     def _create_middleware_handler(self, middleware_func: Callable) -> Callable:
         """Create middleware handler that injects dependencies.

@@ -309,11 +309,20 @@ class TestLaunchContract:
             assert options.permission_mode != "bypassPermissions"
             assert options.can_use_tool is not None
             assert options.sandbox["autoAllowBashIfSandboxed"] is False
-            deny_read = options.sandbox["filesystem"]["denyRead"]
+            # dv-98f2: the CLI's own sandbox is dead on this host, so it is
+            # off for every profile; confined bash runs in the hook's box.
+            assert options.sandbox["enabled"] is False
+            hook = options.hooks["PreToolUse"][0].hooks[0]
+            boxed = await hook(
+                {"tool_name": "Bash", "tool_input": {"command": "echo hi"}},
+                None,
+                None,
+            )
+            updated = (boxed.get("hookSpecificOutput") or {}).get("updatedInput")
             if confined:
-                assert options.sandbox["enabled"] is True
-                assert str(tree.secrets.resolve()) in deny_read
-                assert str(tree.db.resolve()) in deny_read
+                assert updated is not None
+                assert "bash_box.py" in updated["command"]
+                assert str(tree.secrets.resolve()) not in updated["command"]
                 for path in (tree.secrets / "k", tree.db / "bot.db"):
                     assert (
                         await _hook_decision(options, "Read", {"file_path": str(path)})
@@ -327,8 +336,7 @@ class TestLaunchContract:
                 )
             else:
                 # devops is the server admin (dv-e38e): data root reachable.
-                assert options.sandbox["enabled"] is False
-                assert deny_read == []
+                assert updated is None
 
     async def test_credentials_denied(
         self, tree, settings, backend, profile_type

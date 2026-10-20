@@ -17,7 +17,7 @@ This document provides detailed information for developers working on Devvy.
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/itsoneword/Devvy.git
+   git clone https://github.com/itsoneword/devvy-bot.git
    cd Devvy
    ```
 

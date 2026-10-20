@@ -1,0 +1,21 @@
+-- rendered by scripts/render_deploy.py; do not install this file directly --
+# Not enabled by the installer. Enable by hand: systemctl --user enable --now taskpump.timer
+[Unit]
+Description=Tick taskpump every 10 minutes
+
+[Timer]
+# Deliberately not tied to the bot's APScheduler: that scheduler has known
+# weekday/workspace defects (dv-3e91) and caps a turn at 300s, and the pump
+# must keep reaping even while the bot is restarting.
+OnBootSec=5min
+# OnBootSec is relative to kernel boot; if the user manager starts later (linger,
+# migration) it is already elapsed and the timer never arms. OnStartupSec fixes that.
+OnStartupSec=5min
+OnUnitActiveSec=10min
+# A tick missed while the machine was off should run once on the way back up,
+# not fire a backlog of them.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

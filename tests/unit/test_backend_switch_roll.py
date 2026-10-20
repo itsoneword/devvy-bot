@@ -251,7 +251,7 @@ def _turn_harness(settings, repo, run_command):
     update.message.text = "and now?"
     update.message.message_id = 1
     update.message.reply_to_message = None
-    update.message.chat.type = "group"
+    update.message.chat.type = "private"
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock()
     update.message.reply_text.return_value = AsyncMock()

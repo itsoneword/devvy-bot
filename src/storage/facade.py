@@ -179,7 +179,8 @@ class Storage:
         # Update cost tracking
         # None (unpriced turn, dv-0722) is written as 0.0: these are
         # dollars-spent ledgers with no "unknown" state.
-        await self.costs.update_daily_cost(user_id, response.cost_usd)
+        booked_on = datetime.now(UTC).strftime("%Y-%m-%d")
+        await self.costs.update_daily_cost(user_id, response.cost_usd, booked_on)
 
         # Update user stats
         user = await self.users.get_user(user_id)
@@ -216,7 +217,34 @@ class Storage:
             ip_address=ip_address,
         )
         await self.audit.log_event(audit_event)
+        # Last: the user/session totals above are read-modify-write.
+        self._true_up_when_settled(user_id, session_id, message_id, response, booked_on)
         return message_id
+
+    def _true_up_when_settled(
+        self,
+        user_id: int,
+        session_id: str,
+        message_id: int,
+        response: ClaudeResponse,
+        booked_on: str,
+    ) -> None:
+        """Swap the booked estimate for the settled cost (dv-d2f6) in the
+        message row, the daily ledger and the user/session totals."""
+        from ..model_router.turn_cost import Settlement, when_settled
+
+        async def _apply(settled: Settlement) -> None:
+            await self.costs.apply_correction(
+                user_id=user_id,
+                session_id=session_id,
+                message_id=message_id,
+                delta=settled.delta,
+                date=booked_on,
+            )
+
+        when_settled(
+            getattr(response, "cost_settlement", None), _apply, what="cost_tracking"
+        )
 
     async def get_or_create_user(
         self, user_id: int, username: Optional[str] = None

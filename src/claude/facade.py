@@ -660,6 +660,10 @@ class ClaudeIntegration:
             for s in sessions
         ]
 
+    async def stop_turns(self, user_id: int, profile: str) -> int:
+        """Scoped ``/stop`` (AgentBackend): see ClaudeSDKManager.stop_turns."""
+        return await self.sdk_manager.stop_turns(user_id, profile)
+
     def attach_tools(self, services: Any, bridge: Any = None) -> None:
         """In-process MCP tools; the HTTP bridge is for out-of-process backends."""
         self.sdk_manager.attach_agent_services(services)

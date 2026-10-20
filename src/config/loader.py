@@ -1,5 +1,6 @@
 """Configuration loading with environment detection."""
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -69,6 +70,26 @@ def load_config(
         # pydantic-settings will automatically read from environment variables
         # Later files win: the secrets file overrides the config .env.
         settings = Settings(_env_file=env_files)  # type: ignore[call-arg]
+
+        # A reports chat ID is non-secret. Allow an install to set it in the
+        # data directory without giving an agent access to the protected .env.
+        if settings.reports_chat_id is None and settings.devvy_data_root is not None:
+            reports_id_file = settings.devvy_data_root / "reports_chat_id"
+            try:
+                reports_id = reports_id_file.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning("Could not read reports chat ID", error=str(e))
+            else:
+                try:
+                    settings.reports_chat_id = int(reports_id)
+                except ValueError:
+                    logger.warning(
+                        "Invalid reports chat ID file", path=str(reports_id_file)
+                    )
+
+        _load_reports_inbound_file(settings)
 
         # Apply environment-specific overrides
         settings = _apply_environment_overrides(settings, env)
@@ -193,23 +214,6 @@ def _validate_config(settings: Settings) -> None:
     if settings.enable_token_auth and not settings.auth_token_secret:
         raise InvalidConfigError("Token auth enabled but no secret provided")
 
-    if settings.enable_project_threads:
-        if (
-            settings.project_threads_mode == "group"
-            and settings.project_threads_chat_id is None
-        ):
-            raise InvalidConfigError(
-                "Project thread mode is 'group' but no project_threads_chat_id provided"
-            )
-        if not settings.projects_config_path:
-            raise InvalidConfigError(
-                "Project thread mode enabled but no projects_config_path provided"
-            )
-        if not settings.projects_config_path.exists():
-            raise InvalidConfigError(
-                f"Projects config not found: {settings.projects_config_path}"
-            )
-
     # Validate database path for SQLite
     if settings.database_url.startswith("sqlite:///"):
         db_path = settings.database_path
@@ -284,3 +288,42 @@ def create_test_config(**overrides: Any) -> Settings:
     settings = Settings(**test_values)
 
     return settings
+
+
+def _load_reports_inbound_file(settings: Settings) -> None:
+    """Fill reports bindings / inbound policy from ``<data-root>/reports_bindings.json``.
+
+    Format: ``{"policy": "owner", "bindings": {"Topic": "profile-slug"}}``.
+    Environment settings (REPORTS_BINDINGS / REPORTS_INBOUND_POLICY) win; the
+    file only supplies what the environment left at its default.
+    """
+    if settings.devvy_data_root is None:
+        return
+    path = settings.devvy_data_root / "reports_bindings.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        logger.warning("Could not read reports bindings", path=str(path), error=str(e))
+        return
+    if not isinstance(data, dict):
+        logger.warning("Invalid reports bindings file", path=str(path))
+        return
+    bindings = data.get("bindings")
+    if not settings.reports_bindings and isinstance(bindings, dict):
+        settings.reports_bindings = {
+            str(k).strip(): str(v).strip().lower()
+            for k, v in bindings.items()
+            if str(k).strip() and str(v).strip()
+        }
+    reply_only = data.get("reply_only")
+    if not settings.reports_reply_only and isinstance(reply_only, list):
+        settings.reports_reply_only = [
+            str(t).strip() for t in reply_only if str(t).strip()
+        ]
+    policy = data.get("policy")
+    if "reports_inbound_policy" not in settings.model_fields_set and isinstance(
+        policy, str
+    ):
+        settings.reports_inbound_policy = policy.strip().lower()

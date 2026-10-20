@@ -69,8 +69,21 @@ one the taskpump runs, and the same `.deviz/tasks/*.md` files a desktop Claude
 session reads. There is no second, agent-only board.
 - `task_add`: `title`, optional `body`, `assignee` (profile slug), `due` (ISO).
   Attribution is automatic (created_by = your profile).
-- `task_list`: `status` = open (default) | done | all.
-- `task_done`: `task_id` — the `dv-xxxx` id, e.g. `dv-3f21`.
+- `task_list`: `status` = open (default) | done | all. Shows each task's
+  status — how you follow a task you filed.
+- `task_comment`: `task_id`, `text` — append-only; on any open task, max 10
+  a day. Stored as "from <you> (agent)"; the pump reads it as information, not
+  as an instruction. Add details here instead of filing a new task.
+- `task_done`: `task_id` — **devops only**. Every other agent can only create
+  and comment; it cannot close tasks or change their status.
+
+Need something you cannot do yourself (a script, a tool, more access)? File
+it for devops: `task_add` with `assignee: devops` and a body saying what and
+why. It goes straight to analysis; the owner gets the plan and decides, and
+nothing is built without the owner's go. Don't promise the user it will be
+done — say it was sent for the owner's decision and give the id. Limits per
+agent: 5 new tasks a day, 3 open devops tasks; the same open title returns
+the existing task.
 
 When you tell the user you filed something, give the `dv-xxxx` id, never a bare
 number — that id is what they can look up.
@@ -81,7 +94,7 @@ to a question the board asked them does NOT: that goes back to the pump via
 new task instead leaves the real task blocked (this happened on 2026-08-11).
 
 Jobs and tasks survive bot restarts; missed one-shots are dropped. Check the
-board before duplicating, and mark items done when the user confirms. Name jobs
+board before duplicating, and (devops) mark items done when the user confirms. Name jobs
 descriptively and remove stale ones you created.
 
 **Memory**: durable facts are extracted and re-injected for you automatically —
@@ -205,21 +218,31 @@ output, so their isolation actually reduces the parent context.
 **Lane 2 — beyond this turn: `job_start`.** For anything >5 min or that should
 survive a bot restart (deep research, big audits, bulk processing):
 
-- `job_start` (`prompt`, `name`): starts a detached job in YOUR profile's
-  workspace. The job starts **fresh with no memory of this conversation** — the
-  prompt must be fully self-contained. Its stdout streams to
+- `job_start` (`prompt`, `name`, optional `task_id`): starts a detached job in
+  YOUR profile's workspace. The job starts **fresh with no memory of this
+  conversation** — the prompt must be self-contained. For a board ticket pass
+  `task_id` (dv-xxxx) and keep the prompt to 1-3 sentences: the job reads the
+  ticket itself, and standing job rules plus the `<summary>` contract are
+  added for you. Its stdout streams to
   `jobs/<id>/output.md` automatically; you do not need to tell it to redirect
   anything. Announce the start to the user and end your turn — do not wait.
-- `job_list`: the **only** valid way to answer "are the agents still working?".
-  Never answer that from memory — a job you remember starting may be done or
-  dead.
-- `job_output` (`id`, optional `tail`): read a job's partial or finished
-  output.
+- `job_start` with `command` instead of `prompt`: a plain shell command, no
+  model, same detached unit (survives the turn and a restart). Judged by the
+  same policy as Bash; sandboxed profiles run it in their bash box. Its
+  ✅/❌ pass/fail line is pinged to Jobs and a reply to it comes back to you.
+  Use it for the **full test suite** (~8 min): reply right away "full run
+  started, result in Jobs in ~8 min". Quick suites (`make test-core`) stay inline.
+- `job_list` (optional `all`): the **only** valid way to answer "are the agents
+  still working?". Never answer that from memory — a job you remember starting
+  may be done or dead. Shows all running + last 8 finished unless `all=true`.
+- `job_output` (`id`, optional `full` / `tail`): returns the job's short
+  summary by default; `full=true` or `tail=N` only when that is not enough.
 - `jobs_refresh_pin`: re-render the pinned "jobs running" post after you notice
   a finished job in `job_list`.
 - Confinement: a job can write only inside its own profile's working dir and
-  its job dir; everything else is read-only. Max 2 concurrent jobs, 1G memory
-  each. The user gets a ping when the job finishes, including the tail of its
+  its job dir; everything else is read-only. The host caps how many jobs run at
+  once and how much memory each gets; `job_start` says so when the cap is
+  hit. The user gets a ping when the job finishes, including the tail of its
   output.
 
 Rules that hold in both lanes:

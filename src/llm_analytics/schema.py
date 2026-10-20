@@ -115,6 +115,25 @@ bot_windows = Table(
     Column("updated_at", TEXT),
 )
 
+context_items = Table(
+    "context_items",
+    metadata,
+    Column("id", INTEGER, primary_key=True, nullable=True),
+    Column("session_id", TEXT, nullable=False),
+    Column("agent_id", TEXT),
+    Column("file_id", INTEGER, nullable=False),
+    Column("entry_offset", INTEGER, nullable=False),
+    Column("seq", INTEGER, nullable=False),
+    Column("ts", TEXT, nullable=False),
+    Column("kind", TEXT, nullable=False),
+    Column("name", TEXT, nullable=False),
+    Column("chars", INTEGER, nullable=False),
+    Column("request_id", TEXT),
+    UniqueConstraint("file_id", "entry_offset", "seq"),
+    Index("idx_context_items_session", "session_id", "agent_id", "ts"),
+    sqlite_autoincrement=True,
+)
+
 derived_events = Table(
     "derived_events",
     metadata,
@@ -168,6 +187,13 @@ quality_daily = Table(
     Column("recipe_turns", INTEGER, nullable=False, server_default=text("0")),
     Column(
         "recipe_turns_unsearched", INTEGER, nullable=False, server_default=text("0")
+    ),
+    Column("verification_calls", INTEGER, nullable=False, server_default=text("0")),
+    Column("verified_turns", INTEGER, nullable=False, server_default=text("0")),
+    Column("deep_research_turns", INTEGER, nullable=False, server_default=text("0")),
+    Column("program_turns", INTEGER, nullable=False, server_default=text("0")),
+    Column(
+        "program_turns_unchecked", INTEGER, nullable=False, server_default=text("0")
     ),
     Index("idx_quality_daily_date", "date"),
 )
@@ -232,6 +258,10 @@ tool_calls = Table(
     Column("duration_ms", INTEGER),
     Column("is_error", INTEGER),
     Column("input_summary", TEXT),
+    Column("input_chars", INTEGER),
+    Column("result_chars", INTEGER),
+    Column("result_images", INTEGER),
+    Column("result_tokens_est", INTEGER),
     Index("idx_tools_session", "session_id", "agent_id", "ts"),
 )
 

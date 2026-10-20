@@ -177,7 +177,7 @@ ENVIRONMENT=production  # Enables strict security defaults
 **Do not create public GitHub issues for security vulnerabilities.**
 
 Report privately through **GitHub Security Advisories**: open the
-[Security tab](https://github.com/itsoneword/Devvy/security/advisories/new) of
+[Security tab](https://github.com/itsoneword/devvy-bot/security/advisories/new) of
 the repository and choose "Report a vulnerability". The report stays private
 until a fix is published.
 

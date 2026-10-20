@@ -369,6 +369,18 @@ class RateLimiter:
             self._maybe_reset_cost_tracker(user_id)
             self._track_cost(user_id, cost)
 
+    async def adjust_cost(self, user_id: int, delta: float) -> None:
+        """Correct an already-recorded turn cost by ``delta`` USD (dv-d2f6:
+        a third-party turn is recorded at its estimate, then settled to the
+        provider's exact figure). Negative is fine; the day never goes < 0.
+        A correction that lands after the daily reset applies to the new day.
+        """
+        if not delta:
+            return
+        async with self.locks[user_id]:
+            self._maybe_reset_cost_tracker(user_id)
+            self.cost_tracker[user_id] = max(self.cost_tracker[user_id] + delta, 0.0)
+
     async def record_tokens(self, user_id: int, tokens: int) -> None:
         """Record a turn that has NO USD price (dv-0722).
 

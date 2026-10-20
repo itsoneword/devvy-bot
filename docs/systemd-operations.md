@@ -100,6 +100,11 @@ validate the installed copy too, since that is the file sudo actually reads.
 | `data/soul.md`, memory files | No — read at session start |
 | `CLAUDE.md` | No — read at session start |
 
+**Core subset (dv-5206).** Before every restart run `make test-core` (~1 min:
+window roll, evaluator, items, policy parity, export drift; the list is
+`CORE_TESTS` in `tests/conftest.py`). Restart only if it passes; a failure is
+fixed in the session that sees it or gets a line in dv-5206.
+
 **Backend parity gate (dv-b7c4).** Before restarting with backend, sandbox or
 model changes (`src/agent_backends/`, `src/claude/sdk_integration.py`,
 `src/agent_bridge/`, `src/security/`, profile sandbox flags, a claude/codex

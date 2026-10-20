@@ -26,9 +26,9 @@ requires-python = ">=3.11"
 dynamic = ["dependencies"]
 
 [project.urls]
-Homepage = "https://github.com/itsoneword/Devvy"
-Repository = "https://github.com/itsoneword/Devvy"
-Documentation = "https://github.com/itsoneword/Devvy/blob/main/docs/"
+Homepage = "https://github.com/itsoneword/devvy-bot"
+Repository = "https://github.com/itsoneword/devvy-bot"
+Documentation = "https://github.com/itsoneword/devvy-bot/blob/main/docs/"
 
 [project.scripts]
 devvy = "src.main:run"
@@ -89,6 +89,9 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 addopts = "-v --cov=src --cov-report=html --cov-report=term-missing"
 asyncio_mode = "auto"
+markers = [
+    "core: fast core-mechanics subset, run before every restart (make test-core)",
+]
 
 [tool.mypy]
 python_version = "3.11"

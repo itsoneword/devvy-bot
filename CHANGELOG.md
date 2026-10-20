@@ -2,6 +2,62 @@
 
 Release notes for Devvy. Newest first.
 
+## 1.4 — 2026-10-19
+
+### Models and cost
+- OpenRouter as a per-profile provider on the Claude harness (token-priced,
+  `/model` limited to the profile's `allowed_models`). A per-request cost cap
+  stops a turn that runs past its budget; costs are reconciled daily against
+  OpenRouter's own numbers. Price table: `scripts/gen_openrouter_pricing.py`.
+- Router `decide()` call kind: typed yes/no questions answered by TypeSafe Jev
+  (optional, `TYPESAFE_API_KEY`), with a Haiku fallback.
+- Memory: optional Jev gate before the reconciler (`RECONCILE_JEV_GATE_ENABLED`,
+  off) and a Jev fact screen that only runs beside the normal extraction
+  (`MEMORY_SCREEN_MODE=shadow`, writes nothing; `off` disables it).
+  `scripts/screen_shadow_report.py` reads the results. No key = no effect.
+- `CONFIRMATION_TIMEOUT_SECONDS`: one setting for how long an approval prompt
+  waits; related hook and idle timeouts derive from it.
+
+### Topics and routing
+- Reports group: report-type notifications go to a forum group's topics by
+  source, and messages (text, voice, photo, document) in a bound topic talk to
+  that agent in the same conversation.
+- Jobs topic: reply to a job notification and the answer reaches the agent that
+  ran the job. Other messages in the topic get a short, throttled hint.
+- Non-DM turns carry a `[via: group › topic]` source tag.
+- **Removed:** the legacy project topics (`/sync_threads`, `PROJECT_THREADS_*`);
+  the reports topics are the one topic mechanism.
+- Per-(user, agent) turn locks: `/stop` stops the current chat's agent only,
+  `/stop all` stops everything. The busy notice says who holds the turn.
+- Scheduled replies, task-pump and notify messages are rendered as markdown.
+
+### Jobs and tasks
+- Task pump ships (opt-in, timer not enabled by the installer): analyse, ask,
+  design tests, implement on a branch; answers come via chat. Other boards go
+  in your own `config/taskpump/boards.json`. README documents it and deviz
+  (the `.deviz/tasks/*.md` format and Claude Code plugin).
+- Queued-message button interrupts the current turn and runs that message next.
+- Per-turn Claude cost is recorded (delta of the session total).
+- Jobs topic replies also work with voice, photo and document.
+- `scripts/bgjob run --cmd "<command>"` (and `job_start` with `command`) runs a
+  plain command detached, with a ✅/❌ ping carrying exit code and test verdict.
+  Cheaper job context: `task_id`, a `summary.md` per job, compact `job_list`.
+- Agents can comment on any open board task (marked "from <agent>", 10 per day,
+  treated as untrusted input by the task pump).
+
+### Security
+- Sandboxed profiles run Bash inside a bwrap box (workspace + `extra_dirs`
+  writable, `sandbox_read_dirs` read-only, no `~/.claude` or `data/`).
+- The bot token is redacted from file-download URLs in logs.
+
+### Analytics
+- LLM Analytics: per-call context growth (tool-result sizes, window breakdown)
+  and a 24h/7d/30d/all or from–to date filter on the chain view.
+
+### Upgrade
+- Four new schema migrations apply on start. If you used project topics,
+  re-bind those topics as reports topics before updating.
+
 ## 1.3 — 2026-10-12
 
 ### First-run onboarding

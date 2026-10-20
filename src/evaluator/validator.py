@@ -136,7 +136,7 @@ def _validate_entry(entry: object, *, allow_family: bool) -> Dict[str, object]:
         op = "add"
         supersedes_id = None
 
-    return {
+    out: Dict[str, object] = {
         "op": op,
         "tier": tier,
         "content": content,
@@ -148,3 +148,12 @@ def _validate_entry(entry: object, *, allow_family: bool) -> Dict[str, object]:
         "kind": kind,
         "source_ref": source_ref,
     }
+    # Screen-path fields (dv-7e11 step c). Only the targeted prompt asks for
+    # them; they are left out unless set, so the classic path's ops are
+    # unchanged.
+    if entry.get("revokes") is True:
+        out["revokes"] = True
+    conflicts_with_id = entry.get("conflicts_with_id")
+    if isinstance(conflicts_with_id, int) and not isinstance(conflicts_with_id, bool):
+        out["conflicts_with_id"] = conflicts_with_id
+    return out

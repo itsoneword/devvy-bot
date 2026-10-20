@@ -24,7 +24,9 @@ PreToolUse hook and the Codex PreToolUse hook both reach it through
 * deletion and outbound-transfer rules over parsed commands
   (``_deletion_reason`` / ``_egress_reason``), which also look inside
   ``sh -c '...'``;
-* system-path rules for file-writing tools.
+* system-path rules for file-writing tools;
+* merging a pump branch the pump flagged ``pump_privileged`` (dv-535b,
+  ``src/storage/board_policy.py``).
 
 All of them match the command *text*. ``python3 x.py`` shows a script name, not
 what the script does -- these rules catch mistakes and plain injected
@@ -39,6 +41,8 @@ import shlex
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from ..storage.board_policy import privileged_merge_reason
 
 # Dirs under ~/tools that hold the exchange scripts (fetchcrypto, fetchmexc),
 # including their lib/ subdirs -- every JS file under either tree is a money
@@ -525,6 +529,12 @@ def classify(
         money_reason = _money_script_reason(command)
         if money_reason:
             return money_reason
+        # dv-535b: a pump branch an agent-filed task built over privileged
+        # paths (sandbox, security, tool rights, ...) is merged only after an
+        # explicit owner OK. The pump marks it; this is the button.
+        merge_reason = privileged_merge_reason(command, working_directory)
+        if merge_reason:
+            return merge_reason
         commands = _commands(command)
         parsed_reason = _deletion_reason(commands, working_directory) or _egress_reason(
             commands

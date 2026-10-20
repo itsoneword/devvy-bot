@@ -7,7 +7,7 @@ step fails.
 For the two-minute version, see the [README quick start](../README.md#quick-start).
 
 ```bash
-git clone https://github.com/itsoneword/Devvy.git
+git clone https://github.com/itsoneword/devvy-bot.git
 cd Devvy
 ./install.sh --token <token-from-@BotFather>
 ```

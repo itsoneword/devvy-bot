@@ -12,7 +12,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import structlog
 
@@ -385,6 +385,24 @@ class CodexCliIntegration:
         # dv-ffcb.
         self.agent_bridge = agent_bridge
         self._profile_composers: Dict[str, PromptComposer] = {}
+        # In-flight `codex exec` children by (user, profile slug) so a scoped
+        # /stop can reach them; `_stopped_procs` marks the ones /stop killed.
+        self._active_procs: Dict[
+            Tuple[int, str], List["asyncio.subprocess.Process"]
+        ] = {}
+        self._stopped_procs: set = set()
+
+    async def stop_turns(self, user_id: int, profile: str) -> int:
+        """Scoped /stop: kill ``user_id``'s in-flight turn(s) on ``profile``.
+        Returns the number of turns stopped."""
+        procs = list(self._active_procs.get((user_id, profile), ()))
+        for proc in procs:
+            self._stopped_procs.add(proc.pid)
+            await _terminate(proc)
+        logger.info(
+            "Turn stopped", user_id=user_id, profile=profile, stopped=len(procs)
+        )
+        return len(procs)
 
     def attach_agent_bridge(self, bridge: Any) -> None:
         """Wire the agent-tools bridge (post-startup: it needs the scheduler)."""
@@ -487,16 +505,17 @@ class CodexCliIntegration:
         calls even under ``danger-full-access``, and a deny blocks the call.
         The hook is passed per turn, so it needs the trust bypass; nothing
         under ``~/.codex`` is touched. The timeout leaves room for the
-        owner's 120 s confirmation window.
+        owner's confirmation window (``confirmation_timeout_seconds``).
         """
         if not getattr(self.agent_bridge, "policy_url", None):
             return []
         command = f"{sys.executable} {_POLICY_HOOK_SCRIPT}"
+        hook_timeout = self.config.confirmation_hook_timeout_seconds
         return [
             "--dangerously-bypass-hook-trust",
             "-c",
             'hooks.PreToolUse=[{matcher="",hooks=[{type="command",'
-            f"command={json.dumps(command)},timeout=300}}]}}]",
+            f"command={json.dumps(command)},timeout={hook_timeout}}}]}}]",
         ]
 
     def _sandbox_args(self, cwd: Path, user_id: Optional[int]) -> List[str]:
@@ -783,6 +802,11 @@ class CodexCliIntegration:
                 from src.agent_bridge import POLICY_URL_ENV_VAR
 
                 turn_vars[POLICY_URL_ENV_VAR] = policy_url
+                # The hook's HTTP wait must outlive the owner's tap but end
+                # before Codex kills the hook (hook timeout is +margin).
+                turn_vars["DEVVY_POLICY_TIMEOUT_SECONDS"] = str(
+                    self.config.confirmation_hook_timeout_seconds - 10
+                )
             elif self._profile_unrestricted(working_directory):
                 logger.warning(
                     "Codex turn on an unrestricted profile has no policy hook",
@@ -1002,6 +1026,11 @@ class CodexCliIntegration:
             limit=STREAM_LIMIT,
         )
         assert proc.stdout is not None and proc.stderr is not None
+        proc_key = (
+            user_id,
+            self._agent_id_for(working_directory, user_id).split("#")[0],
+        )
+        self._active_procs.setdefault(proc_key, []).append(proc)
         # stderr MUST be drained concurrently. It is a 64KiB pipe, and the CLI
         # writes far more than that to it: a models-list parse failure dumps
         # the entire ~250KB response body, twice per turn. Reading only stdout
@@ -1041,7 +1070,7 @@ class CodexCliIntegration:
             while True:
                 line = await asyncio.wait_for(
                     proc.stdout.readline(),
-                    timeout=self.config.agent_timeout_seconds,
+                    timeout=self.config.agent_idle_limit_seconds,
                 )
                 if not line:
                     break
@@ -1078,7 +1107,7 @@ class CodexCliIntegration:
                     if on_stream:
                         await on_stream(outcome.stream_update)
             await asyncio.wait_for(
-                proc.wait(), timeout=self.config.agent_timeout_seconds
+                proc.wait(), timeout=self.config.agent_idle_limit_seconds
             )
         except asyncio.TimeoutError:
             await _terminate(proc)
@@ -1090,6 +1119,14 @@ class CodexCliIntegration:
             raise RuntimeError("Codex CLI timed out.")
         finally:
             drainer.cancel()
+            group = self._active_procs.get(proc_key, [])
+            if proc in group:
+                group.remove(proc)
+            if not group:
+                self._active_procs.pop(proc_key, None)
+
+        stopped = proc.pid in self._stopped_procs
+        self._stopped_procs.discard(proc.pid)
 
         answer = ""
         try:
@@ -1100,7 +1137,7 @@ class CodexCliIntegration:
             pass
         answer = answer or (final_fallback or "")
 
-        if proc.returncode != 0 and not answer:
+        if proc.returncode != 0 and not answer and not stopped:
             # NOT `proc.stderr.read()`: the drainer above already consumed the
             # whole stream, so re-reading it here returns b"" and the operator
             # gets "exit 1: " with no reason. Report what was actually
@@ -1156,7 +1193,9 @@ class CodexCliIntegration:
         # /usage that Codex was free; None makes them budget the token delta
         # above instead (RateLimiter.record_tokens).
         response = ClaudeResponse(
-            content=answer or "(No response from Codex.)",
+            content=answer
+            or ("(Stopped.)" if stopped else "(No response from Codex.)"),
+            error_type="interrupted" if stopped else None,
             session_id=thread_id or "",
             cost=None,
             duration_ms=int((time.time() - start) * 1000),

@@ -8,11 +8,12 @@ import asyncio
 from typing import Any, Optional, Tuple
 
 import structlog
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from ...profiles.registry import ensure_workspace_for
 from ..utils.html_format import escape_html
+from ..window_seed import model_switch_note
 from .agents_menu import (
     CREATOR_SLUG,
     NEW_AGENT_INTAKE,
@@ -21,10 +22,26 @@ from .agents_menu import (
 )
 from .base import CLAUDE_BACKEND, CODEX_BACKEND, OrchestratorBase, policy_for
 from .routing import _PROFILE_BADGES
-from ..window_seed import model_switch_note
 from .windowing import arm_backend_switch
 
 logger = structlog.get_logger()
+
+INTERRUPT_PREFIX = "qi:"
+INTERRUPT_NOTE = "[previous turn was interrupted by the user]"
+
+
+def interrupt_markup(waiter_id: str) -> InlineKeyboardMarkup:
+    """Button on a queued-message ack (dv-8b49)."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⏹ Прервать текущий и выполнить это",
+                    callback_data=f"{INTERRUPT_PREFIX}{waiter_id}",
+                )
+            ]
+        ]
+    )
 
 
 class CallbacksMixin(OrchestratorBase):
@@ -171,6 +188,27 @@ class CallbacksMixin(OrchestratorBase):
             label = model if model in self._CLAUDE_TIERS else "default model"
             await query.edit_message_text(
                 f"Model backend set to Claude Code ({label})."
+            )
+            return
+        if data.startswith("model:or:"):
+            # A per-profile model (dv-d2f6): accepted only inside the active
+            # profile's allowed_models, whatever the callback data says.
+            pick = data.split(":", 2)[2]
+            user_id = query.from_user.id if query.from_user else None
+            profile = self._active_profile(context, user_id)
+            if profile is None or pick not in profile.allowed_models:
+                await query.edit_message_text(
+                    "That model is not allowed for the active agent."
+                )
+                return
+            context.user_data["agent_backend"] = CLAUDE_BACKEND
+            context.user_data["agent_model"] = pick
+            if user_id is not None:
+                await self._save_user_prefs(
+                    context, user_id, agent_backend=CLAUDE_BACKEND, agent_model=pick
+                )
+            await query.edit_message_text(
+                f"Model set to <code>{escape_html(pick)}</code>.", parse_mode="HTML"
             )
             return
         if data == "model:codex_login":
@@ -387,14 +425,68 @@ class CallbacksMixin(OrchestratorBase):
 
         await query.edit_message_text("Unknown agents action.")
 
+    async def _handle_interrupt_callback(
+        self, query: Any, context: ContextTypes.DEFAULT_TYPE, data: str
+    ) -> None:
+        """qi:<waiter id>: stop the author's current turn on the same agent
+        and run this queued message next (it jumps the queue)."""
+        from ...profiles.registry import DEFAULT_AGENT_ID
+
+        await query.answer()
+        waiter = self._turn_locks.find_waiter(data[len(INTERRUPT_PREFIX) :])
+        user_id = query.from_user.id
+        if waiter is None:
+            await self._drop_buttons(query, "Уже запущено или выполнено.")
+            return
+        if user_id != waiter.user_id and self._resolve_role(user_id, context) != (
+            "owner"
+        ):
+            await query.message.reply_text("Только автор сообщения.")
+            return
+        if waiter.jumped:  # double press
+            return
+        lock = self._turn_locks.get(waiter.user_id, waiter.profile_id)
+        if not lock.jump(waiter):
+            await self._drop_buttons(query, "Уже запущено или выполнено.")
+            return
+        slug = waiter.profile_id or DEFAULT_AGENT_ID
+        stopped = await self._stop_scoped_turns(context, waiter.user_id, slug)
+        waiter.note_due = stopped > 0
+        storage = context.bot_data.get("storage")
+        if storage:
+            await storage.log_bot_event(
+                user_id,
+                "queue_interrupt",
+                {
+                    "profile": slug,
+                    "author": waiter.user_id,
+                    "kind": waiter.kind,
+                    "stopped": stopped,
+                },
+            )
+        await self._drop_buttons(
+            query, "⏹ Прерываю текущий, это сообщение — следующее."
+        )
+
+    @staticmethod
+    async def _drop_buttons(query: Any, text: str) -> None:
+        try:
+            await query.edit_message_text(text)
+        except Exception:
+            pass
+
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Handle cd: callbacks — switch directory and resume session if available."""
         query = update.callback_query
+        data = query.data or ""
+        if data.startswith(INTERRUPT_PREFIX):
+            # Answers the query itself (a refusal is an alert popup).
+            await self._handle_interrupt_callback(query, context, data)
+            return
         await query.answer()
 
-        data = query.data or ""
         if data.startswith("model:"):
             await self._handle_model_callback(query, context, data)
             return

@@ -1,11 +1,12 @@
 """Corpus-driven tests for the deterministic episodic guard (dv-7517 step 3).
 
-Ground truth is the 2026-08-14 manual cleanup of coach#u222222222:
-- positive set = the 64 rows closed as 'cleanup-episodic-2026-08-14'
-  (labeled episodic junk, verbatim);
-- negative set = the active user_facts that cleanup deliberately preserved
-  (recorded before it ran), including all [product-ref] rows and the pinned
-  constraint phrasings.
+The corpus is a SYNTHETIC corpus modeled on the 2026-08-14 labeled cleanup
+(real rows removed for privacy, 2026-10-20):
+- positive set = invented episodic junk (meal logs, day close-outs, watch
+  readouts, single nights, weigh-ins, session actuals), a few deliberately
+  phrased so a durable veto protects them (accepted misses);
+- negative set = invented durable facts (rules, preferences, goals, plans,
+  injuries, product references, protocol weigh-ins).
 
 The hard requirement is ZERO false positives on the negative set — a durable
 fact silently dropped is the failure mode to avoid. Recall on the positive
@@ -25,8 +26,9 @@ _CORPUS = json.loads(
     (Path(__file__).parent / "fixtures" / "episodic_corpus_20260814.json").read_text()
 )
 
-# Documented recall floor on the labeled positive set (55/64 = 86% at tuning
-# time). A word-list edit that drops below this lost real coverage.
+# Documented recall floor on the synthetic positive set (51/57 = 89% measured
+# 2026-10-20; the corpus models the 2026-08-14 labeled cleanup, real rows removed).
+# A word-list edit that drops below this lost real coverage.
 RECALL_FLOOR = 0.85
 
 

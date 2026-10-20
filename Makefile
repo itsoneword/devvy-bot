@@ -1,4 +1,4 @@
-.PHONY: install dev test lint format clean help run run-debug \
+.PHONY: install dev test test-core lint format clean help run run-debug \
        env-example env-example-check \
        bump-patch bump-minor bump-major release version
 
@@ -8,6 +8,7 @@ help:
 	@echo "  install       - Install production dependencies"
 	@echo "  dev           - Install development dependencies"
 	@echo "  test          - Run tests"
+	@echo "  test-core     - Run the fast core subset (before every restart, ~1 min)"
 	@echo "  lint          - Run linting checks"
 	@echo "  format        - Format code"
 	@echo "  clean         - Clean up generated files"
@@ -28,6 +29,11 @@ dev:
 
 test:
 	poetry run pytest
+
+# Core mechanics (window, evaluator, items, policy parity, export drift); the
+# list lives in tests/conftest.py CORE_TESTS. Run before every restart.
+test-core:
+	poetry run pytest -m core --no-cov -q -p no:cacheprovider
 
 lint:
 	poetry run python scripts/gen_env_example.py --check

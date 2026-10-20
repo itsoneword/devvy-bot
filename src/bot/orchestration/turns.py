@@ -27,6 +27,7 @@ from telegram.ext import ContextTypes
 
 from ...profiles.registry import user_media_root
 from ...storage.repositories import MessageRepository
+from ...utils.turn_locks import take_interrupt_note
 from ..utils.draft_streamer import DraftStreamer, generate_draft_id
 from ..utils.formatting import FormattedMessage
 from ..utils.image_extractor import (
@@ -34,6 +35,7 @@ from ..utils.image_extractor import (
     allowed_image_roots,
 )
 from .base import OrchestratorBase
+from .callbacks import INTERRUPT_NOTE, interrupt_markup
 from .formatting import image_save_extension
 from .routing import (
     ProfileAccessDenied,
@@ -180,6 +182,13 @@ class TurnState:
         )
 
 
+def _media_kind(message: Any) -> str:
+    for kind in ("voice", "photo", "document"):
+        if getattr(message, kind, None):
+            return kind
+    return "media"
+
+
 class TurnsMixin(OrchestratorBase):
     """Text/document/photo/voice turn pipelines and their helpers."""
 
@@ -192,6 +201,7 @@ class TurnsMixin(OrchestratorBase):
         def _start_typing_heartbeat(
             chat: Any,
             interval: float = 2.0,
+            message_thread_id: Optional[int] = None,
         ) -> "asyncio.Task[None]":
             raise NotImplementedError
 
@@ -274,8 +284,60 @@ class TurnsMixin(OrchestratorBase):
         messages = MessageRepository(storage.db_manager)
         return await messages.max_message_id_for_project(user_id, wd)
 
+    async def _reports_topic_slug(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> Optional[str]:
+        """Profile a reports-group topic is bound to (dv-e215 v2), else None.
+
+        The one lookup behind the one-turn reroute, shared by text and media
+        turns. Needs a profile registry; the inbound gate (core.py) already
+        decided who may talk in a bound topic.
+        """
+        router = context.bot_data.get("reports_router")
+        if router is None or not context.bot_data.get("profile_registry"):
+            return None
+        message = update.message
+        return cast(
+            Optional[str],
+            await router.profile_for_message(message),
+        )
+
+    async def _source_tag(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> str:
+        """``[via: ...]`` prefix for non-DM turns (dv-1dda), "" for a DM."""
+        from .reply_context import build_source_tag
+
+        message = update.message
+        topic_name = None
+        router = context.bot_data.get("reports_router")
+        if router is not None and message.is_topic_message:
+            topic_name = await router.topic_name_for_thread(
+                message.chat_id, message.message_thread_id
+            )
+        return build_source_tag(update, topic_name)
+
+    def _topic_working_dir(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        slug: str,
+        role: str,
+        user_id: int,
+    ) -> Optional[Path]:
+        """Workspace of the (user, bound profile) conversation, or None when
+        the profile is disabled / not allowed for ``role``."""
+        from ...profiles.registry import ensure_workspace_for
+
+        profile = context.bot_data["profile_registry"].get_enabled_by_slug(slug)
+        if profile is None or not profile.allows_role(role):
+            return None
+        return cast(Path, ensure_workspace_for(profile, role, user_id))
+
     def _media_working_dir(
-        self, context: ContextTypes.DEFAULT_TYPE, user_id: int
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_id: int,
+        topic_slug: Optional[str] = None,
     ) -> Path:
         """Working dir for a media turn (document/photo/voice).
 
@@ -288,10 +350,19 @@ class TurnsMixin(OrchestratorBase):
 
         Raises ProfileAccessDenied when a guest has no allowed profile.
         """
+        if topic_slug:
+            role = self._resolve_role(user_id, context)
+            topic_dir = self._topic_working_dir(context, topic_slug, role, user_id)
+            if topic_dir is None:
+                raise ProfileAccessDenied(topic_slug, role)
+            return topic_dir
         return self._routed_working_dir(context, user_id)
 
     def _media_upload_dir(
-        self, context: ContextTypes.DEFAULT_TYPE, user_id: int
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_id: int,
+        topic_slug: Optional[str] = None,
     ) -> Path:
         """Directory inbound photos and documents are written to.
 
@@ -305,7 +376,7 @@ class TurnsMixin(OrchestratorBase):
         Falls back to ``<working dir>/uploads`` when no profile resolves
         (single-profile installs), which is the old behaviour minus the litter.
         """
-        working_dir = self._media_working_dir(context, user_id)
+        working_dir = self._media_working_dir(context, user_id, topic_slug)
         registry = context.bot_data.get("profile_registry")
         if registry is not None:
             profile = registry.get_by_working_dir(working_dir)
@@ -358,12 +429,19 @@ class TurnsMixin(OrchestratorBase):
             update, context, gated or "", self._resolve_role(user_id, context)
         ):
             return
-        lock = self._turn_lock(user_id)
+        # Serialized per (user, agent): the lock key is the profile this turn
+        # will run on (bound topic -> its profile, else active / @slug).
+        profile_id = await self._turn_profile_slug(update, context, gated)
+        lock = self._turn_lock(user_id, profile_id)
         queued_ack = None
         if lock.locked():
             try:
+                note = lock.queue_note()
+                waiter = self._turn_locks.enqueue(
+                    user_id, update.message.chat_id, "text", profile_id
+                )
                 queued_ack = await update.message.reply_text(
-                    "⏳ Queued — will run when the current turn finishes."
+                    note, reply_markup=interrupt_markup(waiter.id)
                 )
             except Exception:
                 pass
@@ -410,7 +488,14 @@ class TurnsMixin(OrchestratorBase):
                 return
 
         chat = update.message.chat
-        await chat.send_action("typing")
+        await chat.send_action(
+            "typing",
+            message_thread_id=(
+                update.message.message_thread_id
+                if update.message.is_topic_message
+                else None
+            ),
+        )
 
         progress_msg = await update.message.reply_text("Working...")
 
@@ -428,7 +513,31 @@ class TurnsMixin(OrchestratorBase):
             badge = ""
             restore_dir: Optional[Path] = None
             prompt_text = text_prompt
-            if registry:
+            # Reports-group topic bound to a profile (dv-e215 v2): this ONE
+            # turn runs on the bound profile's conversation; the user's
+            # sticky active profile / directory are never touched, so apply_route
+            # (which mutates them) is skipped on this path.
+            topic_slug = await self._reports_topic_slug(update, context)
+            if topic_slug:
+                from .routing import _PROFILE_BADGES
+
+                topic_dir = self._topic_working_dir(context, topic_slug, role, user_id)
+                if topic_dir is None:
+                    await progress_msg.edit_text(
+                        f"🚫 This topic is bound to '{topic_slug}', which is "
+                        "unavailable for you."
+                    )
+                    return None
+                prior_dir = context.user_data.get("current_directory")
+                restore_dir = Path(str(prior_dir)) if prior_dir else None
+                current_dir = topic_dir
+                badge = _PROFILE_BADGES.get(topic_slug, topic_slug)
+                logger.info(
+                    "Reports topic turn routed",
+                    user_id=user_id,
+                    target_profile=topic_slug,
+                )
+            elif registry:
                 try:
                     decision = apply_route(
                         text_prompt,
@@ -463,6 +572,7 @@ class TurnsMixin(OrchestratorBase):
             # rewrote prompt/dirs above); sticky selection is untouched.
             if (
                 registry
+                and not topic_slug
                 and update.message.reply_to_message
                 and restore_dir is None
                 and prompt_text == text_prompt
@@ -527,7 +637,14 @@ class TurnsMixin(OrchestratorBase):
                     getattr(storage_for_ledger, "sent_messages", None),
                     prompt_text,
                     current_agent_id=self._agent_id_for(context, current_dir, user_id),
+                    viewer_user_id=user_id,
+                    viewer_is_owner=role == "owner",
+                    reports_chat_id=self.settings.reports_chat_id,
                 )
+                storage_prompt = prompt_text
+            source_tag = await self._source_tag(update, context)
+            if source_tag:
+                prompt_text = f"{source_tag}\n{prompt_text}"
                 storage_prompt = prompt_text
             return TurnRoute(
                 working_dir=current_dir,
@@ -664,6 +781,19 @@ class TurnsMixin(OrchestratorBase):
             await rate_limiter.record_tokens(user_id, turn_tokens)
         elif claude_response.cost > 0:
             await rate_limiter.record_cost(user_id, claude_response.cost)
+
+            # Third-party turns are recorded at their estimate; swap in the
+            # provider's exact figure once it is in (dv-d2f6).
+            from ...model_router.turn_cost import Settlement, when_settled
+
+            async def _settle_budget(settled: Settlement) -> None:
+                await rate_limiter.adjust_cost(user_id, settled.delta)
+
+            when_settled(
+                getattr(claude_response, "cost_settlement", None),
+                _settle_budget,
+                what="rate_limiter",
+            )
 
         # Session watchdog (dv-8bb5): soft hourly thresholds, checked
         # against the same real cost plus this turn's SDK turn count.
@@ -1042,6 +1172,121 @@ class TurnsMixin(OrchestratorBase):
             return "separate"
         return "edited"
 
+    async def _run_verification_check(
+        self, state: TurnState, claude_response: "ClaudeResponse"
+    ) -> None:
+        """Confirm/escalate ladder (dv-9f41): the coach-side twin of
+        ``_run_recipe_search_retry``, same placement, lock reasoning and
+        delivery path (see that docstring).
+
+        Trigger is mechanical (``verification_budget.needs_confirm_check``):
+        the answer prescribes a training programme and the turn read neither
+        the user's data nor any source. Then ONE confirm turn under the
+        confirm-phase budget (WebSearch only, ``confirm_max`` calls). If -- and
+        only if -- its reply flags a contradiction with the structured marker,
+        ONE escalate turn scoped to that claim. Never a fourth turn. Never
+        raises.
+        """
+        context = state.context
+        if not self.settings.verification_check_enabled:
+            return
+        storage = context.bot_data.get("storage")
+        if storage is None:
+            return
+        try:
+            from ...claude.verification_budget import (
+                CONFIRM_LABEL,
+                ESCALATE_LABEL,
+                PHASE_CONFIRM,
+                PHASE_ESCALATE,
+                confirm_prompt,
+                contradicted_claim,
+                escalate_prompt,
+                needs_confirm_check,
+                verification_phase,
+            )
+            from ...events.types import AgentResponseEvent
+
+            profile_slug = self._agent_id_for(
+                context, state.current_dir, state.user_id
+            ).split("#", 1)[0]
+            allowed_profiles = {
+                slug.strip()
+                for slug in self.settings.verification_check_profiles.split(",")
+                if slug.strip()
+            }
+            if profile_slug not in allowed_profiles:
+                return
+
+            tool_names = [t["name"] for t in claude_response.tools_used]
+            if not needs_confirm_check(claude_response.content, tool_names):
+                return
+
+            active_integration = self._active_backend(context)
+            if active_integration is None:
+                return
+
+            await storage.log_bot_event(
+                state.user_id,
+                "verification_confirm_fired",
+                {
+                    "message_id": state.saved_message_id,
+                    "profile": profile_slug,
+                    "tools_used": tool_names,
+                },
+            )
+            chat = state.request.chat
+            event_bus = context.bot_data.get("event_bus")
+
+            async def _follow_up(phase: str, prompt: str, label: str) -> Any:
+                with verification_phase(phase):
+                    response = await self._router(context).run_turn(
+                        active_integration,
+                        purpose="chat",
+                        prompt=prompt,
+                        working_directory=state.current_dir,
+                        user_id=state.user_id,
+                        requester_chat_id=chat.id,
+                        role=state.request.role,
+                    )
+                if response.content and event_bus is not None:
+                    await event_bus.publish(
+                        AgentResponseEvent(
+                            chat_id=chat.id,
+                            text=f"{label}\n\n{response.content}",
+                            parse_mode=None,
+                            source="verification_check",
+                        )
+                    )
+                return response
+
+            confirm = await _follow_up(
+                PHASE_CONFIRM,
+                confirm_prompt(self.settings.verification_budget_confirm_max),
+                CONFIRM_LABEL,
+            )
+            claim = contradicted_claim(confirm.content or "")
+            escalate_tools: list[str] = []
+            if claim is not None:
+                escalate = await _follow_up(
+                    PHASE_ESCALATE, escalate_prompt(claim), ESCALATE_LABEL
+                )
+                escalate_tools = [t["name"] for t in escalate.tools_used]
+
+            await storage.log_bot_event(
+                state.user_id,
+                "verification_confirm_done",
+                {
+                    "message_id": state.saved_message_id,
+                    "profile": profile_slug,
+                    "confirm_tools_used": [t["name"] for t in confirm.tools_used],
+                    "contradiction": claim,
+                    "escalate_tools_used": escalate_tools,
+                },
+            )
+        except Exception as e:
+            logger.warning("Verification check failed", error=str(e))
+
     async def _account_window(
         self, state: TurnState, claude_response: "ClaudeResponse"
     ) -> None:
@@ -1237,6 +1482,20 @@ class TurnsMixin(OrchestratorBase):
         # resolves user replies to our messages here. Never raises; a failed
         # ledger write only degrades the NEXT reply's origin attribution.
         _ledger_storage = context.bot_data.get("storage")
+        # A reply to a job message (Jobs topic, dv-c41e) carries that job's
+        # ref onto our answer, so the owner can reply to the answer too and
+        # stay in the job thread instead of hitting the read-only hint.
+        _job_ref: Optional[str] = None
+        _quoted = getattr(update.message, "reply_to_message", None)
+        if _ledger_storage is not None and _quoted is not None:
+            try:
+                _q = await _ledger_storage.sent_messages.lookup(
+                    _quoted.chat.id, _quoted.message_id
+                )
+                if _q is not None and (_q.ref or "").startswith("job:"):
+                    _job_ref = _q.ref
+            except Exception as ref_err:
+                logger.warning("job ref lookup failed", error=str(ref_err))
 
         async def _ledger_sent(sent: Any) -> None:
             if _ledger_storage is None or sent is None:
@@ -1250,6 +1509,7 @@ class TurnsMixin(OrchestratorBase):
                     profile_slug=self._agent_id_for(
                         context, state.current_dir, state.user_id
                     ),
+                    ref=_job_ref,
                 )
             except Exception as ledger_err:
                 logger.warning("sent_messages ledger failed", error=str(ledger_err))
@@ -1369,6 +1629,8 @@ class TurnsMixin(OrchestratorBase):
         badge = route.badge
         restore_dir = route.restore_dir
         prompt_text = route.prompt
+        if take_interrupt_note():
+            prompt_text = f"{INTERRUPT_NOTE}\n\n{prompt_text}"
         storage_prompt = (
             route.storage_prompt
             if route.storage_prompt is not None
@@ -1471,7 +1733,13 @@ class TurnsMixin(OrchestratorBase):
         )
 
         # Independent typing heartbeat — stays alive even with no stream events
-        heartbeat = self._start_typing_heartbeat(chat)
+        _msg = update.message
+        heartbeat = self._start_typing_heartbeat(
+            chat,
+            message_thread_id=(
+                _msg.message_thread_id if _msg and _msg.is_topic_message else None
+            ),
+        )
 
         success = True
         try:
@@ -1491,7 +1759,7 @@ class TurnsMixin(OrchestratorBase):
                 on_stream=on_stream,
                 force_new=force_new,
                 **extra_kwargs,
-                model=self._model_override(context),
+                model=self._model_override(context, user_id),
                 requester_chat_id=chat.id,
                 family_id=state.family_id,
                 role=role,
@@ -1600,6 +1868,7 @@ class TurnsMixin(OrchestratorBase):
             await self._run_recipe_search_retry(
                 state, claude_response, formatted_messages
             )
+            await self._run_verification_check(state, claude_response)
 
         # Audit log (text path only — media turns never logged one).
         if request.audit_command is not None:
@@ -1649,7 +1918,7 @@ class TurnsMixin(OrchestratorBase):
 
         chat = update.message.chat
         lock, progress_msg, was_queued = await self._begin_media_turn(
-            update, user_id, "Working..."
+            update, user_id, "Working...", context
         )
         async with lock:
             if was_queued:
@@ -1760,7 +2029,7 @@ class TurnsMixin(OrchestratorBase):
 
         chat = update.message.chat
         lock, progress_msg, was_queued = await self._begin_media_turn(
-            update, user_id, "Working..."
+            update, user_id, "Working...", context
         )
         async with lock:
             if was_queued:
@@ -1778,7 +2047,11 @@ class TurnsMixin(OrchestratorBase):
                 # view it (Codex via -i; Claude via the Read tool path).
                 from ..features.image_handler import save_image_bytes
 
-                upload_dir = self._media_upload_dir(context, user_id)
+                upload_dir = self._media_upload_dir(
+                    context,
+                    user_id,
+                    await self._reports_topic_slug(update, context),
+                )
                 tg_file = await photo.get_file()
                 data = await tg_file.download_as_bytearray()
                 img_path = save_image_bytes(
@@ -1820,7 +2093,7 @@ class TurnsMixin(OrchestratorBase):
 
         chat = update.message.chat
         lock, progress_msg, was_queued = await self._begin_media_turn(
-            update, user_id, "Transcribing..."
+            update, user_id, "Transcribing...", context
         )
         async with lock:
             if was_queued:
@@ -1868,22 +2141,39 @@ class TurnsMixin(OrchestratorBase):
                 )
 
     async def _begin_media_turn(
-        self, update: Update, user_id: int, initial_text: str
+        self,
+        update: Update,
+        user_id: int,
+        initial_text: str,
+        context: Optional[ContextTypes.DEFAULT_TYPE] = None,
     ) -> Tuple[asyncio.Lock, Any, bool]:
         """Claim the user's turn slot AT ARRIVAL — before any download or
         transcription — so execution order matches send order (a voice still
         transcribing must not be overtaken by a text sent a second later).
         Returns (lock, progress_msg, was_queued); the caller enters
         ``async with lock`` and resets the progress text once inside."""
-        lock = self._turn_lock(user_id)
+        profile_id = await self._turn_profile_slug(update, context) if context else None
+        lock = self._turn_lock(user_id, profile_id)
         was_queued = lock.locked()
+        note = lock.queue_note() if was_queued else initial_text
+        waiter = None
+        if was_queued:
+            waiter = self._turn_locks.enqueue(
+                user_id, update.message.chat_id, _media_kind(update.message), profile_id
+            )
         chat = update.message.chat
-        await chat.send_action("typing")
-        progress_msg = await update.message.reply_text(
-            "⏳ Queued — will run when the current turn finishes."
-            if was_queued
-            else initial_text
+        await chat.send_action(
+            "typing",
+            message_thread_id=(
+                update.message.message_thread_id
+                if update.message.is_topic_message
+                else None
+            ),
         )
+        markup = None
+        if was_queued and waiter is not None:
+            markup = interrupt_markup(waiter.id)
+        progress_msg = await update.message.reply_text(note, reply_markup=markup)
         return lock, progress_msg, was_queued
 
     async def _run_agentic_media_turn(
@@ -1906,24 +2196,69 @@ class TurnsMixin(OrchestratorBase):
         """
 
         async def resolve_route() -> Optional[TurnRoute]:
+            # Bound reports topic: same one-turn reroute as the text path —
+            # the bound profile's conversation, sticky profile untouched.
+            topic_slug = await self._reports_topic_slug(update, context)
+            restore_dir: Optional[Path] = None
             try:
-                current_dir = self._media_working_dir(context, user_id)
+                current_dir = self._media_working_dir(context, user_id, topic_slug)
             except ProfileAccessDenied as exc:
                 await progress_msg.edit_text(
                     f"🚫 The '{exc.slug}' profile is owner-only."
+                    if not topic_slug
+                    else f"🚫 This topic is bound to '{topic_slug}', which is "
+                    "unavailable for you."
                 )
                 return None
+            if topic_slug:
+                prior_dir = context.user_data.get("current_directory")
+                restore_dir = Path(str(prior_dir)) if prior_dir else None
             # Same profile badge the text path prefixes (dv-2f19): a photo
             # answer must say which agent replied, exactly like a text one.
             badge = ""
             if context.bot_data.get("profile_registry"):
                 from .routing import _PROFILE_BADGES
 
-                slug = self._agent_id_for(context, current_dir, user_id).split("#", 1)[
-                    0
-                ]
+                slug = (
+                    topic_slug
+                    or self._agent_id_for(context, current_dir, user_id).split("#", 1)[
+                        0
+                    ]
+                )
                 badge = _PROFILE_BADGES.get(slug, slug)
-            return TurnRoute(working_dir=current_dir, prompt=prompt, badge=badge)
+            # A voice/photo sent as a reply carries the same reply envelope as
+            # a text reply (quoted text, origin label, Jobs job note). Without
+            # it a voice reply in Jobs reached the job's profile with no idea
+            # which job it was about.
+            body = prompt
+            if update.message is not None and update.message.reply_to_message:
+                from .reply_context import build_reply_context
+
+                try:
+                    bot_id = context.bot.id
+                except Exception:
+                    bot_id = None
+                storage = context.bot_data.get("storage")
+                role = self._resolve_role(user_id, context)
+                body, _ = await build_reply_context(
+                    update,
+                    bot_id,
+                    getattr(storage, "sent_messages", None),
+                    prompt,
+                    current_agent_id=self._agent_id_for(context, current_dir, user_id),
+                    viewer_user_id=user_id,
+                    viewer_is_owner=role == "owner",
+                    reports_chat_id=self.settings.reports_chat_id,
+                )
+            source_tag = await self._source_tag(update, context)
+            tagged = f"{source_tag}\n{body}" if source_tag else body
+            return TurnRoute(
+                working_dir=current_dir,
+                prompt=tagged,
+                badge=badge,
+                restore_dir=restore_dir,
+                storage_prompt=tagged if (source_tag or body != prompt) else None,
+            )
 
         await self._run_turn(
             TurnRequest(

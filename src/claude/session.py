@@ -7,7 +7,7 @@ from typing import Awaitable, Callable, Dict, List, Optional
 
 import structlog
 
-from ..config.settings import Settings
+from ..config.settings import DEFAULT_WINDOW_REFRESH_THRESHOLD_TOKENS, Settings
 from .sdk_integration import ClaudeResponse
 
 logger = structlog.get_logger()
@@ -78,8 +78,8 @@ class ClaudeSession:
         self.last_eval_checkpoint = self.cumulative_tokens // 50_000
 
     def should_refresh(self) -> bool:
-        """Check if context refresh is needed (150k tokens)."""
-        return self.cumulative_tokens >= 150_000
+        """Check if context refresh is needed (default window threshold)."""
+        return self.cumulative_tokens >= DEFAULT_WINDOW_REFRESH_THRESHOLD_TOKENS
 
     def to_dict(self) -> Dict:
         """Convert session to dictionary for storage."""

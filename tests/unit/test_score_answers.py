@@ -33,12 +33,10 @@ def _bot_db(tmp_path):
         """
     )
     conn.execute(
-        "INSERT INTO sessions VALUES ('s1', 1001, "
-        "'/srv/devvy/workspaces/chef')"
+        "INSERT INTO sessions VALUES ('s1', 1001, '/srv/devvy/workspaces/chef')"
     )
     conn.execute(
-        "INSERT INTO sessions VALUES ('s2', 111, "
-        "'/srv/devvy/workspaces/coach')"
+        "INSERT INTO sessions VALUES ('s2', 111, '/srv/devvy/workspaces/coach')"
     )
     conn.executemany(
         "INSERT INTO messages VALUES (?,?,?,?,?,?)",

@@ -7,7 +7,7 @@ Talks to the bot's FastAPI /internal/* endpoints; auth and port are read
 from the bot's .env (WEBHOOK_API_SECRET, API_SERVER_PORT).
 
 Usage:
-  agentctl notify "text"                          Send a Telegram message now
+  agentctl notify "text" [--markdown] [--source S]  Send a Telegram message now
   agentctl prompt "text" --profile P              Run one agent turn now (resumed session)
   agentctl schedule add --name N --cron "0 7 * * *" [--profile P] "prompt"
   agentctl schedule add --name N --at 2026-07-09T08:00 [--profile P] "prompt"
@@ -86,6 +86,15 @@ def main() -> None:
     p_notify = sub.add_parser("notify", help="send a Telegram message now")
     p_notify.add_argument("text")
     p_notify.add_argument("--chat-id", type=int, default=None)
+    p_notify.add_argument("--markdown", action="store_true",
+                          help="text is markdown; render it as Telegram HTML")
+    p_notify.add_argument("--source", default=None,
+                          help="who is speaking (e.g. server-monitor:host1, "
+                          "taskpump:status, bgjob); picks the reports topic")
+    p_notify.add_argument("--ref", default=None,
+                          help="tag the sent message so a reply maps back (job:<id>)")
+    p_notify.add_argument("--profile", default=None,
+                          help="profile that owns replies to this message")
     p_notify.add_argument("--pin-as", default=None,
                           help="maintain a single pinned status post under this key")
 
@@ -125,6 +134,9 @@ def main() -> None:
     t_list.add_argument("--status", default="open", choices=["open", "done", "all"])
     t_done = tsub.add_parser("done")
     t_done.add_argument("task_id", help="board id, e.g. dv-3f21")
+    t_done.add_argument("--by", default="user",
+                        help="who is closing it; profiles other than devops "
+                        "are refused (dv-535b)")
 
     args = parser.parse_args()
 
@@ -132,7 +144,9 @@ def main() -> None:
         out = _request(
             "POST",
             "/internal/notify",
-            {"text": args.text, "chat_id": args.chat_id, "pin_as": args.pin_as},
+            {"text": args.text, "chat_id": args.chat_id, "pin_as": args.pin_as,
+             "markdown": args.markdown, "source": args.source,
+             "ref": args.ref, "profile": args.profile},
         )
     elif args.cmd == "prompt":
         out = _request(
@@ -178,7 +192,11 @@ def main() -> None:
     elif args.cmd == "task" and args.subcmd == "list":
         out = _request("GET", "/internal/tasks", query=f"?status={args.status}")
     elif args.cmd == "task" and args.subcmd == "done":
-        out = _request("PATCH", f"/internal/tasks/{args.task_id}", {"status": "done"})
+        out = _request(
+            "PATCH",
+            f"/internal/tasks/{args.task_id}",
+            {"status": "done", "by": args.by},
+        )
     else:
         parser.error("unknown command")
         return

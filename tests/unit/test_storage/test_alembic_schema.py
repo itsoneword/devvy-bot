@@ -178,7 +178,7 @@ def test_bridge_from_bot_v20_keeps_rows_and_stamps(tmp_path):
     assert {k: after[k] for k in counts if k != "schema_version"} == {
         k: v for k, v in counts.items() if k != "schema_version"
     }
-    assert diff(snapshot(path), migrate.baseline_snapshot("bot")) == []
+    assert diff(snapshot(path), _head_snapshot("bot")) == []
     assert len(_backups(path)) == 1 and _backups(path)[0].startswith("bot.")
     assert ensure_schema("bot", path) == "current"
     assert len(_backups(path)) == 1
@@ -294,6 +294,18 @@ def test_backups_keep_last_three(tmp_path):
     conn.close()
 
 
+def _head_snapshot(name: str, rev: str = "head"):
+    """Structure of a fresh in-memory DB built by Alembic up to head."""
+    mem = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        mem.execute("BEGIN")
+        migrate._run_alembic(mem, name, command.upgrade, rev)
+        mem.execute("COMMIT")
+        return migrate.snapshot_connection(mem)
+    finally:
+        mem.close()
+
+
 # --- post-baseline revision (throwaway, test-only) ---------------------------
 
 _ADD_COLUMN_REV = """
@@ -344,8 +356,10 @@ def scratch_migrations(tmp_path, monkeypatch):
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", root)
 
     def add(template: str, **kw: str) -> None:
+        # The throwaway revision sits on top of the real head, whatever it is.
+        add.base = head_revision("bot")  # type: ignore[attr-defined]
         (root / "bot" / "versions" / "9001_test.py").write_text(
-            template.format(down=BASELINE["bot"], **kw)
+            template.format(down=add.base, **kw)  # type: ignore[attr-defined]
         )
 
     return add
@@ -386,12 +400,13 @@ def test_new_revision_applies_to_stamped_and_fresh_db(tmp_path, scratch_migratio
     # Rollback procedure (docs/database-migrations.md): downgrade one step.
     conn = sqlite3.connect(stamped, isolation_level=None)
     conn.execute("BEGIN IMMEDIATE")
-    migrate._run_alembic(conn, "bot", command.downgrade, BASELINE["bot"])
+    base = scratch_migrations.base  # type: ignore[attr-defined]
+    migrate._run_alembic(conn, "bot", command.downgrade, base)
     conn.execute("COMMIT")
     conn.close()
     assert "test_flag" not in _columns(stamped, "messages")
-    assert _alembic_rev(stamped) == [BASELINE["bot"]]
-    assert diff(snapshot(stamped), migrate.baseline_snapshot("bot")) == []
+    assert _alembic_rev(stamped) == [base]
+    assert diff(snapshot(stamped), _head_snapshot("bot", base)) == []
 
 
 def test_batch_rebuild_of_fts_table_drops_triggers(tmp_path, scratch_migrations):
@@ -421,7 +436,7 @@ def test_batch_rebuild_of_view_referenced_table_fails_and_rolls_back(
     with pytest.raises(Exception, match="daily_stats"):
         ensure_schema("bot", path)
     assert snapshot(path) == before
-    assert _alembic_rev(path) == [BASELINE["bot"]]
+    assert _alembic_rev(path) == [scratch_migrations.base]  # type: ignore[attr-defined]
 
 
 def test_alembic_config_rejects_unknown_db():

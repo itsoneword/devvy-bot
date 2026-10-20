@@ -16,8 +16,16 @@ import os
 import sys
 import urllib.request
 
-# The owner has 120 s to answer a confirmation; Codex kills the hook at 300 s.
-REQUEST_TIMEOUT_SECONDS = 280
+# Fallback only: the bot passes DEVVY_POLICY_TIMEOUT_SECONDS, derived from
+# CONFIRMATION_TIMEOUT_SECONDS, always shorter than Codex's own hook timeout.
+REQUEST_TIMEOUT_SECONDS = 590
+
+
+def request_timeout() -> float:
+    try:
+        return float(os.environ["DEVVY_POLICY_TIMEOUT_SECONDS"])
+    except (KeyError, ValueError):
+        return float(REQUEST_TIMEOUT_SECONDS)
 
 
 def deny(reason: str) -> None:
@@ -63,7 +71,7 @@ def main() -> None:
     # Loopback only: never route this through a configured proxy.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        with opener.open(request, timeout=request_timeout()) as response:
             answer = json.load(response)
     except Exception:
         deny("Blocked: the bot's policy service did not answer.")

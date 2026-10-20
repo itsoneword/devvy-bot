@@ -119,6 +119,11 @@ class AgentBackend(Protocol):
         """Every session this backend knows for ``user_id``."""
         ...
 
+    async def stop_turns(self, user_id: int, profile: str) -> int:
+        """Scoped ``/stop``: interrupt ``user_id``'s in-flight turn(s) on the
+        agent ``profile`` (bare slug). Returns how many were stopped."""
+        ...
+
     def attach_tools(self, services: Any, bridge: Any = None) -> None:
         """Wire the bot's agent tools, post-startup (they need the scheduler).
 

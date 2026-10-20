@@ -243,7 +243,9 @@ def render_field(name: str, field: Any) -> List[str]:
     """One variable: its help text, then the assignment (usually commented)."""
     key = name.upper()
     required = field.is_required()
-    default = "" if required else render_default(field.default)
+    default = (
+        "" if required else render_default(field.get_default(call_default_factory=True))
+    )
 
     head = field.description or ""
     tag = "required" if required else f"{render_type(field.annotation)}"

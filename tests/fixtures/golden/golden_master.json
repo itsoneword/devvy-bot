@@ -629,6 +629,7 @@
         "kind": "turn_reply",
         "messages_message_id": 1,
         "profile_slug": null,
+        "ref": null,
         "telegram_chat_id": 555,
         "telegram_message_id": 777
       }
@@ -1037,6 +1038,7 @@
       "kind": "turn_reply",
       "messages_message_id": 1,
       "profile_slug": null,
+      "ref": null,
       "telegram_chat_id": 555,
       "telegram_message_id": 777
     }
@@ -1256,15 +1258,19 @@
       "annotations": {
         "db_current_counter": 26,
         "eval_threshold": 120000,
-        "refresh_threshold": 220000
+        "refresh_threshold": 150000
       },
       "series": [
         {
           "bot_counter_cum": 13,
           "cache_expiry": false,
           "context_provided": 113,
+          "delta": null,
           "first_of_session": true,
+          "output_tokens": 10,
+          "request_id": "req_s1_1",
           "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "tools": [],
           "ts": "<ts>",
           "window_id": 1
         },
@@ -1272,8 +1278,12 @@
           "bot_counter_cum": 26,
           "cache_expiry": false,
           "context_provided": 113,
+          "delta": 0,
           "first_of_session": false,
+          "output_tokens": 10,
+          "request_id": "req_s1_2",
           "session_id": "aaaa0001-0000-0000-0000-000000000001",
+          "tools": [],
           "ts": "<ts>",
           "window_id": 1
         },
@@ -1281,8 +1291,12 @@
           "bot_counter_cum": 13,
           "cache_expiry": false,
           "context_provided": 113,
+          "delta": null,
           "first_of_session": true,
+          "output_tokens": 10,
+          "request_id": "req_s2_1",
           "session_id": "aaaa0002-0000-0000-0000-000000000002",
+          "tools": [],
           "ts": "<ts>",
           "window_id": 2
         }
@@ -1499,11 +1513,16 @@
         {
           "claimed_not_logged": 1,
           "complaint_hits": 1,
+          "deep_research_turns": 0,
           "log_calls": 1,
           "pinned_facts": 1,
           "profile": "proj",
+          "program_turns": 0,
+          "program_turns_unchecked": 0,
           "user_id": 111,
-          "user_messages": 3
+          "user_messages": 3,
+          "verification_calls": 0,
+          "verified_turns": 0
         }
       ],
       "daily": [
@@ -1511,17 +1530,27 @@
           "claimed_not_logged": 1,
           "complaint_hits": 1,
           "date": "2026-08-01",
+          "deep_research_turns": 0,
           "log_calls": 1,
           "pinned_facts": 1,
-          "user_messages": 3
+          "program_turns": 0,
+          "program_turns_unchecked": 0,
+          "user_messages": 3,
+          "verification_calls": 0,
+          "verified_turns": 0
         }
       ],
       "totals": {
         "claimed_not_logged": 1,
         "complaint_hits": 1,
+        "deep_research_turns": 0,
         "log_calls": 1,
         "pinned_facts": 1,
-        "user_messages": 3
+        "program_turns": 0,
+        "program_turns_unchecked": 0,
+        "user_messages": 3,
+        "verification_calls": 0,
+        "verified_turns": 0
       }
     },
     "reconciliation": {
@@ -1954,10 +1983,14 @@
           "agent_id": null,
           "assistant_uuid": "uuid-req_s1_2",
           "duration_ms": null,
+          "input_chars": 40,
           "input_summary": "list",
           "is_error": null,
           "name": "Bash",
           "request_id": "req_s1_2",
+          "result_chars": null,
+          "result_images": null,
+          "result_tokens_est": null,
           "result_ts": null,
           "session_id": "aaaa0001-0000-0000-0000-000000000001",
           "tool_use_id": "toolu_01",
@@ -2122,6 +2155,7 @@
         "attended": 1,
         "cache_creation_tokens": 5,
         "cache_read_tokens": 10,
+        "cost_source": null,
         "cost_usd": 0.01,
         "duration_ms": 250,
         "error": null,
@@ -2144,6 +2178,7 @@
         "attended": 0,
         "cache_creation_tokens": 0,
         "cache_read_tokens": 0,
+        "cost_source": null,
         "cost_usd": null,
         "duration_ms": 5,
         "error": "boom",

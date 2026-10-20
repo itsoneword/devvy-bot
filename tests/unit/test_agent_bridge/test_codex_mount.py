@@ -385,7 +385,7 @@ class TestPolicyHookMount:
         # every tool call, the bot's own script, room for the owner's answer
         assert 'matcher=""' in hooks
         assert "codex_policy_hook.py" in hooks
-        assert "timeout=300" in hooks
+        assert f"timeout={settings.confirmation_hook_timeout_seconds}" in hooks
         script = hooks.split("codex_policy_hook.py")[0].split(" ")[-1]
         assert Path(script + "codex_policy_hook.py").is_file()
 

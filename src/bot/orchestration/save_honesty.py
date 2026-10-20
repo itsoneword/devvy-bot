@@ -34,6 +34,7 @@ WRITE_TOOLS = {
     "Bash",
     "mcp__agent__remember",
     "mcp__agent__task_add",
+    "mcp__agent__task_comment",
     "mcp__agent__schedule_add",
     "mcp__agent__memory_forget",
     "mcp__agent__memory_correct",

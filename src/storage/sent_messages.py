@@ -30,6 +30,8 @@ class SentMessage:
     messages_message_id: Optional[int]
     profile_slug: Optional[str]
     created_at: Optional[datetime]
+    # What the message is about, e.g. 'job:<id>' (dv-c41e); None = nothing.
+    ref: Optional[str] = None
 
 
 class SentMessageRepository:
@@ -45,6 +47,7 @@ class SentMessageRepository:
         kind: str,
         messages_message_id: Optional[int] = None,
         profile_slug: Optional[str] = None,
+        ref: Optional[str] = None,
     ) -> None:
         """Record one sent message. Never raises — a ledger failure must not
         break message delivery (it degrades the NEXT reply's attribution,
@@ -54,13 +57,14 @@ class SentMessageRepository:
                 await conn.execute(
                     "INSERT OR REPLACE INTO sent_messages "
                     "(telegram_chat_id, telegram_message_id, kind, "
-                    "messages_message_id, profile_slug) VALUES (?, ?, ?, ?, ?)",
+                    "messages_message_id, profile_slug, ref) VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         telegram_chat_id,
                         telegram_message_id,
                         kind,
                         messages_message_id,
                         profile_slug,
+                        ref,
                     ),
                 )
                 await conn.commit()
@@ -79,7 +83,7 @@ class SentMessageRepository:
             async with self._db.get_connection() as conn:
                 cur = await conn.execute(
                     "SELECT id, telegram_chat_id, telegram_message_id, kind, "
-                    "messages_message_id, profile_slug, created_at "
+                    "messages_message_id, profile_slug, created_at, ref "
                     "FROM sent_messages "
                     "WHERE telegram_chat_id=? AND telegram_message_id=?",
                     (telegram_chat_id, telegram_message_id),
@@ -103,7 +107,7 @@ class SentMessageRepository:
             async with self._db.get_connection() as conn:
                 cur = await conn.execute(
                     "SELECT id, telegram_chat_id, telegram_message_id, kind, "
-                    "messages_message_id, profile_slug, created_at "
+                    "messages_message_id, profile_slug, created_at, ref "
                     "FROM sent_messages "
                     "WHERE messages_message_id=? AND kind='turn_reply' "
                     "ORDER BY id ASC",

@@ -34,7 +34,7 @@ class ConfirmationManager:
         self,
         send_prompt: Callable[[int, str, str], Awaitable[int]],
         chat_ids: Optional[List[int]],
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float = 600.0,
         edit_prompt: Optional[Callable[[int, int, str], Awaitable[None]]] = None,
     ) -> None:
         # send_prompt(chat_id, text, token) -> sends a message with two inline

@@ -7,6 +7,7 @@ own raw SQL against the same table.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Optional
 
 import aiosqlite
@@ -62,12 +63,12 @@ class MemoryExtractionRepository:
         error_message: Optional[str],
         cumulative_tokens_at_run: int,
         op_stats_json: Optional[str],
-    ) -> None:
-        """Insert one extraction attempt. Callers own JSON-encoding the
+    ) -> Optional[int]:
+        """Insert one extraction attempt; returns the new row id. Callers own JSON-encoding the
         list/dict fields first (``parsed_insights``, ``target_files``,
         ``op_stats``) -- this just binds already-SQL-ready values."""
         async with self._db.get_connection() as conn:
-            await conn.execute(
+            cursor = await conn.execute(
                 "INSERT INTO memory_extractions "
                 "(session_id, user_id, prompt_hash, raw_response, "
                 "parsed_insights, validation_status, target_files, "
@@ -85,5 +86,24 @@ class MemoryExtractionRepository:
                     cumulative_tokens_at_run,
                     op_stats_json,
                 ),
+            )
+            await conn.commit()
+            return cursor.lastrowid
+
+    async def set_op_stats_key(self, row_id: int, key: str, value: object) -> None:
+        """Merge one top-level key into a row's ``op_stats`` JSON (the Jev
+        screen's shadow result lands after the row, dv-7e11)."""
+        async with self._db.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT op_stats FROM memory_extractions WHERE id = ?", (row_id,)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return
+            stats = json.loads(row[0]) if row[0] else {}
+            stats[key] = value
+            await conn.execute(
+                "UPDATE memory_extractions SET op_stats = ? WHERE id = ?",
+                (json.dumps(stats), row_id),
             )
             await conn.commit()

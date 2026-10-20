@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Other repos' deviz boards the pump serves (dv-57ba). Edited by hand only.",
+    "Each entry: name (short, lowercase; tasks show as <name>:dv-xxxx) and repo",
+    "(the repo top level, which must have .deviz/tasks/). Listing a board also",
+    "allows its repo for worktrees, branches and commits, like a repos line.",
+    "Optional intake: list = argv printing a JSON array of open items, each with",
+    "an id; close = argv run per filed item, {id} substituted; what = the noun",
+    "used in titles and messages. Both run with cwd = the board's repo.",
+    "This repo's own board is always served and needs no entry."
+  ],
+  "boards": [
+    {
+      "name": "other",
+      "repo": "/abs/path/to/another/repo",
+      "intake": {
+        "what": "report",
+        "list": [
+          "python3",
+          "tools/dump_reports.py",
+          "--json",
+          "--status",
+          "open"
+        ],
+        "close": [
+          "python3",
+          "tools/dump_reports.py",
+          "--mark-handled",
+          "{id}"
+        ]
+      }
+    }
+  ]
+}

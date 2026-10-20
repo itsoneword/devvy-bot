@@ -300,8 +300,10 @@ def build_app(config: AnalyticsConfig) -> FastAPI:
         return await _store(request).reconciliation(user_id=user_id, profile=profile)
 
     @app.get("/api/chains")
-    async def chains(request: Request) -> dict[str, Any]:
-        return await _store(request).chains()
+    async def chains(
+        request: Request, since: str | None = None, until: str | None = None
+    ) -> dict[str, Any]:
+        return await _store(request).chains(since=since, until=until)
 
     @app.get("/api/chains/detail")
     async def chain_detail(
@@ -313,6 +315,18 @@ def build_app(config: AnalyticsConfig) -> FastAPI:
     ) -> dict[str, Any]:
         result = await _store(request).chain_detail(
             user_id=user_id, working_dir=working_dir, since=since, until=until
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail="chain not found")
+        return result
+
+    @app.get("/api/chains/window")
+    async def chain_window(
+        request: Request, user_id: int, working_dir: str, window_id: int
+    ) -> dict[str, Any]:
+        """What filled the context of one window (dv-aeca)."""
+        result = await _store(request).window_context(
+            user_id=user_id, working_dir=working_dir, window_id=window_id
         )
         if result is None:
             raise HTTPException(status_code=404, detail="chain not found")

@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from ..config.settings import Settings
 from ..events.bus import EventBus
 from ..events.types import AgentResponseEvent, ScheduledEvent, WebhookEvent
+from ..storage import board_policy
 from ..storage.database import DatabaseManager
 from ..storage.deviz_board import DevizBoard
 from ..storage.webhook_repository import WebhookEventRepository
@@ -38,6 +39,14 @@ class NotifyRequest(BaseModel):
     # When set, edit/keep-pinned the single status post under this key instead
     # of appending a new message. Empty text retires the pin.
     pin_as: Optional[str] = None
+    # True: text is model markdown, converted to Telegram HTML on delivery.
+    markdown: bool = False
+    # Who is speaking (dv-e215): "server-monitor:<host>", "taskpump:status",
+    # "bgjob", ... Picks the reports-group topic; unmapped/absent = DM.
+    source: Optional[str] = None
+    # Ledger tag + owning profile for replies (dv-c41e): "job:<id>", "devops".
+    ref: Optional[str] = None
+    profile: Optional[str] = None
 
 
 class PromptRequest(BaseModel):
@@ -104,6 +113,9 @@ class TaskCreateRequest(BaseModel):
 
 class TaskUpdateRequest(BaseModel):
     status: str
+    # Who is asking (dv-535b). Self-declared, like created_by: the rule
+    # below stops a profile that says who it is, not one that lies.
+    by: str = "user"
 
 
 def create_api_app(
@@ -263,11 +275,18 @@ def create_api_app(
         event = AgentResponseEvent(
             chat_id=body.chat_id or 0,
             text=body.text,
-            parse_mode=None,
+            parse_mode="markdown" if body.markdown else None,
             pin_as=body.pin_as,
+            source=body.source or "internal",
+            ledger_ref=body.ref,
+            ledger_profile_slug=body.profile,
         )
         await event_bus.publish(event)
-        logger.info("Internal notify published", chat_id=body.chat_id or 0)
+        logger.info(
+            "Internal notify published",
+            chat_id=body.chat_id or 0,
+            source=event.source,
+        )
         return {"status": "sent", "event_id": event.id}
 
     @app.post("/internal/prompt")
@@ -433,6 +452,16 @@ def create_api_app(
             ),
         )
 
+    def _is_other_profile(slug: Optional[str]) -> bool:
+        """A configured profile other than devops: agent rules apply.
+
+        Names that are not profiles (user, taskpump, claude-cli, ...) keep the
+        old behaviour -- they are the owner's tools, not agents.
+        """
+        if not slug or board_policy.is_privileged(slug) or not profile_registry:
+            return False
+        return profile_registry.get_by_slug(board_policy.base_slug(slug)) is not None
+
     @app.post("/internal/tasks")
     async def internal_task_add(
         body: TaskCreateRequest,
@@ -444,6 +473,17 @@ def create_api_app(
         due_at = body.due_at
         if due_at is not None and due_at.tzinfo is None:
             due_at = due_at.replace(tzinfo=UTC)
+        if _is_other_profile(body.created_by):
+            # dv-535b: a profile filing over HTTP gets the same agent rules
+            # as its task_add tool.
+            return await board_policy.file_agent_task(
+                task_repo,
+                slug=body.created_by,
+                title=body.title,
+                body=body.body,
+                assignee=body.assignee,
+                due_at=due_at,
+            )
         task_id = await task_repo.add_task(
             title=body.title,
             body=body.body,
@@ -475,6 +515,11 @@ def create_api_app(
             raise HTTPException(status_code=503, detail="Storage not available")
         if body.status not in ("open", "done"):
             raise HTTPException(status_code=400, detail="status must be open|done")
+        if _is_other_profile(body.by):
+            raise HTTPException(
+                status_code=403,
+                detail="only devops changes task status (dv-535b)",
+            )
         if not await task_repo.set_status(task_id, body.status):
             raise HTTPException(status_code=404, detail="Task not found")
         return {"status": "updated", "task_id": task_id}

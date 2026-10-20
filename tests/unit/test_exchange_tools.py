@@ -13,14 +13,17 @@ import pytest
 
 from src.claude.agent_tools import ALL_TOOL_SPECS, available_tool_specs
 from src.claude.exchange_tools import (
+    SCRIPTS_DIR,
     ACTIONS,
     EXCHANGE_SPECS,
     READ_ACTIONS,
     VENUES,
     BadArgs,
+    ONCHAIN_SPECS,
     ExchangeClient,
     Unsupported,
 )
+from src.security.keystore import KeyStore
 from src.claude.tool_context import AgentServices, TurnContext
 from src.profiles.registry import (
     ProfileDefinition,
@@ -64,7 +67,10 @@ def test_read_actions_match_the_gate_read_only_list() -> None:
 
 
 def test_venue_dirs_are_the_ones_the_bash_gate_watches() -> None:
-    assert {v.directory for v in VENUES.values()} <= set(EXCHANGE_TOOL_DIRS)
+    # node venues can move money, so the Bash gate must watch their dirs;
+    # python venues are read-only (writes are Unsupported, see below).
+    node = {v.directory for v in VENUES.values() if v.runner == "node"}
+    assert node <= set(EXCHANGE_TOOL_DIRS)
 
 
 # -- the gate ------------------------------------------------------------------
@@ -466,7 +472,7 @@ async def test_accounts_lists_names_only(tools_root: Path) -> None:
     services = _services(ExchangeClient(tools_root))
     result = await _spec("exchange_accounts").handler(services, OWNER, {})
     text = result["content"][0]["text"]
-    assert text == "aster: wallet1, wallet2\nmexc: wallet1"
+    assert text == "aster: wallet1, wallet2\nmexc: wallet1\nbybit: (none configured)"
     assert "0x" not in text and "mexc-key" not in text
 
 
@@ -532,4 +538,167 @@ async def test_handler_rechecks_role(tools_root, fake_node) -> None:
     services = _services(ExchangeClient(tools_root, node=fake_node))
     guest = TurnContext(profile_slug="on", user_id=5, role="guest")
     result = await _spec("exchange_report").handler(services, guest, {})
+    assert result["isError"]
+
+
+# -- bybit (python venue, read-only) and onchain_activity ----------------------
+
+BYBIT_KEY = "bybitkey-123456789"
+BYBIT_SECRET = "bybitsecret-987654321"
+ETHERSCAN_KEY = "etherscankey-abcdef123"
+ADDR = "0x0cDF53551f75f2508303B94245B9B708f03a1d83"
+
+
+@pytest.fixture
+def keystore(tmp_path: Path) -> KeyStore:
+    store = KeyStore(tmp_path / "keys")
+    store.set("bybit", "BYBIT_API_KEY", BYBIT_KEY)
+    store.set("bybit", "BYBIT_API_SECRET", BYBIT_SECRET)
+    store.set("etherscan", "ETHERSCAN_API_KEY", ETHERSCAN_KEY)
+    return store
+
+
+@pytest.fixture
+def fake_python(tmp_path: Path) -> str:
+    """Prints runner argv + cwd, and leaks every key to prove redaction."""
+    path = tmp_path / "python3"
+    path.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "print('ARGV', ' '.join(sys.argv[1:]), 'CWD', os.getcwd())\n"
+        "print('have-key', 'BYBIT_API_KEY' in os.environ)\n"
+        f"print('leak {BYBIT_KEY} {BYBIT_SECRET} {ETHERSCAN_KEY}')\n"
+    )
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return str(path)
+
+
+# scripts/venues/ is the owner's and is not shipped (export_public.py).
+NEEDS_VENUE_SCRIPTS = pytest.mark.skipif(
+    not (SCRIPTS_DIR / "bybit_snapshot.py").exists(),
+    reason="scripts/venues is not shipped",
+)
+
+
+@pytest.fixture
+def bybit_root(tools_root: Path) -> Path:
+    (tools_root / "bybit").mkdir()
+    (tools_root / "bybit" / "history.py").write_text("# fake\n")
+    (tools_root / "bybit" / "funding.py").write_text("# fake\n")
+    return tools_root
+
+
+def _bybit_client(root, fake_python, keystore) -> ExchangeClient:
+    return ExchangeClient(root, python=fake_python, keystore=keystore)
+
+
+async def test_bybit_account_comes_from_the_key_store(bybit_root, keystore) -> None:
+    services = _services(ExchangeClient(bybit_root, keystore=keystore))
+    result = await _spec("exchange_accounts").handler(services, OWNER, {})
+    assert result["content"][0]["text"].endswith("bybit: main")
+
+
+@NEEDS_VENUE_SCRIPTS
+async def test_bybit_report_runs_python_with_key_and_redacts(
+    bybit_root, fake_python, keystore
+) -> None:
+    services = _services(_bybit_client(bybit_root, fake_python, keystore))
+    args = {"exchange": "bybit"}
+    result = await _spec("exchange_report").handler(services, OWNER, args)
+    text = result["content"][0]["text"]
+    assert not result.get("isError"), text
+    assert "[bybit main] python bybit_snapshot.py report" in text
+    assert f"bybit_snapshot.py report CWD {bybit_root / 'bybit'}" in text
+    assert "have-key True" in text
+    assert "--yes" not in text and "--dry-run" not in text
+    for secret in (BYBIT_KEY, BYBIT_SECRET):
+        assert secret not in text
+    assert text.count("<redacted>") >= 2
+
+
+async def test_bybit_analytics_history_and_funding(
+    bybit_root, fake_python, keystore
+) -> None:
+    services = _services(_bybit_client(bybit_root, fake_python, keystore))
+    spec = _spec("exchange_analytics")
+    out = await spec.handler(services, OWNER, {"exchange": "bybit", "days": 90})
+    assert "history.py 90" in out["content"][0]["text"]
+    out = await spec.handler(services, OWNER, {"exchange": "bybit", "funding": True})
+    assert "funding.py" in out["content"][0]["text"]
+
+
+async def test_bybit_trades_pass_symbol_and_limit(
+    bybit_root, fake_python, keystore
+) -> None:
+    services = _services(_bybit_client(bybit_root, fake_python, keystore))
+    args = {"exchange": "bybit", "symbol": "BTCUSDT", "limit": 5}
+    out = await _spec("exchange_trades").handler(services, OWNER, args)
+    assert "bybit_snapshot.py trades BTCUSDT 5" in out["content"][0]["text"]
+
+
+@pytest.mark.parametrize("name", sorted(EXCHANGE_DRY_RUN_TOOLS))
+async def test_bybit_writes_are_unsupported_even_with_dry_run(
+    bybit_root, fake_python, keystore, name
+) -> None:
+    services = _services(_bybit_client(bybit_root, fake_python, keystore))
+    args = {"exchange": "bybit", "account": "main", "dry_run": True}
+    result = await _spec(name).handler(services, OWNER, args)
+    text = result["content"][0]["text"]
+    assert result["isError"] and "not supported" in text and "ARGV" not in text
+
+
+def test_bybit_unsupported_reads_are_reported() -> None:
+    with pytest.raises(BadArgs):
+        ACTIONS["analytics"]["bybit"]("", {"symbol": "BTCUSDT"})
+    with pytest.raises(BadArgs):
+        ACTIONS["trades"]["bybit"]("main", {})
+
+
+def test_onchain_spec_is_not_an_exchange_tool() -> None:
+    assert [s.name for s in ONCHAIN_SPECS] == ["onchain_activity"]
+    assert "onchain_activity" in {s.name for s in ALL_TOOL_SPECS}
+    assert "onchain_activity" not in NAMES
+
+
+@NEEDS_VENUE_SCRIPTS
+async def test_onchain_activity_runs_in_workspace_out_and_redacts(
+    tools_root, fake_python, keystore, tmp_path
+) -> None:
+    services = _services(_bybit_client(tools_root, fake_python, keystore))
+    ctx = TurnContext(
+        profile_slug="on", user_id=5, role="owner", working_dir=tmp_path / "ws"
+    )
+    args = {"address": ADDR, "chain": "arbitrum", "days": 7, "limit": 10}
+    result = await ONCHAIN_SPECS[0].handler(services, ctx, args)
+    text = result["content"][0]["text"]
+    assert not result.get("isError"), text
+    assert (
+        f"onchain_activity.py {ADDR} arbitrum 7 10 CWD {tmp_path / 'ws' / 'out'}"
+        in text
+    )
+    assert ETHERSCAN_KEY not in text and "<redacted>" in text
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"address": "0x123"},
+        {"address": ADDR, "chain": "solana"},
+        {"address": ADDR, "days": 0},
+    ],
+)
+async def test_onchain_activity_bad_args(
+    tools_root, fake_python, keystore, args
+) -> None:
+    services = _services(_bybit_client(tools_root, fake_python, keystore))
+    result = await ONCHAIN_SPECS[0].handler(services, OWNER, args)
+    assert result["isError"] and "bad arguments" in result["content"][0]["text"]
+
+
+async def test_onchain_activity_needs_owner_and_key(tools_root, fake_python) -> None:
+    services = _services(ExchangeClient(tools_root, python=fake_python))
+    result = await ONCHAIN_SPECS[0].handler(services, OWNER, {"address": ADDR})
+    assert result["isError"] and "no etherscan key" in result["content"][0]["text"]
+    guest = TurnContext(profile_slug="on", user_id=5, role="guest")
+    result = await ONCHAIN_SPECS[0].handler(services, guest, {"address": ADDR})
     assert result["isError"]

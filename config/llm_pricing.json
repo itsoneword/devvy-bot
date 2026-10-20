@@ -1,9 +1,17 @@
 {
-  "default": {"input": 5.0, "output": 25.0, "cache_read": 0.50, "cache_write_5m": 6.25, "cache_write_1h": 10.0},
+  "default": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write_5m": 6.25, "cache_write_1h": 10.0},
   "rules": [
-    {"pattern": "claude-fable-5*",  "input": 10.0, "output": 50.0, "cache_read": 1.00, "cache_write_5m": 12.50, "cache_write_1h": 20.0},
-    {"pattern": "claude-opus-*",    "input": 5.0,  "output": 25.0, "cache_read": 0.50, "cache_write_5m": 6.25,  "cache_write_1h": 10.0},
-    {"pattern": "claude-sonnet-*",  "input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_write_5m": 3.75,  "cache_write_1h": 6.0},
-    {"pattern": "claude-haiku-*",   "input": 1.0,  "output": 5.0,  "cache_read": 0.10, "cache_write_5m": 1.25,  "cache_write_1h": 2.0}
+    {"pattern": "claude-fable-5-1*", "input": 10.0, "output": 50.0, "cache_read": 0.25, "cache_write_5m": 12.5, "cache_write_1h": 20.0, "source": "Claude Code 2.1.302 baked catalog (pricing_tiers), 2026-10-17"},
+    {"pattern": "claude-opus-5-5*", "input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write_5m": 5.0, "cache_write_1h": 8.0, "source": "Claude Code 2.1.302 baked catalog (pricing_tiers), 2026-10-17"},
+    {"pattern": "claude-sonnet-5-5*", "input": 2.0, "output": 10.0, "cache_read": 0.1, "cache_write_5m": 2.5, "cache_write_1h": 4.0, "source": "Claude Code 2.1.302 baked catalog (pricing_tiers), 2026-10-17"},
+    {"pattern": "claude-sonnet-5*", "input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write_5m": 2.5, "cache_write_1h": 4.0, "source": "Claude Code 2.1.302 baked catalog (pricing_tiers), 2026-10-17"},
+    {"pattern": "claude-haiku-5-5*", "input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write_5m": 0.125, "cache_write_1h": 0.2, "source": "Claude Code 2.1.302 baked catalog (pricing_tiers), 2026-10-17; long-prompt tier (>100k, 5x) not modelled"},
+    {"pattern": "claude-fable-5*", "input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write_5m": 12.5, "cache_write_1h": 20.0},
+    {"pattern": "claude-opus-*", "input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write_5m": 6.25, "cache_write_1h": 10.0},
+    {"pattern": "claude-sonnet-*", "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write_5m": 3.75, "cache_write_1h": 6.0},
+    {"pattern": "claude-haiku-*", "input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write_5m": 1.25, "cache_write_1h": 2.0},
+    {"pattern": "z-ai/glm-5.3", "input": 2.8, "output": 8.8, "cache_read": 0.56, "cache_write_5m": 2.8, "cache_write_1h": 2.8, "source": "openrouter max over 46 endpoints, 2026-10-17 (scripts/gen_openrouter_pricing.py)"},
+    {"pattern": "z-ai/glm-5.2", "input": 2.5, "output": 10.0, "cache_read": 0.56, "cache_write_5m": 2.5, "cache_write_1h": 2.5, "source": "openrouter max over 34 endpoints, 2026-10-17 (scripts/gen_openrouter_pricing.py)"},
+    {"pattern": "z-ai/glm-*", "input": 1.0, "output": 3.2, "cache_read": 0.2, "cache_write_5m": 1.0, "cache_write_1h": 1.0}
   ]
 }

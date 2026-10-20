@@ -10,7 +10,7 @@ who would rather not run an installer.
 ## 1. Install
 
 ```bash
-git clone https://github.com/itsoneword/Devvy.git
+git clone https://github.com/itsoneword/devvy-bot.git
 cd Devvy
 ./install.sh --token <token-from-@BotFather>
 ```
@@ -129,21 +129,6 @@ NOTIFICATION_CHAT_IDS=111111111
 ```
 
 Recurring agent jobs on cron schedules, persisted in SQLite. `/schedules` lists them.
-
-### Project threads
-
-One Telegram topic per project, with strict routing:
-
-```bash
-ENABLE_PROJECT_THREADS=true
-PROJECT_THREADS_MODE=private          # or: group
-PROJECTS_CONFIG_PATH=config/projects.yaml
-PROJECT_THREADS_CHAT_ID=-1001234567890  # group mode only
-```
-
-In strict group mode only `/start` and `/sync_threads` work outside a mapped topic. In
-private mode `/start` syncs the topics in your private chat. Topics must be enabled for
-your bot in BotFather (**Bot Settings → Threaded mode**).
 
 ### Spending controls
 

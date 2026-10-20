@@ -35,6 +35,14 @@ def test_redacts_telegram_token_in_url() -> None:
     assert "api.telegram.org/bot" in out  # the useful part survives
 
 
+def test_redacts_url_encoded_token_in_file_download() -> None:
+    encoded = TOKEN.replace(":", "%3A")
+    line = f"HTTP Request: GET https://api.telegram.org/file/bot{encoded}/voice/f.oga"
+    out = redact(line)
+    assert encoded not in out and TOKEN.split(":")[1] not in out
+    assert f"/file/bot{REDACTED}/voice" in out
+
+
 def test_redacts_query_string_secrets() -> None:
     out = redact("GET https://x.dev/v1?api_key=sk-abc123&page=2")
     assert "sk-abc123" not in out

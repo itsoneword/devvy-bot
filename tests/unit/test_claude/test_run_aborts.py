@@ -187,8 +187,9 @@ class TestBudgetResolution:
         assert manager._max_budget_for(tmp_path / "coach", "owner") is None
         assert manager._max_budget_for(tmp_path / "coach", "guest") == 5.0
 
-    async def test_cap_reaches_the_sdk_options(self, config, tmp_path):
-        """End of the wire: the resolved number is what the CLI is told."""
+    async def test_cap_is_ours_not_the_clis(self, config, tmp_path):
+        """dv-d2f6: the resolved cap is enforced by our stream loop; the CLI's
+        own max_budget_usd (Anthropic-table priced) stays off."""
         registry = ProfileRegistry([_profile(tmp_path, max_cost_per_request=2.5)])
         manager = ClaudeSDKManager(config, profile_registry=registry)
         captured = []
@@ -207,4 +208,4 @@ class TestBudgetResolution:
                 role="owner",
             )
 
-        assert captured[0].max_budget_usd == 2.5
+        assert captured[0].max_budget_usd is None

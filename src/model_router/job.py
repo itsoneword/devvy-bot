@@ -19,6 +19,7 @@ module gives them the same turn through the Agent SDK with:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import sys
@@ -116,6 +117,32 @@ class BotLink:
             logger.warning("model call not recorded", error=str(exc))
             return False
         return True
+
+
+class RemoteModelCallRecorder:
+    """A ``ModelCallRepository`` stand-in for processes whose sandbox makes
+    bot.db read-only (dv-e690): each row goes to the bot's
+    ``/internal/model_calls``, which writes it. Plugs into ``ModelRouter``
+    as its recorder; a bot that is down loses the row, never the call."""
+
+    def __init__(self, link: BotLink) -> None:
+        self._link = link
+
+    async def record(self, call: Any) -> None:
+        await self._link.record(dataclasses.asdict(call))
+
+
+def install_job_router(repo_root: Path) -> Any:
+    """Make ``get_router()`` in a job process a router that records through
+    the bot. Call once at the top of a job script that makes router calls
+    (``decide`` / ``complete``). Returns the router."""
+    from .router import ModelRouter, set_router
+
+    router = ModelRouter(
+        recorder=RemoteModelCallRecorder(bot_link_from_env(repo_root))  # type: ignore[arg-type]
+    )
+    set_router(router)
+    return router
 
 
 def policy_hook(turn: policy.TurnPolicy, link: BotLink, source: str) -> Any:

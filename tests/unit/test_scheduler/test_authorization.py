@@ -18,10 +18,6 @@ class TestJobVisibleTo:
         row = _row(created_by=111)
         assert job_visible_to(row, user_id=111, role="owner") is True
 
-    def test_non_creator_denied(self) -> None:
-        row = _row(created_by=111)
-        assert job_visible_to(row, user_id=222, role="owner") is False
-
     def test_other_owner_role_still_denied(self) -> None:
         """Two owner-role users must not see each other's attributed jobs —
         deliberately NOT 'owner sees everything'."""

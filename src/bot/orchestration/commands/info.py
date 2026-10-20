@@ -11,7 +11,6 @@ from telegram.ext import ContextTypes
 from ....agent_backends.codex_usage import CodexUsageError, format_codex_limits
 from ....agent_backends.protocol import BackendSession
 from ....profiles.registry import family_agent_id_for_agent, guest_agent_id
-from ....projects import PrivateTopicsUnavailableError
 from ...utils.html_format import escape_html
 from ..agents_menu import build_agents_picker
 from ..base import OrchestratorBase, policy_for
@@ -46,40 +45,6 @@ class InfoCommandsMixin(OrchestratorBase):
                 ),
             )
             return
-        sync_line = ""
-        if (
-            self.settings.enable_project_threads
-            and self.settings.project_threads_mode == "private"
-        ):
-            if (
-                not update.effective_chat
-                or getattr(update.effective_chat, "type", "") != "private"
-            ):
-                await update.message.reply_text(
-                    "🚫 <b>Private Topics Mode</b>\n\n"
-                    "Use this bot in a private chat and run <code>/start</code> there.",
-                    parse_mode="HTML",
-                )
-                return
-            manager = context.bot_data.get("project_threads_manager")
-            if manager:
-                try:
-                    result = await manager.sync_topics(
-                        context.bot,
-                        chat_id=update.effective_chat.id,
-                    )
-                    sync_line = (
-                        "\n\n🧵 Topics synced"
-                        f" (created {result.created}, reused {result.reused})."
-                    )
-                except PrivateTopicsUnavailableError:
-                    await update.message.reply_text(
-                        manager.private_topics_unavailable_message(),
-                        parse_mode="HTML",
-                    )
-                    return
-                except Exception:
-                    sync_line = "\n\n🧵 Topic sync failed. Run /sync_threads to retry."
         # Routed like text turns (dv-c07a): the greeting must name the
         # workspace the next message will actually run in. Reading
         # current_directory showed the home-dir fallback on a cold process.
@@ -91,8 +56,7 @@ class InfoCommandsMixin(OrchestratorBase):
             f"Hi {safe_name}! I'm your AI coding assistant.\n"
             f"Just tell me what you need — I can read, write, and run code.\n\n"
             f"Working in: {dir_display}\n"
-            f"Commands: /new (reset) · /status"
-            f"{sync_line}",
+            f"Commands: /new (reset) · /status",
             parse_mode="HTML",
         )
 
@@ -340,6 +304,8 @@ class InfoCommandsMixin(OrchestratorBase):
                 'above is progress notes, not a final result. Send "continue" '
                 "to retry from where it stopped."
             )
+        if error_type == "interrupted":
+            return "🛑 Stopped by /stop — the text above is partial."
         return None
 
     async def agentic_verbose(
@@ -412,7 +378,9 @@ class InfoCommandsMixin(OrchestratorBase):
     ) -> None:
         """Choose backend/model and start OpenAI Codex auth."""
         backend = self._selected_backend(context)
-        model = self._selected_model(context)
+        user = getattr(update, "effective_user", None)
+        user_id = user.id if user else None
+        model = self._selected_model(context, user_id)
         codex_status = (
             "authenticated"
             if (Path.home() / ".codex" / "auth.json").exists()
@@ -427,6 +395,14 @@ class InfoCommandsMixin(OrchestratorBase):
             ]
         ]
         rows += await self._codex_model_rows()
+        # The active profile's own model list (dv-d2f6), e.g. an OpenRouter
+        # agent: only these slugs are pickable while it is active.
+        profile = self._active_profile(context, user_id)
+        if profile is not None and profile.allowed_models:
+            rows += [
+                [InlineKeyboardButton(m, callback_data=f"model:or:{m}")]
+                for m in profile.allowed_models
+            ]
         rows.append(
             [
                 InlineKeyboardButton(
@@ -621,6 +597,40 @@ class InfoCommandsMixin(OrchestratorBase):
     async def agentic_stop(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        """/stop: halt the in-flight turn of THIS chat's agent (DM -> active
+        profile, bound topic -> its profile). ``/stop all`` is the global
+        killswitch: interrupt every run, pause the scheduler, refuse new runs.
+        """
+        args = (update.message.text or "").split()[1:]
+        if args and args[0].lower() == "all":
+            await self._stop_everything(update, context)
+            return
+
+        from ....profiles.registry import DEFAULT_AGENT_ID
+
+        storage = context.bot_data.get("storage")
+        user_id = update.effective_user.id
+        slug = await self._turn_profile_slug(update, context) or DEFAULT_AGENT_ID
+        stopped = await self._stop_scoped_turns(context, user_id, slug)
+        if storage:
+            await storage.log_bot_event(
+                user_id, "command_stop", {"profile": slug, "stopped": stopped}
+            )
+        if stopped:
+            text = (
+                f"🛑 <b>Stopped</b> the running turn of <b>{escape_html(slug)}</b>. "
+                "Other agents and the scheduler are untouched."
+            )
+        else:
+            text = (
+                f"Nothing is running on <b>{escape_html(slug)}</b>. "
+                "<code>/stop all</code> halts every agent and pauses the scheduler."
+            )
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def _stop_everything(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
         """Killswitch: interrupt in-flight runs, pause scheduler, refuse new runs."""
         claude_integration = context.bot_data.get("claude_integration")
         storage = context.bot_data.get("storage")
@@ -632,11 +642,11 @@ class InfoCommandsMixin(OrchestratorBase):
         interrupted = await sdk.stop_all()
         if storage:
             await storage.log_bot_event(
-                user_id, "command_stop", {"interrupted": interrupted}
+                user_id, "command_stop", {"interrupted": interrupted, "all": True}
             )
         await update.message.reply_text(
-            f"🛑 <b>Stopped.</b> Interrupted {interrupted} run(s); scheduler paused.\n"
-            "New runs are refused until /resume.",
+            f"🛑 <b>Stopped all.</b> Interrupted {interrupted} run(s); "
+            "scheduler paused.\nNew runs are refused until /resume.",
             parse_mode="HTML",
         )
 

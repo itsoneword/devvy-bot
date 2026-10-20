@@ -28,6 +28,7 @@ ALLOWED: Dict[str, Set[str]] = {
         "src/model_router/codex_plain.py",  # the Codex plain-call adapter
     },
     r"openrouter\.ai/api/v1/chat": {"src/model_router/openrouter_plain.py"},
+    r"api\.typesafe\.ai": {"src/model_router/typesafe_decide.py"},
 }
 
 # Not moved yet (dv-ef90, waits for the owner's sign-off on how background

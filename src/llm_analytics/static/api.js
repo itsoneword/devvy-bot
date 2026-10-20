@@ -48,6 +48,7 @@ export const api = {
   call: (id) => getJSON("api/calls/" + encodeURIComponent(id)),
   callRaw: (id) => getJSON("api/calls/" + encodeURIComponent(id) + "/raw"),
   reconciliation: (p) => getJSON("api/reconciliation", p),
-  chains: () => getJSON("api/chains"),
+  chains: (p) => getJSON("api/chains", p),
   chainDetail: (p) => getJSON("api/chains/detail", p),
+  chainWindow: (p) => getJSON("api/chains/window", p),
 };

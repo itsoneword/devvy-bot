@@ -13,7 +13,6 @@ import structlog
 
 from src import __version__
 from src.agent_backends import AgentBackend, CodexCliIntegration, CodexSessionStore
-from src.storage.model_calls import ModelCallRepository
 from src.bot.core import ClaudeCodeBot
 from src.bot.features.self_modify import SelfModificationGuard
 from src.claude import (
@@ -27,8 +26,8 @@ from src.events.bus import EventBus
 from src.events.handlers import AgentHandler
 from src.events.middleware import EventSecurityMiddleware
 from src.exceptions import ConfigurationError
+from src.notifications.routing import ReportsRouter
 from src.notifications.service import NotificationService
-from src.projects import ProjectThreadManager, load_project_registry
 from src.scheduler.scheduler import JobScheduler
 from src.security.audit import AuditLogger, InMemoryAuditStorage
 from src.security.auth import (
@@ -41,8 +40,10 @@ from src.security.rate_limiter import RateLimiter
 from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
 from src.storage.hold_repository import HoldStore
+from src.storage.model_calls import ModelCallRepository
 from src.storage.session_storage import SQLiteSessionStorage
 from src.utils.log_redaction import install_secret_redaction
+from src.utils.turn_locks import report_dropped_messages
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -254,6 +255,8 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # feature, so it no longer rides the file-oriented soul_memory flag).
     refresh_service = None
 
+    from src.evaluator.jev_gate import JevGateConfig
+    from src.evaluator.screen import ScreenConfig
     from src.evaluator.service import EvaluatorService
     from src.evaluator.writer import MemoryWriter
     from src.token.tracker import TokenTracker
@@ -270,6 +273,22 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         max_delta_chars=config.evaluator_max_delta_chars,
         timeout_seconds=config.evaluator_timeout_seconds,
         episodic_guard_enabled=config.evaluator_episodic_guard,
+        jev_gate=(
+            JevGateConfig(
+                min_conf_new=config.reconcile_jev_min_conf_new,
+                min_conf_duplicate=config.reconcile_jev_min_conf_duplicate,
+                max_state_change=config.reconcile_jev_max_state_change,
+                top_k=config.reconcile_jev_top_k,
+            )
+            if config.reconcile_jev_gate_enabled
+            else None
+        ),
+        screen=ScreenConfig(
+            mode=config.memory_screen_mode,
+            chunk_tokens=config.memory_screen_chunk_tokens,
+            fact_send_min=config.memory_screen_fact_send_min,
+            fact_send_max=config.memory_screen_fact_send_max,
+        ),
     )
 
     # DB-backed agent memory retriever (always on; replaces file memory).
@@ -466,6 +485,10 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     from src.model_router.claude_plain import ClaudePlainCaller
     from src.model_router.codex_plain import CodexPlainCaller
     from src.model_router.openrouter_plain import OpenRouterPlainCaller
+    from src.model_router.typesafe_decide import (
+        TypesafeDecider,
+        configure_typesafe_key,
+    )
     from src.model_router.types import CLAUDE_HARNESS, CODEX_HARNESS, OPENROUTER_HARNESS
 
     def _profile_slug_for(working_dir: Path) -> Optional[str]:
@@ -487,8 +510,14 @@ async def create_application(config: Settings) -> Dict[str, Any]:
             codex_bin=codex_integration.codex_bin,
         ),
         profile_resolver=_profile_slug_for,
+        decider=TypesafeDecider(),
     )
     set_router(model_router)
+    # dv-e690: the key lives in Settings (scrubbed from os.environ), so hand
+    # it to the Jev adapter once; the env var stays an override.
+    configure_typesafe_key(
+        config.typesafe_api_key.get_secret_value() if config.typesafe_api_key else None
+    )
 
     # Create bot with all dependencies
     dependencies = {
@@ -506,8 +535,6 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "event_bus": event_bus,
         "prompt_composer": prompt_composer,
         "token_tracker": token_tracker,
-        "project_registry": None,
-        "project_threads_manager": None,
         "self_modification_guard": self_modification_guard,
         "profile_registry": profile_registry,
         "lifecycle_logger": lifecycle_logger,
@@ -566,7 +593,6 @@ async def run_application(app: Dict[str, Any]) -> None:
 
     notification_service: Optional[NotificationService] = None
     scheduler: Optional[JobScheduler] = None
-    project_threads_manager: Optional[ProjectThreadManager] = None
     agent_bridge: Optional[Any] = None
 
     # Set up signal handlers for graceful shutdown
@@ -585,48 +611,9 @@ async def run_application(app: Dict[str, Any]) -> None:
         # Initialize the bot first (creates the Telegram Application)
         await bot.initialize()
 
-        if config.enable_project_threads:
-            if not config.projects_config_path:
-                raise ConfigurationError(
-                    "Project thread mode enabled but required settings are missing"
-                )
-            registry = load_project_registry(
-                config_path=config.projects_config_path,
-                approved_directory=config.approved_directory,
-            )
-            project_threads_manager = ProjectThreadManager(
-                registry=registry,
-                repository=storage.project_threads,
-                sync_action_interval_seconds=(
-                    config.project_threads_sync_action_interval_seconds
-                ),
-            )
-
-            bot.deps["project_registry"] = registry
-            bot.deps["project_threads_manager"] = project_threads_manager
-
-            if config.project_threads_mode == "group":
-                if config.project_threads_chat_id is None:
-                    raise ConfigurationError(
-                        "Group thread mode requires PROJECT_THREADS_CHAT_ID"
-                    )
-                sync_result = await project_threads_manager.sync_topics(
-                    bot.app.bot,
-                    chat_id=config.project_threads_chat_id,
-                )
-                logger.info(
-                    "Project thread startup sync complete",
-                    mode=config.project_threads_mode,
-                    chat_id=config.project_threads_chat_id,
-                    created=sync_result.created,
-                    reused=sync_result.reused,
-                    renamed=sync_result.renamed,
-                    failed=sync_result.failed,
-                    deactivated=sync_result.deactivated,
-                )
-
         # Now wire up components that need the Telegram Bot instance
         telegram_bot = bot.app.bot
+        app["agent_handler"].bot = telegram_bot
 
         # Wire notification callbacks for evaluator/refresh services.
         #
@@ -710,12 +697,32 @@ async def run_application(app: Dict[str, Any]) -> None:
         await event_bus.start()
 
         # Notification service
+        reports_router: Optional[ReportsRouter] = None
+        if config.reports_chat_id:
+            reports_router = ReportsRouter(
+                chat_id=config.reports_chat_id,
+                routes=config.reports_routes,
+                repository=storage.project_threads,
+                owner_chat_ids=config.notification_chat_ids or [],
+                bindings=config.reports_bindings,
+                inbound_policy=config.reports_inbound_policy,
+                reply_only=config.reports_reply_only,
+                ledger=storage.sent_messages,
+            )
+            bot.deps["reports_router"] = reports_router
+            await reports_router.ensure_bound_topics(telegram_bot)
+            logger.info(
+                "Reports routing on",
+                chat_id=config.reports_chat_id,
+                routes=config.reports_routes,
+            )
         notification_service = NotificationService(
             event_bus=event_bus,
             bot=telegram_bot,
             default_chat_ids=config.notification_chat_ids or [],
             pin_store=storage.pinned_messages,
             sent_messages=storage.sent_messages,
+            reports_router=reports_router,
         )
         notification_service.register()
         await notification_service.start()
@@ -784,6 +791,16 @@ async def run_application(app: Dict[str, Any]) -> None:
                 cron_expression=config.fact_quality_check_cron,
                 notify_callback=_notify_owner,
                 model=config.fact_quality_check_model,
+            )
+
+            # Daily OpenRouter backstop (dv-d2f6): our recorded OR total vs
+            # the key's usage_daily; drift alerts the owner. Idle without key.
+            from src.model_router.or_reconcile import register_daily_reconcile
+
+            app["openrouter_reconcile"] = register_daily_reconcile(
+                scheduler=scheduler,
+                model_calls=ModelCallRepository(storage.db_manager),
+                notify_callback=_notify_owner,
             )
 
         # Wire in-process agent MCP tools (schedule/notify/task). Done here —
@@ -932,6 +949,7 @@ async def run_application(app: Dict[str, Any]) -> None:
                 send_prompt=_send_confirm_prompt,
                 chat_ids=config.notification_chat_ids or [],
                 edit_prompt=_edit_confirm_prompt,
+                timeout_seconds=config.confirmation_timeout_seconds,
             )
             claude_integration.sdk_manager.attach_confirmation_manager(
                 confirmation_manager
@@ -1071,6 +1089,10 @@ async def run_application(app: Dict[str, Any]) -> None:
         logger.info("Shutting down application")
 
         try:
+            if bot.app is not None:
+                await report_dropped_messages(
+                    app["agent_handler"].turn_locks, bot.app.bot
+                )
             if scheduler:
                 await scheduler.stop()
             if agent_bridge:

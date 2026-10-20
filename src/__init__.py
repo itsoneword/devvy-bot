@@ -23,4 +23,4 @@ except Exception:
 
 __author__ = "itsoneword"
 __license__ = "MIT"
-__homepage__ = "https://github.com/itsoneword/Devvy"
+__homepage__ = "https://github.com/itsoneword/devvy-bot"

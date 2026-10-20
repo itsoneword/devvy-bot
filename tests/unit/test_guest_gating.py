@@ -350,13 +350,13 @@ async def test_owner_only_env_owner_survives_unknown_role(tmp_dir):
 
 
 def test_owner_only_preserves_handler_name(orchestrator):
-    """_inject_deps keys bypasses off handler.__name__ (e.g. sync_threads)."""
+    """_inject_deps keys bypasses off handler.__name__ (e.g. start_command)."""
 
-    async def sync_threads(update, context):
+    async def start_command(update, context):
         pass
 
-    assert orchestrator._owner_only(sync_threads, "sync_threads").__name__ == (
-        "sync_threads"
+    assert orchestrator._owner_only(start_command, "start_command").__name__ == (
+        "start_command"
     )
 
 

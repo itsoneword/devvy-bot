@@ -349,8 +349,10 @@ class TestClaudeSDKManager:
         assert len(captured_options) == 1
         assert captured_options[0].resume == "existing-session-id"
 
-    async def test_execute_command_passes_max_budget_usd(self, sdk_manager, config):
-        """Test that max_budget_usd is passed from config to ClaudeAgentOptions."""
+    async def test_execute_command_never_passes_max_budget_usd(
+        self, sdk_manager, config
+    ):
+        """The per-request cap is enforced by our loop (dv-d2f6), not the CLI."""
         captured_options = []
         mock_factory = _mock_client_factory(
             _make_assistant_message("Test response"),
@@ -367,7 +369,7 @@ class TestClaudeSDKManager:
             )
 
         assert len(captured_options) == 1
-        assert captured_options[0].max_budget_usd == config.claude_max_cost_per_request
+        assert captured_options[0].max_budget_usd is None
 
     async def test_execute_command_owner_role_has_no_budget_cap(self, sdk_manager):
         """role="owner" removes the per-request SDK budget cap entirely."""
@@ -464,16 +466,9 @@ class TestClaudeSandboxSettings:
 
         assert len(captured_options) == 1
         opts = captured_options[0]
-        # autoAllowBashIfSandboxed must stay False: when true the CLI
-        # auto-approves bash for sandboxed profiles and `sqlite3 data/bot.db`
-        # never reaches can_use_tool -- the dv-6dbc cross-user leak.
-        assert opts.sandbox == {
-            "enabled": True,
-            "autoAllowBashIfSandboxed": False,
-            "excludedCommands": ["git", "npm"],
-            # dv-2c1c: bwrap hides the data-root areas from sandboxed bash.
-            "filesystem": {"denyRead": [str(secrets), str(archive), str(db)]},
-        }
+        # dv-98f2: the native sandbox is off for everyone (it cannot start on
+        # this host); confinement is the PreToolUse hook's bwrap box.
+        assert opts.sandbox == {"enabled": False, "autoAllowBashIfSandboxed": False}
 
     async def test_system_prompt_set_with_working_directory(
         self, sdk_manager, tmp_path

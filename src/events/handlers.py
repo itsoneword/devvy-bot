@@ -8,7 +8,15 @@ import contextlib
 import dataclasses
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncContextManager, Dict, List, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncContextManager,
+    AsyncIterator,
+    Dict,
+    List,
+    Optional,
+)
 
 import structlog
 
@@ -24,6 +32,20 @@ if TYPE_CHECKING:
     from ..utils.turn_locks import TurnLocks
 
 logger = structlog.get_logger()
+
+
+def scheduled_report_source(event: ScheduledEvent) -> str:
+    """The ``source`` a scheduled turn's reply carries (dv-e215 routing key).
+
+    Item jobs are the owner's reminders -> ``item`` (always DM). The bgjob
+    finish digest -> ``bgjob:digest``. Everything else ``schedule:<job name>``
+    so the routing map can send e.g. ``schedule:crypto`` to its own topic.
+    """
+    if event.item_id is not None:
+        return "item"
+    if event.job_name.split(":", 1)[0] == "job-finish":
+        return "bgjob:digest"
+    return f"schedule:{event.job_name}" if event.job_name else "schedule"
 
 
 class AgentHandler:
@@ -66,6 +88,9 @@ class AgentHandler:
         # another queued turn" and must not run alongside a Telegram turn for
         # the same user (parallel claude process + session write race).
         self.turn_locks = turn_locks
+        # Telegram Bot, wired in main after bot.initialize(); None = no DM
+        # notice for background turns (tests, headless).
+        self.bot: Any = None
         # Role lookup for the cost caps. AuthManager.get_user_role needs a live
         # Telegram session, which an event-driven turn (a 3am cron job) never
         # has; UserStore reads the durable bot_users role instead. Without it
@@ -95,10 +120,52 @@ class AgentHandler:
         role = getter(user_id)
         return role if isinstance(role, str) else None
 
-    def _turn_lock(self, user_id: int) -> AsyncContextManager[Any]:
+    def _profile_slug_for(self, working_dir: Optional[Path]) -> Optional[str]:
+        """Bare profile slug owning ``working_dir`` (the turn-lock key), the
+        same slug the Telegram path derives; None without a registry."""
+        if self.profile_registry is None or working_dir is None:
+            return None
+        from ..profiles.registry import DEFAULT_AGENT_ID
+
+        profile, _ = self.profile_registry.resolve_working_dir(Path(working_dir))
+        return profile.slug if profile is not None else DEFAULT_AGENT_ID
+
+    def _turn_lock(
+        self,
+        user_id: int,
+        label: str = "a background task",
+        working_dir: Optional[Path] = None,
+    ) -> AsyncContextManager[Any]:
+        """The (user, agent) turn slot, labelled so queued chat messages can
+        say what they wait behind (dv-19a6). ``working_dir`` is where the turn
+        runs; its owning profile is the lock key."""
         if self.turn_locks is None:
             return contextlib.AsyncExitStack()  # no-op context
-        return self.turn_locks.get(user_id)
+        return self.turn_locks.hold(user_id, label, self._profile_slug_for(working_dir))
+
+    @contextlib.asynccontextmanager
+    async def _busy_notice(self, chat_id: int, label: str) -> AsyncIterator[None]:
+        """Show the owner, in his DM, that a background turn holds his
+        conversation; removed when it ends. Best effort, never blocks the turn.
+        Private chats have chat_id == user_id."""
+        sent = None
+        if self.bot is not None and chat_id:
+            try:
+                sent = await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏳ busy: {label}… (your messages will queue)",
+                    disable_notification=True,
+                )
+            except Exception:
+                logger.debug("busy notice send failed", chat_id=chat_id)
+        try:
+            yield
+        finally:
+            if sent is not None:
+                try:
+                    await sent.delete()
+                except Exception:
+                    pass
 
     def register(self) -> None:
         """Subscribe to events that need agent processing."""
@@ -124,7 +191,11 @@ class AgentHandler:
         prompt = self._build_webhook_prompt(event)
 
         try:
-            async with self._turn_lock(self.default_user_id):
+            async with self._turn_lock(
+                self.default_user_id,
+                f"webhook {event.provider}",
+                self.default_working_directory,
+            ):
                 response = await get_router().run_turn(
                     self.claude,
                     purpose="webhook",
@@ -144,7 +215,9 @@ class AgentHandler:
                     AgentResponseEvent(
                         chat_id=0,
                         text=response.content,
+                        parse_mode="markdown",
                         originating_event_id=event.id,
+                        source=f"webhook:{event.provider}",
                     )
                 )
         except Exception:
@@ -191,7 +264,9 @@ class AgentHandler:
         prompt = build_health_export_prompt(summary)
 
         try:
-            async with self._turn_lock(self.health_export_user_id):
+            async with self._turn_lock(
+                self.health_export_user_id, "health export", working_directory
+            ):
                 response = await get_router().run_turn(
                     self.claude,
                     purpose="webhook",
@@ -210,7 +285,9 @@ class AgentHandler:
                     AgentResponseEvent(
                         chat_id=self.health_export_user_id,
                         text=response.content,
+                        parse_mode="markdown",
                         originating_event_id=event.id,
+                        source="health",
                     )
                 )
         except Exception:
@@ -404,11 +481,26 @@ class AgentHandler:
         # tools (notify / schedule_add) fired during this turn keep targeting
         # the chat that owns the job (e.g. a guest's recurring reminder).
         requester_chat_id = event.target_chat_ids[0] if event.target_chat_ids else None
+        report_source = scheduled_report_source(event)
+        # A job-finish digest is ledgered with the job so a reply to it maps
+        # back to the job (dv-c41e).
+        job_ref: Optional[str] = None
+        job_profile_slug: Optional[str] = None
+        if report_source == "bgjob:digest" and ":" in event.job_name:
+            from ..bot.orchestration.job_context import job_profile
+
+            jid = event.job_name.split(":", 1)[1]
+            job_ref = f"job:{jid}"
+            job_profile_slug = job_profile(jid)
 
         try:
             # Loop guard (dv-752a): while this scheduler-driven turn runs, the
             # item tools refuse to create items for other family members.
-            async with self._turn_lock(owner_id):
+            label = f"job {event.job_name}" if event.job_name else "scheduled job"
+            async with (
+                self._turn_lock(owner_id, label, working_dir),
+                self._busy_notice(owner_id, label),
+            ):
                 with automated_turn(owner_id):
                     response = await get_router().run_turn(
                         self.claude,
@@ -428,7 +520,11 @@ class AgentHandler:
                         AgentResponseEvent(
                             chat_id=chat_id,
                             text=response.content,
+                            parse_mode="markdown",
                             originating_event_id=event.id,
+                            source=report_source,
+                            ledger_ref=job_ref,
+                            ledger_profile_slug=job_profile_slug,
                         )
                     )
 
@@ -438,7 +534,11 @@ class AgentHandler:
                         AgentResponseEvent(
                             chat_id=0,
                             text=response.content,
+                            parse_mode="markdown",
                             originating_event_id=event.id,
+                            source=report_source,
+                            ledger_ref=job_ref,
+                            ledger_profile_slug=job_profile_slug,
                         )
                     )
         except Exception:
@@ -537,6 +637,7 @@ class AgentHandler:
                     text=f"{header}\n\n{text}",
                     parse_mode=None,
                     originating_event_id=event.id,
+                    source="reminder",
                     ledger_kind="scheduled_reminder",
                     ledger_profile_slug=agent_id,
                     ledger_messages_message_id=saved_message_id,

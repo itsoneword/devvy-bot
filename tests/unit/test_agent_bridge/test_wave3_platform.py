@@ -232,10 +232,11 @@ class TestWaveThreeIsListed:
             "schedule_remove",
             "task_add",
             "task_list",
-            "task_done",
+            "task_comment",
             "get_weather",
             "export_my_data",
         } <= names
+        assert "task_done" not in names  # devops only (dv-535b)
 
 
 class TestNotify:
@@ -361,19 +362,23 @@ class TestSchedule:
 
 
 class TestTaskBoard:
-    async def test_task_add_and_done_round_trip(
+    async def test_task_add_list_and_comment_round_trip(
         self, bridge: AgentBridge, board: DevizBoard, workspace: Path
     ) -> None:
         async with _Session(bridge, _ctx(USER_A, CHAT_A, workspace)) as caller:
             created = await caller.payload("task_add", title="проверить сон")
             listed = await caller.payload("task_list")
-            done = await caller.payload("task_done", task_id=created["task_id"])
+            commented = await caller.payload(
+                "task_comment", task_id=created["task_id"], text="ещё деталь"
+            )
 
         assert created["status"] == "created"
         assert [t["title"] for t in listed] == ["проверить сон"]
-        assert done["status"] == "updated"
+        assert commented["status"] == "commented"
         task = await board.get_task(created["task_id"])
-        assert task is not None and not task.is_open
+        assert task is not None and task.status == "todo"
+        assert task.path is not None
+        assert "from coach (agent): ещё деталь" in task.path.read_text(encoding="utf-8")
 
     async def test_attribution_is_the_turn_profile_not_a_parameter(
         self, bridge: AgentBridge, board: DevizBoard, workspace: Path
@@ -390,12 +395,16 @@ class TestTaskBoard:
         assert task.created_by == "coach"
         assert task.labels == ["coach"]
 
-    async def test_task_done_on_an_unknown_id_is_not_found(
-        self, bridge: AgentBridge, workspace: Path
+    async def test_task_done_is_refused_for_a_non_devops_agent(
+        self, bridge: AgentBridge, board: DevizBoard, workspace: Path
     ) -> None:
+        """Not even listed; a direct call is still refused (dv-535b)."""
+        task_id = await board.add_task(title="чужая", created_by="coach")
         async with _Session(bridge, _ctx(USER_A, CHAT_A, workspace)) as caller:
-            out = await caller.payload("task_done", task_id="dv-0000")
-        assert out["status"] == "not_found"
+            names = await caller.tools()
+        assert "task_done" not in names
+        task = await board.get_task(task_id)
+        assert task is not None and task.is_open
 
 
 class TestWeather:

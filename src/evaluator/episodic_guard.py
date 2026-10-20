@@ -153,3 +153,48 @@ def classify(content: str, tier: str = "general") -> Optional[str]:
     if _DATE.search(content) and _CONSUMED.search(content):
         return "dated one-off consumption"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Ticket / job status (dv-7e11, b2). The extraction prompt already says "a
+# ticket's current status ... Emit nothing" (prompts.py, Durability rules);
+# the Jev screen's targeted extractor wrote MORE of them (29 -> 49 on devops),
+# so the same rule is counted structurally here. Used on the screen path only.
+# ---------------------------------------------------------------------------
+
+_TICKET_ID = re.compile(r"(?i)\bdv-[0-9a-f]{4}\b|\b(ticket|тикет\w*|задач\w*)\b")
+_COMMIT_REF = re.compile(
+    r"(?i)\bcommit\w*\s+`?[0-9a-f]{7,40}\b|\b[0-9a-f]{7,40}\s+commit"
+)
+_JOB_WORD = re.compile(r"(?i)\b(bgjob|taskpump|job|джоб\w*|agentjob)\b")
+_STATUS_WORD = re.compile(
+    r"(?i)(in[\s_-]progress|in[\s_-]review|\bwaiting[\s_]user\b|\bdone\b|\bshipped\b"
+    r"|\blanded\b|\bmerged\b|\bcommitted\b|\bimplemented\b|\bcompleted\b"
+    r"|\bstarted\b|\bfinished\b|\bqueued\b|\bclosed\b|\bmoved to\b"
+    r"|\bstatus\b|в работе|на ревью|выполнен\w*|завершен\w*|завершён\w*"
+    r"|запущен\w*|закоммичен\w*|влит\w*|готов\w*)"
+)
+# A decision, rule or lasting design fact keeps the row even if it names a ticket.
+_TICKET_VETO = re.compile(
+    r"(?i)(decid|decision|rule|always|never|must\b|should\b|owner|policy|because"
+    r"|реши\w*|правил\w*|всегда|никогда|нельзя|нужно|владелец)"
+)
+
+
+def classify_ticket_status(content: str, tier: str = "general") -> Optional[str]:
+    """Reason if ``content`` is a ticket/commit/job status line, else None.
+
+    Pinned/core are never rejected. A decision/rule wording vetoes."""
+    if tier in ("pinned", "core"):
+        return None
+    if _TICKET_VETO.search(content):
+        return None
+    if not _STATUS_WORD.search(content):
+        return None
+    if _TICKET_ID.search(content):
+        return "ticket status"
+    if _COMMIT_REF.search(content):
+        return "commit status"
+    if _JOB_WORD.search(content):
+        return "job status"
+    return None

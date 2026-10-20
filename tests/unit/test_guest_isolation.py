@@ -25,7 +25,6 @@ from src.profiles.registry import (
     ProfileDefinition,
     ProfileRegistry,
     agent_id_for_working_dir,
-    ensure_guest_working_dir,
     guest_agent_id,
     guest_working_dir,
 )
@@ -130,11 +129,6 @@ class TestRegistryGuestResolution:
         assert guest_working_dir(profile, GUEST_ID) == (
             roots["general"] / "guests" / str(GUEST_ID)
         )
-
-    def test_ensure_guest_working_dir_creates_parents(self, registry, roots):
-        profile = registry.get_by_slug("general")
-        path = ensure_guest_working_dir(profile, GUEST_ID)
-        assert path.is_dir()
 
     def test_sandbox_resolution_for_guest_subdir(self, registry, roots):
         """SECURITY: a guest workspace must inherit its profile's sandbox flag,

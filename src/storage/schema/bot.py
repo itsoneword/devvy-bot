@@ -282,6 +282,7 @@ model_calls = Table(
     Column("duration_ms", INTEGER, nullable=False, server_default=text("0")),
     Column("outcome", TEXT, nullable=False),
     Column("error", TEXT),
+    Column("cost_source", TEXT),
     Index("idx_model_calls_purpose", "purpose", "ts"),
     Index("idx_model_calls_ts", "ts"),
     sqlite_autoincrement=True,
@@ -358,6 +359,7 @@ sent_messages = Table(
     Column("messages_message_id", INTEGER),
     Column("profile_slug", TEXT),
     Column("created_at", TIMESTAMP, server_default=text("CURRENT_TIMESTAMP")),
+    Column("ref", TEXT),
     Index(
         "idx_sent_messages_tg", "telegram_chat_id", "telegram_message_id", unique=True
     ),

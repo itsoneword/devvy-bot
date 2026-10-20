@@ -17,16 +17,21 @@ from typing import Any, Sequence
 
 import aiosqlite
 
+from src.config.settings import DEFAULT_WINDOW_REFRESH_THRESHOLD_TOKENS
+
+from .growth import build_rows, summarize
 from .indexer import _profile_from_cwd
 
 # Chain annotations. These are the thresholds the bot actually applies, read
 # from the same env vars its Settings use (window_eval_interval_tokens /
 # window_refresh_threshold_tokens) so the chart's reference lines follow the
-# deployment. Defaults match src/config/settings.py. The former hardcoded
+# deployment. Refresh default is imported from src/config/settings.py. The former hardcoded
 # 50k/150k were the pre-dv-9f31 numbers, counted against uncached input only —
 # they drew lines the bot has not used since 2026-08-04.
 EVAL_THRESHOLD = int(os.getenv("WINDOW_EVAL_INTERVAL_TOKENS", "120000"))
-REFRESH_THRESHOLD = int(os.getenv("WINDOW_REFRESH_THRESHOLD_TOKENS", "220000"))
+REFRESH_THRESHOLD = int(os.getenv(
+        "WINDOW_REFRESH_THRESHOLD_TOKENS", str(DEFAULT_WINDOW_REFRESH_THRESHOLD_TOKENS)
+    ))
 
 # Reconciliation tolerances (plan: tunable, query-time).
 TURN_COUNT_TOLERANCE = 2
@@ -35,6 +40,10 @@ COST_REL_TOLERANCE = 0.10
 TIME_SKEW_MAX_S = 300.0
 
 TIMELINE_ROW_CAP = 10_000
+
+_INPUT_CATEGORIES = frozenset(
+    {"tool_result", "subagent_result", "reminder", "user_text", "seed", "turn_prefix"}
+)
 
 # Entrypoints that are expected to have no bot.db row: interactive CLI runs
 # and agent-SDK CLI runs ('sdk-cli', 134+ sessions) are not bot traffic.
@@ -74,6 +83,12 @@ def _norm_bound(value: str, *, end: bool) -> str:
     if len(value) == 10:
         return value + ("T23:59:59.999Z" if end else "T00:00:00.000Z")
     return value
+
+
+def _in_range(ts: Any, lo: str | None, hi: str | None) -> bool:
+    """ISO-compare a stored ts (may use a space separator) to bounds."""
+    text = str(ts).replace(" ", "T")
+    return (lo is None or text >= lo) and (hi is None or text <= hi)
 
 
 def _parse_dt(ts: str) -> datetime | None:
@@ -326,7 +341,14 @@ class Store:
             " COALESCE(SUM(q.log_calls), 0) AS log_calls,"
             " COALESCE(SUM(q.claimed_not_logged), 0) AS claimed_not_logged,"
             " COALESCE(SUM(q.complaint_hits), 0) AS complaint_hits,"
-            " COALESCE(SUM(q.user_messages), 0) AS user_messages"
+            " COALESCE(SUM(q.user_messages), 0) AS user_messages,"
+            # dv-9f41 verification-effort band: calls/turn and both tails.
+            " COALESCE(SUM(q.verification_calls), 0) AS verification_calls,"
+            " COALESCE(SUM(q.verified_turns), 0) AS verified_turns,"
+            " COALESCE(SUM(q.deep_research_turns), 0) AS deep_research_turns,"
+            " COALESCE(SUM(q.program_turns), 0) AS program_turns,"
+            " COALESCE(SUM(q.program_turns_unchecked), 0)"
+            " AS program_turns_unchecked"
         )
         totals_row = await self._row(
             f"SELECT {agg} FROM quality_daily q{where}", params
@@ -718,7 +740,14 @@ class Store:
     # api/chains
     # ------------------------------------------------------------------
 
-    async def chains(self) -> dict[str, Any]:
+    async def chains(
+        self, *, since: str | None = None, until: str | None = None
+    ) -> dict[str, Any]:
+        """All chains. ``since``/``until`` (date or ISO) limit the per-window
+        aggregates and the session list to that range (dv-aeca); chains with
+        nothing in range stay listed, empty."""
+        lo = _norm_bound(since, end=False) if since else None
+        hi = _norm_bound(until, end=True) if until else None
         window_state = {
             (row["user_id"], row["working_dir"]): dict(row)
             for row in await self._all("SELECT * FROM bot_windows")
@@ -740,13 +769,20 @@ class Store:
         for row in await self._all(
             "SELECT session_id, ts, window_id, cost FROM bot_messages ORDER BY ts"
         ):
-            messages_by_session[row["session_id"]].append(row)
+            if _in_range(row["ts"], lo, hi):
+                messages_by_session[row["session_id"]].append(row)
         chains: list[dict[str, Any]] = []
         for chain_user, working_dir in keys:
             chain_sessions = [
                 row
                 for row in bot_sessions
-                if row["user_id"] == chain_user and row["project_path"] == working_dir
+                if row["user_id"] == chain_user
+                and row["project_path"] == working_dir
+                and (
+                    lo is None
+                    and hi is None
+                    or row["session_id"] in messages_by_session
+                )
             ]
             chains.append(
                 self._build_chain(
@@ -864,6 +900,126 @@ class Store:
         since: str | None = None,
         until: str | None = None,
     ) -> dict[str, Any] | None:
+        built = await self._chain_series(user_id, working_dir)
+        if built is None:
+            return None
+        series, growth = built
+        for point in series:
+            row = growth.get(point["request_id"])
+            point["delta"] = row["delta"] if row else None
+            point["output_tokens"] = row["output_tokens"] if row else 0
+            # Tool results that landed in this step: [name, chars, tokens].
+            point["tools"] = (
+                [
+                    [e["name"], e["chars"], e["tokens"]]
+                    for e in row["entries"]
+                    if e["category"] in ("tool_result", "subagent_result")
+                ]
+                if row
+                else []
+            )
+        if since:
+            lo = _norm_bound(since, end=False)
+            series = [point for point in series if _in_range(point["ts"], lo, None)]
+        if until:
+            hi = _norm_bound(until, end=True)
+            series = [point for point in series if _in_range(point["ts"], None, hi)]
+        window_row = await self._row(
+            "SELECT cumulative_tokens FROM bot_windows"
+            " WHERE user_id = ? AND working_dir = ?",
+            (user_id, working_dir),
+        )
+        return {
+            "user_id": user_id,
+            "working_dir": working_dir,
+            "series": series,
+            "annotations": {
+                "eval_threshold": EVAL_THRESHOLD,
+                "refresh_threshold": REFRESH_THRESHOLD,
+                "db_current_counter": (
+                    window_row["cumulative_tokens"] if window_row else None
+                ),
+            },
+        }
+
+    async def window_context(
+        self, *, user_id: int, working_dir: str, window_id: int
+    ) -> dict[str, Any] | None:
+        """What filled the context of one window: tokens by category and by
+        tool, the largest single items and the per-call growth steps."""
+        built = await self._chain_series(user_id, working_dir)
+        if built is None:
+            return None
+        series, growth = built
+        rows = [
+            growth[p["request_id"]]
+            for p in series
+            if p["window_id"] == window_id and p["request_id"] in growth
+        ]
+        return {
+            "user_id": user_id,
+            "working_dir": working_dir,
+            "window_id": window_id,
+            # Sizes of what the harness appended exist only for transcripts
+            # read since dv-aeca; older windows show up as "unattributed".
+            "indexed_sizes": any(
+                e["chars"] and e["category"] in _INPUT_CATEGORIES
+                for row in rows
+                for e in row["entries"]
+            ),
+            **summarize(rows),
+            "steps": [
+                {
+                    "ts": row["ts"],
+                    "context": row["context"],
+                    "delta": row["delta"],
+                    "entries": [
+                        e for e in row["entries"] if e["tokens"] and e["category"]
+                    ],
+                }
+                for row in rows
+            ],
+        }
+
+    async def _growth_rows(self, session_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """request_id -> growth row (see growth.build_rows), main chain only."""
+        qmarks = ",".join("?" * len(session_ids))
+        calls: dict[str, list[Any]] = defaultdict(list)
+        for row in await self._all(
+            "SELECT session_id, request_id, ts, input_tokens, output_tokens,"
+            " cache_read_tokens, cache_creation_tokens FROM api_calls"
+            f" WHERE session_id IN ({qmarks}) AND agent_id IS NULL"
+            " ORDER BY ts, entry_offset",
+            session_ids,
+        ):
+            calls[row["session_id"]].append(dict(row))
+        tools: dict[str, list[Any]] = defaultdict(list)
+        for row in await self._all(
+            "SELECT session_id, tool_use_id, name, request_id, result_ts,"
+            " result_chars, result_images, input_chars FROM tool_calls"
+            f" WHERE session_id IN ({qmarks}) AND agent_id IS NULL",
+            session_ids,
+        ):
+            tools[row["session_id"]].append(dict(row))
+        items: dict[str, list[Any]] = defaultdict(list)
+        for row in await self._all(
+            "SELECT session_id, kind, name, chars, ts, request_id"
+            f" FROM context_items WHERE session_id IN ({qmarks})"
+            " AND agent_id IS NULL",
+            session_ids,
+        ):
+            items[row["session_id"]].append(dict(row))
+        out: dict[str, dict[str, Any]] = {}
+        for session_id, session_calls in calls.items():
+            for growth_row in build_rows(
+                session_calls, tools[session_id], items[session_id]
+            ):
+                out[growth_row["request_id"]] = growth_row
+        return out
+
+    async def _chain_series(
+        self, user_id: int, working_dir: str
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]] | None:
         chain_sessions = await self._all(
             "SELECT * FROM bot_sessions WHERE user_id = ? AND project_path = ?"
             " ORDER BY created_at",
@@ -891,7 +1047,7 @@ class Store:
         }
         calls_by_session: dict[str, list[aiosqlite.Row]] = defaultdict(list)
         for row in await self._all(
-            "SELECT session_id, ts, input_tokens, output_tokens,"
+            "SELECT session_id, request_id, ts, input_tokens, output_tokens,"
             " cache_read_tokens, cache_creation_tokens FROM api_calls"
             f" WHERE session_id IN ({qmarks}) AND agent_id IS NULL ORDER BY ts",
             session_ids,
@@ -927,6 +1083,7 @@ class Store:
                 series.append(
                     {
                         "ts": call["ts"],
+                        "request_id": call["request_id"],
                         "session_id": session_id,
                         "window_id": current_window,
                         "context_provided": (
@@ -942,26 +1099,4 @@ class Store:
                 first_of_session = False
             if window_ids:
                 prev_max_window = max(window_ids)
-        if since:
-            lo = _norm_bound(since, end=False)
-            series = [point for point in series if str(point["ts"]) >= lo]
-        if until:
-            hi = _norm_bound(until, end=True)
-            series = [point for point in series if str(point["ts"]) <= hi]
-        window_row = await self._row(
-            "SELECT cumulative_tokens FROM bot_windows"
-            " WHERE user_id = ? AND working_dir = ?",
-            (user_id, working_dir),
-        )
-        return {
-            "user_id": user_id,
-            "working_dir": working_dir,
-            "series": series,
-            "annotations": {
-                "eval_threshold": EVAL_THRESHOLD,
-                "refresh_threshold": REFRESH_THRESHOLD,
-                "db_current_counter": (
-                    window_row["cumulative_tokens"] if window_row else None
-                ),
-            },
-        }
+        return series, await self._growth_rows(session_ids)

@@ -226,6 +226,45 @@ class AuditLogger:
             risk_level=risk_level,
         )
 
+    async def log_chat_membership(
+        self,
+        user_id: int,
+        chat_id: int,
+        chat_type: str,
+        title: Optional[str],
+        old_status: str,
+        new_status: str,
+    ) -> None:
+        """Log the bot being added to / removed from / promoted in a chat.
+
+        Records the chat id so group setup (REPORTS_CHAT_ID, ...) never needs a
+        web client to read it (dv-e215).
+        """
+        event = AuditEvent(
+            timestamp=datetime.now(UTC),
+            user_id=user_id,
+            event_type="chat_membership",
+            success=True,
+            details={
+                "chat_id": chat_id,
+                "chat_type": chat_type,
+                "title": title,
+                "old_status": old_status,
+                "new_status": new_status,
+            },
+            risk_level="low",
+        )
+        await self.storage.store_event(event)
+        logger.info(
+            "Bot chat membership changed",
+            chat_id=chat_id,
+            chat_type=chat_type,
+            title=title,
+            old_status=old_status,
+            new_status=new_status,
+            by_user_id=user_id,
+        )
+
     async def log_file_access(
         self,
         user_id: int,

@@ -1,0 +1,9 @@
+# Other git repos a pump task may target with `repo: /abs/path` (dv-ebf7).
+#
+# One absolute path per line, the repo's top level; `#` starts a comment.
+# Edited by hand only — nothing writes to this file. Each line lets an
+# unattended agent get a worktree and a `pump/<id>` branch in that repo, so
+# adding one is a deliberate act, like `pump_allow`.
+#
+# This repo (devvy_bot) is always allowed and needs no line. A task whose repo
+# is not listed goes `pump: blocked`; add the line, then `taskpump unblock <id>`.

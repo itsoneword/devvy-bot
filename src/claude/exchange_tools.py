@@ -57,18 +57,35 @@ class BadArgs(Exception):
 @dataclass(frozen=True)
 class Venue:
     name: str
-    directory: str  # under the tools root; must be in EXCHANGE_TOOL_DIRS
+    # Under the tools root. node venues must be in EXCHANGE_TOOL_DIRS (their
+    # scripts can move money); read-only python venues need not be.
+    directory: str
+    runner: str = "node"  # "node" | "python"
 
 
 VENUES: Dict[str, Venue] = {
     "aster": Venue("aster", "fetchcrypto"),
     "mexc": Venue("mexc", "fetchmexc"),
+    # Read-only: history.py / funding.py live in ~/tools/bybit, the snapshot
+    # script ships with the bot (SCRIPTS_DIR). Writes are Unsupported.
+    "bybit": Venue("bybit", "bybit", "python"),
 }
+
+# Not an exchange (so not in VENUES, which feeds every exchange enum): the
+# key-store service whose key the read-only onchain_activity tool injects.
+ONCHAIN = Venue("etherscan", "", "python")
+
+# Read-only helper scripts shipped with the bot; Invocation.script may be an
+# absolute path into here.
+SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts" / "venues"
 
 
 @dataclass(frozen=True)
 class Invocation:
-    """One script run: ``node <script> <argv...>`` inside the venue dir."""
+    """One script run: ``<runner> <script> <argv...>`` inside the venue dir.
+
+    ``script`` is relative to the venue dir, or absolute (SCRIPTS_DIR).
+    """
 
     script: str
     argv: Tuple[str, ...]
@@ -102,10 +119,12 @@ class ExchangeClient:
         self,
         root: Path,
         node: Optional[str] = None,
+        python: Optional[str] = None,
         keystore: Optional[KeyStore] = None,
     ) -> None:
         self.root = Path(root)
         self.node = node or shutil.which("node") or "node"
+        self.python = python or shutil.which("python3") or "python3"
         # Key store (dv-0202): keys set via /setkey under service = venue
         # name. Passed as env, which wins over the script's own dotenv file
         # (dotenv never overrides an existing variable).
@@ -115,10 +134,15 @@ class ExchangeClient:
         return self.keystore.env(venue) if self.keystore else {}
 
     def venue_dir(self, venue: str) -> Path:
-        return self.root / VENUES[venue].directory
+        return self.root / _venue(venue).directory
 
     def _env(self, venue: str) -> Dict[str, str]:
-        return {**_parse_env(self.venue_dir(venue) / ".env"), **self._stored(venue)}
+        dotenv = (
+            _parse_env(self.venue_dir(venue) / ".env")
+            if _venue(venue).directory
+            else {}
+        )
+        return {**dotenv, **self._stored(venue)}
 
     def accounts(self) -> Dict[str, List[str]]:
         """``{venue: [account names]}`` for every configured account."""
@@ -138,6 +162,8 @@ class ExchangeClient:
             names.append(env.get(f"MEXC{n}_LABEL") or f"mexc{n}")
             n += 1
         out["mexc"] = names
+        # One Bybit key from the key store (no per-account naming).
+        out["bybit"] = ["main"] if self._env("bybit").get("BYBIT_API_KEY") else []
         return out
 
     def _redact(self, venue: str, text: str) -> str:
@@ -148,21 +174,29 @@ class ExchangeClient:
             text = self.keystore.redact(text, venue)
         return _PRIVATE_KEY_HEX.sub("<redacted>", text)
 
-    async def run(self, venue: str, inv: Invocation, timeout: float) -> Tuple[int, str]:
+    async def run(
+        self,
+        venue: str,
+        inv: Invocation,
+        timeout: float,
+        cwd: Optional[Path] = None,
+    ) -> Tuple[int, str]:
         """Run one script; ``(exit code, redacted output)``. -1 = timed out."""
-        cwd = self.venue_dir(venue)
-        script = cwd / inv.script
+        cwd = cwd or self.venue_dir(venue)
+        script = cwd / inv.script  # an absolute inv.script wins
         if not script.is_file():
-            return 127, f"{inv.script} not found in {cwd}"
+            return 127, f"{Path(inv.script).name} not found"
+        runner = self.python if _venue(venue).runner == "python" else self.node
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": os.environ.get("HOME", str(Path.home())),
             "LANG": "C.UTF-8",
             "DOTENV_CONFIG_QUIET": "true",  # drop dotenv's ad line
+            "PYTHONDONTWRITEBYTECODE": "1",
             **self._stored(venue),
         }
         proc = await asyncio.create_subprocess_exec(
-            self.node,
+            runner,
             str(script),
             *inv.argv,
             cwd=str(cwd),
@@ -183,6 +217,10 @@ class ExchangeClient:
             half = MAX_OUTPUT_CHARS // 2
             text = text[:half] + "\n…[output truncated]…\n" + text[-half:]
         return code, text
+
+
+def _venue(name: str) -> Venue:
+    return ONCHAIN if name == ONCHAIN.name else VENUES[name]
 
 
 # -- argument helpers ---------------------------------------------------------
@@ -533,6 +571,35 @@ def _mexc_transfer(account: str, args: Dict[str, Any]) -> Invocation:
     )
 
 
+_BYBIT_SNAPSHOT = str(SCRIPTS_DIR / "bybit_snapshot.py")
+
+
+def _bybit_report(account: str, args: Dict[str, Any]) -> Invocation:
+    return Invocation(_BYBIT_SNAPSHOT, ("report",), confirms=False)
+
+
+def _bybit_open_orders(account: str, args: Dict[str, Any]) -> Invocation:
+    return Invocation(_BYBIT_SNAPSHOT, ("orders",), confirms=False)
+
+
+def _bybit_trades(account: str, args: Dict[str, Any]) -> Invocation:
+    symbol = _symbol(args)
+    assert symbol
+    limit = _int(args, "limit", 1, 100)
+    return Invocation(
+        _BYBIT_SNAPSHOT, ("trades", symbol, str(limit or 50)), confirms=False
+    )
+
+
+def _bybit_analytics(account: str, args: Dict[str, Any]) -> Invocation:
+    """Account history (history.py), or funding sources (funding.py)."""
+    _reject(args, ("symbol", "window"), "for bybit (whole-account history)")
+    if args.get("funding") is True:
+        return Invocation("funding.py", (), confirms=False)
+    days = _int(args, "days", 1, 730)
+    return Invocation("history.py", (str(days),) if days else (), confirms=False)
+
+
 def _gap(why: str) -> Builder:
     def builder(account: str, args: Dict[str, Any]) -> Invocation:
         raise Unsupported(why)
@@ -541,15 +608,21 @@ def _gap(why: str) -> Builder:
 
 
 ACTIONS: Dict[str, Dict[str, Builder]] = {
-    "report": {"aster": _aster_report, "mexc": _mexc_report},
-    "open_orders": {"aster": _aster_open_orders, "mexc": _mexc_open_orders},
+    "report": {"aster": _aster_report, "mexc": _mexc_report, "bybit": _bybit_report},
+    "open_orders": {
+        "aster": _aster_open_orders,
+        "mexc": _mexc_open_orders,
+        "bybit": _bybit_open_orders,
+    },
     "trades": {
         "aster": _aster_trades,
         "mexc": _gap("mexc has no trade-history script"),
+        "bybit": _bybit_trades,
     },
     "analytics": {
-        "aster": _gap("analytics exists for mexc only (fetchmexc/analytics.js)"),
+        "aster": _gap("analytics exists for mexc and bybit only"),
         "mexc": _mexc_analytics,
+        "bybit": _bybit_analytics,
     },
     "place_order": {"aster": _aster_place, "mexc": _mexc_place},
     "close_position": {
@@ -569,6 +642,15 @@ ACTIONS: Dict[str, Dict[str, Builder]] = {
     "cancel_order": {"aster": _aster_cancel, "mexc": _mexc_cancel},
     "transfer": {"aster": _aster_transfer, "mexc": _mexc_transfer},
 }
+for _write in (
+    "place_order",
+    "close_position",
+    "move_stop",
+    "modify_order",
+    "cancel_order",
+    "transfer",
+):
+    ACTIONS[_write]["bybit"] = _gap("bybit is read-only here (no write scripts)")
 # Read-only actions: no --yes/--dry-run, longer timeout. The GATE's read-only
 # list is separate and authoritative (destructive.EXCHANGE_READ_ONLY_TOOLS).
 READ_ACTIONS = ("report", "open_orders", "trades", "analytics")
@@ -676,7 +758,10 @@ def _run_action(action: str) -> Any:
                 profile=ctx.profile_slug,
             )
             code, output = await client.run(venue, run, timeout)
-            label = f"[{venue}{' ' + account if account else ''}] node {inv.script} {' '.join(argv)}"
+            label = (
+                f"[{venue}{' ' + account if account else ''}] "
+                f"{VENUES[venue].runner} {Path(inv.script).name} {' '.join(argv)}"
+            )
             if code == -1:
                 note = " (timed out" + (
                     "; the request may still have reached the exchange, check open orders)"
@@ -709,9 +794,54 @@ async def _accounts(
     return _text("\n".join(lines))
 
 
+_ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_ONCHAIN_CHAINS = ("ethereum", "arbitrum", "optimism", "base", "polygon")
+_ONCHAIN_SCRIPT = SCRIPTS_DIR / "onchain_activity.py"
+
+
+async def _onchain_activity(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Read-only wallet history via Etherscan; the key stays in this process."""
+    client = _client(services)
+    if client is None or ctx.role != "owner":
+        return _text("error: exchange tools are not available here", True)
+    try:
+        address = str(_opt(args, "address") or "").strip()
+        if not _ADDRESS.match(address):
+            raise BadArgs("address must be a 0x… wallet address (42 chars)")
+        chain = str(_opt(args, "chain") or "ethereum").strip().lower()
+        if chain not in _ONCHAIN_CHAINS:
+            raise BadArgs(f"chain must be one of {', '.join(_ONCHAIN_CHAINS)}")
+        days = _int(args, "days", 1, 3650) or 30
+        limit = _int(args, "limit", 1, 1000) or 200
+    except BadArgs as exc:
+        return _text(f"error (bad arguments): {exc}", True)
+    if not client._stored(ONCHAIN.name).get("ETHERSCAN_API_KEY"):
+        return _text("error: no etherscan key (owner: /setkey etherscan …)", True)
+    # Full rows land in the caller's workspace, next to its other outputs.
+    out_dir = (ctx.working_dir or Path.cwd()) / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    inv = Invocation(
+        str(_ONCHAIN_SCRIPT),
+        (address, chain, str(days), str(limit)),
+        confirms=False,
+    )
+    logger.info("onchain tool run", chain=chain, days=days, profile=ctx.profile_slug)
+    code, output = await client.run(ONCHAIN.name, inv, READ_TIMEOUT_SECONDS, out_dir)
+    if code != 0:
+        why = "timed out" if code == -1 else f"exit {code}"
+        return _text(f"onchain_activity FAILED ({why})\n{output}", True)
+    return _text(output)
+
+
 # -- schemas ------------------------------------------------------------------
 
-_EXCHANGE = {"type": "string", "enum": list(VENUES), "description": "aster | mexc"}
+_EXCHANGE = {
+    "type": "string",
+    "enum": list(VENUES),
+    "description": "aster | mexc | bybit (read-only)",
+}
 _ACCOUNT = {"type": "string", "description": "Account name from exchange_accounts"}
 _SYMBOL_S = {
     "type": "string",
@@ -765,7 +895,8 @@ _SPECS: List[Tuple[str, str, Dict[str, Any], Any]] = [
     ),
     (
         "exchange_trades",
-        "Recent perp fills + open orders for one symbol (aster query_trades.js only).",
+        "Recent perp fills for one symbol (aster query_trades.js with open orders; "
+        "bybit executions, limit up to 100).",
         _schema(
             {
                 "exchange": _EXCHANGE,
@@ -779,8 +910,10 @@ _SPECS: List[Tuple[str, str, Dict[str, Any], Any]] = [
     ),
     (
         "exchange_analytics",
-        "Rolling volatility and drawdown from daily candles (mexc analytics.js; "
-        "public data, no account).",
+        "mexc: rolling volatility and drawdown from daily candles (analytics.js; "
+        "public data, no account). bybit: whole-account history summary over `days` "
+        "(deposits, withdrawals, PnL by symbol/month, funding; history.py, slow), or "
+        "funding=true for where the money came from (transfers, convert, P2P).",
         _schema(
             {
                 "exchange": _EXCHANGE,
@@ -791,7 +924,11 @@ _SPECS: List[Tuple[str, str, Dict[str, Any], Any]] = [
                 },
                 "window": {
                     "type": "integer",
-                    "description": "stddev window, default 30",
+                    "description": "stddev window, default 30 (mexc)",
+                },
+                "funding": {
+                    "type": "boolean",
+                    "description": "bybit: funding-sources report instead of history",
                 },
             }
         ),
@@ -936,6 +1073,33 @@ _SPECS: List[Tuple[str, str, Dict[str, Any], Any]] = [
         ),
         _run_action("transfer"),
     ),
+]
+
+# Not an exchange tool (no exchange_ prefix, so no gate row): read-only, allowed
+# like any other non-exchange MCP tool. Mounted exactly like the exchange tools.
+ONCHAIN_SPECS: List[ToolSpec] = [
+    ToolSpec(
+        name="onchain_activity",
+        description=(
+            "Read-only on-chain transfer history for one wallet via Etherscan: native + "
+            "ERC20 transfers in the last `days`, a compact summary (balance, in/out totals, "
+            "top counterparties, newest 25) and the saved full-rows JSON path under out/."
+        ),
+        schema=_schema(
+            {
+                "address": {"type": "string", "description": "0x… wallet address"},
+                "chain": {"type": "string", "enum": list(_ONCHAIN_CHAINS)},
+                "days": {"type": "integer", "description": "default 30"},
+                "limit": {
+                    "type": "integer",
+                    "description": "max rows per kind (txs, token transfers), default 200",
+                },
+            },
+            "address",
+        ),
+        handler=_onchain_activity,
+        available=exchange_available,
+    )
 ]
 
 EXCHANGE_SPECS: List[ToolSpec] = [

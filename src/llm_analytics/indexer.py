@@ -24,13 +24,17 @@ from .botdb import mirror_bot_db
 from .config import AnalyticsConfig
 from .db import connect, init_db
 from .models import AgentSpawnInput, ParsedEntry, ScanStats
-from .parser import is_seeded_text, normalize_ts, parse_entry
+from .parser import estimate_tokens, is_seeded_text, normalize_ts, parse_entry
 from .pricing import PricingTable
 from .quality import mirror_quality
 
 logger = structlog.get_logger(__name__)
 
 SCHEMA_VERSION = "1"
+# Bump when the parser starts recording something new about existing
+# transcripts: every still-present file is then re-read once from byte 0
+# (all writes are idempotent), so history gains the new fields.
+PARSER_VERSION = "2"  # 2: tool input/result sizes + context_items (dv-aeca)
 
 # Derived-event thresholds — educated guesses from two verified examples
 # (plan risk #2). Tunable HERE only; the UI keeps "inferred" labels.
@@ -88,6 +92,7 @@ class Indexer:
         started = time.monotonic()
         stats = ScanStats()
         repriced_sessions = self._maybe_reprice()
+        self._maybe_reparse(only_session)
         targets = self._discover(only_session)
         stats.files_seen = len(targets)
         self._mark_missing(targets, only_session)
@@ -325,9 +330,11 @@ class Indexer:
             )
         for tool_use in parsed.tool_uses:
             self._conn.execute(
-                "INSERT OR IGNORE INTO tool_calls (tool_use_id, session_id,"
-                " agent_id, name, ts, request_id, assistant_uuid, input_summary)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO tool_calls (tool_use_id, session_id,"
+                " agent_id, name, ts, request_id, assistant_uuid, input_summary,"
+                " input_chars) VALUES (?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(tool_use_id) DO UPDATE SET"
+                " input_chars = excluded.input_chars",
                 (
                     tool_use.tool_use_id,
                     target.session_id,
@@ -337,6 +344,7 @@ class Indexer:
                     tool_use.request_id,
                     tool_use.assistant_uuid,
                     tool_use.input_summary,
+                    tool_use.input_chars,
                 ),
             )
             if tool_use.agent_input is not None:
@@ -345,12 +353,37 @@ class Indexer:
             self._conn.execute(
                 "UPDATE tool_calls SET result_ts = ?, is_error = ?,"
                 " duration_ms = CAST(ROUND((julianday(?) - julianday(ts))"
-                " * 86400000.0) AS INTEGER) WHERE tool_use_id = ?",
+                " * 86400000.0) AS INTEGER), result_chars = ?,"
+                " result_images = ?, result_tokens_est = ?"
+                " WHERE tool_use_id = ?",
                 (
                     tool_result.result_ts,
                     tool_result.is_error,
                     tool_result.result_ts,
+                    tool_result.result_chars,
+                    tool_result.result_images,
+                    estimate_tokens(
+                        tool_result.result_chars, tool_result.result_images
+                    ),
                     tool_result.tool_use_id,
+                ),
+            )
+        for seq, item in enumerate(parsed.context_items):
+            self._conn.execute(
+                "INSERT OR IGNORE INTO context_items (session_id, agent_id,"
+                " file_id, entry_offset, seq, ts, kind, name, chars, request_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    target.session_id,
+                    target.agent_id,
+                    file_id,
+                    line_offset,
+                    seq,
+                    item.ts,
+                    item.kind,
+                    item.name,
+                    item.chars,
+                    item.request_id,
                 ),
             )
         for link in parsed.spawn_links:
@@ -414,6 +447,10 @@ class Indexer:
         )
         self._conn.execute(
             "DELETE FROM derived_events WHERE session_id = ? AND agent_id IS ?",
+            params,
+        )
+        self._conn.execute(
+            "DELETE FROM context_items WHERE session_id = ? AND agent_id IS ?",
             params,
         )
         if target.kind == "session":
@@ -604,6 +641,22 @@ class Indexer:
             )
             touched.add(row["session_id"])
         return touched
+
+    def _maybe_reparse(self, only_session: str | None) -> None:
+        """Re-read every still-present transcript once after a parser upgrade.
+        Rows of vanished files stay as they were (their fields stay NULL)."""
+        stored = self._get_meta("parser_version")
+        if stored == PARSER_VERSION:
+            return
+        if only_session is not None:
+            return  # a partial run must not consume the one-shot full re-read
+        logger.info("parser_changed_reindexing", old=stored, new=PARSER_VERSION)
+        self._conn.execute(
+            "UPDATE files SET byte_offset = 0, mtime = 0, size = 0"
+            " WHERE missing_since IS NULL"
+        )
+        self._set_meta("parser_version", PARSER_VERSION)
+        self._conn.commit()
 
     def _get_meta(self, key: str) -> str | None:
         row = self._conn.execute(

@@ -11,7 +11,9 @@ async def repo():
     db = DatabaseManager(tempfile.mktemp(suffix=".db"))
     await db.initialize()
     # Checkpoint mechanics are tested with it ON; the deployment default is 0.
-    return WindowRepository(db, eval_interval_tokens=120_000)
+    return WindowRepository(
+        db, eval_interval_tokens=120_000, refresh_threshold_tokens=200_000
+    )
 
 
 async def test_checkpoint_off_by_default_never_fires(repo):

@@ -129,7 +129,7 @@ class TestOptionalParams:
         looked up plus the replacement text it was given. Nothing there can be
         invented, so requiring all of it forces no fabrication.
         """
-        addressing_only = {"memory_correct"}
+        addressing_only = {"memory_correct", "task_comment"}
         for name, t in tools.items():
             props = t.input_schema["properties"]
             if len(props) < 2 or name in addressing_only:
@@ -240,3 +240,12 @@ class TestNoShorthandAnywhere:
             + " — the SDK marks every key required (dv-9679/dv-6f2a). "
             "Use tool_schema({...}, *required) from src/claude/tool_schema.py."
         )
+
+
+def test_job_start_task_id_validation():
+    from src.claude.agent_tools import valid_task_id
+
+    assert valid_task_id("dv-dfb1")
+    assert valid_task_id("pl:dv-0a1b2c")
+    for bad in ("", "dv-", "dv-xyz1", "../dv-dfb1", "dv-dfb1; rm", "--cwd=/"):
+        assert not valid_task_id(bad)

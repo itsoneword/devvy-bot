@@ -1,0 +1,173 @@
+{
+ "version": "v1",
+ "state": {
+  "max_message_chars": 6000,
+  "code_block_max_lines": 15
+ },
+ "fit": {
+  "per_request_budget_tokens": 56000
+ },
+ "core_questions": {
+  "remember_request": {
+   "type": "noul",
+   "instructions": "In the `conversation`, does the user explicitly ask the assistant to remember, save, note, or keep something for later?",
+   "criteria": {
+    "true": "The user says remember / save / запомни / сохрани / keep this / note this, or rates something as a keeper to save (e.g. 'сохранить', 'рецепт топ').",
+    "false": "No explicit request to remember or save anything. Asking to save a file or commit code does not count."
+   }
+  },
+  "standing_rule": {
+   "type": "noul",
+   "instructions": "In the `conversation`, does the user give the assistant a standing rule for all future conversations: something it must always do or must never do?",
+   "criteria": {
+    "true": "A lasting instruction about behaviour, output format, communication style, privacy, or what must never be published, shown or created. Example: 'never publish my home location', 'always show the calculation basis', 'do not use alarming wording about calories', 'do not log food anymore'.",
+    "false": "A one-time request for the current task only, a question, or an ordinary preference that is not framed as always/never."
+   }
+  },
+  "health_limit": {
+   "type": "noul",
+   "instructions": "In the `conversation`, does the user state an allergy, intolerance, injury, medical condition, medication, or a physical limit, or say that one has changed or ended?",
+   "criteria": {
+    "true": "Any health or safety limit on food, exercise or activity, including a new injury or a restriction that is now lifted (e.g. 'peanuts are fine now', 'the shoulder is healed').",
+    "false": "No health or safety limit is mentioned. Ordinary tiredness, one bad night's sleep, or a single meal does not count."
+   }
+  },
+  "user_lasting_fact": {
+   "type": "noul",
+   "instructions": "In the `conversation`, does the user state a lasting fact about themselves or their household that will still be true in a few weeks?",
+   "criteria": {
+    "true": "Preferences and dislikes, goals and targets, body metrics, schedule and availability, equipment or possessions, home and location, family, job, education, finances, biography. A repeated pattern stated as a pattern ('I usually skip breakfast') counts.",
+    "false": "Only one-off events (one meal, one workout, one night's sleep, one weigh-in, today's plan), questions, or small talk."
+   }
+  },
+  "decision_reached": {
+   "type": "noul",
+   "instructions": "In the `conversation`, do the user and the assistant reach or confirm a decision that is meant to hold from now on?",
+   "criteria": {
+    "true": "An agreed plan, program, rule, design choice, configuration, or choice between options that the user accepts or orders ('let's do X', 'agreed', 'go with option B', 'the server stays on UTC').",
+    "false": "Options are only discussed, the user is still undecided, or the only outcome is a task to do next."
+   }
+  },
+  "result_to_keep": {
+   "type": "noul",
+   "instructions": "In the `conversation`, does the assistant produce a result that is useful to look up again weeks later?",
+   "criteria": {
+    "true": "Research findings, a diagnosis or root cause, a measured baseline, where something lives or how something is set up, or a recipe or program the user liked or approved.",
+    "false": "Only small talk, logged meals or workouts with their calorie or volume totals, progress updates on work in flight, a todo list, or an answer the user rejected."
+   }
+  },
+  "temporary_condition": {
+   "type": "noul",
+   "instructions": "In the `conversation`, does the user mention a temporary situation that should change the assistant's advice for the next days or weeks?",
+   "criteria": {
+    "true": "Travel, illness, a short-term injury, broken or missing equipment, a busy period, guests, a diet break, a temporary pause of a routine.",
+    "false": "No temporary situation that affects future advice. A single past event with no effect on the coming days does not count."
+   }
+  },
+  "change_or_end": {
+   "type": "noul",
+   "instructions": "In the `conversation`, does the user or the assistant say that something that used to be true has changed, stopped, or no longer applies?",
+   "criteria": {
+    "true": "A goal, plan, preference, rule, restriction, setup, possession or status is replaced, cancelled, postponed, lifted, or corrected ('we moved to the new server', 'I stopped tracking', 'that was a mistake, the real number is').",
+    "false": "Nothing earlier is changed or cancelled; only new information or repetition."
+   }
+  },
+  "only_transient": {
+   "type": "noul",
+   "instructions": "Is everything in the `conversation` either a one-off log entry, small talk, or progress on a task, with nothing that stays true for weeks?",
+   "criteria": {
+    "true": "Meal or workout logs, a day summary, debugging steps, status updates, greetings, questions answered and forgotten.",
+    "false": "At least one statement that would still be true and useful weeks from now."
+   }
+  }
+ },
+ "fact_question_templates": {
+  "fact_touched_short": {
+   "question": "Does the `conversation` change, correct, cancel, or add a new detail to the specific thing `saved_fact` describes (any language)?",
+   "criteria": null
+  },
+  "fact_mentioned": {
+   "question": "Does the `conversation` state, repeat, change, correct, or cancel the specific thing `saved_fact` describes (any language)?",
+   "criteria": null
+  }
+ },
+ "agents": {
+  "devops": {
+   "role": "Software and server operations assistant for the owner: the devvy_bot Telegram bot, its agents, servers and backups, side projects, crypto trading tools.",
+   "examples": {
+    "decision_reached": "'server timezone back to UTC', 'postpone removing xrdp', 'agents learn tools from TOOLS.md, no agent-to-agent chat'.",
+    "result_to_keep": "where a config lives, a measured baseline, a root cause, a new agent's permissions.",
+    "standing_rule": "'the public export must never leak keys', 'do not load whole API docs into context'."
+   },
+   "extra_questions": {}
+  },
+  "chef": {
+   "role": "Cooking assistant for a household in Portugal: recipes, pantry, kitchen equipment, taste preferences.",
+   "examples": {
+    "user_lasting_fact": "a new kitchen appliance, pantry staples, liked or disliked ingredients, household size.",
+    "result_to_keep": "a recipe the user rated as top or asked to save, with quantities."
+   },
+   "extra_questions": {
+    "taste_reaction": {
+     "type": "noul",
+     "instructions": "In the `conversation`, does the user say how much they liked or disliked a specific dish, ingredient or flavour?",
+     "criteria": {
+      "true": "A clear reaction that should shape future recipes ('супертоп', 'didn't like the taste of shrimp itself', 'oyster mushrooms taste like chicken, loved it').",
+      "false": "No reaction, or only a neutral acknowledgement."
+     }
+    }
+   }
+  },
+  "coach": {
+   "role": "Fitness and nutrition coach: training program, calorie and macro targets, body metrics, injuries, communication rules.",
+   "examples": {
+    "user_lasting_fact": "a new goal weight, training availability, supplements, background in sport.",
+    "decision_reached": "a new weekly split, new kcal/protein targets, keeping or dropping a session type.",
+    "standing_rule": "'always show the KБЖУ calculation basis', 'no verdicts about a single day or week', 'stop the daily check-in'."
+   },
+   "extra_questions": {
+    "targets_or_program_change": {
+     "type": "noul",
+     "instructions": "In the `conversation`, are the user's training program, calorie or macro targets, or goal weight set or changed?",
+     "criteria": {
+      "true": "New or changed numbers or structure that apply from now on (e.g. '1650 kcal on 6 days', 'Friday is back day only').",
+      "false": "Only today's numbers, a logged meal or workout, or a discussion without a change."
+     }
+    }
+   }
+  },
+  "general": {
+   "role": "Personal assistant for the owner: career and job applications, education, visas and taxes, travel plans, personal research.",
+   "examples": {
+    "user_lasting_fact": "degree, willingness to relocate or take time off, residence status, career preferences.",
+    "result_to_keep": "research on programs, visas, destinations that answers a question the user asked."
+   },
+   "extra_questions": {}
+  },
+  "research": {
+   "role": "Research assistant for the owner: background research, documents, interview preparation.",
+   "examples": {},
+   "extra_questions": {}
+  },
+  "channel": {
+   "role": "Assistant that maintains a knowledge base of places for a Telegram channel.",
+   "examples": {},
+   "extra_questions": {}
+  },
+  "markets": {
+   "role": "Markets analyst: crypto exchange positions and reports.",
+   "examples": {},
+   "extra_questions": {}
+  },
+  "pm": {
+   "role": "Project management assistant.",
+   "examples": {},
+   "extra_questions": {}
+  },
+  "gymbro": {
+   "role": "Gym training companion.",
+   "examples": {},
+   "extra_questions": {}
+  }
+ }
+}

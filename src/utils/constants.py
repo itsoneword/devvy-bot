@@ -6,6 +6,8 @@ APP_DESCRIPTION = "Telegram bot for remote Claude Code access"
 
 # Default limits
 DEFAULT_CLAUDE_TIMEOUT_SECONDS = 300
+# Slack added on top of the owner-confirmation wait for hooks and idle limits.
+CONFIRMATION_MARGIN_SECONDS = 60
 DEFAULT_CLAUDE_MAX_TURNS = 10
 DEFAULT_CLAUDE_MAX_COST_PER_USER = 10.0
 DEFAULT_CLAUDE_MAX_COST_PER_USER_GUEST = 2.0
@@ -14,7 +16,6 @@ DEFAULT_CLAUDE_MAX_COST_PER_REQUEST = 5.0
 DEFAULT_RATE_LIMIT_REQUESTS = 10
 DEFAULT_RATE_LIMIT_WINDOW = 60
 DEFAULT_RATE_LIMIT_BURST = 20
-DEFAULT_PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS = 1.1
 
 # Session watchdog (dv-8bb5): soft, hourly thresholds that fire an admin
 # alert rather than blocking. Generous on purpose -- a false positive just
@@ -119,3 +120,17 @@ DEFAULT_ACTIVITY_LOG_MAX_LINES = 200
 
 # Logging
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# Reports-group routing (dv-e215): source prefix -> forum topic name. Only
+# consulted when REPORTS_CHAT_ID is set. Sources that need the owner's answer
+# (taskpump:ask, approvals, reminders, family) never route, whatever this says.
+DEFAULT_REPORTS_ROUTES = {
+    "server-monitor": "Monitoring",
+    "taskpump": "Pump",
+    "bgjob": "Jobs",
+    "schedule": "Reports",
+    "schedule:crypto": "Markets",
+    "schedule:news": "Markets",
+    "crypto": "Markets",
+    "news": "Markets",
+}

@@ -121,3 +121,36 @@ def test_job_options_keep_the_print_mode_defaults_and_add_the_gate() -> None:
 
 def test_ask_timeout_is_one_hour() -> None:
     assert ASK_TIMEOUT_SECONDS == 3600
+
+
+async def test_job_router_records_through_the_bot() -> None:
+    """dv-e690: a read-only bot.db must not lose router calls from jobs."""
+    from src.model_router.job import RemoteModelCallRecorder
+    from src.storage.model_calls import ModelCall
+
+    link = BotLink("http://127.0.0.1:1", "s")
+    link.record = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    call = ModelCall(
+        purpose="screen",
+        kind="decide",
+        harness="typesafe",
+        harness_version=None,
+        provider="typesafe",
+        model="jev-latest",
+        attended=False,
+        profile=None,
+        user_id=None,
+        session_id=None,
+        input_tokens=5,
+        output_tokens=0,
+        cache_read_tokens=0,
+        cache_creation_tokens=0,
+        cost_usd=0.1,
+        duration_ms=3,
+        outcome="ok",
+        error=None,
+    )
+    await RemoteModelCallRecorder(link).record(call)
+    row = link.record.call_args.args[0]
+    assert row["purpose"] == "screen" and row["harness"] == "typesafe"
+    assert row["input_tokens"] == 5

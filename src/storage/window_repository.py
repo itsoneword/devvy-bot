@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import structlog
 
+from src.config.settings import DEFAULT_WINDOW_REFRESH_THRESHOLD_TOKENS
+
 if TYPE_CHECKING:
     from .database import DatabaseManager
 
@@ -29,7 +31,7 @@ logger = structlog.get_logger()
 # extraction re-reads the whole window anyway, so a checkpoint ~30k before it
 # was a second, mostly redundant run.
 EVAL_INTERVAL_TOKENS = 0
-REFRESH_THRESHOLD_TOKENS = 200_000
+REFRESH_THRESHOLD_TOKENS = DEFAULT_WINDOW_REFRESH_THRESHOLD_TOKENS
 
 # Backends that can report the conversation's real size per turn, so a missing
 # number from them means "not measurable this turn", not "no such thing".

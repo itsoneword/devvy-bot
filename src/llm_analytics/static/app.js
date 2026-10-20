@@ -12,7 +12,7 @@ const appState = {
   filters: { user_id: "", profile: "", range: "7d" }, // range: 24h|7d|30d|all
   sessionsSort: { sort: "last_ts", order: "desc" },
   sessionView: {}, // per-session UI state, keyed by session id
-  auditView: { user_id: null, working_dir: null },
+  auditView: { user_id: null, working_dir: null, preset: "7d", from: "", to: "", window_id: null },
 };
 
 let currentView = null; // {refresh()} returned by the active view renderer

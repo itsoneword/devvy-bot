@@ -270,4 +270,5 @@ class TestOwnerPath:
             await caller.call("job_list", profile="devops", extra="--cwd=/")
 
         (argv,) = spawned
-        assert list(argv[1:]) == ["list"]
+        # dv-dfb1: fixed compact listing; nothing the model sent reaches argv.
+        assert list(argv[1:]) == ["list", "--compact", "--limit", "8"]

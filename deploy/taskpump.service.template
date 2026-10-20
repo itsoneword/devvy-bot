@@ -1,0 +1,19 @@
+-- rendered by scripts/render_deploy.py; do not install this file directly --
+# Opt-in: the pump is OFF until you enable taskpump.timer (docs/taskpump.md).
+[Unit]
+Description=taskpump — one pass over the deviz board
+Documentation=file:@DEVVY_ROOT@/docs/taskpump.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=@DEVVY_ROOT@
+ExecStart=@DEVVY_ROOT@/scripts/taskpump tick
+
+# systemd --user units get a minimal PATH; bgjob needs systemd-run and git,
+# and XDG_RUNTIME_DIR is what lets `systemd-run --user` find the user manager.
+Environment=PATH=@SERVICE_PATH@
+
+# A tick is bookkeeping — the actual work happens in detached bgjob units, so
+# this process should never sit around.
+TimeoutStartSec=300
+MemoryMax=256M

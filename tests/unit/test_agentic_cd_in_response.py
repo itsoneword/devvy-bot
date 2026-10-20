@@ -76,7 +76,7 @@ def _harness(settings: Settings, tmp_path: Path, answer: str = _ANSWER):
     update.message.message_thread_id = None
     update.message.reply_to_message = None
     update.message.chat.id = 999
-    update.message.chat.type = "group"
+    update.message.chat.type = "private"
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock(return_value=AsyncMock())
 

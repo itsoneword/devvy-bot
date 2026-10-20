@@ -4,6 +4,7 @@ One entry dict in, one ParsedEntry out (or None when the line contributes
 nothing). No I/O, no SQL — the indexer owns offsets, dedupe and writes.
 """
 
+import json
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 from .models import (
     AgentSpawnInput,
     ApiCall,
+    ContextItem,
     ParsedEntry,
     SpawnLink,
     ToolResult,
@@ -36,7 +38,29 @@ SEED_MARKERS = ("<conversation_context>", "<session_notes>", "<recent_conversati
 INPUT_SUMMARY_MAX = 300
 TURN_EXCERPT_MAX = 200
 
-_HANDLED_TYPES = frozenset({"assistant", "user", "queue-operation"})
+_HANDLED_TYPES = frozenset(
+    {"assistant", "user", "queue-operation", "attachment", "api-request-shape"}
+)
+
+# Context-size accounting (dv-aeca). Measured on 12 real transcripts: a tool
+# result costs ~2.3 chars/token (code, JSON and Cyrillic are token-dense); an
+# image block carries no text, ~1.2-1.6k tokens each. Estimates only — the
+# store uses the real next-call input delta wherever it can attribute one.
+CHARS_PER_TOKEN = 2.3
+IMAGE_TOKENS_EST = 1500
+
+# Tags the bot wraps around a user turn (bot-side prompt composition).
+TURN_PREFIX_TAGS = ("family_reminders", "current_time")
+SEED_TAGS = ("conversation_context", "session_notes", "recent_conversation")
+SYSTEM_SECTION_TAGS = (
+    "agent_identity",
+    "shared_capabilities",
+    "constraints",
+    "user_facts",
+    "family_facts",
+    "memory_pointers",
+    "runtime",
+)
 
 
 def normalize_ts(raw: str) -> str:
@@ -67,6 +91,47 @@ def summarize_input(tool_input: dict[str, Any]) -> str | None:
     return None
 
 
+def estimate_tokens(chars: int, images: int = 0) -> int:
+    """Rough token count of `chars` characters plus `images` image blocks."""
+    return round(chars / CHARS_PER_TOKEN) + images * IMAGE_TOKENS_EST
+
+
+def result_size(content: Any) -> tuple[int, int]:
+    """(text chars, image blocks) of a tool_result `content` payload."""
+    if isinstance(content, str):
+        return len(content), 0
+    chars = images = 0
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text":
+                chars += len(block.get("text") or "")
+            elif kind == "image":
+                images += 1
+            else:
+                chars += len(json.dumps(block, ensure_ascii=False))
+    return chars, images
+
+
+def split_user_text(text: str, ts: str) -> list[ContextItem]:
+    """Size the bot's tagged sections of one user message: per-turn prefix
+    (family reminders, clock), window seed, and the user's own words."""
+    items: list[ContextItem] = []
+    rest = text
+    for tag in TURN_PREFIX_TAGS + SEED_TAGS:
+        match = re.search(rf"<{tag}>.*?</{tag}>", rest, re.DOTALL)
+        if match:
+            kind = "turn_prefix" if tag in TURN_PREFIX_TAGS else "seed"
+            items.append(ContextItem(kind, tag, match.end() - match.start(), ts))
+            rest = rest[: match.start()] + rest[match.end() :]
+    rest = rest.strip()
+    if rest:
+        items.append(ContextItem("user_text", "user", len(rest), ts))
+    return items
+
+
 def _text_of(content: Any) -> str:
     """Plain text of a message/tool_result content (str or block list)."""
     if isinstance(content, str):
@@ -91,6 +156,10 @@ def parse_entry(entry: dict[str, Any], *, kind: str) -> ParsedEntry | None:
         return _parse_assistant(entry)
     if entry_type == "user":
         return _parse_user(entry, kind=kind)
+    if entry_type == "attachment":
+        return _parse_attachment(entry)
+    if entry_type == "api-request-shape":
+        return _parse_shape(entry)
     return _parse_queue_operation(entry)
 
 
@@ -136,6 +205,22 @@ def _parse_assistant(entry: dict[str, Any]) -> ParsedEntry | None:
     content = message.get("content")
     if isinstance(content, list):
         for block in content:
+            if isinstance(block, dict) and block.get("type") in ("text", "thinking"):
+                if block["type"] == "text":
+                    size = len(block.get("text") or "")
+                else:
+                    # Thinking text is not stored in transcripts; the signature
+                    # is the only trace. Its tokens are inferred, not measured.
+                    size = len(block.get("signature") or "")
+                result.context_items.append(
+                    ContextItem(
+                        "assistant_text" if block["type"] == "text" else "thinking",
+                        block["type"],
+                        size,
+                        ts,
+                        request_id,
+                    )
+                )
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
             tool_use_id = block.get("id")
@@ -161,6 +246,7 @@ def _parse_assistant(entry: dict[str, Any]) -> ParsedEntry | None:
                     assistant_uuid=uuid,
                     input_summary=summarize_input(tool_input),
                     agent_input=agent_input,
+                    input_chars=len(json.dumps(tool_input, ensure_ascii=False)),
                 )
             )
     return result
@@ -190,11 +276,14 @@ def _parse_user(entry: dict[str, Any], *, kind: str) -> ParsedEntry | None:
             if not isinstance(tool_use_id, str):
                 continue
             if ts is not None:
+                chars, images = result_size(block.get("content"))
                 result.tool_results.append(
                     ToolResult(
                         tool_use_id=tool_use_id,
                         result_ts=ts,
                         is_error=1 if block.get("is_error") else 0,
+                        result_chars=chars,
+                        result_images=images,
                     )
                 )
             match = AGENT_ID_RE.search(_text_of(block.get("content")))
@@ -210,6 +299,8 @@ def _parse_user(entry: dict[str, Any], *, kind: str) -> ParsedEntry | None:
         text = _text_of(content)
         if text:
             result.user_text = text
+            if ts is not None:
+                result.context_items.extend(split_user_text(text, ts))
             # Bot (sdk-py) turns come from bot.db; everything else — cli,
             # sdk-cli, unknown — gets a transcript turn.
             if kind == "session" and entry.get("entrypoint") != "sdk-py" and ts:
@@ -219,9 +310,68 @@ def _parse_user(entry: dict[str, Any], *, kind: str) -> ParsedEntry | None:
         or result.spawn_links
         or result.user_text is not None
         or result.turn is not None
+        or result.context_items
     ):
         return result
     return None
+
+
+def _parse_attachment(entry: dict[str, Any]) -> ParsedEntry | None:
+    """Harness-injected <system-reminder> content (CLAUDE.md, skill list,
+    token counter, ...), sized from its rendered text and named by type."""
+    ts_raw = entry.get("timestamp")
+    attachment = entry.get("attachment")
+    rendered = entry.get("rendered")
+    if not isinstance(ts_raw, str) or not isinstance(attachment, dict):
+        return None
+    if not isinstance(rendered, list):
+        return None
+    chars = sum(
+        len(block["content"])
+        for block in rendered
+        if isinstance(block, dict) and isinstance(block.get("content"), str)
+    )
+    if chars <= 0:
+        return None
+    name = attachment.get("type")
+    item = ContextItem(
+        "reminder", name if isinstance(name, str) else "?", chars, normalize_ts(ts_raw)
+    )
+    return ParsedEntry(context_items=[item])
+
+
+def _parse_shape(entry: dict[str, Any]) -> ParsedEntry | None:
+    """The request's fixed part: system prompt sections and tool schemas."""
+    ts_raw = entry.get("timestamp")
+    shape = entry.get("shape")
+    if not isinstance(ts_raw, str) or not isinstance(shape, dict):
+        return None
+    ts = normalize_ts(ts_raw)
+    items: list[ContextItem] = []
+    for block in shape.get("system") or []:
+        text = block.get("text") if isinstance(block, dict) else None
+        if not isinstance(text, str):
+            continue
+        covered = 0
+        for tag in SYSTEM_SECTION_TAGS:
+            # Line-anchored: prose inside other sections mentions "<tag>" too.
+            match = re.search(rf"^<{tag}>.*?</{tag}>$", text, re.DOTALL | re.MULTILINE)
+            if match:
+                size = match.end() - match.start()
+                items.append(ContextItem("shape_system", tag, size, ts))
+                covered += size
+        if len(text) > covered:
+            items.append(ContextItem("shape_system", "base", len(text) - covered, ts))
+    for tool in shape.get("tools") or []:
+        if isinstance(tool, dict):
+            name = tool.get("name")
+            size = len(json.dumps(tool, ensure_ascii=False))
+            items.append(
+                ContextItem(
+                    "shape_tools", name if isinstance(name, str) else "?", size, ts
+                )
+            )
+    return ParsedEntry(context_items=items) if items else None
 
 
 def _parse_queue_operation(entry: dict[str, Any]) -> ParsedEntry | None:

@@ -23,12 +23,23 @@ Signals:
                        (dv-5d5f Tier-1 mechanical check).
 - recipe_turns_unsearched: of those, the ones with no WebSearch/WebFetch
                        call recorded against that message_id.
+- verification_calls:  WebSearch/WebFetch/Agent/Task calls (dv-9f41), so
+                       calls-per-turn = verification_calls / user_messages.
+- verified_turns:      turns with >=1 such call.
+- deep_research_turns: turns with more than CHEAP_CHECK_MAX such calls — the
+                       turn-1817 tail (17 WebSearch for one chest session).
+- program_turns:       turns whose response prescribes a training programme
+                       (sets x reps / weights / %1RM / RPE in a list).
+- program_turns_unchecked: of those, no Web*/subagent call AND no read of the
+                       user's own data — the dv-7a3c tail. Both tails are
+                       failures; the band between them is the target.
 """
 
 import re
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
+from typing import Sequence
 
 import structlog
 
@@ -69,6 +80,32 @@ _QUANTITY_UNIT_RE = re.compile(
 )
 _WEB_SEARCH_TOOLS = frozenset({"WebSearch", "WebFetch"})
 
+# dv-9f41: a training prescription. List structure plus at least one
+# load-bearing number — set x rep scheme, a weight with a unit, %1RM or RPE.
+# Physiology prose with citations has none of these and is not load-bearing.
+_SET_REP_RE = re.compile(r"\b\d+\s*[x×х]\s*\d+")
+_WEIGHT_RE = re.compile(r"\b\d+(?:[.,]\d+)?\s*(?:кг|kg|lbs?|фунт\w*)(?!\w)", re.I)
+_PERCENT_1RM_RE = re.compile(r"\d+\s*%\s*(?:от\s*)?(?:1\s*RM|1ПМ|ПМ)", re.I)
+_RPE_RE = re.compile(r"\b(?:RPE|RIR)\s*\d+", re.I)
+_PROGRAM_NUMBER_RES = (_SET_REP_RE, _WEIGHT_RE, _PERCENT_1RM_RE, _RPE_RE)
+# dv-9f41 band edge: 1-3 search-class calls is the cheap check; above that a
+# turn is doing research. Same number as VERIFICATION_BUDGET_CONFIRM_MAX's
+# default, kept a constant so historical counts don't move with config.
+CHEAP_CHECK_MAX = 3
+
+# Search-class tools: each call pulls external content into the turn. A
+# foreground subagent is one row in tool_usage but weighs 2 against the live
+# budget: one spawn routinely fans out into many nested Web* calls (turn
+# 1817: Agent x1 -> WebSearch x17 + WebFetch x2).
+SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
+SUBAGENT_WEIGHT = 2
+# Local data reads that ground a training prescription in the user's own
+# history. The load-bearing claim in turn 1817 was "are these sets/weights
+# defensible for THIS user" — lift_history answers that for free.
+_DATA_READ_RE = re.compile(
+    r"(?:^|__)(?:lift_history|day_summary|week_summary|sleep_last)$"
+)
+
 _METRICS = (
     "pinned_facts",
     "log_calls",
@@ -77,6 +114,11 @@ _METRICS = (
     "user_messages",
     "recipe_turns",
     "recipe_turns_unsearched",
+    "verification_calls",
+    "verified_turns",
+    "deep_research_turns",
+    "program_turns",
+    "program_turns_unchecked",
 )
 
 _Key = tuple[str, str | None, int | None]  # (date, profile, user_id)
@@ -93,6 +135,35 @@ def looks_like_recipe(response: str) -> bool:
     if len(_LIST_ITEM_RE.findall(response)) < 2:
         return False
     return len(_QUANTITY_UNIT_RE.findall(response)) >= 2
+
+
+def tool_weight(tool_name: str) -> int:
+    """Budget units one call costs (0 = not search-class)."""
+    if tool_name in _WEB_SEARCH_TOOLS:
+        return 1
+    if tool_name in SUBAGENT_TOOLS:
+        return SUBAGENT_WEIGHT
+    return 0
+
+
+def verification_calls(tool_names: Sequence[str]) -> int:
+    """Unweighted count of search-class calls (Web* + subagent spawns)."""
+    return sum(1 for name in tool_names if tool_weight(name))
+
+
+def is_grounded(tool_names: Sequence[str]) -> bool:
+    """True if the turn checked anything: a web search/fetch, a research
+    subagent, or a read of the user's own logged data."""
+    return any(tool_weight(name) or _DATA_READ_RE.search(name) for name in tool_names)
+
+
+def looks_like_training_program(response: str) -> bool:
+    """True if ``response`` prescribes a workout: a list (>=2 items) plus at
+    least one set x rep, weight, %1RM or RPE figure. Heuristic, the coach-side
+    twin of ``looks_like_recipe`` (dv-9f41)."""
+    if len(_LIST_ITEM_RE.findall(response)) < 2:
+        return False
+    return any(rx.search(response) for rx in _PROGRAM_NUMBER_RES)
 
 
 def agent_parts(agent_id: str) -> tuple[str | None, int | None]:
@@ -143,10 +214,13 @@ def compute_quality_daily(src: sqlite3.Connection) -> list[tuple]:
 
     logged_message_ids: set[int] = set()
     web_searched_message_ids: set[int] = set()
+    tools_by_message: dict[int, list[str]] = defaultdict(list)
     if "tool_usage" in tables:
         for row in src.execute(
             "SELECT session_id, message_id, tool_name, timestamp FROM tool_usage"
         ):
+            if row["message_id"] is not None:
+                tools_by_message[int(row["message_id"])].append(row["tool_name"])
             if row["tool_name"] in _WEB_SEARCH_TOOLS and row["message_id"] is not None:
                 web_searched_message_ids.add(int(row["message_id"]))
             if not is_log_tool(row["tool_name"]):
@@ -182,6 +256,17 @@ def compute_quality_daily(src: sqlite3.Connection) -> list[tuple]:
                 bucket["recipe_turns"] += 1
                 if int(row["message_id"]) not in web_searched_message_ids:
                     bucket["recipe_turns_unsearched"] += 1
+            turn_tools = tools_by_message.get(int(row["message_id"]), [])
+            calls = verification_calls(turn_tools)
+            bucket["verification_calls"] += calls
+            if calls:
+                bucket["verified_turns"] += 1
+            if calls > CHEAP_CHECK_MAX:
+                bucket["deep_research_turns"] += 1
+            if looks_like_training_program(response):
+                bucket["program_turns"] += 1
+                if not is_grounded(turn_tools):
+                    bucket["program_turns_unchecked"] += 1
 
     if "memory_facts" in tables:
         for row in src.execute(
@@ -218,8 +303,10 @@ def mirror_quality(conn: sqlite3.Connection, bot_db_path: Path) -> bool:
         conn.executemany(
             "INSERT INTO quality_daily (date, profile, user_id, pinned_facts,"
             " log_calls, claimed_not_logged, complaint_hits, user_messages,"
-            " recipe_turns, recipe_turns_unsearched)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " recipe_turns, recipe_turns_unsearched, verification_calls,"
+            " verified_turns, deep_research_turns, program_turns,"
+            " program_turns_unchecked)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
     logger.debug("quality_mirrored", rows=len(rows))

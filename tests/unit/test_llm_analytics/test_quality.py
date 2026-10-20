@@ -120,10 +120,12 @@ def _bot_db() -> sqlite3.Connection:
 def test_compute_quality_daily() -> None:
     rows = compute_quality_daily(_bot_db())
     # (date, profile, user_id, pinned, log_calls, claimed_not_logged,
-    #  complaints, user_messages, recipe_turns, recipe_turns_unsearched)
+    #  complaints, user_messages, recipe_turns, recipe_turns_unsearched,
+    #  verification_calls, verified_turns, deep_research_turns,
+    #  program_turns, program_turns_unchecked)
     assert rows == [
-        ("2026-08-10", "coach", 7, 0, 1, 1, 0, 4, 2, 1),
-        ("2026-08-11", "coach", 7, 1, 0, 0, 1, 1, 0, 0),
+        ("2026-08-10", "coach", 7, 0, 1, 1, 0, 4, 2, 1, 1, 1, 0, 0, 0),
+        ("2026-08-11", "coach", 7, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0),
     ]
 
 

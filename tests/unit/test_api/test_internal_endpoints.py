@@ -61,6 +61,16 @@ class TestInternalNotify:
         assert isinstance(event, AgentResponseEvent)
         assert event.text == "workout time"
         assert event.chat_id == 0  # broadcast to default notification chats
+        assert event.parse_mode is None  # default stays plain
+
+    def test_notify_markdown_flag(self) -> None:
+        bus = EventBus()
+        bus.publish = AsyncMock()  # type: ignore[method-assign]
+        client = TestClient(create_api_app(bus, make_settings()))
+        client.post(
+            "/internal/notify", json={"text": "**x**", "markdown": True}, headers=AUTH
+        )
+        assert bus.publish.call_args[0][0].parse_mode == "markdown"
 
 
 class TestInternalSchedule:

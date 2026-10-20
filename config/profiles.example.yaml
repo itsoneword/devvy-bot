@@ -83,6 +83,21 @@
 #     ...
 #     max_cost_per_request: 1.50
 #
+# Optional per-profile `provider:` / `model:` / `allowed_models:` (dv-d2f6) run
+# the profile's chat turns on another model provider through the Claude Code
+# CLI. Only `provider: openrouter` exists. It needs `model:` (an OpenRouter
+# slug) and `max_cost_per_request > 0`, and the profile must be sandboxed,
+# not `unrestricted`, not `devops`, no `exchange`. Put the key in the key
+# store: `/setkey openrouter OPENROUTER_API_KEY <value>`. A user's /model pick
+# is honoured only if listed in `allowed_models`; unset provider = subscription.
+#
+#   - slug: scratch
+#     ...
+#     provider: openrouter
+#     model: z-ai/glm-5.3
+#     allowed_models: [z-ai/glm-5.3, z-ai/glm-5.2]
+#     max_cost_per_request: 0.20
+#
 # Optional per-profile `extra_dirs:` (list of paths) lets a SANDBOXED profile
 # write to directories beyond its own workspace — an Obsidian vault, another
 # project checkout — without flipping `sandbox: false` (which grants the whole
@@ -98,6 +113,23 @@
 #     extra_dirs:
 #       - ~/notes                       # Obsidian vault
 #       - ${DEVVY_ROOT}/../my-project   # another checkout on this host
+#
+# Optional per-profile `sandbox_read_dirs:` (dv-98f2) lists directories a
+# SANDBOXED profile's bash may READ but not write (shared tool checkouts). Bash
+# runs in a bwrap box that contains only: the system (read-only), the
+# workspace + `extra_dirs` (read-write), `sandbox_read_dirs` (read-only) and a
+# private /tmp. Owner-only profiles.
+#
+# Optional per-profile `sandbox_allowed_domains:` (list of bare hostnames) is
+# NOT ENFORCED today: the box shares the host network. The key is validated and
+# kept for the future egress proxy. Owner-only profiles.
+#
+#   - slug: markets
+#     ...
+#     sandbox_read_dirs:
+#       - ~/tools/fetchcrypto
+#     sandbox_allowed_domains:
+#       - api.hyperliquid.xyz
 #
 # Optional per-profile `hireli: true` mounts the hireli_* tools (job
 # applications + interview prep on hireli.xyz). Needs HIRELI_MCP_URL and

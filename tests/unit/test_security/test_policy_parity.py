@@ -102,6 +102,9 @@ CASES: List[Tuple[str, Tuple[str, Dict[str, Any]], bool, str]] = [
         ASK,
     ),
     ("service control", _bash("systemctl restart nginx"), True, ASK),
+    # dv-535b: the pump flagged this agent-filed branch (see _pump_board).
+    ("merge a flagged pump branch", _bash("git merge pump/dv-ab12"), True, ASK),
+    ("merge an unflagged pump branch", _bash("git merge pump/dv-cd34"), True, ALLOW),
     ("write to a system path", ("Write", {"file_path": "/etc/hosts"}), True, ASK),
     # Sandboxed profiles: the denylist holds, the ask-gate does not apply.
     ("sandboxed delete", _bash("rm notes.txt"), False, ALLOW),
@@ -141,6 +144,18 @@ CASES: List[Tuple[str, Tuple[str, Dict[str, Any]], bool, str]] = [
         ALLOW,
     ),
     (
+        "bybit read via exchange tool",
+        ("mcp__agent__exchange_report", {"exchange": "bybit"}),
+        True,
+        ALLOW,
+    ),
+    (
+        "onchain read-only tool",
+        ("mcp__agent__onchain_activity", {"address": "0x" + "ab" * 20}),
+        True,
+        ALLOW,
+    ),
+    (
         "exchange write asks",
         (
             "mcp__agent__exchange_place_order",
@@ -175,6 +190,20 @@ CASES: List[Tuple[str, Tuple[str, Dict[str, Any]], bool, str]] = [
     ),
 ]
 IDS = [case[0] for case in CASES]
+
+
+@pytest.fixture(autouse=True)
+def _pump_board(tmp_path_factory: pytest.TempPathFactory, monkeypatch: Any) -> None:
+    """A board where pump/dv-ab12 is flagged pump_privileged, dv-cd34 not."""
+    from src.storage import board_policy
+
+    tasks = tmp_path_factory.mktemp("board")
+    (tasks / "dv-ab12.md").write_text(
+        "---\nid: dv-ab12\ntitle: t\nstatus: review\n"
+        "pump_privileged: config/profiles.yaml\n---\n"
+    )
+    (tasks / "dv-cd34.md").write_text("---\nid: dv-cd34\ntitle: t\n---\n")
+    monkeypatch.setattr(board_policy, "TASK_DIRS", [tasks])
 
 
 def _turn(cwd: Path, full_access: bool) -> policy.TurnPolicy:
@@ -512,7 +541,9 @@ class TestBridgeRunsAnAskOnlyWithTheOwnersApproval:
         if approved_first:
             body = {"tool_name": f"mcp__agent__{self.WRITE}", "tool_input": self.ARGS}
             await gate.check(_hash("tok"), self.CTX, body)
-        bridge = AgentBridgeMcp(AgentServices(event_bus=None, task_repo=None), TokenRegistry())
+        bridge = AgentBridgeMcp(
+            AgentServices(event_bus=None, task_repo=None), TokenRegistry()
+        )
         request = SimpleNamespace(
             headers={"authorization": "Bearer tok"},
             app=SimpleNamespace(state=SimpleNamespace(policy_gate=gate)),
@@ -525,3 +556,71 @@ class TestBridgeRunsAnAskOnlyWithTheOwnersApproval:
         out = await bridge.call_tool(self.WRITE, self.ARGS)
         assert out.isError is (not approved_first)
         assert handler.await_count == (1 if approved_first else 0)
+
+
+# --- the bash box (dv-98f2) -------------------------------------------------
+# A sandboxed profile's Bash is rewritten to run in bwrap by the Claude hook.
+# Codex has its own OS sandbox (permission profile, codex_sandbox.py), so its
+# route only judges the call; both must agree on allow/deny.
+
+
+def _box_hook(tmp_path: Path):
+    from src.security.bash_box import BashBox
+
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    return _make_pre_tool_use_hook(
+        working_directory=ws,
+        full_access=False,
+        bash_box=BashBox(write_dirs=(ws,)),
+    )
+
+
+async def test_sandboxed_bash_is_rewritten_into_the_box(tmp_path) -> None:
+    out = await _box_hook(tmp_path)(
+        {"tool_name": "Bash", "tool_input": {"command": "ls -la", "timeout": 5}},
+        "t1",
+        None,
+    )
+    updated = out["hookSpecificOutput"]["updatedInput"]
+    assert updated["timeout"] == 5  # other fields survive
+    assert "bash_box.py" in updated["command"]
+    assert updated["command"].endswith("-- 'ls -la'")
+    assert "permissionDecision" not in out["hookSpecificOutput"]
+
+
+async def test_denied_bash_is_denied_not_rewritten(tmp_path) -> None:
+    out = await _box_hook(tmp_path)(
+        {"tool_name": "Bash", "tool_input": {"command": "cat .env"}}, "t1", None
+    )
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "updatedInput" not in out["hookSpecificOutput"]
+
+
+async def test_non_bash_tools_are_not_rewritten(tmp_path) -> None:
+    out = await _box_hook(tmp_path)(
+        {"tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "a")}},
+        "t1",
+        None,
+    )
+    assert out == {}
+
+
+async def test_box_unavailable_fails_closed(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    out = await _box_hook(tmp_path)(
+        {"tool_name": "Bash", "tool_input": {"command": "ls"}}, "t1", None
+    )
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_codex_route_judges_without_rewriting(tmp_path) -> None:
+    app, headers = _bridge_client(tmp_path, False, _confirmation(True))
+    with TestClient(app) as client:
+        response = client.post(
+            POLICY_PATH,
+            json={"tool_name": "Bash", "tool_input": {"command": "ls -la"}},
+            headers=headers,
+        )
+    assert response.json()["decision"] == ALLOW
+    assert "updatedInput" not in response.json()

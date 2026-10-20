@@ -96,6 +96,12 @@ CLAUDE_MAX_TURNS=10
 # single tool call that produces nothing for this long trips it.
 CLAUDE_TIMEOUT_SECONDS=300
 
+# Seconds the owner has to tap Approve/Deny on a risky tool call before it is
+# auto-denied (both backends). Hook timeouts and the turn idle limits
+# (CLAUDE_TIMEOUT_SECONDS, AGENT_TIMEOUT_SECONDS) are raised automatically to
+# outlive this wait + 60/120 s; background jobs use their own 3600 s ask wait.
+CONFIRMATION_TIMEOUT_SECONDS=600
+
 # Max bytes for one stream-json message on the CLI's stdout. The SDK's own
 # default is 1 MiB, which a single image Read overflows and kills the turn.
 CLAUDE_MAX_BUFFER_SIZE=16777216
@@ -195,6 +201,41 @@ EVALUATOR_MAX_DELTA_CHARS=120000
 # Ceiling for one evaluator/reconciler CLI call; on timeout the subprocess is
 # killed and the failure is recorded with an error_message prefixed 'timeout'
 EVALUATOR_TIMEOUT_SECONDS=120
+
+# Jev gate before the reconciler (dv-7e11): per candidate one TypeSafe Jev
+# decide call; confident new/duplicate skip haiku, the rest (every
+# contradicts, low confidence, Jev down) go to haiku in one batch.
+# Needs TYPESAFE_API_KEY. Counts land in op_stats.reconcile_gate.
+RECONCILE_JEV_GATE_ENABLED=false
+RECONCILE_JEV_MIN_CONF_NEW=0.8
+# > 1.0 = duplicates always escalate (no reliable confidence band yet)
+RECONCILE_JEV_MIN_CONF_DUPLICATE=1.01
+# Escalate when P(candidate updates/resolves a saved fact) is above this
+RECONCILE_JEV_MAX_STATE_CHANGE=0.55
+RECONCILE_JEV_TOP_K=15
+
+# Jev screen in front of extraction (dv-7e11 step c). Jev picks which saved
+# facts Sonnet sees; it never skips a chunk. off = classic extraction only.
+# shadow (default) = classic extraction writes memory as before; per chunk of
+# the same slice the screen scores every saved fact with two Jev questions
+# (touched, mentioned), runs a targeted Sonnet call on the facts scoring
+# >= FACT_SEND_MIN (top FACT_SEND_MAX) + pinned + remember-tool facts, and
+# records the proposed ops in memory_extractions.op_stats.screen. It writes no
+# facts. Costs one extra Sonnet call per chunk (model_calls purpose
+# screen_extraction) plus Jev (purpose screen). on = reserved for the cutover
+# step; behaves as shadow today. Read it with scripts/screen_shadow_report.py.
+MEMORY_SCREEN_MODE=shadow
+MEMORY_SCREEN_CHUNK_TOKENS=12000
+MEMORY_SCREEN_FACT_SEND_MIN=0.3
+MEMORY_SCREEN_FACT_SEND_MAX=40
+
+# TypeSafe Jev key (dv-e690). Primary: this variable in the bot's dotenv or
+# secrets file; main.py hands it to the router at startup (the loader keeps it
+# out of os.environ). A TYPESAFE_API_KEY already in the process environment
+# overrides it, which is how jobs get it: `scripts/withkeys typesafe -- <cmd>`
+# (key stored with /setkey typesafe TYPESAFE_API_KEY ...). Unset = decide()
+# falls back to its Haiku leg, or raises when the caller disabled that.
+TYPESAFE_API_KEY=
 ```
 
 Since dv-c5d9 each run is a pipeline: extraction emits *candidates* (with
@@ -289,6 +330,40 @@ confidently wrong recipe as highly as a correct one, so it cannot be trusted
 to decide when a retry is warranted.
 
 In agentic mode, `/model` can switch per user between Claude Code and OpenAI Codex without changing the global default. OpenAI Codex login uses device-code authentication and stores the resulting token JSON with user-only file permissions. The entitled model catalog is refreshed at startup and whenever `/model` opens; unsupported selections fall back to `openai-codex/gpt-5.6-sol`. Current limitation: Codex is wired for the agentic text path; document, photo, and voice workflows still use the Claude integration. Codex sandbox (dv-e38e): profiles with `unrestricted: true` (devops) run `-s danger-full-access`; every other profile runs a codex permission profile that reads everywhere, writes only to its workspace, `extra_dirs` and tmp, and cannot see the data root's `secrets/`, `archive/`, `db/`, credential files, or other users' workspaces (`src/agent_backends/codex_sandbox.py`).
+
+#### Verification budget + confirm/escalate (dv-9f41)
+
+How much searching one turn may do. Both poles were measured on coach: a leg
+programme written with zero data reads (dv-7a3c), and a chest session that
+spawned a subagent and ran 17 WebSearch + 2 WebFetch (turn 1817, ~5x the
+month's mean cost). The `PreToolUse` hook counts search-class calls per turn
+(WebSearch/WebFetch = 1, Agent/Task = 2) for the listed profiles. Count-only
+by default: over-budget turns log `verification_budget_exceeded` and land in
+`quality_daily.deep_research_turns`; `ENFORCE` turns the count into a deny.
+
+After delivery, a training-programme answer (`looks_like_training_program`)
+grounded in nothing — no `lift_history`/`day_summary`/`week_summary`/
+`sleep_last`, no Web*, no subagent — gets ONE confirm turn (`🔎 Проверка
+цифр:`): WebSearch only, `CONFIRM_MAX` calls. Only if that reply starts a line
+with `ПРОТИВОРЕЧИЕ:` does ONE uncapped escalate turn run, scoped to that claim.
+Never a fourth turn. Off by default, like the recipe retry.
+
+```bash
+VERIFICATION_BUDGET_ENFORCE=false      # count-only until counters justify deny
+VERIFICATION_BUDGET_PROFILES=coach,chef
+VERIFICATION_BUDGET_DRAFT_MAX=1        # budget units in an ordinary turn
+VERIFICATION_BUDGET_CONFIRM_MAX=3      # WebSearch calls in the confirm turn
+
+VERIFICATION_CHECK_ENABLED=false       # the confirm/escalate follow-up
+VERIFICATION_CHECK_PROFILES=coach
+```
+
+The 1/3 budgets are untuned starting points. Calibrate them from the
+`quality_daily` counters (`verification_calls`, `verified_turns`,
+`deep_research_turns`, `program_turns`, `program_turns_unchecked`), which the
+analytics daemon mirrors from the live `bot.db`.
+
+In agentic mode, `/model` can switch per user between Claude Code and OpenAI Codex without changing the global default. OpenAI Codex login uses device-code authentication and stores the resulting token JSON with user-only file permissions. The entitled model catalog is refreshed at startup and whenever `/model` opens; unsupported selections fall back to `openai-codex/gpt-5.6-sol`. Current limitation: Codex is wired for the agentic text path; document, photo, and voice workflows still use the Claude integration.
 
 #### Rate Limiting
 
@@ -403,42 +478,79 @@ ENABLE_SCHEDULER=false                # Enable cron job scheduler
 NOTIFICATION_CHAT_IDS=123456,789012  # Default Telegram chat IDs for proactive notifications
 ```
 
-#### Project Thread Mode
+#### Reports group (optional)
+
+Out-of-band report messages (everything `NotificationService` sends) can go
+to topics of a Telegram forum supergroup instead of the DM. Unset = off, the
+DM gets everything as before.
 
 ```bash
-# Strict project routing via Telegram project topics
-ENABLE_PROJECT_THREADS=false
+REPORTS_CHAT_ID=-1001234567890   # forum supergroup; bot is admin with "Manage topics" (+ "Pin messages" for the jobs pin)
+# source prefix=Topic name, comma-separated (or a JSON object). A source
+# matches a key when equal to it or `key:...`; longest key wins. Setting this
+# REPLACES the defaults below.
+# REPORTS_ROUTES=server-monitor=Monitoring,taskpump=Pump,bgjob=Jobs,schedule=Reports,schedule:crypto=Markets,schedule:news=Markets,crypto=Markets,news=Markets
+```
 
-# Mode: private (default) or group
-PROJECT_THREADS_MODE=private
+Alternatively, when `DEVVY_DATA_ROOT` is set, put only the numeric chat ID in
+`<data-root>/reports_chat_id`. `REPORTS_CHAT_ID` in the environment takes
+precedence. Restart the bot after changing either setting.
 
-# YAML registry file with project slugs/names/paths
+**Talking to agents in topics (inbound).** Bind topics to profiles; a message
+in a bound topic is one turn with that profile, in the same conversation as
+the DM (your sticky active profile is untouched), and the reply lands in the
+topic. Bound topics are created on startup. Unbound topics stay ignored.
+
+```bash
+# REPORTS_BINDINGS=Monitoring=devops,Coach=coach     # Topic=profile slug (or JSON)
+# REPORTS_INBOUND_POLICY=owner                       # owner (default) | allowed
+```
+
+Or in `<data-root>/reports_bindings.json`:
+`{"policy": "owner", "bindings": {"Coach": "coach"}}` (env wins). Empty = the
+group stays read-only. Replying to a report in a topic puts it in context.
+
+**Reply-only topics** (`"reply_only": ["Jobs"]` in the same file;
+no env variable): the topic must also be in `bindings` (its profile is
+the fallback). Only a reply to a job message (start, finish or digest;
+ledger `ref` `job:<id>`) is inbound; it runs one turn on the job's profile
+and the answer lands in the topic. Owner only, whatever
+`REPORTS_INBOUND_POLICY` says. Plain posts and replies to anything else get
+one hint per 10 minutes. The turn gets a label with the job id, name, status,
+output path and the first 15 lines of `output.md` (untrusted data).
+
+* Needs `NOTIFICATION_CHAT_IDS` (only the owner's notification chats are routed;
+  a message addressed to anyone else's chat is never moved).
+* Topics are created on first use and stored in `project_threads` (slug
+  `reports:<topic>`). A deleted topic is recreated once; any other failure
+  delivers the message to the DM.
+* **Always DM**, whatever the map says: sources `taskpump:ask` (pump
+  question / blocked / failed cards -- `taskpump:status` are the status cards),
+  `reminder`, `item`, `family`, `approval`, `policy`, `routing`, any
+  ledgered reminder, and the bot's inline-keyboard prompts (tool-call
+  approvals, watchdog), which do not pass through this service.
+* Messages sent in the reports group are ignored (no agent turn). Other
+  groups are unchanged.
+* The bot logs and audits every `my_chat_member` change
+  (`event_type=chat_membership`, with `chat_id`), so a new group's id is in
+  `journalctl -u claude-bot | grep "chat membership"` right after adding the bot.
+
+Sources (`AgentResponseEvent.source`): `schedule:<job name>`, `bgjob`
+(start/finish), `bgjob:status` (pinned jobs list), `bgjob:digest`,
+`taskpump:status|ask`, `webhook:<provider>`, `health`, `reminder`, `item`,
+`family`, `agent` (the `notify` tool), `internal` (`/internal/notify` without
+a source). External callers pass one: `agentctl notify --source
+server-monitor:<host> "..."`.
+
+#### Projects registry
+
+```bash
+# YAML registry file with project slugs/names/paths (read at boot for memory seeding)
 PROJECTS_CONFIG_PATH=config/projects.yaml
-
-# Required only for PROJECT_THREADS_MODE=group
-PROJECT_THREADS_CHAT_ID=-1001234567890
-
-# Minimum delay (seconds) between Telegram API calls during topic sync
-# Set 0 to disable pacing
-PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS=1.1
 ```
 
-`PROJECTS_CONFIG_PATH` schema:
-
-```yaml
-projects:
-  - slug: my-app
-    name: My App
-    path: my-app
-    enabled: true
-```
-
-When `ENABLE_PROJECT_THREADS=true`:
-- `PROJECT_THREADS_MODE=private`:
-  - `/start` and `/sync_threads` are allowed outside topics in private chat.
-  - all other updates must be inside mapped project topics.
-- `PROJECT_THREADS_MODE=group`:
-  - behavior remains forum-topic based using `PROJECT_THREADS_CHAT_ID`.
+The per-project Telegram topics feature (`ENABLE_PROJECT_THREADS`, `/sync_threads`)
+was removed 2026-10-15; the reports router + bindings is the one topic mechanism.
 
 #### Monitoring & Logging
 
@@ -503,9 +615,13 @@ Unset, relative paths resolve against the config file's directory as before.
 Profiles work under both denylist (systemd) and allowlist (container) modes;
 each profile's `working_dir` must be reachable in whichever mode is active.
 Per-profile keys include `sandbox`, `max_turns`, `max_cost_per_request`,
+`provider` / `model` / `allowed_models` (OpenRouter on the Claude harness, dv-d2f6),
 `permission_policy.allowed_roles`, `family_memory`, `personal_memory`, `mcp`,
 `extra_dirs` (extra write roots for a sandboxed profile — a notes vault, another
-checkout — instead of `sandbox: false`) and `enabled` (`false` hides a profile
+checkout — instead of `sandbox: false`), `sandbox_read_dirs` (read-only mounts in the
+sandboxed bash box, e.g. shared tool checkouts; owner-only), `sandbox_allowed_domains`
+(egress allowlist — **not enforced**: the bash box shares the host network until
+an egress proxy exists; validated and kept; owner-only) and `enabled` (`false` hides a profile
 without deleting it). See `config/profiles.example.yaml`.
 
 Owners manage profiles from Telegram: `/agents → ⚙ Manage` toggles `enabled:`

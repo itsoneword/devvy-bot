@@ -379,6 +379,9 @@ class TestQuality:
         assert day["claimed_not_logged"] == 1  # msg 2; msg 1 backed by log_food
         assert day["complaint_hits"] == 1  # «зачем ты» in msg 3
         assert day["user_messages"] == 3
+        # dv-9f41 counters are exposed (fixture has no Web*/programme turns).
+        assert day["deep_research_turns"] == 0
+        assert day["program_turns_unchecked"] == 0
 
     def test_by_agent_split(self, client: TestClient) -> None:
         body = client.get("/api/quality").json()
@@ -552,7 +555,7 @@ class TestChains:
         # settings.py window_* fields).
         assert body["annotations"] == {
             "eval_threshold": 120000,
-            "refresh_threshold": 220000,
+            "refresh_threshold": 150000,
             "db_current_counter": 26,
         }
 
@@ -566,6 +569,30 @@ class TestChains:
             },
         ).json()
         assert [p["session_id"] for p in body["series"]] == [S2]
+
+    def test_chains_range_limits_windows_and_sessions(self, client: TestClient) -> None:
+        def chain_for(**params: str) -> dict:
+            body = client.get("/api/chains", params=params).json()
+            return next(
+                c
+                for c in body["chains"]
+                if c["user_id"] == USER and c["working_dir"] == PROJ
+            )
+
+        full = chain_for()
+        late = chain_for(since="2026-08-01T10:30:00.000Z")
+        assert [w["window_id"] for w in late["windows"]] == [2]
+        assert [s["session_id"] for s in late["sessions"]] == [S2]
+        assert len(full["windows"]) == 2
+        empty = chain_for(until="2000-01-01")
+        assert empty["windows"] == [] and empty["sessions"] == []
+
+    def test_chain_detail_until_filter(self, client: TestClient) -> None:
+        body = client.get(
+            "/api/chains/detail",
+            params={"user_id": USER, "working_dir": PROJ, "until": "2000-01-01"},
+        ).json()
+        assert body["series"] == []
 
     def test_chain_detail_404(self, client: TestClient) -> None:
         response = client.get(

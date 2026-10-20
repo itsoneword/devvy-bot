@@ -57,6 +57,24 @@ def test_settings_with_valid_data(tmp_path):
     assert settings.approved_directory == test_dir
 
 
+def test_reports_chat_id_from_data_root_when_not_in_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("REPORTS_CHAT_ID", raising=False)
+    data_root = tmp_path / "runtime"
+    data_root.mkdir()
+    monkeypatch.setenv("DEVVY_DATA_ROOT", str(data_root))
+    (data_root / "reports_chat_id").write_text("-1004290210285\n")
+    config_file = tmp_path / "config"
+    config_file.write_text(
+        "TELEGRAM_BOT_TOKEN=test_token\n"
+        "TELEGRAM_BOT_USERNAME=test_bot\n"
+        f"DEVVY_DATA_ROOT={data_root}\n"
+    )
+
+    settings = load_config(config_file=config_file)
+
+    assert settings.reports_chat_id == -1004290210285
+
+
 def test_allowed_users_parsing():
     """Test parsing of comma-separated user IDs."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -279,191 +297,6 @@ def test_log_level_validation():
         )
 
         assert settings.log_level == "DEBUG"
-
-
-def test_project_threads_validation_requires_chat_id_in_group_mode(tmp_path):
-    """Group thread mode requires project_threads_chat_id."""
-    project_dir = tmp_path / "projects"
-    project_dir.mkdir()
-    app_dir = project_dir / "app"
-    app_dir.mkdir()
-    config_file = tmp_path / "projects.yaml"
-    config_file.write_text(
-        "projects:\n" "  - slug: app\n" "    name: App\n" "    path: app\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValidationError) as exc_info:
-        Settings(
-            telegram_bot_token="test_token",
-            telegram_bot_username="test_bot",
-            approved_directory=str(project_dir),
-            enable_project_threads=True,
-            project_threads_mode="group",
-            projects_config_path=str(config_file),
-        )
-
-    assert "project_threads_chat_id required" in str(exc_info.value)
-
-
-def test_project_threads_validation_requires_projects_config(tmp_path):
-    """Thread mode requires projects_config_path."""
-    project_dir = tmp_path / "projects"
-    project_dir.mkdir()
-
-    with pytest.raises(ValidationError) as exc_info:
-        Settings(
-            telegram_bot_token="test_token",
-            telegram_bot_username="test_bot",
-            approved_directory=str(project_dir),
-            enable_project_threads=True,
-            project_threads_chat_id=-1001234567890,
-            projects_config_path=None,
-        )
-
-    assert "projects_config_path required" in str(exc_info.value)
-
-
-def test_project_threads_validation_blank_projects_config_path_fails(tmp_path):
-    """Blank projects_config_path should be treated as missing."""
-    project_dir = tmp_path / "projects"
-    project_dir.mkdir()
-
-    with pytest.raises(ValidationError) as exc_info:
-        Settings(
-            telegram_bot_token="test_token",
-            telegram_bot_username="test_bot",
-            approved_directory=str(project_dir),
-            enable_project_threads=True,
-            project_threads_mode="private",
-            projects_config_path="",
-        )
-
-    assert "projects_config_path required" in str(exc_info.value)
-
-
-def test_project_threads_validation_private_mode_no_chat_id(tmp_path):
-    """Private thread mode does not require project_threads_chat_id."""
-    project_dir = tmp_path / "projects"
-    project_dir.mkdir()
-    app_dir = project_dir / "app"
-    app_dir.mkdir()
-    config_file = tmp_path / "projects.yaml"
-    config_file.write_text(
-        "projects:\n" "  - slug: app\n" "    name: App\n" "    path: app\n",
-        encoding="utf-8",
-    )
-
-    settings = Settings(
-        telegram_bot_token="test_token",
-        telegram_bot_username="test_bot",
-        approved_directory=str(project_dir),
-        enable_project_threads=True,
-        project_threads_mode="private",
-        projects_config_path=str(config_file),
-    )
-
-    assert settings.project_threads_mode == "private"
-    assert settings.project_threads_chat_id is None
-
-
-def test_project_threads_validation_private_mode_empty_chat_id(tmp_path):
-    """Private mode accepts blank project_threads_chat_id from env/.env."""
-    project_dir = tmp_path / "projects"
-    project_dir.mkdir()
-    app_dir = project_dir / "app"
-    app_dir.mkdir()
-    config_file = tmp_path / "projects.yaml"
-    config_file.write_text(
-        "projects:\n" "  - slug: app\n" "    name: App\n" "    path: app\n",
-        encoding="utf-8",
-    )
-
-    settings = Settings(
-        telegram_bot_token="test_token",
-        telegram_bot_username="test_bot",
-        approved_directory=str(project_dir),
-        enable_project_threads=True,
-        project_threads_mode="private",
-        project_threads_chat_id="",
-        projects_config_path=str(config_file),
-    )
-
-    assert settings.project_threads_mode == "private"
-    assert settings.project_threads_chat_id is None
-
-
-def test_project_threads_validation_group_mode_empty_chat_id_fails(tmp_path):
-    """Group mode rejects blank project_threads_chat_id."""
-    project_dir = tmp_path / "projects"
-    project_dir.mkdir()
-    app_dir = project_dir / "app"
-    app_dir.mkdir()
-    config_file = tmp_path / "projects.yaml"
-    config_file.write_text(
-        "projects:\n" "  - slug: app\n" "    name: App\n" "    path: app\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValidationError) as exc_info:
-        Settings(
-            telegram_bot_token="test_token",
-            telegram_bot_username="test_bot",
-            approved_directory=str(project_dir),
-            enable_project_threads=True,
-            project_threads_mode="group",
-            project_threads_chat_id="",
-            projects_config_path=str(config_file),
-        )
-
-    assert "project_threads_chat_id required" in str(exc_info.value)
-
-
-def test_project_threads_sync_action_interval_validation(tmp_path):
-    """Thread sync action interval should accept non-negative values only."""
-    project_dir = tmp_path / "projects"
-    project_dir.mkdir()
-
-    settings = Settings(
-        telegram_bot_token="test_token",
-        telegram_bot_username="test_bot",
-        approved_directory=str(project_dir),
-        project_threads_sync_action_interval_seconds=0,
-    )
-    assert settings.project_threads_sync_action_interval_seconds == 0
-
-    settings = Settings(
-        telegram_bot_token="test_token",
-        telegram_bot_username="test_bot",
-        approved_directory=str(project_dir),
-        project_threads_sync_action_interval_seconds="1.1",
-    )
-    assert settings.project_threads_sync_action_interval_seconds == pytest.approx(1.1)
-
-    with pytest.raises(ValidationError):
-        Settings(
-            telegram_bot_token="test_token",
-            telegram_bot_username="test_bot",
-            approved_directory=str(project_dir),
-            project_threads_sync_action_interval_seconds=-0.1,
-        )
-
-
-def test_project_threads_validation_invalid_mode(tmp_path):
-    """Invalid project thread mode should fail validation."""
-    project_dir = tmp_path / "projects"
-    project_dir.mkdir()
-
-    with pytest.raises(ValidationError) as exc_info:
-        Settings(
-            telegram_bot_token="test_token",
-            telegram_bot_username="test_bot",
-            approved_directory=str(project_dir),
-            enable_project_threads=True,
-            project_threads_mode="invalid",
-        )
-
-    assert "project_threads_mode must be one of" in str(exc_info.value)
 
 
 def test_voice_provider_validation_and_normalization(tmp_path):

@@ -73,6 +73,7 @@ def _build(
     captured: Dict[str, Any],
     requester_chat_id: int | None = None,
     user_id: int | None = None,
+    role: str | None = None,
 ) -> Dict[str, Any]:
     build_agent_mcp_server(
         services,
@@ -80,11 +81,38 @@ def _build(
         Path("/tmp/ws"),
         requester_chat_id=requester_chat_id,
         user_id=user_id,
+        role=role,
     )
     return captured
 
 
 class TestNotify:
+    async def test_owner_can_route_report_source(
+        self,
+        services: AgentServices,
+        captured_tools: Dict[str, Any],
+        event_bus: FakeEventBus,
+    ) -> None:
+        tools = _build(services, captured_tools, requester_chat_id=555, role="owner")
+
+        await tools["notify"].handler({"text": "check", "source": "crypto"})
+
+        assert event_bus.published[0].chat_id == 555
+        assert event_bus.published[0].source == "crypto"
+
+    async def test_guest_cannot_route_report_source(
+        self,
+        services: AgentServices,
+        captured_tools: Dict[str, Any],
+        event_bus: FakeEventBus,
+    ) -> None:
+        tools = _build(services, captured_tools, requester_chat_id=555, role="guest")
+
+        result = await tools["notify"].handler({"text": "check", "source": "crypto"})
+
+        assert "error" in result["content"][0]["text"]
+        assert event_bus.published == []
+
     async def test_notify_stamps_requester_chat_id(
         self,
         services: AgentServices,
@@ -1466,6 +1494,64 @@ class TestJobToolsRoleGate:
         assert "--profile" in spawned[0] and "general" in spawned[0]
 
 
+class TestJobStartCommand:
+    async def _tools(self, services, captured, role="owner"):
+        build_agent_mcp_server(
+            services, "general", Path("/tmp/ws"), requester_chat_id=555, role=role
+        )
+        return captured
+
+    async def test_prompt_and_command_are_exclusive(self, services, captured_tools):
+        tools = await self._tools(services, captured_tools)
+        for a in ({}, {"prompt": "x", "command": "ls"}):
+            r = await tools["job_start"].handler(a)
+            assert r.get("isError") is True
+
+    async def test_denied_command_never_spawns(
+        self, services, captured_tools, monkeypatch
+    ):
+        spawned: list = []
+
+        async def fake_exec(*argv: str, **kw: Any) -> Any:
+            spawned.append(argv)
+
+        monkeypatch.setattr(agent_tools.asyncio, "create_subprocess_exec", fake_exec)
+        tools = await self._tools(services, captured_tools)
+        r = await tools["job_start"].handler({"command": "cat /etc/shadow"})
+        assert r.get("isError") is True
+        assert spawned == []
+
+    async def test_allowed_command_reaches_bgjob_with_cmd_flag(
+        self, services, captured_tools, monkeypatch
+    ):
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return (b"started x", b"")
+
+        spawned: list = []
+
+        async def fake_exec(*argv: str, **kw: Any) -> FakeProc:
+            spawned.append(argv)
+            return FakeProc()
+
+        monkeypatch.setattr(agent_tools.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(
+            agent_tools, "_command_job_argv", lambda s, c, cmd: (cmd, "")
+        )
+        tools = await self._tools(services, captured_tools)
+        r = await tools["job_start"].handler({"command": "make test", "name": "t"})
+        assert r.get("isError") is not True
+        assert "--cmd" in spawned[0] and "make test" in spawned[0]
+
+
+def _build_devops(services: AgentServices, captured: Dict[str, Any]) -> Dict[str, Any]:
+    """task_done is mounted for devops only (dv-535b)."""
+    build_agent_mcp_server(services, "devops", Path("/tmp/ws"))
+    return captured
+
+
 class TestTaskBoard:
     """dv-1327: the task tools write the deviz board, not agent_tasks."""
 
@@ -1512,7 +1598,7 @@ class TestTaskBoard:
         captured_tools: Dict[str, Any],
         board: DevizBoard,
     ) -> None:
-        tools = _build(services, captured_tools)
+        tools = _build_devops(services, captured_tools)
         task_id = await board.add_task(title="existing", created_by="devops")
 
         listed = json.loads(
@@ -1532,7 +1618,7 @@ class TestTaskBoard:
     async def test_task_done_on_an_unknown_id_reports_not_found(
         self, services: AgentServices, captured_tools: Dict[str, Any]
     ) -> None:
-        tools = _build(services, captured_tools)
+        tools = _build_devops(services, captured_tools)
 
         result = await tools["task_done"].handler({"task_id": "dv-0000"})
 

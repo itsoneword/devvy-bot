@@ -1,616 +1,571 @@
 {
  "positive": [
   {
-   "id": 206,
+   "id": 1,
    "tier": "general",
-   "content": "Day 7 (04.08) of tracking closed: total ~1662 kcal / Б125 / Ж62 / У140 (dinner: Arla cottage cheese 200g + peach ~150g ~254 kcal; snack: pita; evening: 3 Raffaello + tea ~170 kcal/Ж12.5/У11.9). Very active day (surf + walking): Watch Move 1094/600, Exercise 185/40min, 14,809 steps, 11.86km."
+   "content": "01.09.2025 breakfast: NordFarm Skyr 150g + oats 40g — ~310 kcal / Б28 Ж4 У36"
   },
   {
-   "id": 242,
+   "id": 2,
    "tier": "general",
-   "content": "Day 05.08 (2026) nutrition tracking closed: total ~1688 kcal / Б119.8 / Ж63.2 / У153.4 (breakfast: пшено 40г+молоко100мл+2 яйца+2 Raffaello; snack: банан+яйцо+тёмный шоколад 12г; обед: картофель с кожей 230г+курица 150г+греческий йогурт 60г; ужин: запеканка из творога 150г+яйцо+ст.л. йогурта+ст.л. сахара+ст.л. крахмала, вместо запланированного врапа с креветками)."
+   "content": "02.09.2025 lunch: grilled turkey 180g, rice 150g — ~640 kcal / Б52 Ж12 У78"
   },
   {
-   "id": 243,
+   "id": 3,
    "tier": "general",
-   "content": "Apple Watch activity 05.08: Move 1054/600 kcal (x1.8), Exercise 138/40min (x3.5), Total 2431 kcal — second consecutive extremely active day (surf+walking)."
+   "content": "02.09.2025 dinner: Tessa salmon bowl 350g — ~720 kcal, protein 41g"
   },
   {
-   "id": 250,
+   "id": 4,
    "tier": "general",
-   "content": "Plan for evening of 07.08.2026 (Friday): beer 0.5L (~215 kcal) + chicken wrap (half Taliam tortilla ~65g + chicken 150g, ~444 kcal) — planned deliberately for after the Friday morning weigh-in so it won't affect the reading; flagged that alcohol + salty tortilla combo may cause water-retention 'puffiness' the next day/two (not fat), given ADH suppression rebound effect."
+   "content": "03.09.2025 snack: Brevo protein bar 45g — ~190 kcal / Б20 Ж6 У16"
   },
   {
-   "id": 277,
+   "id": 5,
    "tier": "general",
-   "content": "Apple Watch activity 06.08 (updated/finalized): Move 572/600 kcal (x1.4... corrected to 572), Exercise 126/40min (x3.2), 12757 steps, 9.75km, two walks (5.32km+1.52km), Functional Strength Training session 94 kcal."
+   "content": "04.09.2025 завтрак: омлет из 3 яиц + тост 50г — ~480 kcal / Б27 Ж28 У24"
   },
   {
-   "id": 278,
+   "id": 6,
    "tier": "general",
-   "content": "Gym session 06.08 (corrected after initial misreport): chest press and incline dumbbell press (neutral grip recommended if shoulder feels unstable at top), vertical pulldown, horizontal pulldown, rear delt — NOT shoulder press (user initially misspoke); no shoulder-safety violation occurred."
+   "content": "04.09.2025 обед: гречка 200г, куриная грудка 150г — ~560 ккал / Б48 Ж7 У70"
   },
   {
-   "id": 279,
+   "id": 7,
    "tier": "general",
-   "content": "Day 06.08 (2026) final nutrition total after adding evening dry cider 300ml/4% (~115 kcal, ~7g carbs): ~1776 kcal / Б110.8 / Ж67.6 / У176.5."
+   "content": "05.09.2025 ужин: паста Valdora 120г с томатным соусом — ~610 ккал / Б20 Ж9 У110"
   },
   {
-   "id": 280,
+   "id": 8,
    "tier": "general",
-   "content": "07.08 breakfast: 2 eggs, 1tsp butter, avocado 110g, turkey ham 36g, whole grain bread 60g, 1 pastel de nata — ~852 kcal / Б32.5 / Ж52.7 / У62.7; fat (52.7g) nearly consumed entire daily ~55g fat budget in one meal."
+   "content": "06.09.2025 breakfast: 2 slices rye bread 80g with cottage cheese 100g — ~330 kcal"
   },
   {
-   "id": 281,
+   "id": 9,
    "tier": "general",
-   "content": "07.08 snack: banana ~118g — ~105 kcal / Б1.3 / Ж0.35 / У26.9."
+   "content": "07.09.2025 dessert: Kolvik dark chocolate 30g — ~170 kcal"
   },
   {
-   "id": 282,
+   "id": 10,
    "tier": "general",
-   "content": "07.08 lunch (corrected): chicken breast 170g (not 150g) pan-cooked with honey-butter sauce (sauce was for 1kg raw chicken total, portion only got ~17% of it) + vegetable salad no dressing — ~320 kcal / Б53.7 / Ж7 / У6."
+   "content": "08.09.2025 перекус: банан 120г и горсть орехов 25г — ~260 ккал / Б6 Ж14 У28"
   },
   {
-   "id": 283,
+   "id": 11,
    "tier": "general",
-   "content": "07.08 dinner (padel evening out): chicken wrap (frango) + Heineken 0.5L (full glass, not the smaller Imperial 0.25L originally planned) — estimated ~745 kcal / Б40 / Ж14.6 / У76."
+   "content": "09.09.2025 lunch: chicken wrap 260g, apple 150g — ~590 kcal / Б38 Ж16 У66"
   },
   {
-   "id": 284,
+   "id": 12,
    "tier": "general",
-   "content": "Day 07.08 (2026) nutrition tracking closed: total ~2022 kcal / Б127.5 / Ж74.65 / У171.6 — over the 1600-1700 kcal range mainly due to large wrap+sauce and full-size beer, but protein floor (≥125g) finally met."
+   "content": "10.09.2025 dinner: beef stir-fry 300g, noodles 180g — ~780 kcal / Б46 Ж24 У90"
   },
   {
-   "id": 285,
+   "id": 13,
    "tier": "general",
-   "content": "Apple Watch activity 07.08: padel evening + household activity — Move 858/600 kcal (x1.4), Exercise 176/40min (x4.4), Total 2298 kcal for the day."
+   "content": "11.09 evening: Zorvin lager 0.5L — ~210 kcal"
   },
   {
-   "id": 287,
+   "id": 14,
    "tier": "general",
-   "content": "08.08 breakfast: omelet (2 eggs+milk), butter 5g, shrimp 3pcs, canned tuna in water 35g, Milbona cottage cheese 100g, whole grain bread 70g — ~542 kcal / Б46.3 / Ж22.6 / У35.7."
+   "content": "12.09 morning: oat latte 300ml — ~140 kcal / У18"
   },
   {
-   "id": 288,
+   "id": 15,
    "tier": "general",
-   "content": "08.08 snack: zephyr (marshmallow) 60g — ~182 kcal / Б0.5 / Ж0.1 / У47 (assumed plain, no chocolate, 304kcal/100g)."
+   "content": "12.09 post-run: Brevo whey shake 400ml — ~220 kcal / Б30"
   },
   {
-   "id": 304,
+   "id": 16,
    "tier": "general",
-   "content": "08.08 snacks: peach ~150g (~59 kcal), pão de queijo 30g (~106 kcal), presunto ~15g + white wine ~120ml (~121 kcal)."
+   "content": "13.09 night: handful of almonds 30g — ~180 kcal / Ж16"
   },
   {
-   "id": 305,
+   "id": 17,
    "tier": "general",
-   "content": "08.08 dinner: saltimbocca (veal, prosciutto, sage, flour dredge, butter+olive oil, deglazed with vinho verde) with penne + tomato sauce, cooked by user's husband; final eaten portion ~150g veal (30g tough piece left uneaten) + 50g cooked pasta — recalculated ~403 kcal / Б35.3 / Ж18.7 / У15.8."
+   "content": "14.09 вечер: кефир 250мл — ~130 ккал / Б8 У10"
   },
   {
-   "id": 306,
+   "id": 18,
    "tier": "general",
-   "content": "08.08 evening snack: watermelon ~3 pieces (~300g) eaten on the beach."
+   "content": "15.09 утро: творог 180г с мёдом 15г — ~250 ккал / Б30 Ж5 У20"
   },
   {
-   "id": 307,
+   "id": 19,
    "tier": "general",
-   "content": "08.08 total alcohol intake: ~4 glasses of white wine (~450-500ml total) across the day plus wine with presunto earlier — third consecutive day with an alcohol+salty-food combo, flagged given user's elevated ALT which hasn't yet been reviewed with a doctor."
+   "content": "Day 03.09.25 nutrition tracking closed: total ~2210 kcal, Б152 Ж71 У238"
   },
   {
-   "id": 317,
+   "id": 20,
    "tier": "general",
-   "content": "09.08 breakfast (corrected): 2 eggs + 1.5 chicken sausages (Gustoland Bockwurst, ~50g total, confirmed label data) + vegetable mix (pepper/beans/corn/onion) + 2 slices whole grain bread — ~640 kcal / Б30.2 / Ж32.2 / У55.4. (Initial estimate of ~669 kcal used a wrong sausage calorie basis and was corrected in nutrition_log.md.)"
+   "content": "Day 05.09.2025 nutrition tracking closed: total ~1985 kcal, Б140 Ж62 У210"
   },
   {
-   "id": 338,
+   "id": 21,
    "tier": "general",
-   "content": "09.08 dinner: white wine 200ml + 2 slices homemade pizza (dough of ricotta-style cheese+egg+flour, topping tomato/mushroom/turkey ham/salami/mozzarella 2 tbsp) — rough estimate ~398 kcal / Б16.6 / Ж13.3 / У17.1 (weight of dough/slices not given, recipe assumed)."
+   "content": "Day 08.09.25 nutrition tracking closed: total ~2405 kcal, Б160 Ж80 У250"
   },
   {
-   "id": 339,
+   "id": 22,
    "tier": "general",
-   "content": "09.08 dessert: watermelon, several pieces (~300g assumed, same as 08.08 portion) — ~90 kcal / Б1.8 / Ж0.45 / У22.8."
+   "content": "Day 10.09.2025 nutrition tracking closed: total ~1760 kcal, Б128 Ж55 У190"
   },
   {
-   "id": 347,
+   "id": 23,
    "tier": "general",
-   "content": "10.08 breakfast: 2 eggs + Milbona cottage cheese 100g + turkey ham (Fumadinho) 44g + whole grain bread 40g + zephyr Vkusnasha 60g — ~587 kcal / Б36.1 / Ж17.2 / У69.4."
+   "content": "Day 13.09.25 nutrition tracking closed: total ~2090 kcal, Б149 Ж68 У225"
   },
   {
-   "id": 348,
+   "id": 24,
    "tier": "general",
-   "content": "10.08 snack: half pack Arla Protein Cottage Cheese + half banana — ~150 kcal / Б15.7 / Ж1.7 / У16.5."
+   "content": "Итого за день 07.09: 2330 ккал, Б158 Ж74 У244"
   },
   {
-   "id": 360,
+   "id": 25,
    "tier": "general",
-   "content": "10.08 lunch sauce (tomato/garlic/basil, stewed) recalculated with 1 tsp (5g) olive oil added: ~60 kcal/50g portion, Б0.65/Ж5.15/У2.5 — lunch total revised to ~428 kcal / Б36.55/Ж19.85/У26.6."
+   "content": "Day summary 11.09: ~1890 kcal, protein 146g, carbs 200g"
   },
   {
-   "id": 361,
+   "id": 26,
    "tier": "general",
-   "content": "10.08 dessert: peach ~150g — ~59 kcal / Б1.4/Ж0.4/У14.3 (peach flagged again as recurring high-FODMAP bloating candidate)."
+   "content": "Nutrition total 14.09.2025: 2150 kcal, Б150 Ж66 У230"
   },
   {
-   "id": 363,
+   "id": 27,
    "tier": "general",
-   "content": "10.08 snack: milk 150ml (3.2%) + the Lidl protein bar (45g) — ~262 kcal / Б18.3/Ж12.45/У20.1; flagged as high combined FODMAP/polyol risk day (bar polyols + peach eaten same lunch)."
+   "content": "Watch 02.09: Move 812/700 kcal, Exercise 64/45min"
   },
   {
-   "id": 365,
+   "id": 28,
    "tier": "general",
-   "content": "Apple Watch activity 10.08: Move 544/600 kcal, Exercise 79/40min (2x target), 13,980 steps, 10.92km — used to justify allowing an expanded kcal budget (~1800-1850) for the day given real expenditure ~1954 kcal (BMR 1410 + Move 544)."
+   "content": "Watch 03.09: Move 655/700 kcal, Exercise 38/45min"
   },
   {
-   "id": 366,
+   "id": 29,
    "tier": "general",
-   "content": "10.08 dinner: Milbona cottage cheese 200g + honey 1 tsp (~7g) — ~217 kcal / Б22/Ж8.6/У12.5."
+   "content": "Watch 05.09: Move 940/700 kcal, Exercise 71/45min"
   },
   {
-   "id": 367,
+   "id": 30,
    "tier": "general",
-   "content": "Day 10.08.26 nutrition tracking closed: total ~1703 kcal / Б~130 / Ж~60.2 / У~159.4 — protein floor (125g) met with margin for the first time in several days; calorie total within the day's expanded allowance (~1800-1850) given high activity."
+   "content": "Watch 06.09: Move 720/700 kcal, Exercise 52/45min"
   },
   {
-   "id": 368,
+   "id": 31,
    "tier": "general",
-   "content": "11.08 breakfast: 2 eggs + Milbona mozzarella 60g + milk 3.2% 30ml — ~323 kcal / Б24/Ж23/У3.5; fat was 23g of the ~55g daily fat budget (42%) in one meal, flagged as the second time this pattern has occurred."
+   "content": "Watch 09.09: Move 1010/700 kcal, Exercise 88/45min"
   },
   {
-   "id": 370,
+   "id": 32,
    "tier": "general",
-   "content": "11.08 snack: another zephyr Vkusnasha 60g — ~191 kcal / Б0.5/Ж0/У47.2, eaten right after a protein/fat breakfast (food-order insulin-blunting effect noted)."
+   "content": "Watch 12.09: Move 588/700 kcal, Exercise 30/45min"
   },
   {
-   "id": 373,
+   "id": 33,
    "tier": "general",
-   "content": "11.08 snack: half a peach (~75g) — ~30 kcal / Б0.7/Ж0.2/У7.1; second consecutive day with peach on the table, flagged as first bloating suspect if any occurs."
+   "content": "Slept 6 hours last night, woke once"
   },
   {
-   "id": 374,
+   "id": 34,
    "tier": "general",
-   "content": "11.08 snack: yesterday's beef 43g + boiled potato 100g + yesterday's tomato sauce 50g — ~229 kcal / Б14.6/Ж8.7/У22.6, using same reference values as 10.08 (beef 190kcal/100g, potato 87kcal/100g)."
+   "content": "Sam slept 7.5 hours, felt rested"
   },
   {
-   "id": 375,
+   "id": 35,
    "tier": "general",
-   "content": "11.08 dessert: Lidl protein pudding 200g (label photo) — ~166 kcal / Б20.2/Ж3.0/У13.0 (sugar 8.4g), no sugar-alcohol/polyol sweeteners per ingredient list, low fiber."
+   "content": "Спал 5 часов, голова тяжёлая"
   },
   {
-   "id": 376,
+   "id": 36,
    "tier": "general",
-   "content": "11.08 snack: banana ~118g (average, unweighed) — ~105 kcal / Б1.3/Ж0.35/У26.9, base 89kcal/100g."
+   "content": "Ночь 07->08.09.2025: отбой 23:10, уснул за 15 минут, подъём 6:40"
   },
   {
-   "id": 395,
+   "id": 37,
    "tier": "general",
-   "content": "11.08 lunch: shrimp fried in 1 tsp butter 100g + boiled wild rice 100g + low-fat cheese (0% M.G., Lidl) 40g — ~258 kcal / Б31.4/Ж5.8/У23.3."
+   "content": "Night 12->13.09.2025: bedtime 22:45, woke up at 6:20, 455 мин сна"
   },
   {
-   "id": 396,
+   "id": 38,
    "tier": "general",
-   "content": "11.08 snack: asparagus ~50g — ~10 kcal / Б1.1/Ж0.1/У2."
+   "content": "01.09.2025 morning fasted weight: 78.4 kg"
   },
   {
-   "id": 397,
+   "id": 39,
    "tier": "general",
-   "content": "11.08 dessert: raspberry 200g — ~104 kcal / Б2.4/Ж1.3/У23.8, base ~52kcal/100g."
+   "content": "Weigh-in 08.09.2025: 77.9 kg after run"
   },
   {
-   "id": 398,
+   "id": 40,
    "tier": "general",
-   "content": "Apple Watch activity 11.08: Move 693/600 kcal, Exercise 115/40min (~2.9x target), 18,117 steps, 14.11km — high-activity day, though not the single most active day of the tracking period (corrected after initial overstatement)."
+   "content": "15.09.2025 взвешивание: 77.6 кг натощак"
   },
   {
-   "id": 399,
+   "id": 41,
    "tier": "general",
-   "content": "11.08 dinner: cottage cheese (assumed Milbona, 98kcal/100g) 200g + half a peach (~75g) — ~225 kcal / Б22.7/Ж8.8/У13.9."
+   "content": "2025-09-12 weigh-in 78.1kg, a bit heavy after dinner"
   },
   {
-   "id": 400,
+   "id": 42,
    "tier": "general",
-   "content": "11.08 evening: beer 0.5L (type unspecified, standard lager ~43kcal/100ml reference used) — ~215 kcal / Б2.5/Ж0/У18.2."
+   "content": "Bench press 4x8 @60kg, gym session"
   },
   {
-   "id": 401,
+   "id": 43,
    "tier": "general",
-   "content": "Day 11.08.26 nutrition tracking closed: total ~1856 kcal / Б121.4/Ж51.25/У201.5 — protein ~3.6g below the 125g floor, carbs well over the 160g soft target, but justified by the day's high activity (Move 693, Exercise 115min) giving an estimated real deficit ~250 kcal."
+   "content": "Deadlift 5x5 at 100kg in gym, felt heavy"
   },
   {
-   "id": 402,
+   "id": 44,
    "tier": "general",
-   "content": "12.08 breakfast: shakshuka (2 eggs, vegetables ~120g assumed, 1 tsp butter) + whole grain bread 40g + turkey ham (Fumadinho, 95kcal/100g reference) 30g — ~357 kcal / Б23.1/Ж18/У25.7."
+   "content": "Gym session: squat 3x10 @80kg, pull-ups 4x6"
   },
   {
-   "id": 413,
+   "id": 45,
    "tier": "general",
-   "content": "12.08 snack: banana ~118g — ~105 kcal / Б1.3/Ж0.35/У26.9, same 89kcal/100g reference as 11.08."
+   "content": "Сегодня тренировка: жим 4x8 по 62кг, подтягивания 3x8"
   },
   {
-   "id": 415,
+   "id": 46,
    "tier": "general",
-   "content": "12.08 snack: Lidl protein bar (new variant), whole bar 50g — ~195 kcal / Б16/Ж7.6/У21.25 (polyols ~15.65g), flagged high polyol dose for a single serving."
+   "content": "Overhead press workout: 3x6 @40kg, last set failed"
   },
   {
-   "id": 416,
+   "id": 47,
    "tier": "general",
-   "content": "12.08 snack: savoiardi cookies 1.5 pieces (~9g, assumed 6g/cookie standard Vicenzi) — ~35 kcal / Б0.7/Ж0.5/У6.7, reference 393kcal/100g (no label photo)."
+   "content": "Row sets 4×10 at 55kg in session"
   },
   {
-   "id": 417,
+   "id": 48,
    "tier": "general",
-   "content": "12.08 lunch: wild rice 100g + chicken cooked in 20% cream (no separate sauce) 140g + mozzarella 60g + tomato ~50g — recalculated ~550 kcal / Б59.15/Ж22.64/У25.21 after correcting mozzarella weight (60g, was ~80g estimate) and cream fat % (20%)."
+   "content": "Вчера 09.09 выпил 2 бутылки Zorvin на вечеринке"
   },
   {
-   "id": 418,
+   "id": 49,
    "tier": "general",
-   "content": "12.08 snack: half a peach (~75g) — ~30 kcal / Б0.7/Ж0.2/У7.1, reference 40kcal/100g."
+   "content": "Ate a whole tub of Kolvik ice cream on 06.09"
   },
   {
-   "id": 420,
+   "id": 50,
    "tier": "general",
-   "content": "12.08 afternoon snack: Corona Extra beer can ~330ml — ~138 kcal / Б0.9/Ж0/У13."
+   "content": "13.09 Sam drank three coffees and ate pizza at a friend's place"
   },
   {
-   "id": 421,
+   "id": 51,
    "tier": "general",
-   "content": "12.08 dinner: white/red wine 3 glasses (~450ml) — ~360 kcal / Б0/Ж0/У10.8."
+   "content": "Вчера 11.09 съел кусок торта на дне рождения"
   },
   {
-   "id": 422,
+   "id": 52,
    "tier": "general",
-   "content": "12.08 dinner: homemade tiramisu (low sugar, egg-white/mascarpone cream) ~150g portion (estimate, unweighed) — ~398 kcal / Б7.5/Ж27/У36."
+   "content": "Package nutrition label for NordFarm Skyr: 04.09 eaten 150g, ~95 kcal"
   },
   {
-   "id": 423,
+   "id": 53,
    "tier": "general",
-   "content": "12.08 dinner: cured sausage ~30g + cheese ~30g appetizer — ~206 kcal / Б14.7/Ж16.8/У0.6."
+   "content": "Doctor visit 09.09 then lunch: 12.09 ate soup 300g — ~220 kcal"
   },
   {
-   "id": 424,
+   "id": 54,
    "tier": "general",
-   "content": "Day 12.08.26 nutrition tracking closed: total ~2374 kcal / Б124/Ж93/У173 — protein floor nearly met (-1g), fat ~38g over the ~55g target (mainly from tiramisu+cheese+sausage dinner), day included double alcohol (Corona beer + 3 glasses wine)."
+   "content": "06.09 dinner with pain in left foot after run: pasta 200g, ~600 kcal / Б22"
   },
   {
-   "id": 425,
+   "id": 55,
    "tier": "general",
-   "content": "Apple Watch activity 12.08: Move 656/600 kcal, Exercise 143/40min (3.6x target), Stand 15/12, 9910 steps, 7.99km, Outdoor Walk 2.34km — very high activity day, partially offsetting the day's calorie surplus."
+   "content": "Usually fine, but 07.09 breakfast: 3 eggs 150g — ~230 kcal"
   },
   {
-   "id": 428,
+   "id": 56,
    "tier": "general",
-   "content": "13.08 breakfast: turkey ham (Fumadinho) 36g + whole grain bread 56g + 2 eggs + cottage cheese (Milbona) 100g + butter 3g — ~450 kcal / Б35.2/Ж19.9/У30.5."
+   "content": "Weekly check 10.09 lunch: salad 250g, tuna 80g — ~310 kcal"
   },
   {
-   "id": 429,
+   "id": 57,
    "tier": "general",
-   "content": "13.08 snack: peach 1.5 pieces (~225g, corrected from initial half-peach estimate) — ~90 kcal / Б2.1/Ж0.6/У21.3, reference 40kcal/100g."
-  },
-  {
-   "id": 430,
-   "tier": "general",
-   "content": "13.08: homemade tiramisu (whole cake made with 50g sugar total, low-sugar version), user ate ~200g portion (rounded up from estimated 150g quarter-slice) — ~530 kcal / Б10/Ж36/У48, reference ~265kcal/100g for low-sugar mascarpone-biscuit composition."
-  },
-  {
-   "id": 431,
-   "tier": "general",
-   "content": "User plans to eat only protein and vegetables for the rest of 13.08 after a high-fat/sugar day; agent advised not eliminating fat entirely (keep ~15-20g for the remaining day) rather than fully restricting."
-  },
-  {
-   "id": 432,
-   "tier": "general",
-   "content": "13.08 lunch: chicken breast 190g fried on dry pan (no oil) — ~314 kcal / Б58.9/Ж6.8/У0, reference 165kcal/100g plain breast."
-  },
-  {
-   "id": 433,
-   "tier": "general",
-   "content": "13.08 lunch addition: fat-free cheese (Milbona-type 0%, ~35g, 2 tbsp, corrected after photo to a near-zero-protein product) — ~19 kcal / Б0/Ж0.1/У1.7."
-  },
-  {
-   "id": 434,
-   "tier": "general",
-   "content": "13.08 dinner: cottage cheese (Milbona) 200g + half a peach — ~226 kcal / Б22.7/Ж8.8/У13.9."
-  },
-  {
-   "id": 435,
-   "tier": "general",
-   "content": "Apple Watch activity 13.08: surfing 2h + walking ~54min — Move 971/600 kcal (x1.6), Exercise 174/40min (x4.4), 16,256 steps, 13.03km, Outdoor Walk 6.35km — very high activity day."
-  },
-  {
-   "id": 436,
-   "tier": "general",
-   "content": "Day 13.08.26 nutrition tracking closed: total ~1734 kcal / Б130/Ж73/У142 — protein floor (125) met with margin, fat over target (+18g, mostly carried from prior day's tiramisu), carbs within range; high activity (surfing 2h, Move 971) gave a real deficit despite kcal being above nominal target."
+   "content": "Day 14.09 nutrition tracking closed with every meal logged: total ~2050 kcal"
   }
  ],
  "negative": [
   {
-   "id": 63,
-   "tier": "pinned",
-   "content": "For every food/meal KБЖУ (calorie/macro) estimate, always include the calculation breakdown: weight used (given or assumed, and why), and the base reference figure (kcal/100g or standard portion) used."
-  },
-  {
-   "id": 65,
+   "id": 1001,
    "tier": "general",
-   "content": "User (girlfriend, being coached on nutrition/fitness): female, 35 years old, height 174cm, weight 66kg."
+   "content": "Product reference: NordFarm Skyr 150g — 95 kcal, Б17 Ж0.2 У5"
   },
   {
-   "id": 66,
+   "id": 1002,
    "tier": "general",
-   "content": "Goal: lose body fat and reduce water retention/edema (\"избавиться от жира и отёков\"); reports feeling soft/watery with cellulite and puffy arms."
+   "content": "Product reference: Brevo whey isolate, 30g scoop — 112 kcal, Б26 Ж0.5 У1"
   },
   {
-   "id": 68,
+   "id": 1003,
    "tier": "general",
-   "content": "Training: gym 3x/week, plus daily walking ~5-7km (sometimes more), occasional surfing. Sleep 7-8 hours/night."
+   "content": "Product reference: Kolvik dark chocolate 70%, 100g — 560 kcal, Б8 Ж40 У34"
   },
   {
-   "id": 69,
+   "id": 1004,
    "tier": "general",
-   "content": "Reported eating 1500-1800 kcal/day (usually 1500-1600, rarely above 2000) for ~3 months with no fat loss progress and even some weight gain; regular menstrual cycle but low libido."
+   "content": "Product reference: Valdora fusilli, dry 100g — 355 kcal, Б12 Ж1.5 У72"
   },
   {
-   "id": 70,
+   "id": 1005,
    "tier": "general",
-   "content": "Working hypothesis (agreed with user): reported low-calorie days likely undercount true weekly intake because of uncounted \"cheat\" days (e.g. pizza, chips, beer) 1-2x/week that can add 2000-3500 kcal; doing 7-day fully honest tracking (including cheat days) to find real weekly average before deciding between reverse diet vs. other approaches."
+   "content": "Product reference: Zorvin lager 0.5L — 210 kcal, 0g protein"
   },
   {
-   "id": 71,
+   "id": 1006,
    "tier": "general",
-   "content": "Tracking is logged in nutrition_log.md and training_log.md; user sends food photos (sometimes with portion weights) and voice notes about workouts (exercises, weights, reps, energy level 1-10)."
+   "content": "Product reference: Tessa smoked salmon 100g — 185 kcal, Б21 Ж11 У0"
   },
   {
-   "id": 72,
+   "id": 1007,
    "tier": "general",
-   "content": "User drinks regular (3.2% fat) milk by default unless stated otherwise."
+   "content": "Product reference: Brevo protein bar 45g — 190 kcal, Б20 Ж6 У16"
   },
   {
-   "id": 74,
+   "id": 1008,
    "tier": "general",
-   "content": "User also sends Apple Watch activity screenshots (Move/Exercise calories, steps); these are logged in a dedicated column in training_log.md alongside meals to cross-check against calorie intake. Watch is not always worn during strength training, so Move calories can under-count true energy expenditure on those days — account for this when estimating weekly energy balance."
+   "content": "Use this for future logging: Mirel oat milk 100ml = 46 kcal"
   },
   {
-   "id": 75,
+   "id": 1009,
    "tier": "general",
-   "content": "2026-07-30 morning weigh-in (day 1 of 7-day tracking): 66.3kg, measured before using the bathroom. For comparability, future weigh-ins during this tracking period should note the same conditions (morning, pre-bathroom) since that affects the reading."
+   "content": "Per package: Tessa rice cakes 9g each, 35 kcal"
   },
   {
-   "id": 100,
+   "id": 1010,
    "tier": "general",
-   "content": "Recurring homemade dish 'фаршированный перец' (stuffed pepper), per user's correction: small pepper (smaller than a fist), ~3 tbsp pure lean ground beef (no oil), 1 tbsp cooked rice, no sauce/oil added. Use this recipe for future calorie estimates of this dish rather than assuming restaurant-style with oil/sauce."
+   "content": "Sam is 41, male, runs and lifts; main aim is body recomposition"
   },
   {
-   "id": 101,
+   "id": 1011,
    "tier": "general",
-   "content": "Estimated TDEE for user ~1900-2000 kcal/day (BMR ~1410 + activity from Watch/steps). Days 1-3 of honest tracking (29-31.07.2026) totaled ~1825 / ~2026 / ~1944 kcal (avg ~1930) — close to maintenance, confirming she was not actually in the deep deficit (1500-1600 kcal) she believed."
+   "content": "Goal: lose 4 kg of body fat by December while keeping strength"
   },
   {
-   "id": 104,
+   "id": 1012,
    "tier": "general",
-   "content": "User repeatedly describes her body as 'soft/watery,' cellulite-heavy, with arms she perceives as 'thick as legs' — but this self-description has consistently and significantly diverged from what's actually visible in the photos she's shared (which show normal tone, proportionate limbs, no notable excess fat or edema). Assistant has flagged this gap and suggested it may be worth raising with a doctor/therapist as a body-image-perception question, separate from nutrition coaching. Be mindful of this in future body-related feedback — stay honest per instructions but don't reinforce the distorted self-perception."
+   "content": "Target protein 150-160g per day, calories around 2200 on training days"
   },
   {
-   "id": 105,
+   "id": 1013,
    "tier": "general",
-   "content": "Assistant does not save user's body-check photos into text logs (nutrition_log.md/training_log.md); keeps them only in conversation context for visual trend comparison over time."
+   "content": "Сэм предпочитает ужинать до 20:00 и не есть после тренировки позже 21:00"
   },
   {
-   "id": 144,
-   "tier": "pinned",
-   "content": "Exercise programming constraints: (1) varicose veins in one leg — no squats; prefers hip-hinge/leg-press pattern for lower body instead. (2) Right shoulder subluxates/unstable — no rotational or overhead shoulder movements; use neutral-grip/machine-fixed-path exercises, face pulls for shoulder stability work."
-  },
-  {
-   "id": 145,
+   "id": 1014,
    "tier": "general",
-   "content": "Current gym split (agreed 03.08, 3x/week): Monday = heavy legs/glute-focus (main compound: heavy leg press — glute bridge machine was tried and removed as physically uncomfortable in their gym); Wednesday = upper body; Friday = light legs/shaping (high-rep isolation, e.g. hip abduction, kickback, leg curl/extension). Other days: walking/surf as before."
+   "content": "Preference: simple high-protein meals, no more than 5 ingredients"
   },
   {
-   "id": 146,
+   "id": 1015,
    "tier": "general",
-   "content": "Current active diet plan (from 03.08): target 1600-1700 kcal/day, protein ≥120g/day minimum, deficit ~250-350 kcal/day from estimated TDEE ~1950. Chosen over a more aggressive ~1475 kcal/-2kg-month option after discussing LEA/muscle-loss risk."
+   "content": "Sam prefers whey isolate after runs, not casein"
   },
   {
-   "id": 147,
+   "id": 1016,
    "tier": "general",
-   "content": "At the agreed 1600-1700 kcal/day plan (~250-350 kcal deficit), expected fat loss is ~1-1.5kg/month, not more. Visible abs/arm definition realistically 4-7 months out from 03.08, given the earlier ~5-9kg fat-loss estimate."
+   "content": "Training split: Mon upper, Wed lower, Fri full body, Sat long run"
   },
   {
-   "id": 148,
+   "id": 1017,
    "tier": "general",
-   "content": "Weigh-in 03.08: 67.3kg, same conditions as 30.07's 66.3kg (morning, pre-bathroom) — confirmed comparable, so the +1kg is real on the scale but assessed as water/glycogen/sodium retention from a 31.07 binge (beer/salami/mozzarella/profiteroles) plus two very high-exertion days (01-02.08, Watch showed 2200-2550 total kcal/day), not fat gain."
+   "content": "Сплит тренировок: пн верх, ср низ, пт фулбади, сб длинный бег"
   },
   {
-   "id": 150,
+   "id": 1018,
    "tier": "general",
-   "content": "User regularly drinks Pedras (Portuguese sparkling mineral water) with lemon — flagged as meaningfully high in sodium (~110-115mg per 200ml serving), relevant to her edema/water-retention goal."
+   "content": "Schedule: gym at 07:00 on weekdays, easy run on Sunday"
   },
   {
-   "id": 151,
-   "tier": "pinned",
-   "content": "For every meal, in addition to the KБЖУ breakdown with calculation basis, always also include: (1) quality assessment (processed vs. whole food) and (2) edema/bloating risk assessment naming the specific likely trigger if any (sodium, alcohol, lactose, high-FODMAP fruits like peach/dried apricot, fast sugars, soda, etc.). Also show running remaining kcal/protein/fat/carb budget for the day after each meal, using daily targets of ~1650 kcal / protein floor ≥125g / fat ~55g / carbs ~160g (fat/carbs flexible)."
-  },
-  {
-   "id": 152,
-   "tier": "pinned",
-   "content": "User has two exercise-limiting physical constraints: varicose veins in one leg (no squats or heavy standing knee-flexion loading) and a right shoulder that subluxates/pops out (no shoulder rotation or overhead/behind-the-head movements). Always respect both when programming or modifying workouts."
-  },
-  {
-   "id": 153,
-   "tier": "pinned",
-   "content": "Coaching rule: if an exercise causes low back pain that doesn't resolve after correcting technique (stance, pelvic tilt, tempo), remove it from the program entirely rather than having the user push through the pain. Applied already to the barbell/machine glute bridge, which was dropped."
-  },
-  {
-   "id": 154,
+   "id": 1019,
    "tier": "general",
-   "content": "Final agreed 3x/week gym split: Monday = heavy legs (glute-focused compounds: leg press wide/high stance, RDL, pull-through, hip abduction, kickback), Wednesday = upper body (chest press machine, cable rows, neutral-grip DB press, face pulls, biceps/triceps, plank), Friday = light legs/shape-focused isolation work (leg extension/curl, hip abduction, kickback, band walks, calf raises). Rest days: walking + situational surfing, unchanged."
+   "content": "Weekly running volume 30-35 km, long run on Saturday"
   },
   {
-   "id": 155,
+   "id": 1020,
    "tier": "general",
-   "content": "The gym's glute bridge machine is uncomfortable/doesn't work for her — permanently removed from her program. Glute volume is instead covered via leg press (wide/high stance), pull-through, hip abduction, and kickback."
+   "content": "Knee injury: no deep lunges, avoid jumping drills"
   },
   {
-   "id": 156,
+   "id": 1021,
    "tier": "general",
-   "content": "Current deficit-phase targets (started 03.08): ~1600-1700 kcal/day, protein floor ≥120-125g/day (not a ceiling), deficit ~250-350 kcal/day from TDEE ~1950. Chosen over the faster -2kg/month option (~1450-1500 kcal) due to her history of low energy availability markers (low libido, low iron, elevated ALT) and risk of repeating the restrict-then-binge pattern."
+   "content": "Травма левого колена: без глубоких выпадов и прыжков"
   },
   {
-   "id": 157,
+   "id": 1022,
    "tier": "general",
-   "content": "Visual body-photo assessment (not a real measurement): estimated body fat ~26-30%, ~5-9kg fat loss needed for visible abs/arm definition. At the agreed realistic rate of ~1-1.5kg fat/month, this is expected to take ~4-7 months, not weeks — set explicitly to prevent discouragement from slow scale movement in the first weeks."
+   "content": "Right shoulder impingement — no behind-the-neck presses, injury constraint"
   },
   {
-   "id": 158,
+   "id": 1023,
    "tier": "general",
-   "content": "Weight 67.3kg recorded 03.08 (day 6 of the 7-day tracking, same morning/pre-bathroom conditions as the 66.3kg on 30.07 — confirmed comparable). The +1kg was attributed to water/sodium/glycogen retention from the 31.07 binge (beer+salami+mozzarella+profiteroles) plus two very high-exertion days (01-02.08, Watch-reported total 2200-2550 kcal/day), not fat gain."
+   "content": "Allergic to hazelnuts; check labels on bars and spreads"
   },
   {
-   "id": 202,
+   "id": 1024,
    "tier": "general",
-   "content": "Product reference: White Kidney Beans in tomato sauce (Lidl) — 94 kcal/100g, fat 0.7g, carbs 13.6g (sugar 4.9g), fiber 7.1g, protein 4.8g, salt 0.5g. Use this for future estimates when this product recurs."
+   "content": "Аллергия на фундук, всегда проверять состав"
   },
   {
-   "id": 203,
+   "id": 1025,
    "tier": "general",
-   "content": "Product reference: Arla Protein Cottage Cheese, 1.5% fat, standard package 200g — ~194 kcal, protein 30g, fat ~3g, carbs ~6g per package. Use this for future estimates when this product recurs."
+   "content": "Sam is lactose intolerant: prefers lactose-free skyr and kefir"
   },
   {
-   "id": 205,
+   "id": 1026,
    "tier": "general",
-   "content": "7-day honest tracking (29.07-04.08) concluded: average of 5 known days ~1984 kcal / Б115 / Ж78 / У175 — near TDEE (~1900-2000), not a deep deficit. 01-02.08 were data gaps but Watch showed extreme activity (2235-2547 kcal total) those days. Conclusion: hypothesis of chronic undereating not confirmed; not doing reverse diet. Continuing current plan (1600-1700 kcal/day, protein ≥120g) and shifting focus to closing tracking gaps for one more full week before judging trend."
+   "content": "Hard no: liver, blue cheese, and energy drinks"
   },
   {
-   "id": 213,
+   "id": 1027,
    "tier": "general",
-   "content": "User is currently in PMS/luteal phase (as of early Aug 2026) — expect scale weight to be temporarily elevated by water retention (1-2kg) independent of fat; don't react to individual daily readings during this window."
+   "content": "Coaching rule: always give the protein number first, then calories"
   },
   {
-   "id": 214,
-   "tier": "pinned",
-   "content": "Weigh-in schedule changed to weekly: every Friday morning, same conditions (before bathroom) for comparability. A reminder is set for every Thursday at 20:00 Portugal time (job 'friday-weighin-reminder'); note it will shift to 19:00 once Portugal switches to winter time in late Oct/early Nov."
-  },
-  {
-   "id": 245,
+   "id": 1028,
    "tier": "general",
-   "content": "Product reference: Milbona High Protein Pudding (chocolate), 200g — 65 kcal/100g, protein ~20g, fat 1.8g, carbs 9.8g per 200g serving. Use this for future estimates when this product recurs."
+   "content": "Правило: всегда сначала белок, потом калории и остальные макро"
   },
   {
-   "id": 246,
+   "id": 1029,
    "tier": "general",
-   "content": "Product reference: Milbona Mozzarella — 200g net / 125g dry weight package, 248 kcal/100g, protein 17.5g, fat 19g, carbs 1.5g, salt 0.5g per 100g. Use this for future estimates when this product recurs."
+   "content": "Coach should be direct and short; no motivational filler"
   },
   {
-   "id": 247,
+   "id": 1030,
    "tier": "general",
-   "content": "Product reference: Milbona cottage cheese — 98 kcal/100g, protein 11g, fat 4.3g, carbs 3.4g per 100g. Use this for future estimates when this product recurs."
+   "content": "Reply in Russian when Sam writes in Russian, otherwise English"
   },
   {
-   "id": 248,
+   "id": 1031,
    "tier": "general",
-   "content": "Product reference: Taliam tortilla wrap — large size, ~130g per piece (pack of 3x130g=390g), 301 kcal/100g, salt 1.8g/100g. A 'half lepёshka' portion is ~65g, not the ~65g whole assumed earlier — the whole piece is 130g. Use this for future estimates when this product recurs."
+   "content": "Weekly check-in on Sunday evening: weight trend, sessions done, next week's plan"
   },
   {
-   "id": 251,
+   "id": 1032,
    "tier": "general",
-   "content": "Recurring pattern noted: high-FODMAP fruits (pear, peach, dried apricot) have appeared multiple times this week and are flagged as repeat candidates for bloating, not one-off events."
+   "content": "Weigh-in protocol: Monday morning, fasted, after toilet, same scale; keep conditions comparable"
   },
   {
-   "id": 273,
+   "id": 1033,
    "tier": "general",
-   "content": "User's period started 08.08.26. This is the second consecutive month her cycle arrived ~5 days earlier than her prior baseline — cycle length is shortening. Flagged as worth discussing with her doctor alongside her existing unresolved lab findings (low iron, mildly elevated ALT) and low libido, given plausible link to energy availability/training-stress on the HPO axis."
+   "content": "Weigh-in 08.09.2025: 77.9 kg. Trend: 01.09=78.4 → 08.09=77.9, on track"
   },
   {
-   "id": 274,
+   "id": 1034,
    "tier": "general",
-   "content": "Weigh-in 07.08 (Friday, first official weekly weigh-in under new schedule): 66.1kg. Trend: 30.07=66.3 → 03.08=67.3 → 07.08=66.1."
+   "content": "Weight is tracked weekly; only same-condition readings are comparable"
   },
   {
-   "id": 275,
+   "id": 1035,
    "tier": "general",
-   "content": "User confirmed thyroid (щитовидка) was checked and results are normal — rules out thyroid as cause of shortening menstrual cycle."
+   "content": "Race plan: half marathon on 2025-11-09, target time 1:45"
   },
   {
-   "id": 276,
+   "id": 1036,
    "tier": "general",
-   "content": "User has been taking iron supplement for over a month as of 08.08.26; ferritin/iron stores typically take 3-6 months to fully restore, so deficit may still have contributed to recent cycle changes."
+   "content": "План: к марту выйти на 76 кг, держать жим 80 кг на 5 повторов"
   },
   {
-   "id": 302,
+   "id": 1037,
    "tier": "general",
-   "content": "Acute neck muscle spasm (likely trapezius/levator scapulae, left side) started 08.08.26; red flags (dizziness, nausea, tinnitus, post-pain visual disturbance, arm weakness) were checked and ruled out; pain was severe with forward/lateral neck movement ('sparks in eyes') before improving with rest, sleep, and heat; surfing postponed until neck rotation amplitude recovers (recheck in 2-3 days from 08.08), Wednesday upper-body gym session flagged as possibly needing modification depending on recovery."
+   "content": "Long-term goal: bench press 100 kg by next summer"
   },
   {
-   "id": 303,
+   "id": 1038,
    "tier": "general",
-   "content": "Sleeping position that kept neck pain-free during the 08.08.26 neck spasm: lying on right side, knees bent, pillow height keeping neck neutral/in line with spine — confirmed working by user, advised to keep it and avoid stomach-sleeping."
+   "content": "TDEE estimate is about 2600 kcal with the current training load"
   },
   {
-   "id": 309,
+   "id": 1039,
    "tier": "general",
-   "content": "User considered taking a psilocybin mushroom on the evening of 08.08.26 after already drinking ~420ml wine that day; decided against it after being advised the alcohol+psilocybin combo is risky and adds nervous-system load on an already stressful day (neck spasm + first day of period)."
+   "content": "Maintenance calories roughly 2500; deficit of 300-400 for cutting"
   },
   {
-   "id": 311,
+   "id": 1040,
    "tier": "general",
-   "content": "08.08 evening: neck pain became noticeably better after drinking wine; agent attributed this to alcohol's muscle-relaxant/GABA effect temporarily masking the spasm symptom (not treating the cause), and cautioned against relying on alcohol for this given her elevated ALT."
+   "content": "Рабочий дефицит 300-400 ккал от поддержания, не больше"
   },
   {
-   "id": 312,
+   "id": 1041,
    "tier": "general",
-   "content": "08.08 dinner: user couldn't chew a tough ~30g piece of veal; agent flagged a possible (unconfirmed) connection between jaw/TMJ tightness and the same muscular chain as the neck spasm, worth watching if it recurs."
+   "content": "Sam takes creatine 5g daily as a supplement and vitamin D in winter"
   },
   {
-   "id": 313,
+   "id": 1042,
    "tier": "general",
-   "content": "The nutrition agent has no automatic access to the /chef agent's saved recipes or notes (e.g., saltimbocca recipe) — they live in the chef agent's own workspace folder; user must relay ingredient/weight details here for KБЖУ calculations."
+   "content": "Добавки: креатин 5г ежедневно, витамин D зимой по рекомендации врача"
   },
   {
-   "id": 315,
+   "id": 1043,
    "tier": "general",
-   "content": "Product reference: Chicken Bockwurst sausage (Gustoland brand, chicken not pork, smoked, contains sodium nitrite) — package is 200g/6 pieces, so 1 piece ≈ 33g (NOT 50g/piece as previously recorded). Label values per 100g: 264 kcal, protein 13g, fat 23g, carbs 1g, salt 1.3g. Use these exact figures for future estimates when this product recurs (e.g. 1.5 pieces = ~50g total = ~132 kcal/Б6.5/Ж11.5/У0.5)."
+   "content": "Sam's doctor advised as a rule to keep sodium moderate"
   },
   {
-   "id": 316,
+   "id": 1044,
    "tier": "general",
-   "content": "Chicken Bockwurst sausage (Gustoland) calories are confirmed from package label (recorded 06.08.26): 264 kcal/100g, protein 13g, fat 23g, carbs 1g, salt 1.3g per 100g; 1 piece ≈ 33g. The earlier ~215 kcal/100g estimate used for the 09.08 breakfast was wrong and has been corrected in nutrition_log.md."
+   "content": "Pattern: energy dips on days with less than 6 hours of sleep"
   },
   {
-   "id": 318,
+   "id": 1045,
    "tier": "general",
-   "content": "06.08.26 breakfast sausage portion recalculated with corrected label data: 1.5 sausages ≈ 50g ≈ 132 kcal / Б6.5/Ж11.5/У0.5 (matches the corrected 09.08 breakfast sausage figure exactly, same Gustoland pack)."
+   "content": "Паттерн: после коротких ночей тянет на сладкое вечером"
   },
   {
-   "id": 337,
+   "id": 1046,
    "tier": "general",
-   "content": "Product reference: Vkusnasha zephyr (marshmallow, Slavic store) confirmed via package label: 60g portion = ~191 kcal, fat 0g, carbs ~47.2g (protein ~0.5g estimated, not from label) — equivalent to ~318 kcal/100g. Use for future estimates of this product."
+   "content": "Usually trains fasted on Saturdays before the long run"
   },
   {
-   "id": 344,
+   "id": 1047,
    "tier": "general",
-   "content": "Pattern flagged: user ate a sugary snack (zephyr) on 3 consecutive days (08.08, 09.08, 10.08); agent recommended not eliminating it but limiting frequency to ~1-2x/week and prioritizing protein-based sweets (e.g. Milbona protein pudding, cottage cheese+honey) over plain sugar when possible, given repeated protein-floor misses and sugar's mild sodium-retention effect via insulin."
+   "content": "Обычно перекусывает творогом перед сном"
   },
   {
-   "id": 346,
+   "id": 1048,
    "tier": "general",
-   "content": "Product reference: Turkey ham (Fumadinho brand) — 95 kcal/100g, established 07.08.26 and reused for 10.08 breakfast estimate."
+   "content": "Meal prep is done on Sunday: chicken, rice, roasted vegetables for 4 days"
   },
   {
-   "id": 359,
+   "id": 1049,
    "tier": "general",
-   "content": "User reports that recently bloating from high-FODMAP foods (peach, watermelon, polyol-containing protein bars) is essentially absent — only occasional mild morning gas, no visible distension/discomfort, despite repeated same-day/consecutive-day high-FODMAP intake. Her real-world FODMAP tolerance appears higher than initially assumed; edema/water retention complaints are more likely driven by sodium/alcohol than FODMAP fermentation. Calibrate future bloating-risk flags accordingly — lower alarm level for FODMAP items specifically."
+   "content": "Breakfast routine: skyr, oats, berries, 9-10am, about 30g protein"
   },
   {
-   "id": 362,
+   "id": 1050,
    "tier": "general",
-   "content": "Corrected label data for the Lidl protein bar (45g) from actual package photo: per 100g — 379 kcal, protein 30g, carbs 29g (sugar 2.2g, polyols 25g), fat 17g. Per 45g portion: Б13.5/Ж7.65/У13.05 (polyols ~11.25g). Supersedes the earlier memory-based estimate of 22.5g protein/12.3g polyols."
+   "content": "Завтрак обычно в 9-10 утра, белок 30г, без сладкого"
   },
   {
-   "id": 414,
+   "id": 1051,
    "tier": "general",
-   "content": "Product reference: Lidl protein bar (different variant from the one earlier in the week) — per 100g: 389 kcal, fat 15.2g (sat 7.9g), carbs 42.5g (sugar 2.3g, polyols 31.3g), fiber 2.5g, protein 32g, salt 0.67g; bar weight = 50g (16g protein/bar per label)."
+   "content": "Lunch is usually at the office canteen; prefers grilled options"
   },
   {
-   "id": 419,
+   "id": 1052,
    "tier": "general",
-   "content": "Product reference: Corona Extra beer — official data 148 kcal/355ml; a ~330ml can = ~138 kcal / Б0.9/Ж0/У13."
+   "content": "Hydration rule: 2.5 litres of water daily, more on long-run days"
+  },
+  {
+   "id": 1053,
+   "tier": "general",
+   "content": "Sleep target: 7.5 hours; aim to be in bed by 23:00 on weeknights"
+  },
+  {
+   "id": 1054,
+   "tier": "general",
+   "content": "Цель по сну: 7.5 часов, отбой до 23:00 в будни"
+  },
+  {
+   "id": 1055,
+   "tier": "general",
+   "content": "Deload week every fourth week: cut volume by 40%"
+  },
+  {
+   "id": 1056,
+   "tier": "general",
+   "content": "Progression rule: add 2.5 kg when all sets hit the top of the rep range"
   }
  ]
 }

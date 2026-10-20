@@ -184,3 +184,17 @@ class TestValidateEvaluatorOutput:
     def test_leading_trailing_whitespace(self):
         raw = '  \n  [{"op":"add","tier":"general","content":"hi"}]  \n  '
         assert len(validate_evaluator_output(raw)) == 1
+
+
+def test_screen_fields_pass_through_only_when_set():
+    from src.evaluator.validator import validate_evaluator_output
+
+    raw = (
+        '[{"op":"add","tier":"general","content":"a","revokes":true,'
+        '"conflicts_with_id":4},'
+        '{"op":"add","tier":"general","content":"b","revokes":null,'
+        '"conflicts_with_id":null}]'
+    )
+    first, second = validate_evaluator_output(raw)
+    assert first["revokes"] is True and first["conflicts_with_id"] == 4
+    assert "revokes" not in second and "conflicts_with_id" not in second

@@ -47,8 +47,23 @@ from claude_agent_sdk.types import McpHttpServerConfig, StreamEvent
 
 from ..config.settings import Settings
 from ..model_router.harness import CLAUDE_ACCOUNT_ENV
+from ..model_router.routes import (
+    PROVIDER_ANTHROPIC_SUB,
+    PROVIDER_OPENROUTER,
+    cost_for,
+    cost_from_tokens,
+    openrouter_key,
+    provider_env,
+    resolve_turn_route,
+)
+from ..model_router.turn_cost import (
+    GenerationLookup,
+    SessionCostTracker,
+    Settlement,
+    TurnCostMeter,
+)
 from ..security import policy
-from ..security.denylist import sandbox_deny_read
+from ..security.bash_box import BashBox, BoxUnavailable
 from ..security.read_scope import ReadScope, build_read_scope
 from ..security.validators import SecurityValidator
 from .exceptions import (
@@ -66,7 +81,7 @@ from .monitor import (
 )
 
 if TYPE_CHECKING:
-    from ..profiles.registry import ProfileRegistry
+    from ..profiles.registry import ProfileDefinition, ProfileRegistry
     from ..storage.memory_repository import MemoryRetriever
     from .agent_tools import AgentServices
     from .confirmation import ConfirmationManager
@@ -79,6 +94,9 @@ from .turn_setup import (
     image_roots_env,
     resolve_turn_context,
 )
+from .verification_budget import VerificationBudget
+from .verification_budget import current_phase as current_verification_phase
+from .verification_budget import make_budget
 
 logger = structlog.get_logger()
 
@@ -345,6 +363,33 @@ _ABORT_SUBTYPES = {
 }
 
 
+# Bot-side bounds on a turn's tail (dv-586f). The idle watchdog only sees
+# silence; these catch a CLI that keeps talking (or acks an interrupt) without
+# ever finishing the turn.
+# After /stop interrupts a run, wait this long for the CLI's ResultMessage,
+# then abandon the run on the bot side (disconnect kills the CLI).
+_INTERRUPT_GRACE_SECONDS = 15.0
+# After the model's final answer (stop_reason end_turn, no pending tool use),
+# the ResultMessage follows within milliseconds. If it has not arrived after
+# this long, take the answer we have instead of waiting out the CLI.
+_FINAL_RESULT_GRACE_SECONDS = 120.0
+# One stream callback (a Telegram edit/send) may not stall consumption of the
+# CLI stream; past this it is abandoned for that message.
+_STREAM_CALLBACK_TIMEOUT_SECONDS = 20.0
+# How often the receive loop wakes to check the deadlines above.
+_POLL_SECONDS = 1.0
+
+
+@dataclass(eq=False)
+class _ActiveRun:
+    """One in-flight SDK client, addressable by (user, agent) for /stop."""
+
+    client: Any
+    user_id: int
+    profile: str
+    interrupted_at: Optional[float] = None
+
+
 def _peak_context_tokens(messages: List[Any]) -> int:
     """Largest single-API-call context across a turn's AssistantMessages.
 
@@ -472,6 +517,22 @@ class ClaudeResponse:
     # so a context reset is distinguishable from a healthy window roll
     # (dv-2a5a): before this, both read as the same drop in the level gauge.
     session_fresh_reason: Optional[str] = None
+    # Set only when the turn ran on a provider other than the subscription
+    # (dv-d2f6): the router records them instead of the harness defaults.
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    # Third-party routes only (dv-d2f6): "estimate" while any call is priced
+    # from tokens, "exact" once every call has OpenRouter's total_cost.
+    # ``cost_settlement`` resolves to the final figure (~6 s after the last
+    # call); the cost sinks swap their estimate via turn_cost.when_settled.
+    cost_source: Optional[str] = None
+    cost_settlement: Optional["asyncio.Task[Settlement]"] = field(
+        default=None, repr=False, compare=False
+    )
+    # Model calls seen in the stream, and how many lacked the stream-json
+    # ``request_id`` (the live smoke fails on any: the field is undocumented).
+    api_calls: int = 0
+    request_ids_missing: int = 0
 
     @property
     def cost_usd(self) -> float:
@@ -527,6 +588,8 @@ def _make_pre_tool_use_hook(
     read_scope: Optional[ReadScope] = None,
     unrestricted: bool = False,
     confirmation_manager: Optional["ConfirmationManager"] = None,
+    verification_budget: Optional[VerificationBudget] = None,
+    bash_box: Optional[BashBox] = None,
 ) -> Any:
     """Deny secrets / multi-tenant stores for EVERY tool call.
 
@@ -552,6 +615,14 @@ def _make_pre_tool_use_hook(
 
     ``unrestricted`` (profile flag, dv-e38e): skip the data-root areas
     (secrets/, archive/, db/); the credential-filename rules still apply.
+
+    ``verification_budget`` (dv-9f41) is this turn's search-class counter; it
+    lives here for the same reason — WebSearch is in ``allowed_tools`` and so
+    never reaches ``can_use_tool``. Built fresh per turn by the caller.
+
+    ``bash_box`` (dv-98f2): a sandboxed profile's Bash commands are rewritten
+    here, via ``updatedInput``, to run inside bwrap (``src/security/bash_box.py``).
+    The CLI's own sandbox cannot start on this host, so this is the OS boundary.
     """
     turn = policy.TurnPolicy(
         working_directory=working_directory,
@@ -609,6 +680,35 @@ def _make_pre_tool_use_hook(
                         "permissionDecisionReason": (
                             f"Denied by owner (confirmation gate): {decision.reason}"
                         ),
+                    }
+                }
+        if verification_budget is not None:
+            over_reason = verification_budget.charge(tool_name)
+            if over_reason:
+                return deny(tool_name, over_reason)
+            if verification_budget.over and not verification_budget.exceeded_logged:
+                # Once per turn: the count-only telemetry line (dv-9f41).
+                verification_budget.exceeded_logged = True
+                logger.warning(
+                    "verification_budget_exceeded",
+                    phase=verification_budget.phase,
+                    limit=verification_budget.limit,
+                    used=verification_budget.used,
+                    tool_name=tool_name,
+                    cwd=str(working_directory),
+                )
+        if bash_box is not None and tool_name == "Bash":
+            command = tool_input.get("command")
+            if isinstance(command, str) and command:
+                try:
+                    boxed = bash_box.wrap(command, input_data.get("cwd"))
+                except BoxUnavailable as exc:
+                    # Fail closed: no box, no bash.
+                    return deny(tool_name, f"Bash is unavailable: {exc}")
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "updatedInput": {**tool_input, "command": boxed},
                     }
                 }
         return {}
@@ -741,6 +841,23 @@ def _make_can_use_tool_callback(
                     "false (you will wait for the result in this turn; "
                     "parallel foreground agents are fine), or use the "
                     "job_start tool for work that must outlive the turn."
+                )
+            )
+        # A sandboxed bash reaching a host outside sandbox.network.allowedDomains
+        # is not refused by the CLI: it asks, as a "SandboxNetworkAccess" tool
+        # call. The default-allow at the bottom of this callback let every such
+        # call through, so the allowlist was decoration (dv-98f2).
+        if tool_name == "SandboxNetworkAccess":
+            logger.warning(
+                "can_use_tool denied sandbox network access",
+                host=tool_input.get("host"),
+                port=tool_input.get("port"),
+            )
+            return PermissionResultDeny(
+                message=(
+                    "Network access to this host is not allowed for this "
+                    "agent. The owner can add it to the profile's "
+                    "sandbox_allowed_domains."
                 )
             )
         # The destructive-op confirmation gate moved to the PreToolUse hook
@@ -927,7 +1044,9 @@ class ClaudeSDKManager:
         # SDK clients are interrupted. Active clients are tracked so /stop can
         # reach them.
         self._stopped: bool = False
-        self._active_clients: Set["ClaudeSDKClient"] = set()
+        self._active_runs: Dict[Tuple[int, str], List[_ActiveRun]] = {}
+        # dv-4517: the CLI's total_cost_usd is session-cumulative on resume.
+        self._session_costs = SessionCostTracker()
         # Owner approve/deny gate for destructive ops on full-access profiles.
         self._confirmation_manager: Optional["ConfirmationManager"] = None
 
@@ -949,6 +1068,12 @@ class ClaudeSDKManager:
         self._agent_services = services
         logger.info("Agent MCP services attached")
 
+    def _idle_limit_seconds(self) -> int:
+        """Turn idle limit; with a confirmation gate it outlives the owner wait."""
+        if self._confirmation_manager is not None:
+            return int(self.config.claude_idle_limit_seconds)
+        return int(self.config.claude_timeout_seconds)
+
     def attach_confirmation_manager(self, manager: "ConfirmationManager") -> None:
         """Wire the destructive-op confirmation gate (post-startup, needs bot)."""
         self._confirmation_manager = manager
@@ -958,18 +1083,40 @@ class ClaudeSDKManager:
     def is_stopped(self) -> bool:
         return self._stopped
 
-    async def stop_all(self) -> int:
-        """Killswitch: refuse new runs, interrupt every in-flight SDK client,
-        and pause the scheduler. Returns the number of runs interrupted."""
-        self._stopped = True
-        clients = list(self._active_clients)
+    def _profile_slug_for(self, working_directory: Path, user_id: Optional[int]) -> str:
+        """Bare profile slug (no ``#u<id>`` suffix) a run belongs to: the key
+        half of ``_active_runs``, matched by ``stop_turns``."""
+        return self._agent_id_for(working_directory, user_id).split("#", 1)[0]
+
+    async def _interrupt_runs(self, runs: List[_ActiveRun]) -> int:
         interrupted = 0
-        for client in clients:
+        for run in runs:
+            run.interrupted_at = time.monotonic()
             try:
-                await client.interrupt()
+                await run.client.interrupt()
                 interrupted += 1
             except Exception as exc:  # best-effort; disconnect happens in finally
                 logger.warning("interrupt failed during stop", error=str(exc))
+        return interrupted
+
+    async def stop_turns(self, user_id: int, profile: str) -> int:
+        """Scoped /stop: interrupt only ``user_id``'s in-flight run(s) on
+        ``profile``. No killswitch, scheduler untouched. Returns the number of
+        runs interrupted."""
+        runs = list(self._active_runs.get((user_id, profile), ()))
+        interrupted = await self._interrupt_runs(runs)
+        logger.info(
+            "Turn stopped", user_id=user_id, profile=profile, interrupted=interrupted
+        )
+        return interrupted
+
+    async def stop_all(self) -> int:
+        """Killswitch (/stop all): refuse new runs, interrupt every in-flight
+        SDK client, and pause the scheduler. Returns the number of runs
+        interrupted."""
+        self._stopped = True
+        runs = [r for group in self._active_runs.values() for r in group]
+        interrupted = await self._interrupt_runs(runs)
         if self._agent_services and self._agent_services.scheduler:
             try:
                 self._agent_services.scheduler.pause()
@@ -1091,6 +1238,12 @@ class ClaudeSDKManager:
             full_access=full_access,
         )
 
+    def _profile_for(self, working_directory: Path) -> Optional["ProfileDefinition"]:
+        """The profile owning ``working_directory`` (guest workspaces included)."""
+        if self.profile_registry is None:
+            return None
+        return self.profile_registry.get_by_working_dir(working_directory)
+
     def _extra_dirs_for(self, working_directory: Path) -> Tuple[Path, ...]:
         """The profile's extra write roots (dv-3103); empty outside profiles.
 
@@ -1102,12 +1255,55 @@ class ClaudeSDKManager:
         profile = self.profile_registry.get_by_working_dir(working_directory)
         return profile.extra_dirs if profile is not None else ()
 
+    def _bash_box_for(self, working_directory: Path) -> BashBox:
+        """The bash box of a sandboxed profile (dv-98f2): workspace +
+        ``extra_dirs`` writable, ``sandbox_read_dirs`` read-only."""
+        profile = (
+            self.profile_registry.get_by_working_dir(working_directory)
+            if self.profile_registry
+            else None
+        )
+        extra = tuple(profile.extra_dirs) if profile is not None else ()
+        read = tuple(profile.sandbox_read_dirs) if profile is not None else ()
+        return BashBox(
+            write_dirs=(Path(working_directory).resolve(), *extra), read_dirs=read
+        )
+
     def _unrestricted_for(self, working_directory: Path) -> bool:
         """The profile's ``unrestricted`` flag (dv-e38e); False outside profiles."""
         if self.profile_registry is None:
             return False
         profile = self.profile_registry.get_by_working_dir(working_directory)
         return bool(profile is not None and profile.unrestricted)
+
+    def _verification_budget_for(
+        self, working_directory: Path
+    ) -> Optional[VerificationBudget]:
+        """A fresh per-turn search budget, or None if the profile at this
+        working dir is not in ``VERIFICATION_BUDGET_PROFILES`` (dv-9f41).
+
+        The phase comes from the orchestrator's ContextVar: follow-up confirm /
+        escalate turns set it around their ``run_command``.
+        """
+        cfg = self.config
+        if self.profile_registry is None:
+            return None
+        profile = self.profile_registry.get_by_working_dir(working_directory)
+        if profile is None:
+            return None
+        allowed = {
+            slug.strip()
+            for slug in cfg.verification_budget_profiles.split(",")
+            if slug.strip()
+        }
+        if profile.slug not in allowed:
+            return None
+        return make_budget(
+            current_verification_phase(),
+            draft_max=cfg.verification_budget_draft_max,
+            confirm_max=cfg.verification_budget_confirm_max,
+            enforce=cfg.verification_budget_enforce,
+        )
 
     def _sandbox_enabled_for(self, working_directory: Path) -> bool:
         """Resolve the bash-sandbox flag for the profile at this working dir.
@@ -1169,6 +1365,10 @@ class ClaudeSDKManager:
             "you to investigate.\n"
             "</runtime>"
         )
+
+    def _generation_lookup(self, key: str) -> GenerationLookup:
+        """OpenRouter generation-cost client for one turn (tests swap it)."""
+        return GenerationLookup(key)
 
     def _max_budget_for(
         self, working_directory: Path, role: Optional[str]
@@ -1498,16 +1698,30 @@ class ClaudeSDKManager:
                 sdk_allowed_tools = [t for t in sdk_allowed_tools if t not in _GATED]
 
             # Per-request budget cap: per-profile override > global config >
-            # uncapped for owners. When this cap is hit the CLI aborts the turn
-            # with result=None, which is why _ABORT_SUBTYPES below has to label
-            # the outcome rather than let the partial narration stand.
+            # uncapped for owners. Enforced by OUR stream loop on every route
+            # (dv-d2f6): the meter charges each model call as it arrives and
+            # the loop interrupts the turn at the cap. The CLI's own
+            # max_budget_usd stays off: it prices every model by its Anthropic
+            # table, ~15x wrong on OpenRouter.
             max_budget_usd = self._max_budget_for(Path(working_directory), role)
+
+            # Provider route (dv-d2f6): subscription unless the profile opts in.
+            route = resolve_turn_route(self._profile_for(working_directory), model)
+            if route.provider != PROVIDER_ANTHROPIC_SUB:
+                model = route.model
+            or_key = openrouter_key() if route.provider == PROVIDER_OPENROUTER else None
+            partial_for_meter_only = stream_callback is None and route.is_third_party
+            meter = TurnCostMeter(
+                route,
+                cap=max_budget_usd,
+                lookup=self._generation_lookup(or_key) if or_key else None,
+            )
 
             # Build Claude Agent options
             options = ClaudeAgentOptions(
                 max_turns=self._max_turns_for(working_directory),
                 model=model or self.config.claude_model or None,
-                max_budget_usd=max_budget_usd,
+                max_budget_usd=None,
                 cwd=str(working_directory),
                 # Profile extra_dirs (dv-3103): `--add-dir` is what makes a path
                 # writable for bash *inside* the bwrap jail (verified live,
@@ -1518,24 +1732,21 @@ class ClaudeSDKManager:
                 disallowed_tools=sdk_disallowed_tools,
                 cli_path=self.config.claude_cli_path or None,
                 permission_mode="default",
-                include_partial_messages=stream_callback is not None,
+                # Third-party routes always: the per-call usage and the
+                # provider's charge arrive only in the partial-stream
+                # message_delta (dv-d2f6); the assistant events carry zeros.
+                include_partial_messages=(
+                    stream_callback is not None or partial_for_meter_only
+                ),
+                # The CLI's native sandbox cannot start on this host (AppArmor
+                # strips its nested seccomp step), so it is off for everyone;
+                # sandboxed profiles get the bwrap box via the PreToolUse hook
+                # instead (src/security/bash_box.py, dv-98f2).
+                # autoAllowBashIfSandboxed stays False (dv-6dbc): bash must
+                # keep reaching can_use_tool.
                 sandbox={  # type: ignore[arg-type]
-                    "enabled": sandbox_enabled,
-                    # Must stay False: when true the CLI auto-approves bash for
-                    # sandboxed profiles, so `sqlite3 data/bot.db` never reaches
-                    # can_use_tool. The sandbox blocks bash *writes* and egress,
-                    # not reads -- and reads are the cross-user leak (dv-6dbc).
+                    "enabled": False,
                     "autoAllowBashIfSandboxed": False,
-                    "excludedCommands": self.config.sandbox_excluded_commands or [],
-                    # Data-root areas no agent may read (dv-2c1c): the CLI
-                    # mounts an empty tmpfs over each, so bash in the bwrap
-                    # jail never sees them. A key the SDK's TypedDict does
-                    # not declare; the CLI reads it (verified in 2.1.283).
-                    "filesystem": {
-                        "denyRead": sandbox_deny_read(
-                            full_access, unrestricted=unrestricted
-                        )
-                    },
                 },
                 system_prompt=base_prompt,
                 setting_sources=["project"],
@@ -1590,6 +1801,7 @@ class ClaudeSDKManager:
                 **CLAUDE_ACCOUNT_ENV,
                 **self._seam_env(Path(working_directory)),
                 **self._route_mcp_env_secrets(options.mcp_servers),
+                **provider_env(route, or_key),
             }
             if turn_env:
                 options.env = {**options.env, **turn_env}
@@ -1606,11 +1818,20 @@ class ClaudeSDKManager:
                                 read_scope=read_scope,
                                 unrestricted=unrestricted,
                                 confirmation_manager=self._confirmation_manager,
+                                verification_budget=self._verification_budget_for(
+                                    working_directory
+                                ),
+                                bash_box=(
+                                    self._bash_box_for(Path(working_directory))
+                                    if sandbox_enabled
+                                    else None
+                                ),
                             )
                         ],
-                        # The gate waits up to 120s for the owner's tap; the
-                        # SDK's 60s default would kill the hook first.
-                        timeout=180,
+                        # The gate waits up to confirmation_timeout_seconds
+                        # for the owner's tap; the SDK's 60s default would
+                        # kill the hook first.
+                        timeout=self.config.confirmation_hook_timeout_seconds,
                     )
                 ]
             }
@@ -1643,14 +1864,25 @@ class ClaudeSDKManager:
             # CLI sent, not from the start of the turn. See the wait loop below.
             last_activity = time.monotonic()
 
+            run_key = (user_id or 0, self._profile_slug_for(working_directory, user_id))
+            # Set by the loop when it gives up waiting for the CLI's
+            # ResultMessage ("interrupted" | "result_missing").
+            abandoned: List[str] = []
+            was_interrupted = False
+            budget_stopped = False
+
             async def _run_client() -> None:
-                nonlocal last_activity
+                nonlocal last_activity, was_interrupted, budget_stopped
                 # Use connect(None) + query(prompt) pattern because
                 # can_use_tool requires the prompt as AsyncIterable, not
                 # a plain string. connect(None) uses an empty async
                 # iterable internally, satisfying the requirement.
                 client = ClaudeSDKClient(options)
-                self._active_clients.add(client)
+                run = _ActiveRun(client=client, user_id=run_key[0], profile=run_key[1])
+                self._active_runs.setdefault(run_key, []).append(run)
+                final_at: Optional[float] = None
+                post_final_seen: List[str] = []
+                next_msg: Optional["asyncio.Future[Any]"] = None
                 try:
                     await client.connect()
                     await client.query(
@@ -1664,10 +1896,59 @@ class ClaudeSDKManager:
                     # generator, Python terminates that generator permanently,
                     # causing us to lose all subsequent messages including
                     # the ResultMessage.
-                    async for raw_data in client._query.receive_messages():
+                    stream = client._query.receive_messages().__aiter__()
+                    while True:
+                        # Poll in 1s slices so the interrupt / final-answer
+                        # deadlines below fire even when the CLI goes quiet
+                        # or keeps emitting non-result traffic.
+                        if next_msg is None:
+                            next_msg = asyncio.ensure_future(stream.__anext__())
+                        done, _ = await asyncio.wait({next_msg}, timeout=_POLL_SECONDS)
+                        now = time.monotonic()
+                        if not done:
+                            if (
+                                run.interrupted_at is not None
+                                and now - run.interrupted_at > _INTERRUPT_GRACE_SECONDS
+                            ):
+                                was_interrupted = True
+                                abandoned.append("interrupted")
+                                break
+                            if (
+                                final_at is not None
+                                and now - final_at > _FINAL_RESULT_GRACE_SECONDS
+                            ):
+                                abandoned.append("result_missing")
+                                break
+                            continue
+                        fut, next_msg = next_msg, None
+                        try:
+                            raw_data = fut.result()
+                        except StopAsyncIteration:
+                            break
+                        if run.interrupted_at is not None:
+                            was_interrupted = True
                         # Any traffic from the CLI — including a tool result
                         # after a long-running command — resets the watchdog.
                         last_activity = time.monotonic()
+                        # Cost per model call, read from the RAW event: the
+                        # SDK's AssistantMessage drops ``request_id`` (dv-d2f6).
+                        # Over the cap and asking for a tool = the turn would
+                        # spend more, so stop it; a final answer is let through.
+                        if (
+                            meter.observe(raw_data)
+                            and not budget_stopped
+                            and meter.over_cap
+                            and meter.wants_more
+                        ):
+                            budget_stopped = True
+                            logger.warning(
+                                "Per-request cost cap reached; interrupting",
+                                cap=max_budget_usd,
+                                spent=round(meter.total, 6),
+                                provider=route.provider,
+                                calls=len(meter.calls),
+                            )
+                            await self._interrupt_runs([run])
                         try:
                             message = parse_message(raw_data)
                         except MessageParseError as e:
@@ -1681,17 +1962,54 @@ class ClaudeSDKManager:
                         # unrecognized message types (forward compat)
                         if message is None:
                             continue
+                        # Partial-stream events forced on for the meter only
+                        # (third-party route, no streaming caller): the rest
+                        # of the loop sees what it saw before.
+                        if partial_for_meter_only and isinstance(message, StreamEvent):
+                            continue
 
                         messages.append(message)
 
                         if isinstance(message, ResultMessage):
                             break
 
-                        # Handle streaming callback
+                        # Track the model's final answer: afterwards only the
+                        # ResultMessage is expected (see _FINAL_RESULT_GRACE).
+                        if isinstance(message, AssistantMessage) and not getattr(
+                            message, "parent_tool_use_id", None
+                        ):
+                            blocks = message.content if message.content else []
+                            has_tool = any(isinstance(b, ToolUseBlock) for b in blocks)
+                            if getattr(message, "stop_reason", None) == "end_turn":
+                                final_at = None if has_tool else time.monotonic()
+                            elif has_tool:
+                                final_at = None
+                        elif final_at is not None:
+                            # Evidence for dv-586f: what does the CLI send
+                            # between the final answer and the result?
+                            kind = (
+                                f"{type(message).__name__}:"
+                                f"{getattr(message, 'subtype', '')}"
+                            )
+                            if kind not in post_final_seen and len(post_final_seen) < 8:
+                                post_final_seen.append(kind)
+                                logger.info(
+                                    "Message after final answer",
+                                    kind=kind,
+                                    secs_since_final=round(
+                                        time.monotonic() - final_at, 1
+                                    ),
+                                )
+
+                        # Handle streaming callback. Bounded: a hung Telegram
+                        # call must not stop us reading the ResultMessage.
                         if stream_callback:
                             try:
-                                await self._handle_stream_message(
-                                    message, stream_callback
+                                await asyncio.wait_for(
+                                    self._handle_stream_message(
+                                        message, stream_callback
+                                    ),
+                                    _STREAM_CALLBACK_TIMEOUT_SECONDS,
                                 )
                             except Exception as callback_error:
                                 logger.warning(
@@ -1700,7 +2018,13 @@ class ClaudeSDKManager:
                                     error_type=type(callback_error).__name__,
                                 )
                 finally:
-                    self._active_clients.discard(client)
+                    if next_msg is not None and not next_msg.done():
+                        next_msg.cancel()
+                    group = self._active_runs.get(run_key, [])
+                    if run in group:
+                        group.remove(run)
+                    if not group:
+                        self._active_runs.pop(run_key, None)
                     await client.disconnect()
 
             # Execute with an *idle* timeout, not a total-wall-clock one.
@@ -1713,11 +2037,20 @@ class ClaudeSDKManager:
             # answer did not). Wall-clock length is not evidence of a hang;
             # silence is. So the clock now restarts on every message from the
             # CLI, and only an actually stalled turn trips it.
+            idle_limit = self._idle_limit_seconds()
             await _await_with_idle_timeout(
                 asyncio.ensure_future(_run_client()),
                 lambda: last_activity,
-                self.config.claude_timeout_seconds,
+                idle_limit,
             )
+
+            if abandoned:
+                logger.warning(
+                    "Stopped waiting for the CLI result",
+                    reason=abandoned[0],
+                    user_id=user_id,
+                    profile=run_key[1],
+                )
 
             # Extract cost, tools, token usage, and session_id from result message
             cost = 0.0
@@ -1783,6 +2116,63 @@ class ClaudeSDKManager:
                         )
                         break
 
+            # dv-4517: total_cost_usd is the session's running total; record
+            # this turn's share (the one place; every reader sees the delta).
+            cli_total = cost
+            cost = self._session_costs.turn_cost(
+                cli_total,
+                resumed_from=session_id if (session_id and continue_session) else None,
+                final_session_id=claude_session_id,
+                fallback=cost_for(
+                    route,
+                    model=model,
+                    usage={
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_read_input_tokens": cache_read_tokens,
+                        "cache_creation_input_tokens": cache_creation_tokens,
+                    },
+                ),
+            )
+
+            # The CLI prices every model by its Anthropic table; for another
+            # provider's model the figure is wrong, so the meter's per-call sum
+            # is billed instead (OpenRouter's exact cost where already in, the
+            # conservative estimate otherwise; the settlement swaps the rest).
+            # No rule for the model -> None (unpriced), never a made-up number.
+            billed_cost: Optional[float] = cost
+            cost_source: Optional[str] = None
+            settlement = None
+            if route.is_third_party:
+                if meter.calls:
+                    billed_cost = meter.reported_cost()
+                    settlement = meter.settle()
+                else:
+                    billed_cost = cost_from_tokens(
+                        route.model,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cache_read_tokens=cache_read_tokens,
+                        cache_creation_tokens=cache_creation_tokens,
+                    )
+                cost_source = meter.source
+                logger.info(
+                    "Third-party turn cost",
+                    provider=route.provider,
+                    model=route.model,
+                    calls=len(meter.calls),
+                    cost=billed_cost,
+                    cost_source=cost_source,
+                    pending_lookups=len(meter.pending),
+                    cli_cost=cost,
+                )
+            if meter.missing_request_ids:
+                logger.warning(
+                    "Stream events without request_id; cost stays an estimate",
+                    missing=meter.missing_request_ids,
+                    calls=len(meter.calls),
+                )
+
             # Calculate duration
             duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
 
@@ -1825,6 +2215,9 @@ class ClaudeSDKManager:
             # the same expensive turn straight into the same wall and bill for
             # it twice. Those fall through to the stop-reason branch below.
             aborted = (result_subtype or "") in _ABORT_SUBTYPES
+            # A /stop must not be undone by the empty-result retry below.
+            if was_interrupted:
+                aborted = True
             if (
                 not _is_retry
                 and not aborted
@@ -1878,10 +2271,29 @@ class ClaudeSDKManager:
                     subtype=result_subtype,
                 )
 
+            if budget_stopped:
+                # Our cap, not a /stop: the same label the CLI's cap had.
+                stop_reason = "max_budget"
+                logger.warning(
+                    "Claude run stopped at the per-request cost cap",
+                    session_id=final_session_id,
+                    max_budget_usd=max_budget_usd,
+                    spent=round(meter.total, 6),
+                    provider=route.provider,
+                )
+            if was_interrupted and not stop_reason:
+                stop_reason = "interrupted"
+
             return ClaudeResponse(
                 content=content,
                 session_id=final_session_id,
-                cost=cost,
+                cost=billed_cost,
+                provider=route.provider,
+                model=route.model if route.is_third_party else None,
+                cost_source=cost_source,
+                cost_settlement=settlement,
+                api_calls=len(meter.calls),
+                request_ids_missing=meter.missing_request_ids,
                 duration_ms=duration_ms,
                 error_type=stop_reason,
                 num_turns=len(
@@ -1902,11 +2314,10 @@ class ClaudeSDKManager:
         except asyncio.TimeoutError:
             logger.error(
                 "Claude SDK command timed out",
-                idle_timeout_seconds=self.config.claude_timeout_seconds,
+                idle_timeout_seconds=self._idle_limit_seconds(),
             )
             raise ClaudeTimeoutError(
-                "Claude SDK produced no output for "
-                f"{self.config.claude_timeout_seconds}s"
+                "Claude SDK produced no output for " f"{self._idle_limit_seconds()}s"
             )
 
         except CLINotFoundError as e:

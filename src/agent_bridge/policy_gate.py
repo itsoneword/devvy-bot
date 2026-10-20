@@ -143,7 +143,9 @@ class PolicyGate:
     def turn_policy(self, ctx: TurnContext) -> policy.TurnPolicy:
         return self._resolver(ctx)
 
-    def take_approval(self, turn_key: str, tool_name: str, args: Dict[str, Any]) -> bool:
+    def take_approval(
+        self, turn_key: str, tool_name: str, args: Dict[str, Any]
+    ) -> bool:
         """Use up one owner approval for this exact call; False if none."""
         key = (turn_key, _call_key(tool_name, args))
         if self._approved.get(key, 0) <= 0:
@@ -175,7 +177,9 @@ def check_tool_call(
         )
         decision = policy.decide(tool_name, args, turn)
     except Exception as exc:
-        logger.warning("bridge policy check failed -> refused", tool=name, error=str(exc))
+        logger.warning(
+            "bridge policy check failed -> refused", tool=name, error=str(exc)
+        )
         return "the policy check failed"
     if decision.action == policy.ALLOW:
         return None
@@ -183,7 +187,9 @@ def check_tool_call(
         return decision.reason
     if gate is not None and gate.take_approval(turn_key, tool_name, args):
         return None
-    return f"{decision.reason}: needs the owner's approval, which this call does not have"
+    return (
+        f"{decision.reason}: needs the owner's approval, which this call does not have"
+    )
 
 
 def _deny(reason: str) -> Dict[str, str]:

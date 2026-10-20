@@ -19,9 +19,12 @@ its prompt, to write its findings to files incrementally.
 
 Usage:
   bgjob run "<prompt>" [--profile general] [--name research]
-  bgjob list
+  bgjob run --cmd "<shell command>" [--name N] [--cwd DIR]  (no model call)
+  bgjob run --task dv-xxxx "<short instruction>"   (job reads the ticket)
+  bgjob list [--compact] [--limit N]
   bgjob status <id>
-  bgjob output <id> [--tail N]
+  bgjob output <id> [--tail N | --full]   (default: summary.md)
+  bgjob summarize <id>
   bgjob cancel <id>
 """
 
@@ -42,10 +45,16 @@ REPO = Path(__file__).resolve().parent.parent
 JOBS_ROOT = Path(os.environ.get("BGJOB_ROOT", REPO.parent / "jobs"))
 PROFILES_YAML = REPO / "config" / "profiles.yaml"
 AGENTCTL = REPO / "scripts" / "agentctl"
+TASKPUMP = REPO / "scripts" / "taskpump"
+PREAMBLE = REPO / "templates" / "bgjob_preamble.md"
 
-# Host has ~3.8G RAM and has already had an OOM reboot from parallel claude
-# processes; the bot itself is capped at MemoryMax=2.5G. Keep detached jobs
-# well inside what is left.
+SUMMARY_LINES = 15
+SUMMARY_CHARS = 1500
+_SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.DOTALL)
+
+# Conservative defaults for small hosts (a 3.8G host once OOM-rebooted from
+# parallel claude processes). Bigger hosts raise them via BGJOB_MAX_CONCURRENT /
+# BGJOB_MEMORY_MAX in the environment of the bot and taskpump units.
 MAX_CONCURRENT = int(os.environ.get("BGJOB_MAX_CONCURRENT", "2"))
 JOB_MEMORY_MAX = os.environ.get("BGJOB_MEMORY_MAX", "1G")
 
@@ -102,6 +111,78 @@ def load_extra_dirs(slug: str) -> list:
     """The profile's ``extra_dirs`` (owner-only, dv-3103). A job runs with the
     owner's authority, so it may write where the profile's turns may."""
     return list(_registry().get(slug, {}).get("extra_dirs", []))
+
+
+def extract_summary(text: str) -> str:
+    """The job's `<summary>` block (the LAST one, so quoted examples earlier in
+    the answer lose), else the last SUMMARY_LINES lines. Always capped, so a
+    crashed job or one that ignored the contract still yields a summary."""
+    found = _SUMMARY_RE.findall(text)
+    if found:
+        body = found[-1].strip()
+        lines = body.splitlines()[:SUMMARY_LINES]
+        return "\n".join(lines)[:SUMMARY_CHARS]
+    lines = text.strip().splitlines()[-SUMMARY_LINES:]
+    if not lines:
+        return ""
+    return ("(no summary block; tail)\n" + "\n".join(lines))[:SUMMARY_CHARS]
+
+
+CMD_SUMMARY_LINES = 30
+_PYTEST_RE = re.compile(r"\d+ (passed|failed|error|skipped|deselected)")
+
+
+def cmd_oneline_text(text: str) -> str:
+    """One-line result of a plain-command job: pytest's passed/failed line when
+    there is one, else the last non-empty line."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        if _PYTEST_RE.search(ln):
+            return ln.strip("= ").strip()[:200]
+    return (lines[-1] if lines else "(no output)")[:200]
+
+
+def write_cmd_summary(job_id: str) -> str:
+    """summary.md of a --cmd job: exit code + the last ~30 output lines."""
+    d = job_dir(job_id)
+    try:
+        text = (d / "output.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    try:
+        rc = (d / "exit_code").read_text().strip()
+    except OSError:
+        rc = "?"
+    # Verdict first: readers (Jobs ping, reply context) show only the head, and
+    # a long warnings tail used to push pytest's result line out of view.
+    head = f"exit code: {rc} | {cmd_oneline_text(text)}\n"
+    tail = "\n".join(text.strip().splitlines()[-CMD_SUMMARY_LINES:])
+    tail = tail[-(SUMMARY_CHARS * 2 - len(head)) :]
+    summary = head + tail
+    (d / "summary.md").write_text(summary + "\n", encoding="utf-8")
+    return summary
+
+
+def write_summary(job_id: str) -> str:
+    d = job_dir(job_id)
+    if read_meta(job_id).get("cmd"):
+        return write_cmd_summary(job_id)
+    try:
+        text = (d / "output.md").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    summary = extract_summary(text)
+    if not summary:
+        err = ""
+        try:
+            err = "\n".join(
+                (d / "stderr.log").read_text(errors="replace").strip().splitlines()[-3:]
+            )
+        except OSError:
+            pass
+        summary = "(no output)" + (f"\n{err}" if err else "")
+    (d / "summary.md").write_text(summary + "\n", encoding="utf-8")
+    return summary
 
 
 def job_dir(job_id: str) -> Path:
@@ -234,9 +315,36 @@ def cmd_run(args: argparse.Namespace) -> int:
     if len(running) >= MAX_CONCURRENT:
         sys.exit(
             f"error: {len(running)} job(s) already running "
-            f"(cap {MAX_CONCURRENT}, host has ~3.8G RAM). "
+            f"(cap {MAX_CONCURRENT}, set by BGJOB_MAX_CONCURRENT). "
             f"Wait or `bgjob cancel {running[0]}`."
         )
+
+    quiet = getattr(args, "quiet", False)
+    command = getattr(args, "cmd", None)
+    if command and (args.prompt or getattr(args, "task", None)):
+        sys.exit("error: --cmd takes no prompt and no --task")
+    if not command and not args.prompt:
+        sys.exit("error: a prompt (or --cmd) is required")
+    task = getattr(args, "task", None)
+    ticket = ""
+    if task:
+        # One ticket reader: taskpump's. Unknown/ambiguous ids exit non-zero.
+        r = subprocess.run(
+            [str(TASKPUMP), "path", task], capture_output=True, text=True
+        )
+        ticket = r.stdout.strip()
+        if r.returncode != 0 or not ticket:
+            sys.exit(f"error: unknown task {task}: {r.stderr.strip()[:200]}")
+    if not quiet and not command:
+        parts = []
+        try:
+            parts.append(PREAMBLE.read_text(encoding="utf-8").strip())
+        except OSError:
+            pass  # a missing preamble must not stop a job
+        if ticket:
+            parts.append(f"Ticket: {ticket} — read it first, it is the spec.")
+        parts.append(args.prompt)
+        args.prompt = "\n\n".join(parts)
 
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     safe = re.sub(r"[^a-zA-Z0-9_-]+", "-", args.name).strip("-") or "job"
@@ -244,6 +352,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     d = job_dir(job_id)
     d.mkdir(parents=True, exist_ok=True)
 
+    if command:
+        args.prompt = command
+        (d / "cmd.txt").write_text(command, encoding="utf-8")
     (d / "prompt.txt").write_text(args.prompt, encoding="utf-8")
     output = d / "output.md"
     output.touch()
@@ -259,7 +370,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         "model": args.model,
         "prompt": args.prompt[:2000],
     }
+    if command:
+        meta["cmd"] = command[:2000]
+    if task:
+        meta["task"] = task
     (d / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    if command:
+        return _launch_cmd_job(args, job_id, d, cwd, unit, output, quiet)
 
     # The turn runs through the model router (scripts/agentjob, dv-ef90): same
     # tool-call policy as chat, asks go to the owner over the bot, and the call
@@ -311,6 +429,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # The ping must carry the ANSWER, not just say "there is a file". Tail
         # capped so _split_message doesn't chunk the notification; the header
         # above already names the full output path for the truncated case.
+        f'hdr="$msg"\n'
         f"out_bytes=$(wc -c < {str(output)!r} 2>/dev/null || echo 0)\n"
         f'if [ "$out_bytes" -gt 0 ]; then\n'
         # `tail -c` is a byte cut and can start mid-character; iconv -c drops
@@ -321,6 +440,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         f"\n"
         f'$body"\n'
         f"fi\n"
+        # summary.md (written by run.sh) beats the raw tail: the verdict is
+        # usually last, but a tail cuts mid-sentence. Tail stays the fallback.
+        f"if [ -s {str(d / 'summary.md')!r} ]; then\n"
+        f'  msg="$hdr\n\n$(cat {str(d / "summary.md")!r})"\n'
+        f"fi\n"
         # The bot may be down exactly when we finish -- a restart is the whole
         # reason this runner exists. A single fire-and-forget notify would be
         # swallowed by `|| true` and the user would never learn the job ended.
@@ -328,7 +452,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # still discoverable instead of silently lost.
         f"sent=0\n"
         f"for i in $(seq 1 30); do\n"
-        f'  if {str(AGENTCTL)!r} notify "$msg" >>{str(d / "notify.log")!r} 2>&1; then\n'
+        f'  if {str(AGENTCTL)!r} notify --source bgjob --markdown --ref job:{job_id} --profile {args.profile} "$msg" >>{str(d / "notify.log")!r} 2>&1; then\n'
         f"    sent=1; break\n"
         f"  fi\n"
         f"  sleep 10\n"
@@ -342,11 +466,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         f'if [ "$sent" = "1" ]; then\n'
         f"  {str(AGENTCTL)!r} prompt "
         f'"[Background job \\"{args.name}\\" (id: {job_id}) finished with '
-        f"exit code $rc. Read its output at {str(output)} (job_output tool "
-        f"or the file directly) and report the outcome to the user. The "
-        f"user already saw a raw tail of it -- give the digested result, "
+        f"exit code $rc. Read its summary at {str(d / 'summary.md')} (job_output "
+        f"tool returns it); the full output is at {str(output)} only if "
+        f"the summary is not enough. Report the outcome to the user. The "
+        f"user already saw the summary -- give the digested result, "
         f'not a re-dump.]" '
-        f"--profile {args.profile} --name job-finish "
+        f"--profile {args.profile} --name job-finish:{job_id} "
         f">>{str(d / 'notify.log')!r} 2>&1 || true\n"
         f"fi\n"
         # Retire/refresh the pinned status: this job is no longer running, and
@@ -377,11 +502,76 @@ def cmd_run(args: argparse.Namespace) -> int:
         # stdout is the answer; the runner's log lines go to their own file.
         f">> {str(output)!r} 2>> {str(d / 'stderr.log')!r}\n"
         "rc=$?\n"
-        f'echo "$rc" > {str(d / "exit_code")!r}\n' + notify_tail,
+        f'echo "$rc" > {str(d / "exit_code")!r}\n'
+        f"{shlex.quote(python_bin)} {str(Path(__file__).resolve())!r} "
+        f"summarize {shlex.quote(job_id)} >/dev/null 2>&1 || true\n" + notify_tail,
         encoding="utf-8",
     )
     runner.chmod(0o755)
 
+    return _start_unit(args, job_id, unit, runner, output, quiet)
+
+
+def _launch_cmd_job(
+    args: argparse.Namespace,
+    job_id: str,
+    d: Path,
+    cwd: str,
+    unit: str,
+    output: Path,
+    quiet: bool,
+) -> int:
+    """A plain-command job: same unit, job dir, limits and Telegram surface as an
+    agent job, but no model call. The caller (job_start tool / the owner's own
+    shell) has already judged the command; the job runs with that authority and
+    no extra bwrap, so poetry/pytest can use their caches."""
+    py = shlex.quote(sys.executable)
+    me = shlex.quote(str(Path(__file__).resolve()))
+    ref = f"job:{job_id}"
+    notify = ""
+    if not quiet:
+        notify = (
+            'if [ $rc -eq 0 ]; then icon="✅"; else icon="❌"; fi\n'
+            f"line=$({py} {me} oneline {shlex.quote(job_id)})\n"
+            'msg="$icon '
+            + f'{args.name}: $line"\n'
+            + "sent=0\n"
+            + "for i in $(seq 1 30); do\n"
+            + f"  if {str(AGENTCTL)!r} notify --source bgjob --ref {ref} "
+            + f'--profile {shlex.quote(args.profile)} "$msg" '
+            + f">>{str(d / 'notify.log')!r} 2>&1; then sent=1; break; fi\n"
+            + "  sleep 10\n"
+            + "done\n"
+            + f'if [ "$sent" != "1" ]; then echo "$msg" > '
+            + f"{str(d / 'PENDING_NOTIFY')!r}; fi\n"
+            + f"{me} pin --exclude {job_id} >/dev/null 2>&1 || true\n"
+        )
+    runner = d / "run.sh"
+    runner.write_text(
+        "#!/bin/bash\n"
+        'export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"\n'
+        f"cd {cwd!r} || exit 1\n"
+        f'/bin/bash -c "$(cat {str(d / "cmd.txt")!r})" '
+        f"> {str(output)!r} 2>&1 < /dev/null\n"
+        "rc=$?\n"
+        f'echo "$rc" > {str(d / "exit_code")!r}\n'
+        f"{py} {me} summarize {shlex.quote(job_id)} >/dev/null 2>&1 || true\n"
+        + notify,
+        encoding="utf-8",
+    )
+    runner.chmod(0o755)
+    return _start_unit(args, job_id, unit, runner, output, quiet)
+
+
+def _start_unit(
+    args: argparse.Namespace,
+    job_id: str,
+    unit: str,
+    runner: Path,
+    output: Path,
+    quiet: bool,
+) -> int:
+    """Start run.sh as a transient unit and announce it (agent and --cmd jobs)."""
     cmd = [
         "systemd-run",
         "--user",
@@ -404,11 +594,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     # cron) silently produced no start message at all -- which is exactly the
     # "did it actually start?" ambiguity this whole mechanism exists to kill.
     started_at = datetime.now(UTC).strftime("%H:%M UTC")
-    if not getattr(args, "quiet", False):
+    if not quiet:
         subprocess.run(
             [
                 str(AGENTCTL),
                 "notify",
+                "--source",
+                "bgjob",
+                "--ref",
+                f"job:{job_id}",
+                "--profile",
+                args.profile,
                 f'🚀 {args.profile} · job "{args.name}" started\n'
                 f"at {started_at}\nid: {job_id}",
             ],
@@ -416,7 +612,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             text=True,
         )
         subprocess.run(
-            [str(AGENTCTL), "notify", render_jobs_status(), "--pin-as", "jobs"],
+            [
+                str(AGENTCTL),
+                "notify",
+                render_jobs_status(),
+                "--source",
+                "bgjob:status",
+                "--pin-as",
+                "jobs",
+            ],
             capture_output=True,
             text=True,
         )
@@ -438,31 +642,43 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_list(_args: argparse.Namespace) -> int:
+def _job_state(jid: str, meta: dict) -> str:
+    unit = meta.get("unit", "")
+    if unit and unit_active(unit):
+        prog = job_progress(unit)
+        return f"RUNNING ({prog})" if prog else "RUNNING"
+    ec = job_dir(jid) / "exit_code"
+    rc = ec.read_text().strip() if ec.exists() else "?"
+    return "done" if rc == "0" else f"failed(rc={rc})"
+
+
+def cmd_list(args: argparse.Namespace) -> int:
     jobs = all_jobs()
     if not jobs:
         print("no jobs")
         return 0
-    for jid in jobs:
-        meta = read_meta(jid)
-        unit = meta.get("unit", "")
-        if unit and unit_active(unit):
-            prog = job_progress(unit)
-            state = f"RUNNING ({prog})" if prog else "RUNNING"
+    rows = [(jid, read_meta(jid)) for jid in jobs]
+    states = {jid: _job_state(jid, meta) for jid, meta in rows}
+    limit = getattr(args, "limit", None)
+    older = 0
+    if limit is not None:
+        # All RUNNING first, then the newest `limit` finished (newest first).
+        running = [r for r in rows if states[r[0]].startswith("RUNNING")]
+        done = [r for r in rows if not states[r[0]].startswith("RUNNING")]
+        older = max(0, len(done) - limit)
+        rows = running + done[:limit]
+    compact = getattr(args, "compact", False)
+    for jid, meta in rows:
+        out = job_dir(jid) / "output.md"
+        size = out.stat().st_size if out.exists() else 0
+        if compact:
+            task = f" {meta['task']}" if meta.get("task") else ""
+            print(f"{jid} {states[jid]} {size}B{task}")
         else:
-            rc = (
-                (job_dir(jid) / "exit_code").read_text().strip()
-                if (job_dir(jid) / "exit_code").exists()
-                else "?"
-            )
-            state = "done" if rc == "0" else f"failed(rc={rc})"
-        size = (
-            (job_dir(jid) / "output.md").stat().st_size
-            if (job_dir(jid) / "output.md").exists()
-            else 0
-        )
-        profile = meta.get("profile", "?")
-        print(f"{jid:<34} {state:<32} {size:>7}B  {profile}")
+            profile = meta.get("profile", "?")
+            print(f"{jid:<34} {states[jid]:<32} {size:>7}B  {profile}")
+    if older:
+        print(f"+{older} older finished (job_list all=true)")
     return 0
 
 
@@ -481,13 +697,50 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_summarize(args: argparse.Namespace) -> int:
+    write_summary(args.id)
+    return 0
+
+
+def cmd_oneline(args: argparse.Namespace) -> int:
+    try:
+        text = (job_dir(args.id) / "output.md").read_text(errors="replace")
+    except OSError:
+        text = ""
+    rc = ""
+    try:
+        rc = (job_dir(args.id) / "exit_code").read_text().strip()
+    except OSError:
+        pass
+    line = cmd_oneline_text(text)
+    print(line if rc in ("", "0") else f"rc={rc}: {line}")
+    return 0
+
+
 def cmd_output(args: argparse.Namespace) -> int:
-    p = job_dir(args.id) / "output.md"
+    d = job_dir(args.id)
+    p = d / "output.md"
     if not p.exists():
         sys.exit(f"error: no output for {args.id}")
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    for line in lines[-args.tail :] if args.tail else lines:
-        print(line)
+    if args.tail or args.full:
+        for line in lines[-args.tail :] if args.tail else lines:
+            print(line)
+        return 0
+    # Default: the short summary. A running job has no output yet (it is
+    # written once at the end), so say so instead of printing nothing.
+    if not (d / "exit_code").exists():
+        print(f"job {args.id} is still running; no output yet. "
+              "Use job_list / bgjob status.")
+        return 0
+    sf = d / "summary.md"
+    summary = (
+        sf.read_text(encoding="utf-8", errors="replace").strip()
+        if sf.exists()
+        else write_summary(args.id)  # job predates summaries
+    )
+    print(summary)
+    print(f"[summary; full output: {len(lines)} lines, call with full=true]")
     return 0
 
 
@@ -522,7 +775,7 @@ def render_jobs_status(exclude: str | None = None) -> str:
 
 def _push_pin(text: str) -> int:
     r = subprocess.run(
-        [str(AGENTCTL), "notify", text, "--pin-as", "jobs"],
+        [str(AGENTCTL), "notify", text, "--source", "bgjob:status", "--pin-as", "jobs"],
         capture_output=True,
         text=True,
     )
@@ -583,7 +836,7 @@ def cmd_flush(_args: argparse.Namespace) -> int:
         marker = job_dir(jid) / "PENDING_NOTIFY"
         msg = marker.read_text(encoding="utf-8").strip()
         r = subprocess.run(
-            [str(AGENTCTL), "notify", msg], capture_output=True, text=True
+            [str(AGENTCTL), "notify", "--source", "bgjob", "--markdown", msg], capture_output=True, text=True
         )
         if r.returncode == 0:
             marker.unlink()
@@ -611,7 +864,13 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("run", help="start a detached job")
-    p.add_argument("prompt")
+    p.add_argument("prompt", nargs="?", default=None)
+    p.add_argument(
+        "--cmd",
+        metavar="COMMAND",
+        help="run this shell command instead of a model turn (e.g. the full "
+        "test suite). Same unit/limits/Jobs ping; summary = exit code + tail.",
+    )
     p.add_argument("--profile", default="general")
     p.add_argument("--name", default="job")
     p.add_argument(
@@ -645,9 +904,22 @@ def main() -> int:
         "job that pings twice from two layers is worse than one that pings "
         "once from the layer that knows what the message should say.",
     )
+    p.add_argument(
+        "--task",
+        metavar="ID",
+        help="board ticket id (dv-xxxx); the job is told to read it itself. "
+        "Resolved by `taskpump path`.",
+    )
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("list", help="list jobs")
+    p.add_argument("--compact", action="store_true", help="one short line per job")
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="all RUNNING jobs plus the newest N finished",
+    )
     p.set_defaults(fn=cmd_list)
 
     p = sub.add_parser("status", help="show one job")
@@ -657,7 +929,16 @@ def main() -> int:
     p = sub.add_parser("output", help="print job output")
     p.add_argument("id")
     p.add_argument("--tail", type=int, default=0)
+    p.add_argument("--full", action="store_true", help="whole output, not summary")
     p.set_defaults(fn=cmd_output)
+
+    p = sub.add_parser("summarize", help="write summary.md for a finished job")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_summarize)
+
+    p = sub.add_parser("oneline", help="one-line result of a --cmd job")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_oneline)
 
     p = sub.add_parser("pin", help="refresh the pinned running-jobs status post")
     p.add_argument(

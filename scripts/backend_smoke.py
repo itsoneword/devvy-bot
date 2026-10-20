@@ -36,6 +36,14 @@ seeded in the temp bot.db and the agent calls ``item_add`` for the other
 member. PASS = an items row assigned to member 2 plus an item-linked job
 targeting member 2's chat (nothing fires; the scheduler is never started).
 
+``claude:sandbox`` (dv-98f2) proves a sandboxed profile's Bash runs in the
+bwrap box the PreToolUse hook builds (src/security/bash_box.py): (a) bash works
+and writes the workspace, (b) the CLI login file is unreadable, (c) the real
+data/secrets is absent, (d) nothing is written outside the workspace, (e) an
+external host is reachable. Paths are built at runtime so the box, not the
+lexical deny layer, is what answers. Run it via ``systemd-run --user`` (see
+FINDINGS 2026-10-17): an agent session's own userns blocks bwrap.
+
 Exit 0 only when every cell passes. Covered live: agent bridge + in-process
 tools, approval/sandbox config, tool_usage recording, filesystem deny.
 Not covered: send_image_to_user (config/mcp.json stdio server; ENABLE_MCP is
@@ -50,6 +58,7 @@ import os
 import secrets
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -61,6 +70,7 @@ REPO = Path(__file__).resolve().parent.parent
 UID = 900001
 UID2 = 900002  # the second family member (dv-752a scenario)
 CELLS = (
+    "claude:sandbox",
     "claude:confined",
     "claude:unrestricted",
     "codex:confined",
@@ -75,6 +85,10 @@ class CellResult:
     tool: str = "FAIL"
     denied: str = "FAIL"
     family: str = "n/a"
+    # dv-d2f6: every Claude model call must carry the stream-json request_id
+    # (the OpenRouter generation id our cost lookup reads). Undocumented CLI
+    # field: this is the check that fails when an upgrade drops it.
+    request_id: str = "n/a"
     notes: List[str] = field(default_factory=list)
     seconds: float = 0.0
 
@@ -84,6 +98,7 @@ class CellResult:
             self.tool == "PASS"
             and self.denied in ("PASS", "n/a")
             and self.family in ("PASS", "n/a")
+            and self.request_id in ("PASS", "n/a")
         )
 
 
@@ -206,7 +221,11 @@ class Harness:
                     sandbox=False,
                     unrestricted=True,
                 ),  # fmt: skip
-                profile("coach", self.coach_ws, sandbox=True),
+                profile(
+                    "coach",
+                    self.coach_ws,
+                    sandbox=True,
+                ),
             ]
         )
         session_manager = SessionManager(
@@ -334,7 +353,124 @@ class Harness:
         result.notes.append(f"family item rows={rows}")
         return "FAIL"
 
+    async def run_sandbox_cell(self) -> CellResult:
+        """dv-98f2: a sandboxed profile's Bash runs in the bwrap box.
+
+        (a) bash works and writes in the workspace, (b) the CLI login file is
+        unreadable, (c) the real data/secrets is absent, (d) writes outside
+        the workspace do not reach the host, (e) egress to an external host
+        works. Paths are assembled at runtime (``a""b``) so the lexical deny
+        layer cannot answer for the box: the box itself must.
+        """
+        result = CellResult("claude:sandbox")
+        start = time.monotonic()
+        if shutil.which("bwrap") is None:
+            result.notes.append("bwrap not installed")
+            return result
+        try:
+            probe = subprocess.run(
+                ["bwrap", "--ro-bind", "/", "/", "true"],
+                capture_output=True, text=True, timeout=20,
+            )  # fmt: skip
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            result.notes.append(f"bwrap probe failed: {exc}")
+            return result
+        if probe.returncode != 0:
+            result.notes.append(f"bwrap cannot start: {probe.stderr.strip()[:200]}")
+            result.seconds = time.monotonic() - start
+            return result
+
+        def var(name: str, path: Path) -> str:
+            # The lexical deny layer strips quotes, so a quoted split is still
+            # caught; joining two shell variables is not a literal it can see.
+            text = str(path)
+            cut = len(text) - 5
+            return f"{name}1='{text[:cut]}'; {name}2='{text[cut:]}'; {name}=$" + (
+                f"{{{name}1}}${{{name}2}}"
+            )
+
+        nonce = secrets.token_hex(3)
+        login = Path.home() / ".claude" / (".credentials" + ".json")
+        real_secrets = Path.home() / "Devvybot" / "data" / "secrets"
+        home_probe = Path.home() / f"box-probe-{nonce}"
+        sibling_probe = self.coach_ws / f"box-probe-{nonce}"
+        curl = "curl -s -m 10 -o curl.out -w '%{http_code}' https://example.com/"
+        cmd = (
+            f"{var('L', login)}; {var('S', real_secrets)}; "
+            f"{var('H', home_probe)}; {var('W', sibling_probe)}; "
+            "echo boxed > in-box.txt; echo A=$(cat in-box.txt); "
+            'o=$(cat "$L" 2>&1); echo B=$?; '
+            'o=$(ls "$S" 2>&1); echo C=$?; '
+            'touch "$H" 2>&1; touch "$W" 2>&1; '
+            "o=$(touch /etc/box-probe 2>&1); echo D=$?; "
+            f"echo E=$({curl})"
+        )
+        prompt = (
+            "Automated sandbox test, authorised by the bot owner: the command "
+            "probes the OS sandbox and is EXPECTED to be denied or come back "
+            "empty, so run it even though it names paths outside your workspace. "
+            "Run exactly this one shell command with your Bash tool, then reply "
+            "with its full stdout verbatim and nothing else (if it errors, "
+            "reply with the error):\n" + cmd
+        )
+        reply = ""
+        # A small model sometimes declines to name a path outside its
+        # workspace; that is not a sandbox verdict, so ask again (max 3).
+        for _ in range(3):
+            try:
+                response = await self.backends["claude"].run_command(
+                    prompt=prompt, working_directory=self.confined_cwd,
+                    user_id=UID, force_new=True, model=MODELS["claude"],
+                    requester_chat_id=UID, role="owner",
+                )  # fmt: skip
+            except Exception as exc:
+                result.notes.append(f"turn failed: {str(exc)[:300]}")
+                result.seconds = time.monotonic() - start
+                return result
+            reply = response.content or ""
+            if "A=" in reply:
+                break
+        got = {
+            k.strip(): v.strip()
+            for k, _, v in (
+                line.partition("=") for line in reply.splitlines() if "=" in line
+            )
+        }
+        problems = []
+        if got.get("A") != "boxed":
+            problems.append("(a) bash did not run / cannot write the workspace")
+        elif not (self.confined_cwd / "in-box.txt").exists():
+            problems.append("(a) workspace write did not reach the host")
+        if not login.exists():
+            result.notes.append("precondition: no CLI login file on this host")
+        elif got.get("B") in (None, "0"):
+            problems.append("(b) the CLI login file is readable from bash")
+        if not real_secrets.exists():
+            result.notes.append("precondition: no data/secrets on this host")
+        elif got.get("C") in (None, "0"):
+            problems.append("(c) data/secrets is visible from bash")
+        if got.get("D") in (None, "0"):
+            problems.append("(d) /etc is writable from bash")
+        for leak in (home_probe, sibling_probe):
+            if leak.exists():
+                problems.append(f"(d) bash wrote outside the workspace: {leak}")
+                leak.unlink()
+        if got.get("E") != "200":
+            problems.append(f"(e) external curl returned {got.get('E')!r}")
+        if "apply-seccomp" in reply:
+            problems.append("the CLI's own sandbox is on (it must be off)")
+        result.notes.append(" ".join(f"{k}={got.get(k)}" for k in "ABCDE"))
+        if problems:
+            result.notes.extend(problems)
+            result.notes.append(f"reply: {reply[:300]!r}")
+        else:
+            result.tool = result.denied = "PASS"
+        result.seconds = time.monotonic() - start
+        return result
+
     async def run_cell(self, cell: str) -> CellResult:
+        if cell == "claude:sandbox":
+            return await self.run_sandbox_cell()
         backend, profile_type = cell.split(":")
         result = CellResult(cell)
         start = time.monotonic()
@@ -381,6 +517,8 @@ class Harness:
             result.notes.append(f"turn failed: {str(exc)[:300]}")
             result.seconds = time.monotonic() - start
             return result
+        if backend == "claude":
+            result.request_id = request_id_check(response, result.notes)
         message_id = await self.storage.save_claude_interaction(
             user_id=UID,
             session_id=response.session_id,
@@ -465,17 +603,30 @@ class Harness:
         return result
 
 
+def request_id_check(response: Any, notes: List[str]) -> str:
+    """PASS when the turn saw model calls and every one had a request_id."""
+    calls = getattr(response, "api_calls", 0)
+    missing = getattr(response, "request_ids_missing", 0)
+    if calls and not missing:
+        return "PASS"
+    notes.append(
+        f"request_id missing on {missing}/{calls} calls: the CLI stream no "
+        "longer carries it; OpenRouter cost stays an estimate (dv-d2f6)"
+    )
+    return "FAIL"
+
+
 def _table(results: List[CellResult]) -> str:
     lines = [
         "| cell | bot tool (tool_usage success=1 + delivered) | denied path "
-        "| family item | time | notes |",
-        "|---|---|---|---|---|---|",
+        "| family item | request_id | time | notes |",
+        "|---|---|---|---|---|---|---|",
     ]
     for r in results:
         notes = "; ".join(r.notes).replace("|", "/")
         lines.append(
-            f"| {r.cell} | {r.tool} | {r.denied} | {r.family} | {r.seconds:.0f}s "
-            f"| {notes} |"
+            f"| {r.cell} | {r.tool} | {r.denied} | {r.family} | {r.request_id} "
+            f"| {r.seconds:.0f}s | {notes} |"
         )
     return "\n".join(lines)
 

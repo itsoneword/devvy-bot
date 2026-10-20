@@ -13,99 +13,18 @@ and test_window_transitions. This file covers:
 """
 
 import asyncio
-import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from src.bot.orchestrator import MessageOrchestrator
 from src.config import create_test_config
-from src.storage.database import DatabaseManager
-from src.storage.window_repository import WindowRepository
-
-
-class _Eval:
-    def __init__(self, result: bool = True):
-        self.calls = []
-        self._result = result
-
-    async def run(self, **kw):
-        self.calls.append(kw)
-        return self._result
-
-
-async def _make_repo() -> WindowRepository:
-    db = DatabaseManager(tempfile.mktemp(suffix=".db"))
-    await db.initialize()
-    return WindowRepository(
-        db, eval_interval_tokens=50_000, refresh_threshold_tokens=150_000
-    )
-
-
-async def _seed_conversation(repo, user_id: int, working_dir: str) -> None:
-    """One user + session + a couple of window-1 messages for tail/extraction."""
-    async with repo._db.get_connection() as conn:
-        await conn.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
-        await conn.execute(
-            "INSERT INTO sessions (session_id, user_id, project_path) "
-            "VALUES ('s', ?, ?)",
-            (user_id, working_dir),
-        )
-        await conn.execute(
-            "INSERT INTO messages (session_id,user_id,prompt,response,window_id) "
-            "VALUES ('s',?,'weather at caparica','san jose costa rica',1)",
-            (user_id,),
-        )
-        await conn.commit()
-
-
-def _mock_response(context_tokens: int = 5_000):
-    r = MagicMock()
-    r.session_id = "fresh-session-1"
-    r.content = "answer"
-    r.tools_used = []
-    r.input_tokens = 100
-    r.output_tokens = 50
-    r.context_tokens = context_tokens
-    r.cost = 0.0
-    r.error_type = None
-    return r
-
-
-def _harness(settings, repo, evaluator, run_command: AsyncMock):
-    """update/context pair wired like the live text pipeline."""
-    claude_integration = MagicMock()
-    claude_integration.run_command = run_command
-
-    storage = MagicMock()
-    storage.db_manager = repo._db
-    storage.memory_repository = None
-    storage.save_claude_interaction = AsyncMock(return_value=1)
-    storage.log_bot_event = AsyncMock()
-    storage.pending_notes.consume = AsyncMock(return_value=[])
-
-    update = MagicMock()
-    update.effective_user.id = 123
-    update.message.text = "so did you fix it?"
-    update.message.message_id = 1
-    update.message.reply_to_message = None
-    update.message.chat.type = "group"
-    update.message.chat.send_action = AsyncMock()
-    update.message.reply_text = AsyncMock()
-    progress_msg = AsyncMock()
-    update.message.reply_text.return_value = progress_msg
-
-    context = MagicMock()
-    context.user_data = {}
-    context.bot_data = {
-        "settings": settings,
-        "claude_integration": claude_integration,
-        "storage": storage,
-        "rate_limiter": None,
-        "audit_logger": None,
-        "window_repo": repo,
-        "evaluator_service": evaluator,
-    }
-    return update, context
+from tests.unit.window_harness import (
+    _Eval,
+    _harness,
+    _make_repo,
+    _mock_response,
+    _seed_conversation,
+)
 
 
 async def test_guard_runs_full_transition_and_seeds_same_turn(tmp_path):

@@ -122,6 +122,7 @@ class StreamingMixin(OrchestratorBase):
     def _start_typing_heartbeat(
         chat: Any,
         interval: float = 2.0,
+        message_thread_id: Optional[int] = None,
     ) -> "asyncio.Task[None]":
         """Start a background typing indicator task.
 
@@ -135,7 +136,12 @@ class StreamingMixin(OrchestratorBase):
                 while True:
                     await asyncio.sleep(interval)
                     try:
-                        await chat.send_action("typing")
+                        if message_thread_id is None:
+                            await chat.send_action("typing")
+                        else:
+                            await chat.send_action(
+                                "typing", message_thread_id=message_thread_id
+                            )
                     except Exception:
                         pass
             except asyncio.CancelledError:

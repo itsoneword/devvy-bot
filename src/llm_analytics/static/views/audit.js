@@ -128,6 +128,19 @@ export async function renderAudit(view, state) {
   // ------------------------------------------------------------------
   let chainsData = null;
 
+  // Date range of the chain view (default: last 7 days). Sent as since/until
+  // to /api/chains and /api/chains/detail, which filter server-side.
+  const PRESETS = [["24h", 1], ["7d", 7], ["30d", 30], ["all", 0]];
+  const isoDay = (d) => d.toISOString().slice(0, 10);
+  function chainRange() {
+    if (av.preset === "custom") return { since: av.from, until: av.to };
+    const days = (PRESETS.find((p) => p[0] === av.preset) || ["", 0])[1];
+    if (!days) return {};
+    // 24h = since this moment yesterday; days are whole UTC days otherwise
+    if (days === 1) return { since: new Date(Date.now() - 864e5).toISOString() };
+    return { since: isoDay(new Date(Date.now() - (days - 1) * 864e5)) };
+  }
+
   async function loadChains() {
     chainSection.textContent = "";
     chainSection.append(loadingState());
@@ -183,19 +196,55 @@ export async function renderAudit(view, state) {
     });
     selects.append(el("label", { text: "Chain:" }), userSel, dirSel);
     card.append(selects);
+    card.append(rangeBar(card));
     card.append(el("div", { class: "chain-body" }));
     chainSection.append(card);
     await loadChainDetail(card);
+  }
+
+  function rangeBar(card) {
+    const bar = el("div", { class: "chain-select" });
+    bar.append(el("label", { text: "Period:" }));
+    const fromIn = el("input", { type: "date", "aria-label": "From" });
+    const toIn = el("input", { type: "date", "aria-label": "To" });
+    const buttons = [];
+    const sync = () => {
+      for (const [b, name] of buttons) b.classList.toggle("active", av.preset === name);
+      const r = chainRange();
+      fromIn.value = av.preset === "custom" ? av.from : (r.since || "").slice(0, 10);
+      toIn.value = av.preset === "custom" ? av.to : "";
+    };
+    for (const [name] of PRESETS) {
+      const b = el("button", { class: "btn", type: "button", text: name });
+      b.addEventListener("click", () => { av.preset = name; sync(); loadChainDetail(card); });
+      buttons.push([b, name]);
+      bar.append(b);
+    }
+    const custom = () => {
+      av.preset = "custom"; av.from = fromIn.value; av.to = toIn.value;
+      sync(); loadChainDetail(card);
+    };
+    fromIn.addEventListener("change", custom);
+    toIn.addEventListener("change", custom);
+    bar.append(el("label", { text: "from" }), fromIn, el("label", { text: "to" }), toIn);
+    const reload = el("button", { class: "btn", type: "button", text: "↻ refresh", title: "Reload chain data (no auto-refresh here)" });
+    reload.addEventListener("click", () => loadChainDetail(card));
+    bar.append(reload);
+    sync();
+    return bar;
   }
 
   async function loadChainDetail(card) {
     const body = card.querySelector(".chain-body");
     body.textContent = "";
     body.append(loadingState());
-    const chain = chainsData.find((c) => c.user_id === av.user_id && c.working_dir === av.working_dir);
+    const range = chainRange();
+    let chain;
     let detail;
     try {
-      detail = await api.chainDetail({ user_id: av.user_id, working_dir: av.working_dir });
+      const ranged = (await api.chains(range)).chains || [];
+      chain = ranged.find((c) => c.user_id === av.user_id && c.working_dir === av.working_dir);
+      detail = await api.chainDetail({ user_id: av.user_id, working_dir: av.working_dir, ...range });
     } catch (e) {
       body.textContent = "";
       body.append(errorState("Failed to load chain detail: " + e.message));
@@ -224,7 +273,7 @@ export async function renderAudit(view, state) {
     const hasSessions = chain && (chain.sessions || []).length > 0;
 
     if (!series.length) {
-      body.append(emptyState("No indexed API calls for this chain (transcripts missing or never indexed)."));
+      body.append(emptyState("No indexed API calls for this chain in the selected period (or transcripts missing / never indexed)."));
       // still list the sessions — this is exactly when you want to inspect them
       if (hasSessions) body.append(chainSessionTable(chain));
       return;
@@ -261,7 +310,97 @@ export async function renderAudit(view, state) {
     body.append(box);
     drawChainChart(box, series, ann, chain);
 
+    body.append(growthSection(series));
+
     if (hasSessions) body.append(chainSessionTable(chain));
+  }
+
+  // "What grew the context" (dv-aeca): pick a window, see where its tokens
+  // went by category and by tool, plus the single largest items and every
+  // call's step. Measured per-step growth; only the split inside a step is
+  // estimated (by size), see src/llm_analytics/growth.py.
+  const CATEGORY_LABEL = {
+    base_system: "system prompt (persona, CLI)", base_tools: "tool schemas",
+    base_reminder: "CLAUDE.md / skills / env reminders", base_unknown: "system+tools (not logged)",
+    seed: "window seed", turn_prefix: "per-turn prefix (time, family)",
+    user_text: "user text", reminder: "harness reminders", tool_result: "tool results",
+    subagent_result: "sub-agent reports", tool_use: "tool call inputs",
+    assistant_text: "assistant text", thinking: "thinking (hidden)",
+    unattributed: "unattributed", context_shrink: "context shrank",
+  };
+
+  function growthSection(series) {
+    const wrap = el("div", { class: "chain-sessions" });
+    wrap.append(el("h3", { text: "What grew the context" }));
+    const windows = [...new Set(series.map((p) => p.window_id).filter((w) => w != null))].sort((a, b) => a - b);
+    if (!windows.length) {
+      wrap.append(emptyState("No window ids for this chain."));
+      return wrap;
+    }
+    const sel = el("select", { "aria-label": "Window" });
+    for (const w of windows) sel.append(el("option", { value: w, text: "window " + w }));
+    // keep the picked window across reloads; fall back to the newest
+    sel.value = String(windows.includes(av.window_id) ? av.window_id : windows[windows.length - 1]);
+    const out = el("div");
+    wrap.append(el("div", { class: "card-sub", text: "per window: tokens by category and tool (measured step growth, split by size inside a step)" }), sel, out);
+    const load = async () => {
+      out.textContent = "";
+      out.append(loadingState());
+      let data;
+      try {
+        data = await api.chainWindow({ user_id: av.user_id, working_dir: av.working_dir, window_id: sel.value });
+      } catch (e) {
+        out.textContent = "";
+        out.append(errorState("Failed to load window breakdown: " + e.message));
+        return;
+      }
+      out.textContent = "";
+      if (!data.indexed_sizes) {
+        out.append(el("div", { class: "banner" }, el("span", { class: "banner-icon", text: "!" }),
+          el("span", { text: "No size data for this window yet — its transcripts predate the re-index or are gone." })));
+      }
+      out.append(growthTables(data));
+    };
+    sel.addEventListener("change", () => { av.window_id = Number(sel.value); load(); });
+    load();
+    return wrap;
+  }
+
+  function sizeTable(headers, rows) {
+    const wrap = el("div", { class: "table-wrap" });
+    const table = el("table", { class: "data" });
+    table.append(el("thead", {}, el("tr", {}, ...headers.map((h, i) => el("th", { class: i ? "num" : "", text: h })))));
+    const tbody = el("tbody");
+    for (const r of rows) tbody.append(el("tr", {}, ...r.map((c, i) => el("td", { class: i ? "num" : "", text: String(c) }))));
+    table.append(tbody);
+    wrap.append(table);
+    return wrap;
+  }
+
+  function growthTables(data) {
+    const box = el("div");
+    const total = data.categories.reduce((a, c) => a + c.tokens, 0) || 1;
+    box.append(el("h4", { text: `${fmtCompact(total)} tokens over ${data.calls} calls` }));
+    box.append(sizeTable(["Category", "Tokens", "Share"],
+      data.categories.map((c) => [CATEGORY_LABEL[c.category] || c.category, fmtInt(c.tokens),
+        (100 * c.tokens / total).toFixed(1) + "%"])));
+    box.append(el("h4", { text: "Tool results by tool" }));
+    box.append(sizeTable(["Tool", "Calls", "Tokens", "p95", "max", "Chars"],
+      data.tools.map((t) => [t.name, t.calls, fmtInt(t.tokens), fmtInt(t.p95), fmtInt(t.max), fmtInt(t.chars)])));
+    box.append(el("h4", { text: "Largest single items" }));
+    box.append(sizeTable(["Item", "Call", "Time", "Tokens", "Chars"],
+      data.top_items.map((e) => [`${CATEGORY_LABEL[e.category] || e.category}: ${e.name}`, "#" + e.call,
+        fmtDateTime(e.ts), fmtInt(e.tokens), fmtInt(e.chars)])));
+    box.append(el("h4", { text: "Every step (context growth per call)" }));
+    const stepRows = data.steps.map((st, i) => {
+      const top = [...st.entries].sort((a, b) => b.tokens - a.tokens).slice(0, 3)
+        .map((e) => `${e.name} ${fmtCompact(e.tokens)}`).join(", ");
+      return ["#" + (i + 1) + " " + fmtDateTime(st.ts), st.delta == null ? "start" : "+" + fmtInt(st.delta), fmtInt(st.context), top];
+    });
+    const stepTable = sizeTable(["Call", "Growth", "Context", "Biggest pieces"], stepRows);
+    stepTable.querySelectorAll("td:last-child").forEach((td) => { td.classList.remove("num"); });
+    box.append(stepTable);
+    return box;
   }
 
   // Sessions of the selected chain, newest first — the chart bands are precise
@@ -460,6 +599,8 @@ export async function renderAudit(view, state) {
         ] : []),
         { line: CONTEXT_LINE.color, value: fmtCompact(p.context_provided), label: "context provided" },
         { line: COUNTER_LINE.color, value: fmtCompact(p.bot_counter_cum), label: "bot counter (cum)" },
+        ...(p.delta != null ? [{ label: "context growth since previous call", value: "+" + fmtInt(p.delta) }] : []),
+        ...(p.tools || []).map((t) => ({ label: "result: " + t[0] + " (" + fmtInt(t[1]) + " chars)", value: "~" + fmtCompact(t[2]) })),
         ...(p.first_of_session ? [{ label: "first call of session", value: "" }] : []),
         ...(p.cache_expiry ? [{ label: "cache expiry", value: "" }] : []),
         { label: "click to open this session", value: "" },
@@ -472,6 +613,9 @@ export async function renderAudit(view, state) {
   await Promise.all([loadReconciliation(), loadChains()]);
 
   return {
-    refresh: async () => { await Promise.all([loadReconciliation(), loadChains()]); },
+    // Poll refreshes only the reconciliation card: rebuilding the chain
+    // explorer reset the window pick and scroll every poll (owner, 17.10). The
+    // chain explorer reloads on its own ↻ button or a filter change.
+    refresh: async () => { await loadReconciliation(); },
   };
 }
