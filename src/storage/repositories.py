@@ -22,7 +22,6 @@ from .models import (
     MessageModel,
     ProjectThreadModel,
     SessionModel,
-    ToolUsageModel,
     UserModel,
 )
 
@@ -669,89 +668,6 @@ class MessageRepository:
         ]
 
 
-class ToolUsageRepository:
-    """Tool usage data access."""
-
-    def __init__(self, db_manager: DatabaseManager):
-        """Initialize repository."""
-        self.db = db_manager
-
-    async def save_tool_usage(self, tool_usage: ToolUsageModel) -> int:
-        """Save tool usage and return ID."""
-        async with self.db.get_connection() as conn:
-            tool_input_json = (
-                json.dumps(tool_usage.tool_input) if tool_usage.tool_input else None
-            )
-
-            cursor = await conn.execute(
-                """
-                INSERT INTO tool_usage
-                (session_id, message_id, tool_name, tool_input,
-                 timestamp, success, error_message)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    tool_usage.session_id,
-                    tool_usage.message_id,
-                    tool_usage.tool_name,
-                    tool_input_json,
-                    tool_usage.timestamp,
-                    tool_usage.success,
-                    tool_usage.error_message,
-                ),
-            )
-            await conn.commit()
-            return cursor.lastrowid
-
-    async def get_session_tool_usage(self, session_id: str) -> List[ToolUsageModel]:
-        """Get tool usage for session."""
-        async with self.db.get_connection() as conn:
-            cursor = await conn.execute(
-                """
-                SELECT * FROM tool_usage
-                WHERE session_id = ?
-                ORDER BY timestamp DESC
-            """,
-                (session_id,),
-            )
-            rows = await cursor.fetchall()
-            return [ToolUsageModel.from_row(row) for row in rows]
-
-    async def get_user_tool_usage(self, user_id: int) -> List[ToolUsageModel]:
-        """Get tool usage for user."""
-        async with self.db.get_connection() as conn:
-            cursor = await conn.execute(
-                """
-                SELECT tu.* FROM tool_usage tu
-                JOIN sessions s ON tu.session_id = s.session_id
-                WHERE s.user_id = ?
-                ORDER BY tu.timestamp DESC
-            """,
-                (user_id,),
-            )
-            rows = await cursor.fetchall()
-            return [ToolUsageModel.from_row(row) for row in rows]
-
-    async def get_tool_stats(self) -> List[Dict[str, any]]:
-        """Get tool usage statistics."""
-        async with self.db.get_connection() as conn:
-            cursor = await conn.execute(
-                """
-                SELECT
-                    tool_name,
-                    COUNT(*) as usage_count,
-                    COUNT(DISTINCT session_id) as sessions_used,
-                    SUM(CASE WHEN success = TRUE THEN 1 ELSE 0 END) as success_count,
-                    SUM(CASE WHEN success = FALSE THEN 1 ELSE 0 END) as error_count
-                FROM tool_usage
-                GROUP BY tool_name
-                ORDER BY usage_count DESC
-            """
-            )
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
-
-
 class AuditLogRepository:
     """Audit log data access."""
 
@@ -981,9 +897,9 @@ class AnalyticsRepository:
                 SELECT
                     tu.tool_name,
                     COUNT(*) as usage_count
-                FROM tool_usage tu
+                FROM tool_calls tu
                 JOIN sessions s ON tu.session_id = s.session_id
-                WHERE s.user_id = ?
+                WHERE s.user_id = ? AND tu.parent_tool_use_id IS NULL
                 GROUP BY tu.tool_name
                 ORDER BY usage_count DESC
                 LIMIT 10
@@ -1054,7 +970,8 @@ class AnalyticsRepository:
                     tool_name,
                     COUNT(*) as usage_count,
                     COUNT(DISTINCT session_id) as sessions_used
-                FROM tool_usage
+                FROM tool_calls
+                WHERE parent_tool_use_id IS NULL
                 GROUP BY tool_name
                 ORDER BY usage_count DESC
                 LIMIT 10

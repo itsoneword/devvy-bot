@@ -25,7 +25,7 @@ Task: **{{TASK_ID}} — {{TASK_TITLE}}**
 {{TASK_TEXT}}
 ```
 
-The full analysis is at `docs/research/{{TASK_ID}}/analysis.md` in this
+The full analysis is at `docs/research/{{TASK_DIR}}/analysis.md` in this
 worktree. Read it first: it names the files, functions and test files.
 
 {{PHASE}}

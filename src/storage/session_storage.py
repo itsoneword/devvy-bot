@@ -147,7 +147,7 @@ class SQLiteSessionStorage(SessionStorage):
                 total_cost=session_model.total_cost,
                 total_turns=session_model.total_turns,
                 message_count=session_model.message_count,
-                tools_used=[],  # Tools are tracked separately in tool_usage table
+                tools_used=[],  # Tools are tracked separately in tool_calls table
             )
 
             logger.debug(

@@ -179,7 +179,8 @@ def _fetch_context_turns(
 
 def _fetch_tool_calls(conn: sqlite3.Connection, message_id: int) -> list[str]:
     rows = conn.execute(
-        "SELECT DISTINCT tool_name FROM tool_usage WHERE message_id = ?", (message_id,)
+        "SELECT DISTINCT tool_name FROM tool_calls WHERE message_id = ?",
+        (message_id,),
     ).fetchall()
     return [row["tool_name"] for row in rows]
 

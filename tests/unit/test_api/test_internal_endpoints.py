@@ -73,6 +73,53 @@ class TestInternalNotify:
         assert bus.publish.call_args[0][0].parse_mode == "markdown"
 
 
+class TestInternalNotifyDeliver:
+    """dv-a9b0: `deliver` routes a card to the named profile's own chat
+    (AgentResponseEvent.deliver_profile, the job digest's route)."""
+
+    @staticmethod
+    def _client(bus):  # type: ignore[no-untyped-def]
+        registry = MagicMock()
+        registry.get_by_slug.side_effect = lambda slug: (
+            MagicMock(slug=slug) if slug in ("app", "keyed", "devops") else None
+        )
+        return TestClient(
+            create_api_app(bus, make_settings(), profile_registry=registry)
+        )
+
+    def test_deliver_sets_deliver_profile_for_a_known_profile(self) -> None:
+        bus = EventBus()
+        bus.publish = AsyncMock()  # type: ignore[method-assign]
+        r = self._client(bus).post(
+            "/internal/notify",
+            json={
+                "text": "q?",
+                "source": "taskpump:ask",
+                "ref": "pump:app:dv-1",
+                "profile": "app",
+                "deliver": True,
+            },
+            headers=AUTH,
+        )
+        assert r.status_code == 200
+        event = bus.publish.call_args[0][0]
+        assert event.deliver_profile == "app"
+        assert event.ledger_profile_slug == "app"
+        assert event.ledger_ref == "pump:app:dv-1"
+
+    def test_without_deliver_profile_only_tags_the_ledger(self) -> None:
+        bus = EventBus()
+        bus.publish = AsyncMock()  # type: ignore[method-assign]
+        self._client(bus).post(
+            "/internal/notify",
+            json={"text": "q?", "ref": "pump:dv-1", "profile": "devops"},
+            headers=AUTH,
+        )
+        event = bus.publish.call_args[0][0]
+        assert not event.deliver_profile
+        assert event.ledger_profile_slug == "devops"
+
+
 class TestInternalSchedule:
     def _client_with_scheduler(self, scheduler) -> TestClient:  # type: ignore[no-untyped-def]
         app = create_api_app(

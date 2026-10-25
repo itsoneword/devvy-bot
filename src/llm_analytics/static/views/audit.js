@@ -11,10 +11,6 @@ import {
 } from "../charts.js";
 
 const CONTEXT_LINE = { label: "context provided (real) — what rotation reads", color: "var(--s-cache-read)" };
-// The legacy flow counter: SUM(input + output), cache excluded. Under prompt
-// caching input_tokens is ~2/call, so this line barely moves — that is the
-// dv-9f31 defect, kept on the chart precisely so the gap stays visible.
-const COUNTER_LINE = { label: "bot counter (flow, cache-excluded)", color: "var(--s-cache-write)" };
 const SESSION_LINE = { label: "new session", color: "var(--ink-2)" };
 
 export async function renderAudit(view, state) {
@@ -280,14 +276,11 @@ export async function renderAudit(view, state) {
     }
 
     // rotation banner. Rotation reads the real context level (dv-9f31), so the
-    // threshold is quoted against the context peak; the flow counter is shown
-    // beside it only to expose how far it under-reads.
-    const counterPeak = Math.max(...series.map((p) => p.bot_counter_cum));
+    // threshold is quoted against the context peak. The legacy flow counter is
+    // no longer drawn: it confused readers and nothing decides on it (25.10).
     const contextPeak = Math.max(...series.map((p) => p.context_provided));
     const threshold = ann.refresh_threshold || 220000;
-    const counterNote = `context peak ${fmtCompact(contextPeak)} of ${fmtCompact(threshold)}` +
-      ` · flow counter peak ${fmtCompact(counterPeak)}` +
-      (ann.db_current_counter != null ? ` (bot.db counter now ${fmtCompact(ann.db_current_counter)})` : "");
+    const counterNote = `context peak ${fmtCompact(contextPeak)} of ${fmtCompact(threshold)}`;
     if (rotations === 0) {
       body.append(el("div", { class: "banner" },
         el("span", { class: "banner-icon", text: "!" }),
@@ -300,7 +293,6 @@ export async function renderAudit(view, state) {
 
     body.append(legend([
       { label: CONTEXT_LINE.label, color: CONTEXT_LINE.color, kind: "line" },
-      { label: COUNTER_LINE.label, color: COUNTER_LINE.color, kind: "line" },
       { label: SESSION_LINE.label, color: SESSION_LINE.color, kind: "line" },
       { label: "cache expiry", color: "var(--st-serious)", kind: "marker" },
       { label: "rotation", color: "var(--st-crit)", kind: "line" },
@@ -456,7 +448,7 @@ export async function renderAudit(view, state) {
     const n = series.length;
     const refresh = ann.refresh_threshold || 220000;
     let maxY = refresh * 1.08;
-    for (const p of series) maxY = Math.max(maxY, p.context_provided, p.bot_counter_cum);
+    for (const p of series) maxY = Math.max(maxY, p.context_provided);
     const x = linScale(0, Math.max(1, n - 1), pad.l, pad.l + plotW);
     const y = linScale(0, maxY, pad.t + plotH, pad.t);
 
@@ -543,11 +535,9 @@ export async function renderAudit(view, state) {
       }
     }
 
-    // step lines: real context (blue) vs replayed counter (orange)
+    // step line: real context provided per call
     const ctxPts = series.map((p, i) => [x(i), y(p.context_provided)]);
-    const cntPts = series.map((p, i) => [x(i), y(p.bot_counter_cum)]);
     node.append(svg("path", { d: stepPath(ctxPts), fill: "none", stroke: CONTEXT_LINE.color, "stroke-width": 2, "stroke-linejoin": "round", class: "no-hit" }));
-    node.append(svg("path", { d: stepPath(cntPts), fill: "none", stroke: COUNTER_LINE.color, "stroke-width": 2, "stroke-linejoin": "round", class: "no-hit" }));
 
     // cache-expiry markers on the context line (icon + tooltip, not color-alone)
     for (let i = 0; i < n; i++) {
@@ -598,7 +588,6 @@ export async function renderAudit(view, state) {
           { label: "bot msgs", value: fmtInt(info.message_count) },
         ] : []),
         { line: CONTEXT_LINE.color, value: fmtCompact(p.context_provided), label: "context provided" },
-        { line: COUNTER_LINE.color, value: fmtCompact(p.bot_counter_cum), label: "bot counter (cum)" },
         ...(p.delta != null ? [{ label: "context growth since previous call", value: "+" + fmtInt(p.delta) }] : []),
         ...(p.tools || []).map((t) => ({ label: "result: " + t[0] + " (" + fmtInt(t[1]) + " chars)", value: "~" + fmtCompact(t[2]) })),
         ...(p.first_of_session ? [{ label: "first call of session", value: "" }] : []),

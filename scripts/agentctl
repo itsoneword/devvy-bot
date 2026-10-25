@@ -95,6 +95,12 @@ def main() -> None:
                           help="tag the sent message so a reply maps back (job:<id>)")
     p_notify.add_argument("--profile", default=None,
                           help="profile that owns replies to this message")
+    p_notify.add_argument("--deliver", action="store_true",
+                          help="send to --profile's own chat (its topic, else DM)")
+    p_notify.add_argument("--image", action="append", default=[],
+                          help="image path to send after the text (repeatable)")
+    p_notify.add_argument("--images-from", default=None,
+                          help="file whose `image: <path>` lines are sent as --image")
     p_notify.add_argument("--pin-as", default=None,
                           help="maintain a single pinned status post under this key")
 
@@ -141,12 +147,23 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "notify":
+        images = list(args.image)
+        if args.images_from:
+            try:
+                for line in Path(args.images_from).read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines():
+                    if line.lower().startswith("image:") and line[6:].strip():
+                        images.append(line[6:].strip())
+            except OSError:
+                pass
         out = _request(
             "POST",
             "/internal/notify",
             {"text": args.text, "chat_id": args.chat_id, "pin_as": args.pin_as,
              "markdown": args.markdown, "source": args.source,
-             "ref": args.ref, "profile": args.profile},
+             "ref": args.ref, "profile": args.profile, "images": images[:10],
+             "deliver": args.deliver},
         )
     elif args.cmd == "prompt":
         out = _request(

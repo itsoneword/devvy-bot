@@ -119,6 +119,16 @@ class ImageHandler:
             "according to your role."
         )
 
+    def create_photo_prompt(self, caption: Optional[str]) -> str:
+        return self._create_generic_prompt(caption)
+
+    def create_album_prompt(self, count: int, caption: Optional[str]) -> str:
+        """Prompt for a Telegram album: the caption(s) first, then what was sent."""
+        sent = f"I'm sending you {count} photos in one message."
+        if caption:
+            return f"{caption}\n\n{sent}"
+        return f"{sent} No caption. Interpret and handle them according to your role."
+
     def supports_format(self, filename: str) -> bool:
         """Check if image format is supported"""
         if not filename:

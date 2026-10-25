@@ -27,6 +27,7 @@ PURPOSES = frozenset(
         "onboarding",
         "screen",
         "screen_extraction",
+        "ask_explain",
     }
 )
 

@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""trace — what a turn did: question, answer, tree of tool calls (dv-2260).
+
+  scripts/trace                  newest traced turn
+  scripts/trace <message_id>     a bot turn, by its messages row
+  scripts/trace call:<id>        any model call (bgjob, taskpump, ...)
+  scripts/trace last [N]         the N newest traced turns (ids to pick from)
+
+Read-only on bot.db. Needs the bot's poetry environment.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from src.model_router.trace_view import trace_report  # noqa: E402
+from src.storage.database import DatabaseManager  # noqa: E402
+from src.utils.paths import data_layout  # noqa: E402
+
+
+async def main(argv: list) -> None:
+    db = DatabaseManager(f"sqlite:///{data_layout().bot_db}")
+    print(await trace_report(db, " ".join(argv)))
+
+
+if __name__ == "__main__":
+    asyncio.run(main(sys.argv[1:]))

@@ -252,3 +252,125 @@ def test_notify_request_carries_ref_and_profile():
 
     n = NotifyRequest(text="x", ref=f"job:{JOB}", profile="devops")
     assert (n.ref, n.profile) == (f"job:{JOB}", "devops")
+
+
+# --- pump question cards (2026-10-20) ----------------------------------------
+
+
+def test_pump_envelope_names_task_and_answer_command():
+    from src.bot.orchestration.job_context import pump_envelope, pump_task_from_ref
+
+    assert pump_task_from_ref("pump:name:dv-1") == "name:dv-1"
+    assert pump_task_from_ref("job:x") is None
+    env = pump_envelope("name:dv-1")
+    # dv-a9b0: the card may sit in any board agent's chat, and sandboxed
+    # agents cannot run the script -> name the tools, not scripts/taskpump.
+    assert "pump_pending" in env and "pump_answer" in env
+    assert "name:dv-1" in env and "verbatim" in env
+    assert "scripts/taskpump" not in env and "in Pump" not in env
+
+
+async def test_reply_context_uses_pump_envelope():
+    quoted = SimpleNamespace(
+        text="🔍 dv-1 · t\n1. q?",
+        caption=None,
+        message_id=601,
+        chat=SimpleNamespace(id=GROUP, type="supergroup"),
+        from_user=SimpleNamespace(id=BOT_ID),
+    )
+    update = SimpleNamespace(message=SimpleNamespace(reply_to_message=quoted))
+    ledger = FakeLedger({(GROUP, 601): _entry("pump:dv-1")})
+    prompt, user_text = await build_reply_context(
+        update,
+        BOT_ID,
+        ledger,
+        "1 default",
+        viewer_user_id=OWNER,
+        viewer_is_owner=True,
+        reports_chat_id=GROUP,
+    )
+    assert user_text == "1 default"
+    assert "pump_answer" in prompt and "dv-1" in prompt
+    assert prompt.endswith("1 default")
+
+
+def test_reply_only_accepts_pump_ref():
+    from src.notifications import routing
+
+    assert "pump:" in routing.REPLY_REF_PREFIXES
+
+
+# --- pump cards in a board agent's own chat (dv-a9b0) --------------------------
+
+GYMBRO_THREAD = 41
+
+
+def _pump_quote(message_id, chat_id=GROUP, chat_type="supergroup"):
+    quoted = SimpleNamespace(
+        text="🔍 gymbro:dv-1 · t\n1. q?",
+        caption=None,
+        message_id=message_id,
+        chat=SimpleNamespace(id=chat_id, type=chat_type),
+        from_user=SimpleNamespace(id=BOT_ID),
+    )
+    return SimpleNamespace(message=SimpleNamespace(reply_to_message=quoted))
+
+
+async def test_reply_to_gymbro_card_runs_on_gymbro_with_pump_tools():
+    """Scenario 1, reply half: the owner replies to a pump card delivered to
+    the GymBro topic; the turn runs on gymbro and its envelope names the
+    pump tools for the task."""
+    repo = FakeRepo()
+    repo.rows[(GROUP, "reports:gymbro")] = SimpleNamespace(
+        message_thread_id=GYMBRO_THREAD, is_active=True
+    )
+    ledger = FakeLedger({(GROUP, 701): _entry("pump:gymbro:dv-1", "gymbro")})
+    router = ReportsRouter(
+        GROUP,
+        {},
+        repo,
+        [OWNER],
+        bindings={"GymBro": "gymbro", "Pump": "devops"},
+        inbound_policy="owner",
+        reply_only=["Pump"],
+        ledger=ledger,
+    )
+    m = _m(thread=GYMBRO_THREAD, reply_to=701, text="1 default, 2 да")
+    assert await router.profile_for_message(m) == "gymbro"
+
+    prompt, user_text = await build_reply_context(
+        _pump_quote(701),
+        BOT_ID,
+        ledger,
+        "1 default, 2 да",
+        current_agent_id="gymbro",
+        viewer_user_id=OWNER,
+        viewer_is_owner=True,
+        reports_chat_id=GROUP,
+    )
+    assert user_text == "1 default, 2 да"
+    assert "pump_pending" in prompt and "pump_answer" in prompt
+    assert "gymbro:dv-1" in prompt
+    assert "scripts/taskpump" not in prompt
+    assert prompt.endswith("1 default, 2 да")
+
+
+async def test_dm_fallback_pump_card_is_not_called_a_scheduled_reminder():
+    """No topic for the profile: the card lands in the owner DM, ledgered as
+    scheduled_reminder (so a reply reroutes to the profile). The envelope
+    must still be the pump one, not 'a scheduled reminder you composed'."""
+    entry = _entry("pump:gymbro:dv-1", "gymbro")
+    entry.kind = "scheduled_reminder"
+    ledger = FakeLedger({(OWNER, 702): entry})
+    prompt, _ = await build_reply_context(
+        _pump_quote(702, chat_id=OWNER, chat_type="private"),
+        BOT_ID,
+        ledger,
+        "go",
+        current_agent_id="gymbro",
+        viewer_user_id=OWNER,
+        viewer_is_owner=True,
+        reports_chat_id=GROUP,
+    )
+    assert "scheduled reminder" not in prompt
+    assert "pump_answer" in prompt and "gymbro:dv-1" in prompt

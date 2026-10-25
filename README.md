@@ -87,7 +87,7 @@ sequenceDiagram
     P-->>U: Approve / Deny button (ask only)
     R-->>O: streamed reply, tokens, cost
     O->>M: evaluator extracts facts (window roll, /new, "remember")
-    O-->>U: reply; one model_calls row written
+    O-->>U: reply, one model_calls row written
 ```
 
 ---
@@ -129,7 +129,9 @@ folders) and scaffolds the profile. See
   switches backend and model per user (Codex choices come from the account's live catalog).
 - `src/model_router/` is the single entry point: `run_turn` for an agent turn, `complete` for a
   plain prompt-in / text-out call. Each call writes one `model_calls` row (purpose, harness,
-  version, model, input / output / cache tokens, cost).
+  version, model, input / output / cache tokens, cost). The same pass records the turn's
+  tool calls (main agent and subagents) in `tool_calls`; the owner reads them with `/trace`
+  or `scripts/trace`.
 - Background jobs run `scripts/agentjob`, the same turn out of process, so they are recorded
   the same way.
 - `/usage` reads that ledger (`/limits` shows Codex account limits). Rolling-24h caps per owner and per guest use the
@@ -151,6 +153,10 @@ bridge. A rule added once holds on both backends.
 
 Before the agent runs: input validation, a token-bucket rate limiter and an audit log. Path
 policy is a denylist (default) or a single-directory allowlist (`APPROVED_DIRECTORY`).
+
+The **Confirm risky action** card also carries an independent plain-language explanation of
+the command and a verdict from a cheap model that never sees the agent's reasoning. It is
+advisory: only your tap approves.
 
 **Self-modification tiers** (`src/bot/features/self_modify.py`): Tier 0 files outside the bot
 are ungated; Tier 1 data / config is freely editable; Tier 2 source and dependencies need
@@ -209,7 +215,11 @@ grep or version them by hand.
 `scripts/taskpump` works the board unattended: a task you move to `in_progress`
 is analysed, you get a short plan and up to three questions in Telegram, your
 answer arrives as an ordinary chat message, then it designs tests and implements
-on a `pump/<id>` branch in a git worktree. Merging stays yours. It is off until
+on a `pump/<id>` branch in a git worktree. Separate **architect** (checks the plan),
+**review** (can send a build back once) and **acceptance** (runs the product) jobs
+bracket the build, and small tasks skip what they do not need. `deps:` and `start_at:`
+in a task's frontmatter hold its launch, and a pinned status post shows what runs, what
+needs you and what waits. Merging stays yours. It is off until
 you enable the timer (`deploy/taskpump.timer.template`, rendered by
 `scripts/render_deploy.py`); other repos' boards are listed in your own
 `config/taskpump/boards.json` (see `boards.example.json`). Details:
@@ -373,7 +383,7 @@ Bot: ✏️ Edit: http_client.py
 ```
 
 Commands, in the Telegram menu: `/start`, `/new`, `/agents`, `/stop`, `/resume`, `/restart`,
-`/help`, `/status`, `/usage`, `/model`, `/tasks`.
+`/help`, `/status`, `/usage`, `/model`, `/tasks`. Owner-only `/trace` shows what a turn did.
 
 Registered but unlisted — type them and they work: `/auth`, `/verbose`, `/memory`, `/repo`,
 `/servercheck`, `/schedules`, `/sessions`, `/adduser`, `/rmuser`, `/family`, `/diag`,

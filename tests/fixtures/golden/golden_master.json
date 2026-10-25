@@ -654,16 +654,26 @@
         "user_id": 1001
       }
     ],
-    "dump.tool_usage": [
+    "dump.tool_calls": [
       {
-        "error_message": null,
+        "detached": 0,
+        "duration_ms": null,
+        "error": null,
         "id": "<id>",
+        "input_short": "{\"command\": \"ls\"}",
         "message_id": "<id>",
+        "model_call_id": null,
+        "ok": 1,
+        "parent_tool_use_id": null,
+        "result_bytes": null,
+        "result_preview": null,
+        "seq": 1,
         "session_id": "sess-1",
-        "success": 1,
-        "timestamp": "<ts>",
-        "tool_input": "{\"command\": \"ls\"}",
-        "tool_name": "Bash"
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "subagent_type": null,
+        "tool_name": "Bash",
+        "tool_use_id": "u1",
+        "trace_id": "golden-trace"
       }
     ],
     "dump.user_holds": [
@@ -833,16 +843,26 @@
         "total_turns": 1,
         "user_id": 1001
       },
-      "tool_usage": [
+      "tool_calls": [
         {
-          "error_message": null,
+          "detached": 0,
+          "duration_ms": null,
+          "error": null,
           "id": "<id>",
+          "input_short": "{\"command\": \"ls\"}",
           "message_id": "<id>",
+          "model_call_id": null,
+          "ok": 1,
+          "parent_tool_use_id": null,
+          "result_bytes": null,
+          "result_preview": null,
+          "seq": 1,
           "session_id": "sess-1",
-          "success": 1,
-          "timestamp": "<ts>",
-          "tool_input": "{\"command\": \"ls\"}",
-          "tool_name": "Bash"
+          "started_at": "2026-01-01T00:00:00+00:00",
+          "subagent_type": null,
+          "tool_name": "Bash",
+          "tool_use_id": "u1",
+          "trace_id": "golden-trace"
         }
       ]
     },

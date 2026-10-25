@@ -121,6 +121,10 @@ class ProfileDefinition:
     # Mounted read-only into the bash box (src/security/bash_box.py). Owner-only
     # profiles only, like extra_dirs.
     sandbox_read_dirs: Tuple[Path, ...] = ()
+    # Key-store services (`/setkey <service> ...`) put into a *sandboxed*
+    # profile's bash environment by the box launcher, values redacted from
+    # output (dv-0277, src/security/bash_box.py). Owner-only profiles only.
+    sandbox_keys: Tuple[str, ...] = ()
     # Outbound hosts a *sandboxed* profile's bash is meant to reach (dv-98f2).
     # NOT ENFORCED: the box shares the host network (no egress proxy yet), so
     # bash can reach any host. Kept so the list is ready for the proxy task.
@@ -757,6 +761,12 @@ def load_profile_registry(
                 f"Profile '{slug}': sandbox_read_dirs is not allowed on a"
                 " guest-allowed profile"
             )
+        sandbox_keys = _parse_sandbox_keys(item, slug)
+        if sandbox_keys and "guest" in allowed_roles:
+            raise ValueError(
+                f"Profile '{slug}': sandbox_keys is not allowed on a"
+                " guest-allowed profile"
+            )
         allowed_domains = _parse_allowed_domains(item, slug)
         if allowed_domains and "guest" in allowed_roles:
             raise ValueError(
@@ -869,6 +879,7 @@ def load_profile_registry(
             exchange=exchange,
             extra_dirs=extra_dirs,
             sandbox_read_dirs=read_dirs,
+            sandbox_keys=sandbox_keys,
             sandbox_allowed_domains=allowed_domains,
             enabled=enabled,
             unrestricted=unrestricted,
@@ -923,6 +934,24 @@ def _parse_allowed_domains(item: Dict[str, Any], slug: str) -> Tuple[str, ...]:
         if host not in out:
             out.append(host)
     return tuple(out)
+
+
+def _parse_sandbox_keys(item: Dict[str, Any], slug: str) -> Tuple[str, ...]:
+    """Parse `sandbox_keys: [service, ...]` (key-store service names)."""
+    raw = item.get("sandbox_keys")
+    if raw is None:
+        return ()
+    import re
+
+    pattern = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")  # keystore.SERVICE_RE
+    if not isinstance(raw, list) or not all(
+        isinstance(x, str) and pattern.match(x) for x in raw
+    ):
+        raise ValueError(
+            f"Profile '{slug}': sandbox_keys must be a list of key-store"
+            " service names (lowercase, digits, - or _)"
+        )
+    return tuple(dict.fromkeys(raw))
 
 
 def _parse_extra_dirs(

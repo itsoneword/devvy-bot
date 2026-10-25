@@ -70,7 +70,18 @@ PLATFORM_TOOLS = frozenset(
         "get_weather",
     }
 )
-JOB_TOOLS = frozenset({"job_start", "job_list", "job_output", "jobs_refresh_pin"})
+JOB_TOOLS = frozenset(
+    {
+        "job_start",
+        "job_list",
+        "job_output",
+        "jobs_refresh_pin",
+        # dv-a9b0: the board agent's pump tools, owner-only like jobs.
+        "pump_status",
+        "pump_pending",
+        "pump_answer",
+    }
+)
 
 
 def _profile(slug: str, groups: frozenset) -> ProfileDefinition:

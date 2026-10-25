@@ -17,7 +17,11 @@ This file is the one place for the *ask* rules, for every backend: the Claude
 PreToolUse hook and the Codex PreToolUse hook both reach it through
 ``src/security/policy.py`` (dv-1601). Three kinds of rule:
 
-* regexes over the whole command string (``_BASH_RULES``);
+* regexes over the command string: ``_BASH_RULES`` match commands, so they
+  skip text inside quotes and heredocs unless that text is itself a command
+  line (``sh -c 'kill 1'``, ``watch 'pkill x'``, ``"$(pkill x)"``) -- see
+  ``_command_rule_reason`` (dv-af70); ``_LITERAL_RULES`` (SQL, fork bomb)
+  match the raw text, because SQL lives in literals;
 * the exchange-tool execution gate (``_money_script_reason``, dv-8664):
   confirm-by-default for any node/npm execution inside an
   ``EXCHANGE_TOOL_DIRS`` tree, except ``READ_ONLY_SCRIPT_NAMES``;
@@ -98,13 +102,13 @@ _SYSTEM_PREFIXES = (
 )
 
 # (compiled pattern, human reason). Order doesn't matter; first match wins.
+# Matched against commands, not literal text (``_command_rule_reason``).
 _BASH_RULES: List[Tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bdd\b[^|]*\bof="), "raw disk write (dd)"),
     (re.compile(r"\bmkfs\b"), "filesystem format (mkfs)"),
     (re.compile(r"\bshred\b"), "secure file wipe (shred)"),
     (re.compile(r"\btruncate\b"), "file truncation (truncate)"),
     (re.compile(r"\bwipefs\b"), "filesystem signature wipe (wipefs)"),
-    (re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"), "fork bomb"),
     (re.compile(r"\bgit\s+push\b[^\n]*\s(--force|-f)\b"), "force git push"),
     (re.compile(r"\bgit\s+reset\s+--hard\b"), "git reset --hard"),
     (
@@ -122,15 +126,24 @@ _BASH_RULES: List[Tuple[re.Pattern[str], str]] = [
         re.compile(r"\bdocker\b[^\n]*\b(rm|rmi|prune)\b"),
         "docker resource removal (docker rm/prune)",
     ),
+    (re.compile(r"\bmv\s+[^\n]+\s+/dev/null\b"), "move to /dev/null (data loss)"),
+]
+
+# Matched against the raw text, quotes and all: the SQL is *in* a literal
+# (`sqlite3 db "DROP TABLE x"`), and the fork bomb is punctuation the segment
+# split would break apart.
+_LITERAL_RULES: List[Tuple[re.Pattern[str], str]] = [
+    (re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"), "fork bomb"),
     (
         re.compile(r"\b(drop\s+(table|database)|truncate\s+table)\b", re.IGNORECASE),
         "destructive SQL (DROP/TRUNCATE)",
     ),
-    (re.compile(r"\bmv\s+[^\n]+\s+/dev/null\b"), "move to /dev/null (data loss)"),
 ]
 
-# A redirect ( > or >> ) whose target lands under a system prefix.
-_REDIRECT_RE = re.compile(r">>?\s*(?P<path>/[^\s;&|]+)")
+# A redirect ( > or >> ) whose target lands under a system prefix. The path
+# stops at `)` / backtick / quote: `$(ls x 2>/dev/null)` targets /dev/null,
+# not "/dev/null)" (dv-af70).
+_REDIRECT_RE = re.compile(r">>?\s*(?P<path>/[^\s;&|()`'\"]+)")
 
 # Redirecting a stream *into* these is never destructive: there's no real data
 # there to damage (unlike e.g. /dev/sda, an actual device backing store).
@@ -259,6 +272,137 @@ def _commands(command: str, depth: int = 0) -> List[List[str]]:
                     found.extend(_commands(argv[idx + 1], depth + 1))
                     break
     return found
+
+
+# -- command rules vs. literal text (dv-af70) --------------------------------
+#
+# `kill` inside `python3 -c "... LIKE '%kill %'"` is SQL, not a command, yet
+# the old whole-text regex asked on it. Command rules now see the line with
+# every quoted string and heredoc body blanked; each blanked body is then
+# checked as a command line of its own -- a rule must match at the *start* of
+# one of its simple commands (after wrappers, `xargs`, a path prefix). That
+# keeps `bash -c 'kill 1'`, `su -c 'kill 1'`, `watch 'pkill x'`,
+# `find -exec sh -c 'kill ...'`, `"$(pkill x)"`, `bash <<EOF` and even
+# `os.system('kill 1')` asking, while `LIKE '%kill %'` and
+# `git commit -m "fix: kill stale lock"` do not. A literal that *starts* with
+# a command word still asks (`LIKE 'kill%'`): fail-safe direction.
+
+_HEREDOC = re.compile(r"<<(-?)[ \t]*(\\?)(['\"]?)([A-Za-z_][A-Za-z0-9_-]*)\3")
+
+
+def _mask_literals(command: str) -> Tuple[str, List[str]]:
+    """``(command with literal contents blanked, the literal bodies)``.
+
+    Blanks the inside of '...', "..." and heredoc bodies (newlines kept, so
+    line-bound rules still see lines). Double-quoted bodies come back with
+    their backslash escapes undone. An unterminated quote masks nothing:
+    the rules then see the raw text, as before (fail-safe).
+    """
+    out: List[str] = []
+    bodies: List[str] = []
+    heredocs: List[Tuple[str, bool]] = []
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(command[i : i + 2])
+            i += 2
+        elif ch == "'":
+            ansi = i > 0 and command[i - 1] == "$"
+            j = i + 1
+            while j < n and command[j] != "'":
+                j += 2 if ansi and command[j] == "\\" else 1
+            if j >= n:
+                return command, []
+            bodies.append(command[i + 1 : j])
+            out.append("'" + _blank(command[i + 1 : j]) + "'")
+            i = j + 1
+        elif ch == '"':
+            j = i + 1
+            body: List[str] = []
+            while j < n and command[j] != '"':
+                if command[j] == "\\" and j + 1 < n:
+                    nxt = command[j + 1]
+                    if nxt in '$`"\\\n':
+                        body.append(nxt)
+                    else:
+                        body.append(command[j : j + 2])
+                    j += 2
+                else:
+                    body.append(command[j])
+                    j += 1
+            if j >= n:
+                return command, []
+            bodies.append("".join(body))
+            out.append('"' + _blank(command[i + 1 : j]) + '"')
+            i = j + 1
+        elif (
+            ch == "<"
+            and command.startswith("<<", i)
+            and not command.startswith("<<<", i)
+        ):
+            m = _HEREDOC.match(command, i)
+            if not m:
+                out.append(ch)
+                i += 1
+                continue
+            heredocs.append((m.group(4), m.group(1) == "-"))
+            out.append(m.group(0))
+            i = m.end()
+        elif ch == "\n" and heredocs:
+            out.append(ch)
+            i += 1
+            for delimiter, strip_tabs in heredocs:
+                lines: List[str] = []
+                while i < n:
+                    end = command.find("\n", i)
+                    end = n if end < 0 else end
+                    line = command[i:end]
+                    i = min(end + 1, n)
+                    if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                        out.append(line + ("\n" if end < n else ""))
+                        break
+                    lines.append(line)
+                    out.append(_blank(line) + ("\n" if end < n else ""))
+                bodies.append("\n".join(lines))
+            heredocs = []
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out), bodies
+
+
+def _blank(text: str) -> str:
+    return re.sub(r"[^\n]", " ", text)
+
+
+def _command_rule_reason(command: str, depth: int = 0) -> Optional[str]:
+    """First ``_BASH_RULES`` hit on a command (not on literal text) in *command*.
+
+    At the top level a rule may match anywhere in the masked line (as before
+    dv-af70, minus the literals); inside a literal it must match at the start
+    of a simple command, since a literal is usually data.
+    """
+    masked, bodies = _mask_literals(command)
+    if depth == 0:
+        for pattern, reason in _BASH_RULES:
+            if pattern.search(masked):
+                return reason
+    else:
+        for segment in _segments(masked):
+            argv = _argv(segment)
+            if not argv:
+                continue
+            line = " ".join([os.path.basename(argv[0]), *argv[1:]])
+            for pattern, reason in _BASH_RULES:
+                if pattern.match(line):
+                    return reason
+    if depth < _MAX_NESTING:
+        for body in bodies:
+            hit = _command_rule_reason(body, depth + 1)
+            if hit:
+                return hit
+    return None
 
 
 # -- exchange-tool execution gate (dv-8664) ----------------------------------
@@ -523,7 +667,10 @@ def classify(
     """Return a reason string if the op needs confirmation, else None."""
     if tool_name in _BASH_TOOLS:
         command = tool_input.get("command", "") or ""
-        for pattern, reason in _BASH_RULES:
+        rule_reason = _command_rule_reason(command)
+        if rule_reason:
+            return rule_reason
+        for pattern, reason in _LITERAL_RULES:
             if pattern.search(command):
                 return reason
         money_reason = _money_script_reason(command)

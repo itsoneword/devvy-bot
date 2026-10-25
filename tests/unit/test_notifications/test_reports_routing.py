@@ -117,7 +117,7 @@ async def test_topic_created_once_and_persisted(bot: AsyncMock) -> None:
 
 
 @pytest.mark.parametrize(
-    "source", ["taskpump:ask", "reminder", "item", "family", "agent", "unknown"]
+    "source", ["reminder", "item", "family", "agent", "unknown"]
 )
 async def test_answer_needed_and_unmapped_stay_in_dm(
     bot: AsyncMock, source: str
@@ -125,6 +125,12 @@ async def test_answer_needed_and_unmapped_stay_in_dm(
     await deliver(make_service(bot), source)
     assert bot.send_message.call_args.kwargs["chat_id"] == OWNER
     bot.create_forum_topic.assert_not_called()
+
+
+async def test_taskpump_ask_goes_to_pump_topic(bot: AsyncMock) -> None:
+    await deliver(make_service(bot), "taskpump:ask")
+    assert bot.send_message.call_args.kwargs["chat_id"] == REPORTS
+    assert bot.create_forum_topic.call_args.kwargs["name"] == "Pump"
 
 
 async def test_ledgered_reminder_and_other_chats_stay_in_dm(bot: AsyncMock) -> None:
@@ -183,6 +189,65 @@ async def test_pinned_status_posts_inside_topic(bot: AsyncMock) -> None:
     kw = bot.send_message.call_args.kwargs
     assert kw["chat_id"] == REPORTS and "message_thread_id" in kw
     bot.pin_chat_message.assert_awaited_once()
+
+
+
+async def test_first_pump_pin_unpins_old_topic_pins_then_edits_in_place(
+    bot: AsyncMock,
+) -> None:
+    """dv-3d3d: the stray 15.10 pin in the Pump topic goes when ours is made."""
+    bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(chat=SimpleNamespace(id=REPORTS), message_id=7)
+    )
+    svc = make_service(bot)
+    await deliver(svc, "taskpump:status", pin_as="pump")
+
+    thread = bot.send_message.call_args.kwargs["message_thread_id"]
+    bot.unpin_all_forum_topic_messages.assert_awaited_once()
+    ukw = bot.unpin_all_forum_topic_messages.call_args.kwargs
+    assert ukw["chat_id"] == REPORTS and ukw["message_thread_id"] == thread
+    names = [c[0] for c in bot.mock_calls]
+    assert names.index("unpin_all_forum_topic_messages") < names.index(
+        "pin_chat_message"
+    )
+
+    # Next tick: same message edited in place, nothing re-posted or re-cleared.
+    await deliver(svc, "taskpump:status", pin_as="pump")
+    assert bot.send_message.await_count == 1
+    bot.edit_message_text.assert_awaited_once()
+    assert bot.edit_message_text.call_args.kwargs["message_id"] == 7
+    bot.unpin_all_forum_topic_messages.assert_awaited_once()
+
+
+async def test_transient_pin_edit_error_does_not_post_a_second_pin(
+    bot: AsyncMock,
+) -> None:
+    """dv-3d3d: only a vanished message is re-created; a hiccup waits a tick."""
+    bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(chat=SimpleNamespace(id=REPORTS), message_id=7)
+    )
+    svc = make_service(bot)
+    await deliver(svc, "taskpump:status", pin_as="pump")
+    bot.edit_message_text = AsyncMock(side_effect=TelegramError("Bad Gateway"))
+
+    await deliver(svc, "taskpump:status", pin_as="pump")
+
+    assert bot.send_message.await_count == 1
+    assert bot.pin_chat_message.await_count == 1
+    assert svc._pinned_messages == {(REPORTS, "pump"): 7}
+
+    # A really deleted message is re-created, and the old id unpinned first.
+    bot.edit_message_text = AsyncMock(
+        side_effect=BadRequest("Message to edit not found")
+    )
+    bot.send_message = AsyncMock(
+        return_value=SimpleNamespace(chat=SimpleNamespace(id=REPORTS), message_id=8)
+    )
+    await deliver(svc, "taskpump:status", pin_as="pump")
+    assert bot.send_message.await_count == 1
+    assert svc._pinned_messages == {(REPORTS, "pump"): 8}
+    unpinned = [c.kwargs.get("message_id") for c in bot.unpin_chat_message.call_args_list]
+    assert 7 in unpinned
 
 
 def test_routes_setting_parses_pairs_and_json() -> None:

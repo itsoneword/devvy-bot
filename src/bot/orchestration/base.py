@@ -60,6 +60,11 @@ class OrchestratorBase:
         from ...utils.turn_locks import TurnLocks
 
         self._turn_locks: TurnLocks = deps.get("turn_locks") or TurnLocks()
+        from .albums import AlbumBuffer
+
+        self._albums = AlbumBuffer()
+        # Queue-interrupt stops run off the callback handler (dv-b399).
+        self._interrupt_tasks: set = set()
 
     def _turn_lock(
         self, user_id: int, profile_id: Optional[str] = None

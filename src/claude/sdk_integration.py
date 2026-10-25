@@ -35,6 +35,7 @@ from claude_agent_sdk import (
     PermissionResultDeny,
     ProcessError,
     ResultMessage,
+    TextBlock,
     ThinkingBlock,
     ToolPermissionContext,
     ToolResultBlock,
@@ -56,6 +57,7 @@ from ..model_router.routes import (
     provider_env,
     resolve_turn_route,
 )
+from ..model_router.trace import current_trace
 from ..model_router.turn_cost import (
     GenerationLookup,
     SessionCostTracker,
@@ -86,8 +88,12 @@ if TYPE_CHECKING:
     from .agent_tools import AgentServices
     from .confirmation import ConfirmationManager
     from .window_bundle import WindowBundleProvider
+
+from .process_tree import cli_pid, terminate_tree
 from .prompt_composer import PromptComposer
 from .tool_context import TurnContext
+from .turn_activity import TurnActivity
+from .turn_activity import set_current as set_current_activity
 from .turn_setup import (
     compose_persona,
     composer_for,
@@ -369,15 +375,67 @@ _ABORT_SUBTYPES = {
 # After /stop interrupts a run, wait this long for the CLI's ResultMessage,
 # then abandon the run on the bot side (disconnect kills the CLI).
 _INTERRUPT_GRACE_SECONDS = 15.0
-# After the model's final answer (stop_reason end_turn, no pending tool use),
+# After the model's final answer (a top-level text message with no tool use),
 # the ResultMessage follows within milliseconds. If it has not arrived after
 # this long, take the answer we have instead of waiting out the CLI.
-_FINAL_RESULT_GRACE_SECONDS = 120.0
+_FINAL_RESULT_GRACE_SECONDS = 60.0
+# Partial-stream events that mean the model is generating something new.
+_NEW_GENERATION_EVENTS = frozenset(
+    {"message_start", "content_block_start", "content_block_delta"}
+)
 # One stream callback (a Telegram edit/send) may not stall consumption of the
 # CLI stream; past this it is abandoned for that message.
 _STREAM_CALLBACK_TIMEOUT_SECONDS = 20.0
 # How often the receive loop wakes to check the deadlines above.
 _POLL_SECONDS = 1.0
+
+
+def _is_final_answer(blocks: List[Any], stop_reason: Optional[str]) -> bool:
+    """True when a top-level assistant message ends the turn (dv-586f).
+
+    ``stop_reason`` is None on streamed assistant messages, so text with no
+    tool call is the signal; ``end_turn`` is honoured when present.
+    """
+    if any(isinstance(b, ToolUseBlock) for b in blocks):
+        return False
+    if stop_reason == "end_turn":
+        return True
+    return any(isinstance(b, TextBlock) and b.text.strip() for b in blocks)
+
+
+def _trailing_answer(messages: List[Any]) -> List[Any]:
+    """The final answer's messages: the top-level text-only assistant
+    messages after the last tool call or tool result (dv-586f)."""
+    out: List[Any] = []
+    for msg in reversed(messages):
+        if isinstance(msg, AssistantMessage) and not msg.parent_tool_use_id:
+            blocks = msg.content or []
+            if any(isinstance(b, ToolUseBlock) for b in blocks):
+                break
+            out.append(msg)
+        elif isinstance(msg, UserMessage) and not getattr(
+            msg, "parent_tool_use_id", None
+        ):
+            break
+    out.reverse()
+    return out
+
+
+def _sum_assistant_usage(messages: List[Any]) -> Tuple[int, int, int, int]:
+    """Token totals (in, out, cache read, cache write) from assistant
+    messages, one usage per API message id (the last wins)."""
+    per_id: Dict[str, Dict[str, Any]] = {}
+    for i, msg in enumerate(messages):
+        if isinstance(msg, AssistantMessage) and msg.usage:
+            per_id[msg.message_id or f"#{i}"] = msg.usage
+    keys = (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    )
+    a, b, c, d = (sum(u.get(k, 0) or 0 for u in per_id.values()) for k in keys)
+    return a, b, c, d
 
 
 @dataclass(eq=False)
@@ -388,6 +446,9 @@ class _ActiveRun:
     user_id: int
     profile: str
     interrupted_at: Optional[float] = None
+    # Set once the CLI process tree was ended by force (dv-b399): the broken
+    # stream that follows is the stop, not a failure.
+    hard_stopped: bool = False
 
 
 def _peak_context_tokens(messages: List[Any]) -> int:
@@ -521,6 +582,9 @@ class ClaudeResponse:
     # (dv-d2f6): the router records them instead of the harness defaults.
     provider: Optional[str] = None
     model: Optional[str] = None
+    # The harness trace of this turn (dv-2260), set by the router; the storage
+    # facade ties its tool_calls rows to the saved message by it.
+    trace_id: Optional[str] = None
     # Third-party routes only (dv-d2f6): "estimate" while any call is priced
     # from tokens, "exact" once every call has OpenRouter's total_cost.
     # ``cost_settlement`` resolves to the final figure (~6 s after the last
@@ -1045,6 +1109,8 @@ class ClaudeSDKManager:
         # reach them.
         self._stopped: bool = False
         self._active_runs: Dict[Tuple[int, str], List[_ActiveRun]] = {}
+        # Hard-stop watchdogs (one per interrupted run), kept alive here.
+        self._stop_watchdogs: set["asyncio.Future[None]"] = set()
         # dv-4517: the CLI's total_cost_usd is session-cumulative on resume.
         self._session_costs = SessionCostTracker()
         # Owner approve/deny gate for destructive ops on full-access profiles.
@@ -1088,16 +1154,53 @@ class ClaudeSDKManager:
         half of ``_active_runs``, matched by ``stop_turns``."""
         return self._agent_id_for(working_directory, user_id).split("#", 1)[0]
 
+    async def _hard_stop_run(self, run: _ActiveRun, why: str) -> None:
+        """End the run's CLI AND everything it spawned (Task sub-agents live
+        inside the CLI; child shells are its descendants). Detached bgjobs are
+        systemd units, not descendants, and keep running. Idempotent."""
+        if run.hard_stopped:
+            return
+        run.hard_stopped = True
+        pid = cli_pid(run.client)
+        stopped = await terminate_tree(pid) if pid else 0
+        logger.warning(
+            "Turn hard-stopped",
+            why=why,
+            user_id=run.user_id,
+            profile=run.profile,
+            cli_pid=pid,
+            processes=stopped,
+        )
+
+    async def _hard_stop_if_running(self, run: _ActiveRun) -> None:
+        """Watchdog: an interrupt the CLI acknowledged but did not act on
+        within the grace is escalated to a hard stop."""
+        await asyncio.sleep(_INTERRUPT_GRACE_SECONDS)
+        if run in self._active_runs.get((run.user_id, run.profile), ()):
+            await self._hard_stop_run(run, "still running after interrupt")
+
+    async def _interrupt_one(self, run: _ActiveRun) -> bool:
+        """Interrupt one run; escalate to a hard stop if the CLI does not
+        answer within the grace (it is wedged in a tool: dv-b399 2026-10-20,
+        'Control request timeout: interrupt' after 60 s)."""
+        run.interrupted_at = time.monotonic()
+        try:
+            await asyncio.wait_for(run.client.interrupt(), _INTERRUPT_GRACE_SECONDS)
+        except Exception as exc:  # incl. TimeoutError: the CLI is not answering
+            logger.warning(
+                "interrupt failed during stop",
+                error=str(exc) or type(exc).__name__,
+            )
+            await self._hard_stop_run(run, "interrupt failed")
+            return True  # the turn is ended either way
+        task = asyncio.ensure_future(self._hard_stop_if_running(run))
+        self._stop_watchdogs.add(task)
+        task.add_done_callback(self._stop_watchdogs.discard)
+        return True
+
     async def _interrupt_runs(self, runs: List[_ActiveRun]) -> int:
-        interrupted = 0
-        for run in runs:
-            run.interrupted_at = time.monotonic()
-            try:
-                await run.client.interrupt()
-                interrupted += 1
-            except Exception as exc:  # best-effort; disconnect happens in finally
-                logger.warning("interrupt failed during stop", error=str(exc))
-        return interrupted
+        results = await asyncio.gather(*(self._interrupt_one(r) for r in runs))
+        return sum(1 for ok in results if ok)
 
     async def stop_turns(self, user_id: int, profile: str) -> int:
         """Scoped /stop: interrupt only ``user_id``'s in-flight run(s) on
@@ -1257,17 +1360,14 @@ class ClaudeSDKManager:
 
     def _bash_box_for(self, working_directory: Path) -> BashBox:
         """The bash box of a sandboxed profile (dv-98f2): workspace +
-        ``extra_dirs`` writable, ``sandbox_read_dirs`` read-only."""
+        ``extra_dirs`` writable, ``sandbox_read_dirs`` read-only, ``sandbox_keys``
+        injected (dv-0277)."""
         profile = (
             self.profile_registry.get_by_working_dir(working_directory)
             if self.profile_registry
             else None
         )
-        extra = tuple(profile.extra_dirs) if profile is not None else ()
-        read = tuple(profile.sandbox_read_dirs) if profile is not None else ()
-        return BashBox(
-            write_dirs=(Path(working_directory).resolve(), *extra), read_dirs=read
-        )
+        return BashBox.for_profile(profile, Path(working_directory))
 
     def _unrestricted_for(self, working_directory: Path) -> bool:
         """The profile's ``unrestricted`` flag (dv-e38e); False outside profiles."""
@@ -1808,23 +1908,34 @@ class ClaudeSDKManager:
 
             # Denylist enforcement that must hold for EVERY tool call, including
             # reads of files inside cwd -- which can_use_tool never sees.
+            # dv-586f: ledger of what this turn's CLI is waiting on. Set in
+            # the context so in-process MCP tools (run by SDK tasks spawned
+            # from this one) time themselves into it.
+            activity = TurnActivity(
+                f"{self._profile_slug_for(working_directory, user_id)}:"
+                f"{(session_id or 'new')[:8]}"
+            )
+            set_current_activity(activity)
             options.hooks = {
                 "PreToolUse": [
                     HookMatcher(
                         hooks=[
-                            _make_pre_tool_use_hook(
-                                working_directory=Path(working_directory),
-                                full_access=full_access,
-                                read_scope=read_scope,
-                                unrestricted=unrestricted,
-                                confirmation_manager=self._confirmation_manager,
-                                verification_budget=self._verification_budget_for(
-                                    working_directory
-                                ),
-                                bash_box=(
-                                    self._bash_box_for(Path(working_directory))
-                                    if sandbox_enabled
-                                    else None
+                            activity.wrap(
+                                "hook:PreToolUse",
+                                _make_pre_tool_use_hook(
+                                    working_directory=Path(working_directory),
+                                    full_access=full_access,
+                                    read_scope=read_scope,
+                                    unrestricted=unrestricted,
+                                    confirmation_manager=self._confirmation_manager,
+                                    verification_budget=self._verification_budget_for(
+                                        working_directory
+                                    ),
+                                    bash_box=(
+                                        self._bash_box_for(Path(working_directory))
+                                        if sandbox_enabled
+                                        else None
+                                    ),
                                 ),
                             )
                         ],
@@ -1838,15 +1949,18 @@ class ClaudeSDKManager:
 
             # Wire can_use_tool callback for preventive tool validation
             if self.security_validator:
-                options.can_use_tool = _make_can_use_tool_callback(
-                    security_validator=self.security_validator,
-                    working_directory=working_directory,
-                    approved_directory=self.config.approved_directory,
-                    full_access=full_access,
-                    confirmation_manager=self._confirmation_manager,
-                    read_scope=read_scope,
-                    extra_write_roots=extra_dirs,
-                    unrestricted=unrestricted,
+                options.can_use_tool = activity.wrap(
+                    "can_use_tool",
+                    _make_can_use_tool_callback(
+                        security_validator=self.security_validator,
+                        working_directory=working_directory,
+                        approved_directory=self.config.approved_directory,
+                        full_access=full_access,
+                        confirmation_manager=self._confirmation_manager,
+                        read_scope=read_scope,
+                        extra_write_roots=extra_dirs,
+                        unrestricted=unrestricted,
+                    ),
                 )
 
             # Resume previous session if we have a session_id
@@ -1859,6 +1973,10 @@ class ClaudeSDKManager:
 
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
+            # The harness trace (dv-2260) the router opened for this turn:
+            # every tool call is written as it streams, so an interrupted or
+            # failed turn keeps its rows.
+            trace = current_trace()
 
             # Watchdog clock: the timeout is measured from the last message the
             # CLI sent, not from the start of the turn. See the wait loop below.
@@ -1905,14 +2023,25 @@ class ClaudeSDKManager:
                             next_msg = asyncio.ensure_future(stream.__anext__())
                         done, _ = await asyncio.wait({next_msg}, timeout=_POLL_SECONDS)
                         now = time.monotonic()
+                        # dv-586f: a quiet CLI is described in the log (ledger
+                        # of last events + CLI process/socket state).
+                        if not done and activity.stall_due():
+                            await activity.log_stall(cli_pid(client))
+                        # Checked on every slice, not only when the CLI is
+                        # quiet: a run that keeps streaming after an interrupt
+                        # (sub-agent, long tool) otherwise outlives /stop by
+                        # minutes (dv-b399: 2m43s on 2026-10-20).
+                        if (
+                            run.interrupted_at is not None
+                            and now - run.interrupted_at > _INTERRUPT_GRACE_SECONDS
+                        ):
+                            was_interrupted = True
+                            abandoned.append("interrupted")
+                            # disconnect() ends only the CLI; its shells and
+                            # whatever they started would outlive the stop.
+                            await self._hard_stop_run(run, "interrupt grace over")
+                            break
                         if not done:
-                            if (
-                                run.interrupted_at is not None
-                                and now - run.interrupted_at > _INTERRUPT_GRACE_SECONDS
-                            ):
-                                was_interrupted = True
-                                abandoned.append("interrupted")
-                                break
                             if (
                                 final_at is not None
                                 and now - final_at > _FINAL_RESULT_GRACE_SECONDS
@@ -1925,11 +2054,21 @@ class ClaudeSDKManager:
                             raw_data = fut.result()
                         except StopAsyncIteration:
                             break
+                        except Exception:
+                            if run.hard_stopped:
+                                # The CLI was ended by force; its dying stream
+                                # is the stop, not a failure to report.
+                                was_interrupted = True
+                                abandoned.append("interrupted")
+                                break
+                            raise
                         if run.interrupted_at is not None:
                             was_interrupted = True
                         # Any traffic from the CLI — including a tool result
                         # after a long-running command — resets the watchdog.
                         last_activity = time.monotonic()
+                        if isinstance(raw_data, dict):
+                            activity.note_raw(raw_data)
                         # Cost per model call, read from the RAW event: the
                         # SDK's AssistantMessage drops ``request_id`` (dv-d2f6).
                         # Over the cap and asking for a tool = the turn would
@@ -1969,6 +2108,8 @@ class ClaudeSDKManager:
                             continue
 
                         messages.append(message)
+                        if trace is not None:
+                            trace.feed_sdk(message)
 
                         if isinstance(message, ResultMessage):
                             break
@@ -1980,9 +2121,24 @@ class ClaudeSDKManager:
                         ):
                             blocks = message.content if message.content else []
                             has_tool = any(isinstance(b, ToolUseBlock) for b in blocks)
-                            if getattr(message, "stop_reason", None) == "end_turn":
-                                final_at = None if has_tool else time.monotonic()
-                            elif has_tool:
+                            # The CLI leaves AssistantMessage.stop_reason None
+                            # (only the ResultMessage carries "end_turn"; probed
+                            # CLI 2.1.302 / SDK 0.2.123), so a top-level message
+                            # with text and no tool call is the final answer.
+                            final_at = (
+                                time.monotonic()
+                                if _is_final_answer(blocks, message.stop_reason)
+                                else None
+                            )
+                        elif isinstance(message, StreamEvent):
+                            # New generation under way: not the end after all.
+                            # The closing events of the final message itself
+                            # (content_block_stop, message_delta, message_stop)
+                            # arrive after it and must not reset the grace;
+                            # they did, so it never started.
+                            if (message.event or {}).get(
+                                "type"
+                            ) in _NEW_GENERATION_EVENTS:
                                 final_at = None
                         elif final_at is not None:
                             # Evidence for dv-586f: what does the CLI send
@@ -2004,6 +2160,9 @@ class ClaudeSDKManager:
                         # Handle streaming callback. Bounded: a hung Telegram
                         # call must not stop us reading the ResultMessage.
                         if stream_callback:
+                            cb_token = activity.begin(
+                                "stream_cb", type(message).__name__
+                            )
                             try:
                                 await asyncio.wait_for(
                                     self._handle_stream_message(
@@ -2017,7 +2176,10 @@ class ClaudeSDKManager:
                                     error=str(callback_error),
                                     error_type=type(callback_error).__name__,
                                 )
+                            finally:
+                                activity.end(cb_token)
                 finally:
+                    activity.log_summary(reason=abandoned[0] if abandoned else "end")
                     if next_msg is not None and not next_msg.done():
                         next_msg.cancel()
                     group = self._active_runs.get(run_key, [])
@@ -2102,6 +2264,18 @@ class ClaudeSDKManager:
                                             tool_entry["error"] = error
                                         tools_used.append(tool_entry)
                     break
+
+            # No ResultMessage (abandoned after the final answer, dv-586f): the
+            # cost total is unknown, so ``cost`` stays 0 and the next resumed
+            # turn's delta absorbs it (the baseline is kept). Tokens come from
+            # the assistant messages so the no-baseline fallback has input.
+            if not any(isinstance(m, ResultMessage) for m in messages):
+                (
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                ) = _sum_assistant_usage(messages)
 
             # Fallback: extract session_id from StreamEvent messages if
             # ResultMessage didn't provide one (can happen with some CLI versions)
@@ -2191,7 +2365,11 @@ class ClaudeSDKManager:
                 content = result_content
             else:
                 content_parts = []
-                for msg in messages:
+                for msg in (
+                    _trailing_answer(messages)
+                    if "result_missing" in abandoned
+                    else messages
+                ):
                     if isinstance(msg, AssistantMessage):
                         msg_content = getattr(msg, "content", [])
                         if msg_content and isinstance(msg_content, list):
@@ -2501,7 +2679,9 @@ class ClaudeSDKManager:
         env = cfg.setdefault("env", {})
         if isinstance(env, dict):
             env[IMAGE_ROOTS_ENV] = image_roots_env(
-                self.config.approved_directory, working_directory
+                self.config.approved_directory,
+                working_directory,
+                self._extra_dirs_for(working_directory),
             )
 
     def _load_mcp_config(self, config_path: Path) -> Dict[str, Any]:

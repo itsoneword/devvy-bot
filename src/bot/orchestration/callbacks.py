@@ -28,6 +28,8 @@ logger = structlog.get_logger()
 
 INTERRUPT_PREFIX = "qi:"
 INTERRUPT_NOTE = "[previous turn was interrupted by the user]"
+# Upper bound for the whole stop (backends cap themselves at ~15 s).
+_STOP_DEADLINE_SECONDS = 25.0
 
 
 def interrupt_markup(waiter_id: str) -> InlineKeyboardMarkup:
@@ -430,50 +432,132 @@ class CallbacksMixin(OrchestratorBase):
     ) -> None:
         """qi:<waiter id>: stop the author's current turn on the same agent
         and run this queued message next (it jumps the queue)."""
-        from ...profiles.registry import DEFAULT_AGENT_ID
-
-        await query.answer()
         waiter = self._turn_locks.find_waiter(data[len(INTERRUPT_PREFIX) :])
         user_id = query.from_user.id
+        storage = context.bot_data.get("storage")
+
+        async def audit(outcome: str, **extra: Any) -> None:
+            # Every press leaves a row, including refusals (dv-b399): a silent
+            # no-op press was undiagnosable.
+            if storage:
+                try:
+                    await storage.log_bot_event(
+                        user_id,
+                        "queue_interrupt",
+                        {"outcome": outcome, "waiter": data[len(INTERRUPT_PREFIX) :]}
+                        | extra,
+                    )
+                except Exception:
+                    pass
+
+        async def refuse(text: str, outcome: str) -> None:
+            # Popup alert: always visible, whatever happens to the message.
+            await query.answer(text, show_alert=True)
+            await audit(outcome)
+
         if waiter is None:
+            await query.answer()
             await self._drop_buttons(query, "Уже запущено или выполнено.")
+            await audit("gone")
             return
         if user_id != waiter.user_id and self._resolve_role(user_id, context) != (
             "owner"
         ):
-            await query.message.reply_text("Только автор сообщения.")
+            await refuse("Только автор сообщения.", "not_author")
             return
-        if waiter.jumped:  # double press
+        if waiter.stopping:  # double press while the stop is still running
+            await refuse("Уже останавливаю — это сообщение следующее.", "double")
             return
         lock = self._turn_locks.get(waiter.user_id, waiter.profile_id)
         if not lock.jump(waiter):
+            await query.answer()
             await self._drop_buttons(query, "Уже запущено или выполнено.")
+            await audit("not_parked")
             return
-        slug = waiter.profile_id or DEFAULT_AGENT_ID
-        stopped = await self._stop_scoped_turns(context, waiter.user_id, slug)
-        waiter.note_due = stopped > 0
-        storage = context.bot_data.get("storage")
-        if storage:
-            await storage.log_bot_event(
-                user_id,
-                "queue_interrupt",
-                {
-                    "profile": slug,
-                    "author": waiter.user_id,
-                    "kind": waiter.kind,
-                    "stopped": stopped,
-                },
-            )
-        await self._drop_buttons(
-            query, "⏹ Прерываю текущий, это сообщение — следующее."
-        )
-
-    @staticmethod
-    async def _drop_buttons(query: Any, text: str) -> None:
+        waiter.stopping = True
+        # Optimistic: the stop may free the lock before it reports back, and
+        # the jumped turn reads this flag the moment it starts. Corrected below.
+        waiter.note_due = True
+        # Visible FIRST (dv-b399 round 2): the stop can take seconds (a wedged
+        # CLI is only ended after the 15 s grace), and an answer sent after it
+        # is rejected by Telegram ("Query is too old") while the owner, seeing
+        # nothing change, presses again.
         try:
-            await query.edit_message_text(text)
+            await query.answer("⏹ Останавливаю…")
         except Exception:
             pass
+        await self._drop_buttons(query, "⏹ Останавливаю текущий…")
+        task = asyncio.ensure_future(
+            self._finish_interrupt(query, context, waiter, user_id)
+        )
+        self._interrupt_tasks.add(task)
+        task.add_done_callback(self._interrupt_tasks.discard)
+
+    async def _finish_interrupt(
+        self,
+        query: Any,
+        context: ContextTypes.DEFAULT_TYPE,
+        waiter: Any,
+        presser_id: int,
+    ) -> None:
+        """The slow half of the queue-interrupt button, off the callback
+        handler: stop the running turn(s), audit, update the message."""
+        from ...profiles.registry import DEFAULT_AGENT_ID
+
+        slug = waiter.profile_id or DEFAULT_AGENT_ID
+        storage = context.bot_data.get("storage")
+        stopped = 0
+        try:
+            stopped = await asyncio.wait_for(
+                self._stop_scoped_turns(context, waiter.user_id, slug),
+                _STOP_DEADLINE_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning("queue interrupt stop failed", error=str(exc) or repr(exc))
+        finally:
+            waiter.stopping = False
+        waiter.note_due = stopped > 0
+        if storage:
+            try:
+                await storage.log_bot_event(
+                    presser_id,
+                    "queue_interrupt",
+                    {
+                        "outcome": "jumped",
+                        "profile": slug,
+                        "author": waiter.user_id,
+                        "kind": waiter.kind,
+                        "stopped": stopped,
+                    },
+                )
+            except Exception:
+                pass
+        if stopped:
+            await self._drop_buttons(
+                query, "⏹ Текущий остановлен, это сообщение — следующее."
+            )
+        else:
+            # Nothing to stop yet (the holder is still starting): keep the
+            # button so a second press goes straight through.
+            await self._drop_buttons(
+                query,
+                "Текущий ещё стартует — это сообщение следующее.",
+                markup=interrupt_markup(waiter.id),
+            )
+
+    @staticmethod
+    async def _drop_buttons(
+        query: Any, text: str, markup: Optional[InlineKeyboardMarkup] = None
+    ) -> None:
+        try:
+            await query.edit_message_text(text, reply_markup=markup)
+        except Exception:
+            # The button message may be gone or unchanged; the press must
+            # still be visible (dv-b399).
+            try:
+                await query.message.reply_text(text)
+            except Exception:
+                pass
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

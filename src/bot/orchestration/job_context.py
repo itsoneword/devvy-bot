@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
 HEAD_LINES = 15
 HEAD_CHARS = 1200
 JOB_REF_PREFIX = "job:"
+PUMP_REF_PREFIX = "pump:"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
@@ -31,6 +32,25 @@ def job_id_from_ref(ref: Optional[str]) -> Optional[str]:
     if ref and ref.startswith(JOB_REF_PREFIX):
         return ref[len(JOB_REF_PREFIX) :] or None
     return None
+
+
+def pump_task_from_ref(ref: Optional[str]) -> Optional[str]:
+    """Task id (pump name prefix included) of a ``pump:<id>`` ledger ref."""
+    if ref and ref.startswith(PUMP_REF_PREFIX):
+        return ref[len(PUMP_REF_PREFIX) :] or None
+    return None
+
+
+def pump_envelope(task_id: str) -> str:
+    """Label for a reply to a task-pump card. The card may sit in any board
+    agent's chat, and a sandboxed agent cannot run the script: name the
+    tools (dv-a9b0)."""
+    return (
+        f"[reply to the task-pipeline card of task {task_id}. If this reply "
+        "answers its question, call `pump_pending` to check, then "
+        f'`pump_answer(task_id="{task_id}", text="<the reply below, verbatim>")`; '
+        "do not paraphrase it.]"
+    )
 
 
 def _read(path: Path) -> Optional[str]:

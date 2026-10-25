@@ -26,6 +26,7 @@ from .claude_plain import ClaudePlainCaller
 from .codex_plain import CodexPlainCaller
 from .harness import HarnessVersions
 from .openrouter_plain import OpenRouterPlainCaller
+from .trace import TraceCollector, activate
 from .turn_cost import Settlement, when_settled
 from .types import (
     CLAUDE_HARNESS,
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
     from src.agent_backends.protocol import AgentBackend
     from src.claude.sdk_integration import ClaudeResponse
     from src.storage.model_calls import ModelCallRepository
+    from src.storage.tool_calls import ToolCallRepository
 
 logger = structlog.get_logger()
 
@@ -70,6 +72,7 @@ class ModelRouter:
         versions: Optional[HarnessVersions] = None,
         profile_resolver: Optional[ProfileResolver] = None,
         decider: Optional[Decider] = None,
+        tool_calls: Optional["ToolCallRepository"] = None,
     ) -> None:
         self.backends: Dict[str, "AgentBackend"] = backends if backends else {}
         self._plain: Dict[str, PlainCaller] = (
@@ -85,6 +88,7 @@ class ModelRouter:
         self._versions = versions or HarnessVersions()
         self._profile_resolver = profile_resolver
         self._decider: Decider = decider or TypesafeDecider()
+        self._tool_calls = tool_calls
 
     async def run_turn(
         self,
@@ -103,10 +107,15 @@ class ModelRouter:
             _default_model(adapter) if self._recorder is not None else None
         )
         started = time.monotonic()
+        # The harness trace (dv-2260): backends feed it through current_trace();
+        # rows are written as the turn runs, so a failed turn keeps its tools.
+        trace = TraceCollector(self._tool_calls)
         try:
-            response = await adapter.run_command(**turn)
+            with activate(trace):
+                response = await adapter.run_command(**turn)
         except BaseException as exc:
-            await self._record(
+            trace.close("turn failed")
+            row_id = await self._record(
                 purpose=purpose,
                 kind="turn",
                 harness=harness,
@@ -119,7 +128,14 @@ class ModelRouter:
                 outcome="error",
                 error=_error_text(exc),
             )
+            await self._link_trace(trace, row_id, turn.get("session_id"))
             raise
+        trace.close()
+        if trace.rows():
+            try:
+                response.trace_id = trace.trace_id
+            except AttributeError:
+                pass
         row_id = await self._record(
             purpose=purpose,
             kind="turn",
@@ -140,6 +156,7 @@ class ModelRouter:
             cost_usd=response.cost,
             cost_source=getattr(response, "cost_source", None),
         )
+        await self._link_trace(trace, row_id, response.session_id)
         recorder = self._recorder
         if row_id is not None and recorder is not None:
 
@@ -153,6 +170,21 @@ class ModelRouter:
                 what="model_calls",
             )
         return response
+
+    async def _link_trace(
+        self, trace: TraceCollector, row_id: Optional[int], session_id: Optional[str]
+    ) -> None:
+        """Flush the trace and tie it to the turn's ``model_calls`` row."""
+        if self._tool_calls is None:
+            return
+        try:
+            await trace.flush()
+            if row_id is not None and trace.rows():
+                await self._tool_calls.link_model_call(
+                    trace.trace_id, row_id, session_id
+                )
+        except Exception as exc:
+            logger.warning("trace not linked", error=str(exc))
 
     async def complete(self, request: CallRequest) -> CallResult:
         """Run one plain call and return its result."""

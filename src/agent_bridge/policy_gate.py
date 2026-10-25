@@ -10,6 +10,10 @@ Fail-closed rules:
 1. No resolver, no working directory or a crash in the policy -> deny.
 2. An ``ask`` with no confirmation manager -> deny.
 3. The answer is only ever ``allow`` or ``deny``; the hook never decides.
+   An ``allow`` may carry ``updated_input``: on a turn with sandbox keys
+   (``TurnContext.redact_env``, dv-28f2) every allowed Bash command comes
+   back wrapped in the bash box's redaction mode. The policy always judges
+   the ORIGINAL command; a deny or ask is never rewritten.
 4. The bridge runs a tool whose call ``decide()`` answers ``ask`` only with an
    owner approval this gate granted for that exact call in that turn
    (:func:`check_tool_call`). A hook that never ran (not mounted, failed to
@@ -66,13 +70,13 @@ class PolicyGate:
         self._approved: "Counter[Tuple[str, str]]" = Counter()
         # Codex can fire the hook twice for one tool call (seen on 0.157.1):
         # the second call must get the first one's answer, not a second button.
-        self._calls: "OrderedDict[Tuple[str, str], asyncio.Task[Dict[str, str]]]" = (
+        self._calls: "OrderedDict[Tuple[str, str], asyncio.Task[Dict[str, Any]]]" = (
             OrderedDict()
         )
 
     async def check(
         self, turn_key: str, ctx: TurnContext, body: Dict[str, Any]
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         tool_use_id = str(body.get("tool_use_id") or "")
         if not tool_use_id:
             return await self._check(turn_key, ctx, body)
@@ -87,7 +91,7 @@ class PolicyGate:
 
     async def _check(
         self, turn_key: str, ctx: TurnContext, body: Dict[str, Any]
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         tool_name = str(body.get("tool_name") or "")
         tool_input = body.get("tool_input")
         if not isinstance(tool_input, dict):
@@ -106,7 +110,7 @@ class PolicyGate:
             return _deny("the policy check failed")
 
         if decision.action == policy.ALLOW:
-            return {"decision": policy.ALLOW, "reason": ""}
+            return _allow(ctx, tool_name, tool_input)
         if decision.action == policy.DENY:
             logger.warning(
                 "PreToolUse hook denied tool call",
@@ -138,7 +142,7 @@ class PolicyGate:
             self._approved[(turn_key, _call_key(tool_name, tool_input))] += 1
             while len(self._approved) > _MAX_REMEMBERED:
                 del self._approved[next(iter(self._approved))]
-        return {"decision": policy.ALLOW, "reason": ""}
+        return _allow(ctx, tool_name, tool_input)
 
     def turn_policy(self, ctx: TurnContext) -> policy.TurnPolicy:
         return self._resolver(ctx)
@@ -190,6 +194,28 @@ def check_tool_call(
     return (
         f"{decision.reason}: needs the owner's approval, which this call does not have"
     )
+
+
+def _allow(
+    ctx: TurnContext, tool_name: str, tool_input: Dict[str, Any]
+) -> Dict[str, Any]:
+    """An allow; on a keyed turn a Bash call comes back redaction-wrapped.
+
+    The Codex twin of the Claude hook's ``BashBox.wrap`` rewrite: the key
+    values sit in the shell's env, the wrapper scrubs them from the output
+    the model, the JSONL stream and Codex's rollout get (dv-28f2).
+    """
+    answer: Dict[str, Any] = {"decision": policy.ALLOW, "reason": ""}
+    command = tool_input.get("command")
+    if tool_name == "Bash" and ctx.redact_env and isinstance(command, str):
+        if command.strip():
+            from src.security.bash_box import BashBox
+
+            answer["updated_input"] = {
+                **tool_input,
+                "command": BashBox.wrap_env(command, ctx.redact_env),
+            }
+    return answer
 
 
 def _deny(reason: str) -> Dict[str, str]:

@@ -512,9 +512,10 @@ group stays read-only. Replying to a report in a topic puts it in context.
 
 **Reply-only topics** (`"reply_only": ["Jobs"]` in the same file;
 no env variable): the topic must also be in `bindings` (its profile is
-the fallback). Only a reply to a job message (start, finish or digest;
+the fallback). Only a reply to a job message (start or finish;
 ledger `ref` `job:<id>`) is inbound; it runs one turn on the job's profile
-and the answer lands in the topic. Owner only, whatever
+and the answer lands in that agent's own chat (its bound topic, else the DM),
+with a one-line pointer left in the topic. Pump replies answer in place. Owner only, whatever
 `REPORTS_INBOUND_POLICY` says. Plain posts and replies to anything else get
 one hint per 10 minutes. The turn gets a label with the job id, name, status,
 output path and the first 15 lines of `output.md` (untrusted data).
@@ -524,8 +525,10 @@ output path and the first 15 lines of `output.md` (untrusted data).
 * Topics are created on first use and stored in `project_threads` (slug
   `reports:<topic>`). A deleted topic is recreated once; any other failure
   delivers the message to the DM.
-* **Always DM**, whatever the map says: sources `taskpump:ask` (pump
-  question / blocked / failed cards -- `taskpump:status` are the status cards),
+* `taskpump:ask` (pump question / blocked / failed cards) goes to the Pump
+  topic with a `pump:<id>` ref since 2026-10-20; a reply there reaches the
+  devops session with the ticket id (Pump must be in `bindings` + `reply_only`).
+* **Always DM**, whatever the map says: sources
   `reminder`, `item`, `family`, `approval`, `policy`, `routing`, any
   ledgered reminder, and the bot's inline-keyboard prompts (tool-call
   approvals, watchdog), which do not pass through this service.
@@ -536,7 +539,7 @@ output path and the first 15 lines of `output.md` (untrusted data).
   `journalctl -u claude-bot | grep "chat membership"` right after adding the bot.
 
 Sources (`AgentResponseEvent.source`): `schedule:<job name>`, `bgjob`
-(start/finish), `bgjob:status` (pinned jobs list), `bgjob:digest`,
+(start/finish), `bgjob:status` (pinned jobs list), `bgjob:digest` (batch digest, delivered to the agent's own chat),
 `taskpump:status|ask`, `webhook:<provider>`, `health`, `reminder`, `item`,
 `family`, `agent` (the `notify` tool), `internal` (`/internal/notify` without
 a source). External callers pass one: `agentctl notify --source
@@ -621,7 +624,10 @@ Per-profile keys include `sandbox`, `max_turns`, `max_cost_per_request`,
 checkout — instead of `sandbox: false`), `sandbox_read_dirs` (read-only mounts in the
 sandboxed bash box, e.g. shared tool checkouts; owner-only), `sandbox_allowed_domains`
 (egress allowlist — **not enforced**: the bash box shares the host network until
-an egress proxy exists; validated and kept; owner-only) and `enabled` (`false` hides a profile
+an egress proxy exists; validated and kept; owner-only), `sandbox_keys` (key-store
+services a sandboxed profile's shell gets in its env, values redacted from output;
+both backends — on Codex via the policy hook's `--redact-env` wrapper, dv-28f2;
+owner-only) and `enabled` (`false` hides a profile
 without deleting it). See `config/profiles.example.yaml`.
 
 Owners manage profiles from Telegram: `/agents → ⚙ Manage` toggles `enabled:`

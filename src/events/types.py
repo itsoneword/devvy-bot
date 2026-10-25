@@ -82,3 +82,10 @@ class AgentResponseEvent(Event):
     # What the message is about ("job:<id>", dv-c41e). Unlike ledger_kind it
     # does not change routing; it only tags the ledger row.
     ledger_ref: Optional[str] = None
+    # Validated image/file paths sent after the text (dv-f90c); the internal
+    # notify API checks them with validate_image_path before setting this.
+    image_paths: List[str] = field(default_factory=list)
+    # Deliver to this profile's own chat (dv-c41e amendment, 2026-10-22): its
+    # bound topic, else the DM. Used by the batch job digest, which must not
+    # land in Jobs (the log).
+    deliver_profile: Optional[str] = None

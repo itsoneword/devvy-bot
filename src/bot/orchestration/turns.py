@@ -6,6 +6,7 @@ src/bot/orchestrator.py.
 """
 
 import asyncio
+import html
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,11 +29,14 @@ from telegram.ext import ContextTypes
 from ...profiles.registry import user_media_root
 from ...storage.repositories import MessageRepository
 from ...utils.turn_locks import take_interrupt_note
+from ..telegram_retry import with_telegram_retry
 from ..utils.draft_streamer import DraftStreamer, generate_draft_id
+from ..utils.ephemeral_updater import EphemeralUpdater
 from ..utils.formatting import FormattedMessage
 from ..utils.image_extractor import (
     ImageAttachment,
     allowed_image_roots,
+    should_send_as_photo,
 )
 from .base import OrchestratorBase
 from .callbacks import INTERRUPT_NOTE, interrupt_markup
@@ -68,6 +72,23 @@ BINARY_DOCUMENT_EXTENSIONS = {
     ".pptx",
     ".zip",
 }
+
+
+def _profile_extra_dirs(context: Any, working_dir: Any) -> Any:
+    """The owning profile's extra_dirs (deliverable image roots, dv-f90c)."""
+    registry = context.bot_data.get("profile_registry")
+    profile = registry.get_by_working_dir(working_dir) if registry else None
+    return tuple(getattr(profile, "extra_dirs", ()) or ())
+
+
+@dataclass
+class _ReplyRedirect:
+    """Where the answer to a reply in Jobs is sent instead of Jobs."""
+
+    chat_id: Any
+    thread_id: Optional[int]
+    slug: str
+    topic: str  # the agent's topic name; "" = the owner's DM
 
 
 @dataclass
@@ -214,6 +235,7 @@ class TurnsMixin(OrchestratorBase):
             mcp_images: Optional[List[ImageAttachment]] = None,
             approved_directory: Optional[Path] = None,
             draft_streamer: Optional[DraftStreamer] = None,
+            updater: Optional[EphemeralUpdater] = None,
         ) -> Optional[Callable[["StreamUpdate"], Any]]:
             raise NotImplementedError
 
@@ -428,6 +450,10 @@ class TurnsMixin(OrchestratorBase):
         if await gate_text(
             update, context, gated or "", self._resolve_role(user_id, context)
         ):
+            return
+        # A plain message sent while an album is still collecting is its
+        # comment (dv-b399): folded into that album's turn, no turn of its own.
+        if override_text is None and self._albums.absorb_text(update):
             return
         # Serialized per (user, agent): the lock key is the profile this turn
         # will run on (bound topic -> its profile, else active / @slug).
@@ -1446,6 +1472,97 @@ class TurnsMixin(OrchestratorBase):
                     FormattedMessage(text=footer.strip(), parse_mode=None)
                 )
 
+    async def _jobs_reply_redirect(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> Optional["_ReplyRedirect"]:
+        """Where the answer to a reply in Jobs goes: the owning agent's own chat
+        (its bound topic, else the owner's DM). None = answer in place (not a
+        reply-only topic, or no router)."""
+        router = context.bot_data.get("reports_router")
+        message = update.message
+        if router is None or message is None or not message.is_topic_message:
+            return None
+        try:
+            topic = await router.topic_name_for_thread(
+                message.chat_id, message.message_thread_id
+            )
+            if topic is None or topic not in router.reply_only:
+                return None
+            slug = await router.profile_for_message(message)
+            own = router.profile_topic(slug)
+            if own:
+                thread = await router.thread_id(context.bot, own)
+                return _ReplyRedirect(router.chat_id, thread, slug or "", own)
+        except Exception as e:
+            logger.warning("Jobs reply redirect failed, DM", error=str(e))
+            slug = None
+        return _ReplyRedirect(update.effective_user.id, None, slug or "", "")
+
+    def _with_jobs_quote(
+        self, first: FormattedMessage, update: Update
+    ) -> FormattedMessage:
+        """Say what the answer is about: it lands in a chat that never saw the
+        owner's comment in Jobs."""
+        quoted = (update.message.text or update.message.caption or "").strip()
+        quoted = " ".join(quoted.split())[:80]
+        if not quoted:
+            return first
+        if first.parse_mode == "HTML":
+            head = f"↩ в Jobs: «{html.escape(quoted)}»\n\n"
+        else:
+            head = f"↩ в Jobs: «{quoted}»\n\n"
+        return FormattedMessage(text=head + first.text, parse_mode=first.parse_mode)
+
+    async def _jobs_pointer(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        redirect: "_ReplyRedirect",
+        last_message_id: Optional[int],
+    ) -> None:
+        """One line in Jobs saying where the answer went (best effort)."""
+        where = redirect.slug or "agent"
+        link = where
+        if redirect.topic and redirect.thread_id and last_message_id:
+            raw = str(redirect.chat_id)
+            if raw.startswith("-100"):
+                url = f"https://t.me/c/{raw[4:]}/{redirect.thread_id}/{last_message_id}"
+                link = f'<a href="{url}">{html.escape(where)}</a>'
+        text = (
+            f"→ ответ в чате {link}"
+            if redirect.topic
+            else (f"→ ответ в личке ({html.escape(where)})")
+        )
+        try:
+            await update.message.reply_text(
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_to_message_id=update.message.message_id,
+            )
+        except Exception as e:
+            logger.warning("Jobs pointer failed", error=str(e))
+
+    async def _send_images_to(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        redirect: "_ReplyRedirect",
+        images: List[ImageAttachment],
+    ) -> None:
+        for img in images[:10]:
+            try:
+                with open(img.path, "rb") as f:
+                    kw: Dict[str, Any] = {
+                        "chat_id": redirect.chat_id,
+                        "message_thread_id": redirect.thread_id,
+                    }
+                    if should_send_as_photo(img.path):
+                        await context.bot.send_photo(photo=f, **kw)
+                    else:
+                        await context.bot.send_document(document=f, **kw)
+            except Exception as img_err:
+                logger.warning("Redirected image send failed", error=str(img_err))
+
     async def _deliver_reply(
         self,
         state: TurnState,
@@ -1458,13 +1575,47 @@ class TurnsMixin(OrchestratorBase):
         Text path (``resilient_send``): HTML send -> plain retry -> failure
         notice. Media path: no fallback (preserved drift) — a send error
         propagates to the media entry point.
+
+        A reply to a job message in Jobs is answered in the agent's own chat
+        instead, with a pointer left in Jobs (dv-c41e amendment, 2026-10-22).
         """
         context = state.context
         request = state.request
 
+        # Ledger every outgoing reply (dv-7783): the reply-context builder
+        # resolves user replies to our messages here. Never raises; a failed
+        # ledger write only degrades the NEXT reply's origin attribution.
+        _ledger_storage = context.bot_data.get("storage")
+        # A reply to a pump card (Pump topic) carries that ref onto our answer,
+        # so the owner can reply to the answer too and stay in the thread
+        # instead of hitting the read-only hint.
+        _job_ref: Optional[str] = None
+        _quoted = getattr(update.message, "reply_to_message", None)
+        if _ledger_storage is not None and _quoted is not None:
+            try:
+                _q = await _ledger_storage.sent_messages.lookup(
+                    _quoted.chat.id, _quoted.message_id
+                )
+                if _q is not None and (_q.ref or "").startswith(("job:", "pump:")):
+                    _job_ref = _q.ref
+            except Exception as ref_err:
+                logger.warning("job ref lookup failed", error=str(ref_err))
+
+        # A reply in Jobs is answered in the agent's chat; Jobs gets a pointer.
+        redirect: Optional[_ReplyRedirect] = None
+        if (_job_ref or "").startswith("job:"):
+            redirect = await self._jobs_reply_redirect(update, context)
+        if redirect is not None:
+            _job_ref = None  # the answer lives in the agent chat, not the job
+            if formatted_messages and formatted_messages[0].text:
+                formatted_messages = [
+                    self._with_jobs_quote(formatted_messages[0], update),
+                    *formatted_messages[1:],
+                ]
+
         # Try to combine text + images in one message when possible
         caption_sent = False
-        if images and len(formatted_messages) == 1:
+        if redirect is None and images and len(formatted_messages) == 1:
             msg = formatted_messages[0]
             if msg.text and len(msg.text) <= 1024:
                 try:
@@ -1478,27 +1629,14 @@ class TurnsMixin(OrchestratorBase):
                 except Exception as img_err:
                     logger.warning("Image+caption send failed", error=str(img_err))
 
-        # Ledger every outgoing reply (dv-7783): the reply-context builder
-        # resolves user replies to our messages here. Never raises; a failed
-        # ledger write only degrades the NEXT reply's origin attribution.
-        _ledger_storage = context.bot_data.get("storage")
-        # A reply to a job message (Jobs topic, dv-c41e) carries that job's
-        # ref onto our answer, so the owner can reply to the answer too and
-        # stay in the job thread instead of hitting the read-only hint.
-        _job_ref: Optional[str] = None
-        _quoted = getattr(update.message, "reply_to_message", None)
-        if _ledger_storage is not None and _quoted is not None:
-            try:
-                _q = await _ledger_storage.sent_messages.lookup(
-                    _quoted.chat.id, _quoted.message_id
-                )
-                if _q is not None and (_q.ref or "").startswith("job:"):
-                    _job_ref = _q.ref
-            except Exception as ref_err:
-                logger.warning("job ref lookup failed", error=str(ref_err))
+        last_sent_id: Optional[int] = None
 
         async def _ledger_sent(sent: Any) -> None:
-            if _ledger_storage is None or sent is None:
+            nonlocal last_sent_id
+            if sent is None:
+                return
+            last_sent_id = sent.message_id
+            if _ledger_storage is None:
                 return
             try:
                 await _ledger_storage.sent_messages.record(
@@ -1514,6 +1652,21 @@ class TurnsMixin(OrchestratorBase):
             except Exception as ledger_err:
                 logger.warning("sent_messages ledger failed", error=str(ledger_err))
 
+        async def _reply(text: str, parse_mode: Optional[str], first: bool) -> Any:
+            if redirect is not None:
+                return await context.bot.send_message(
+                    chat_id=redirect.chat_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    message_thread_id=redirect.thread_id,
+                )
+            return await update.message.reply_text(
+                text,
+                parse_mode=parse_mode,
+                reply_markup=None,  # No keyboards in agentic mode
+                reply_to_message_id=(update.message.message_id if first else None),
+            )
+
         # Send text messages (skip if caption was already embedded in photos)
         if caption_sent:
             return
@@ -1523,23 +1676,13 @@ class TurnsMixin(OrchestratorBase):
             if not request.resilient_send:
                 # Media path: no HTML→plain fallback (preserved drift) —
                 # a send error propagates to the media entry point.
-                sent_msg = await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=None,
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
-                )
+                sent_msg = await _reply(message.text, message.parse_mode, i == 0)
                 await _ledger_sent(sent_msg)
                 if i < len(formatted_messages) - 1:
                     await asyncio.sleep(0.5)
                 continue
             try:
-                sent_msg = await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=None,  # No keyboards in agentic mode
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
-                )
+                sent_msg = await _reply(message.text, message.parse_mode, i == 0)
                 await _ledger_sent(sent_msg)
                 if i < len(formatted_messages) - 1:
                     await asyncio.sleep(0.5)
@@ -1550,13 +1693,7 @@ class TurnsMixin(OrchestratorBase):
                     message_index=i,
                 )
                 try:
-                    sent_msg = await update.message.reply_text(
-                        message.text,
-                        reply_markup=None,
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
-                    )
+                    sent_msg = await _reply(message.text, None, i == 0)
                     await _ledger_sent(sent_msg)
                 except Exception as plain_err:
                     await update.message.reply_text(
@@ -1571,13 +1708,19 @@ class TurnsMixin(OrchestratorBase):
         # Send images separately if caption wasn't used
         if images:
             try:
-                await self._send_images(
-                    update,
-                    images,
-                    reply_to_message_id=update.message.message_id,
-                )
+                if redirect is not None:
+                    await self._send_images_to(context, redirect, images)
+                else:
+                    await self._send_images(
+                        update,
+                        images,
+                        reply_to_message_id=update.message.message_id,
+                    )
             except Exception as img_err:
                 logger.warning("Image send failed", error=str(img_err))
+
+        if redirect is not None:
+            await self._jobs_pointer(update, context, redirect, last_sent_id)
 
     async def _run_turn(
         self,
@@ -1703,6 +1846,9 @@ class TurnsMixin(OrchestratorBase):
         mcp_images: List[ImageAttachment] = []
 
         # Stream drafts (private chats only; text path only)
+        # All ephemeral Telegram UI of this turn goes through one latest-wins
+        # background updater so the SDK reader never waits on the rate limiter.
+        updater = EphemeralUpdater(name=f"turn:{user_id}")
         draft_streamer: Optional[DraftStreamer] = None
         if (
             request.enable_stream_drafts
@@ -1715,6 +1861,7 @@ class TurnsMixin(OrchestratorBase):
                 draft_id=generate_draft_id(),
                 message_thread_id=update.message.message_thread_id,
                 throttle_interval=self.settings.stream_draft_interval,
+                updater=updater,
             )
 
         on_stream = self._make_stream_callback(
@@ -1727,9 +1874,11 @@ class TurnsMixin(OrchestratorBase):
             # fall back to the current request's working dir (profile-aware)
             # so send_image_to_user still has a boundary to validate against.
             approved_directory=allowed_image_roots(
-                self.settings.approved_directory or current_dir
+                self.settings.approved_directory or current_dir,
+                _profile_extra_dirs(context, current_dir),
             ),
             draft_streamer=draft_streamer,
+            updater=updater,
         )
 
         # Independent typing heartbeat — stays alive even with no stream events
@@ -1837,6 +1986,15 @@ class TurnsMixin(OrchestratorBase):
             ]
         finally:
             heartbeat.cancel()
+            # Stop + await the updater BEFORE anything final is sent: no stale
+            # progress edit may land after the answer.
+            await updater.stop()
+            logger.info(
+                "Ephemeral UI summary",
+                user_id=user_id,
+                draft_failures=draft_streamer.failures if draft_streamer else 0,
+                **updater.summary(),
+            )
             if draft_streamer:
                 try:
                     await draft_streamer.flush()
@@ -2027,6 +2185,16 @@ class TurnsMixin(OrchestratorBase):
             await update.message.reply_text("Photo processing is not available.")
             return
 
+        # Album (dv-b399): one turn for the whole media group. The first item
+        # is the leader and waits for the rest; the others return here.
+        album = None
+        if getattr(update.message, "media_group_id", None):
+            album, is_leader = self._albums.join(update)
+            if not is_leader:
+                return
+            await self._albums.collect(album)
+        items = album.items if album is not None else [update]
+
         chat = update.message.chat
         lock, progress_msg, was_queued = await self._begin_media_turn(
             update, user_id, "Working...", context
@@ -2038,13 +2206,10 @@ class TurnsMixin(OrchestratorBase):
                 except Exception:
                     pass
             try:
-                photo = update.message.photo[-1]
-                processed_image = await image_handler.process_image(
-                    photo, update.message.caption
-                )
+                # Save every image into the working dir so the active backend
+                # can view it (Codex via -i; Claude via the Read tool path).
+                import base64
 
-                # Save the image into the working dir so the active backend can
-                # view it (Codex via -i; Claude via the Read tool path).
                 from ..features.image_handler import save_image_bytes
 
                 upload_dir = self._media_upload_dir(
@@ -2052,20 +2217,35 @@ class TurnsMixin(OrchestratorBase):
                     user_id,
                     await self._reports_topic_slug(update, context),
                 )
-                tg_file = await photo.get_file()
-                data = await tg_file.download_as_bytearray()
-                img_path = save_image_bytes(
-                    bytes(data), image_save_extension(processed_image), upload_dir
-                )
+                paths: List[Path] = []
+                for item in items:
+                    processed_image = await image_handler.process_image(
+                        item.message.photo[-1], None
+                    )
+                    paths.append(
+                        save_image_bytes(
+                            base64.b64decode(processed_image.base64_data),
+                            image_save_extension(processed_image),
+                            upload_dir,
+                        )
+                    )
+                if album is not None:
+                    caption = "\n\n".join(album.captions()) or None
+                else:
+                    caption = update.message.caption
+                if len(paths) > 1:
+                    prompt = image_handler.create_album_prompt(len(paths), caption)
+                else:
+                    prompt = image_handler.create_photo_prompt(caption)
 
                 await self._run_agentic_media_turn(
                     update=update,
                     context=context,
-                    prompt=processed_image.prompt,
+                    prompt=prompt,
                     progress_msg=progress_msg,
                     user_id=user_id,
                     chat=chat,
-                    images=[img_path],
+                    images=paths,
                 )
 
             except Exception as e:
@@ -2162,18 +2342,22 @@ class TurnsMixin(OrchestratorBase):
                 user_id, update.message.chat_id, _media_kind(update.message), profile_id
             )
         chat = update.message.chat
-        await chat.send_action(
-            "typing",
-            message_thread_id=(
-                update.message.message_thread_id
-                if update.message.is_topic_message
-                else None
-            ),
+        thread_id = (
+            update.message.message_thread_id
+            if update.message.is_topic_message
+            else None
+        )
+        await with_telegram_retry(
+            lambda: chat.send_action("typing", message_thread_id=thread_id),
+            what="send_action",
         )
         markup = None
         if was_queued and waiter is not None:
             markup = interrupt_markup(waiter.id)
-        progress_msg = await update.message.reply_text(note, reply_markup=markup)
+        progress_msg = await with_telegram_retry(
+            lambda: update.message.reply_text(note, reply_markup=markup),
+            what="progress message",
+        )
         return lock, progress_msg, was_queued
 
     async def _run_agentic_media_turn(

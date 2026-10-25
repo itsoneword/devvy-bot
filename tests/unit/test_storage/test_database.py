@@ -50,7 +50,7 @@ class TestDatabaseManager:
                 "users",
                 "sessions",
                 "messages",
-                "tool_usage",
+                "tool_calls",
                 "audit_log",
                 "user_tokens",
                 "cost_tracking",

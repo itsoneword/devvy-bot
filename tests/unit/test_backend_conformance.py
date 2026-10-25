@@ -16,7 +16,7 @@ Cells: ``claude`` / ``codex`` x ``confined`` (sandboxed profile, e.g. coach)
   data-root secrets/ and db/; unrestricted cells run full access by design.
 * the credential layer holds on every cell that has one.
 
-Plus one per-backend scenario: a failed tool call reaches ``tool_usage`` as
+Plus one per-backend scenario: a failed tool call reaches ``tool_calls`` as
 success=0 with its error (the second dv-c7d1 bug). The live counterpart is
 ``scripts/backend_smoke.py``.
 """
@@ -55,6 +55,7 @@ from src.security.denylist import ProtectedDirs
 from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
+from tests.helpers.traced import traced
 
 BACKENDS = ("claude", "codex")
 PROFILE_TYPES = ("confined", "unrestricted")
@@ -375,7 +376,7 @@ class TestLaunchContract:
 
 
 # --------------------------------------------------------------------------
-# Tool outcome -> tool_usage, per backend
+# Tool outcome -> tool_calls (harness trace), per backend
 # --------------------------------------------------------------------------
 
 FAIL_MSG = "MCP tool call requires approval, but approval policy is never"
@@ -425,8 +426,11 @@ async def _run_turn(backend: str, tree: Tree, settings: Settings, storage, tmp_p
             session_store=InMemoryCodexSessionStore(),
             session_manager=manager,
         )
-        return await integ.run_command(
-            prompt="p", working_directory=tree.own, user_id=USER_ID, force_new=True
+        return await traced(
+            storage,
+            lambda: integ.run_command(
+                prompt="p", working_directory=tree.own, user_id=USER_ID, force_new=True
+            ),
         )
     messages = [
         AssistantMessage(
@@ -445,7 +449,12 @@ async def _run_turn(backend: str, tree: Tree, settings: Settings, storage, tmp_p
         AssistantMessage(content=[TextBlock(text="ok")], model="haiku"),
         _result(),
     ]
-    _, response = await _claude_run(tree, settings, "confined", messages)
+
+    async def _claude_call() -> Any:
+        _, resp = await _claude_run(tree, settings, "confined", messages)
+        return resp
+
+    response = await traced(storage, _claude_call)
     # The Claude facade owns the sessions row; mirror it for the FK.
     from datetime import datetime, timezone
 
@@ -477,7 +486,7 @@ async def test_failed_tool_call_recorded_as_failure(
     )
     async with storage.db_manager.get_connection() as conn:
         cur = await conn.execute(
-            "SELECT tool_name, success, error_message FROM tool_usage "
+            "SELECT tool_name, ok, error FROM tool_calls "
             "WHERE message_id = ? ORDER BY id",
             (message_id,),
         )

@@ -71,8 +71,9 @@ def _bot_db() -> sqlite3.Connection:
             project_path TEXT);
         CREATE TABLE messages (message_id INTEGER, session_id TEXT,
             user_id INTEGER, timestamp TEXT, prompt TEXT, response TEXT);
-        CREATE TABLE tool_usage (id INTEGER, session_id TEXT,
-            message_id INTEGER, tool_name TEXT, timestamp TEXT);
+        CREATE TABLE tool_calls (id INTEGER, session_id TEXT,
+            message_id INTEGER, tool_name TEXT, started_at TEXT,
+            parent_tool_use_id TEXT);
         CREATE TABLE memory_facts (id INTEGER, agent_id TEXT, tier TEXT,
             created_at TEXT);
         """
@@ -103,7 +104,8 @@ def _bot_db() -> sqlite3.Connection:
         ],
     )
     conn.executemany(
-        "INSERT INTO tool_usage VALUES (?,?,?,?,?)",
+        "INSERT INTO tool_calls (id, session_id, message_id, tool_name, started_at)"
+        " VALUES (?,?,?,?,?)",
         [
             (1, "s1", 1, "mcp__agent__log_food", "2026-08-10T09:00:01+00:00"),
             (2, "s1", 3, "Bash", "2026-08-11T09:00:01+00:00"),

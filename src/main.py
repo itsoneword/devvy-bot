@@ -42,6 +42,7 @@ from src.storage.facade import Storage
 from src.storage.hold_repository import HoldStore
 from src.storage.model_calls import ModelCallRepository
 from src.storage.session_storage import SQLiteSessionStorage
+from src.storage.tool_calls import ToolCallRepository
 from src.utils.log_redaction import install_secret_redaction
 from src.utils.turn_locks import report_dropped_messages
 
@@ -485,11 +486,11 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     from src.model_router.claude_plain import ClaudePlainCaller
     from src.model_router.codex_plain import CodexPlainCaller
     from src.model_router.openrouter_plain import OpenRouterPlainCaller
+    from src.model_router.types import CLAUDE_HARNESS, CODEX_HARNESS, OPENROUTER_HARNESS
     from src.model_router.typesafe_decide import (
         TypesafeDecider,
         configure_typesafe_key,
     )
-    from src.model_router.types import CLAUDE_HARNESS, CODEX_HARNESS, OPENROUTER_HARNESS
 
     def _profile_slug_for(working_dir: Path) -> Optional[str]:
         if profile_registry is None:
@@ -511,6 +512,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         ),
         profile_resolver=_profile_slug_for,
         decider=TypesafeDecider(),
+        tool_calls=ToolCallRepository(storage.db_manager),
     )
     set_router(model_router)
     # dv-e690: the key lives in Settings (scrubbed from os.environ), so hand
@@ -803,6 +805,20 @@ async def run_application(app: Dict[str, Any]) -> None:
                 notify_callback=_notify_owner,
             )
 
+        # Harness trace retention (dv-2260): tool_calls older than 90 days.
+        from src.storage.tool_calls import RETENTION_DAYS
+
+        _trace_store = ToolCallRepository(storage.db_manager)
+
+        async def _prune_tool_calls() -> None:
+            try:
+                n = await _trace_store.prune(RETENTION_DAYS)
+                logger.info("tool_calls pruned", rows=n, days=RETENTION_DAYS)
+            except Exception as e:
+                logger.error("tool_calls prune failed", error=str(e))
+
+        scheduler.add_native_job("tool-calls-prune", "30 4 * * *", _prune_tool_calls)
+
         # Wire in-process agent MCP tools (schedule/notify/task). Done here —
         # not at SDK-manager construction — because the scheduler is created
         # now. These tools run outside the Bash sandbox, so agents no longer
@@ -911,9 +927,10 @@ async def run_application(app: Dict[str, Any]) -> None:
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
             from src.claude.confirmation import CALLBACK_PREFIX, ConfirmationManager
+            from src.security import ask_explain
 
-            async def _send_confirm_prompt(chat_id: int, text: str, token: str) -> int:
-                keyboard = InlineKeyboardMarkup(
+            def _confirm_keyboard(token: str) -> InlineKeyboardMarkup:
+                return InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
@@ -927,13 +944,28 @@ async def run_application(app: Dict[str, Any]) -> None:
                         ]
                     ]
                 )
+
+            async def _send_confirm_prompt(chat_id: int, text: str, token: str) -> int:
                 message = await telegram_bot.send_message(
                     chat_id=chat_id,
                     text=text,
                     parse_mode="HTML",
-                    reply_markup=keyboard,
+                    reply_markup=_confirm_keyboard(token),
                 )
                 return message.message_id
+
+            # dv-af70: the explanation is edited into a still-pending card,
+            # so the same buttons go back on with it.
+            async def _update_confirm_prompt(
+                chat_id: int, message_id: int, text: str, token: str
+            ) -> None:
+                await telegram_bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=_confirm_keyboard(token),
+                )
 
             async def _edit_confirm_prompt(
                 chat_id: int, message_id: int, text: str
@@ -950,6 +982,8 @@ async def run_application(app: Dict[str, Any]) -> None:
                 chat_ids=config.notification_chat_ids or [],
                 edit_prompt=_edit_confirm_prompt,
                 timeout_seconds=config.confirmation_timeout_seconds,
+                explain=ask_explain.explain,
+                update_prompt=_update_confirm_prompt,
             )
             claude_integration.sdk_manager.attach_confirmation_manager(
                 confirmation_manager

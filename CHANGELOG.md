@@ -2,6 +2,78 @@
 
 Release notes for Devvy. Newest first.
 
+## 1.5 — 2026-10-25
+
+### Tracing
+- `tool_calls` records every tool call of a turn as it happens: bot turns,
+  background jobs and task-pump runs, subagent calls linked to the call that
+  started them, with a short result preview. A turn that is interrupted or
+  crashes keeps what it did. Rows are kept 90 days. It replaces `tool_usage`.
+- Owner-only `/trace` (and `scripts/trace`) prints a turn's question, answer and
+  tool-call tree: `/trace` (newest), `/trace <message_id>`, `/trace call:<id>`
+  (jobs, pump), `/trace last [N]`.
+- Per-turn activity ledger: when a turn stalls, the log names what it was
+  waiting on (API, a hook or MCP request, or the bot not reading its stream).
+  An event-loop lag monitor warns when the loop runs late.
+
+### Safety and approvals
+- The "Confirm risky action" card now carries an independent plain-language
+  explanation of the command and a verdict, from a cheap model that sees only
+  the rule reason and the command, never the agent's reasoning. The command is
+  treated as untrusted. The verdict is advisory: only your tap approves, and if
+  the explainer fails the card is unchanged.
+- `sandbox_keys` (profile key-store services injected into a sandboxed
+  profile's Bash, redacted from output) now works on the Codex backend too.
+- Closed a path where background jobs could leave the bwrap box by starting a
+  new systemd unit.
+
+### Task pump
+- New stages: **architect** (checks the plan before you see it), **review**
+  (a separate job that can send a build back once) and **acceptance** (runs the
+  product as a user would). Small tasks skip what they do not need; a task can
+  carry `size: S|M|L`, and an L build runs alone on its repo.
+- `taskpump start <id>`, and `job_start` with `task_id`, start a task directly.
+  Each board runs under its own profile; cards go to that agent's chat.
+- Launch holds: `deps:` not yet done, or `start_at:` in the future, keep a task
+  from launching. The reason shows in the status pin.
+- One pinned live status post (running / needs you / waiting / today).
+- A per-task launch cap (`PUMP_TASK_CAP`, 15) replaces the daily cap as the
+  runaway guard; a capped task continues on "go" or `taskpump retry <id> --more N`.
+  `PUMP_DAILY_CAP` stays as a fuse. `taskpump retry <id>` re-runs a failed step.
+- `PUMP_MAX_ACCEPTANCE` (default 1) limits concurrent acceptance runs.
+  Question and result cards go to the board's agent chat; reply there to answer.
+- Tick interval is 5 minutes. The repo feature map (`docs/features.yaml`) is
+  passed to the stages when present.
+- `scripts/testrun -- <cmd>` runs tests under their own memory cap
+  (`PUMP_TEST_MEMORY_MAX`), so a heavy suite is OOM-killed alone instead of
+  taking its job down.
+
+### Telegram reliability
+- Telegram network timeouts are retried with backoff; if all retries fail you
+  get a "not processed, resend" notice instead of a security warning.
+- Progress edits, drafts and tool lines run on a background updater (newest
+  wins), so a rate-limited Telegram call can no longer stall the model stream.
+  The typing indicator no longer counts against the group rate limit.
+- One turn per Telegram album (caption first); text sent while an album is open
+  joins it.
+- `/stop` cuts a run that is still streaming at the grace deadline, ends the
+  CLI's whole process tree, and ignores stale callback errors. Detached
+  background jobs are unaffected. The interrupt button always gives feedback.
+- A text-only final message counts as the answer, with a 60 s grace for
+  trailing events.
+
+### Jobs
+- Jobs topic is a log: one batch digest per agent turn goes to the agent's chat,
+  and replies in the Jobs topic are answered in the agent chat. Duplicate-job
+  guard and clearer `task_id` errors.
+- `extra_dirs` count as image roots, and job finish notifications attach images.
+  The job stream buffer is 16 MiB like bot turns.
+- `scripts/bgjob` lists only real job directories.
+
+### Upgrade
+- One new schema migration (`tool_calls`) applies on start.
+- `tool_usage` readers now read `tool_calls`.
+
 ## 1.4 — 2026-10-19
 
 ### Models and cost

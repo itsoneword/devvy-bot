@@ -332,11 +332,11 @@ class WindowRepository:
             )
             messages = await cur.fetchall()
             cur = await conn.execute(
-                "SELECT t.message_id, t.tool_name FROM tool_usage t "
+                "SELECT t.message_id, t.tool_name FROM tool_calls t "
                 "JOIN messages m ON t.message_id = m.message_id "
                 "JOIN sessions s ON m.session_id = s.session_id "
                 "WHERE m.user_id=? AND s.project_path=? AND m.window_id=? "
-                "ORDER BY t.id ASC",
+                "AND t.parent_tool_use_id IS NULL ORDER BY t.id ASC",
                 (user_id, wd, window_id),
             )
             tools: Dict[int, List[str]] = {}

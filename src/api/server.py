@@ -47,6 +47,12 @@ class NotifyRequest(BaseModel):
     # Ledger tag + owning profile for replies (dv-c41e): "job:<id>", "devops".
     ref: Optional[str] = None
     profile: Optional[str] = None
+    # Files to send after the text (a job's `image:` lines, dv-f90c). Must sit
+    # inside the profile's working dir / extra_dirs; anything else is dropped.
+    images: List[str] = []
+    # True: deliver to `profile`'s own chat (its bound topic, else the DM),
+    # the job digest's route (dv-a9b0). Unknown profile = routed by source.
+    deliver: bool = False
 
 
 class PromptRequest(BaseModel):
@@ -92,6 +98,15 @@ class ModelCallRequest(BaseModel):
     duration_ms: int = 0
     outcome: str
     error: Optional[str] = None
+    # The harness trace this call made (dv-2260), rows already sent.
+    trace_id: Optional[str] = None
+
+
+class ToolCallsRequest(BaseModel):
+    """Tool-call rows of a job's trace (dv-2260), sent as they happen."""
+
+    trace_id: str
+    rows: List[Dict[str, Any]]
 
 
 class ScheduleRequest(BaseModel):
@@ -265,6 +280,29 @@ def create_api_app(
             )
         return profile.working_dir
 
+    def _validated_images(paths: List[str], profile_slug: Optional[str]) -> List[str]:
+        """Keep only paths deliverable for this profile (one validator, dv-f90c)."""
+        if not paths or not profile_registry or not profile_slug:
+            return []
+        profile = profile_registry.get_by_slug(profile_slug)
+        if not profile:
+            return []
+        from ..bot.utils.image_extractor import (
+            MAX_IMAGES_PER_RESPONSE,
+            allowed_image_roots,
+            validate_image_path,
+        )
+
+        roots = allowed_image_roots(profile.working_dir, profile.extra_dirs)
+        out: List[str] = []
+        for raw in paths[:MAX_IMAGES_PER_RESPONSE]:
+            img = validate_image_path(raw, roots, any_file=False)
+            if img is None:
+                logger.warning("notify image rejected", path=raw, profile=profile_slug)
+                continue
+            out.append(str(img.path))
+        return out
+
     @app.post("/internal/notify")
     async def internal_notify(
         body: NotifyRequest,
@@ -272,14 +310,28 @@ def create_api_app(
     ) -> Dict[str, str]:
         """Send a Telegram message to the user right now."""
         _require_internal_auth(authorization)
+        image_paths = _validated_images(body.images, body.profile)
+        deliver_profile = None
+        if body.deliver:
+            # Never a 4xx: the pump's outbox would retry a rejected card forever.
+            if (
+                body.profile
+                and profile_registry
+                and profile_registry.get_by_slug(body.profile)
+            ):
+                deliver_profile = body.profile
+            else:
+                logger.warning("notify deliver: unknown profile", profile=body.profile)
         event = AgentResponseEvent(
             chat_id=body.chat_id or 0,
+            image_paths=image_paths,
             text=body.text,
             parse_mode="markdown" if body.markdown else None,
             pin_as=body.pin_as,
             source=body.source or "internal",
             ledger_ref=body.ref,
             ledger_profile_slug=body.profile,
+            deliver_profile=deliver_profile,
         )
         await event_bus.publish(event)
         logger.info(
@@ -344,7 +396,7 @@ def create_api_app(
 
         if body.purpose not in PURPOSES:
             raise HTTPException(status_code=400, detail="unknown purpose")
-        await model_calls.record(
+        row_id = await model_calls.record(
             ModelCall(
                 purpose=body.purpose,
                 kind=body.kind,
@@ -368,6 +420,26 @@ def create_api_app(
                 error=body.error,
             )
         )
+        if body.trace_id and row_id is not None and db_manager is not None:
+            from src.storage.tool_calls import ToolCallRepository
+
+            await ToolCallRepository(db_manager).link_model_call(
+                body.trace_id, row_id, body.session_id
+            )
+        return {"status": "recorded"}
+
+    @app.post("/internal/tool_calls")
+    async def internal_tool_calls(
+        body: ToolCallsRequest,
+        authorization: Optional[str] = Header(None),
+    ) -> Dict[str, str]:
+        """Store tool-call rows of a job's trace (dv-2260)."""
+        _require_internal_auth(authorization)
+        if db_manager is None:
+            raise HTTPException(status_code=503, detail="database not available")
+        from src.storage.tool_calls import ToolCallRepository
+
+        await ToolCallRepository(db_manager).upsert(body.trace_id, body.rows[:200])
         return {"status": "recorded"}
 
     @app.post("/internal/schedule")

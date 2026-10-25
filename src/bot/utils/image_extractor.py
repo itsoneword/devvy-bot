@@ -35,11 +35,19 @@ def session_scratch_roots() -> List[Path]:
     return [r for r in roots if r.exists()]
 
 
-def allowed_image_roots(working_directory: Union[str, Path, None]) -> List[Path]:
-    """Roots a ``send_image_to_user`` path may live under for this turn."""
+def allowed_image_roots(
+    working_directory: Union[str, Path, None],
+    extra_dirs: Sequence[Union[str, Path]] = (),
+) -> List[Path]:
+    """Roots a ``send_image_to_user`` path may live under for this turn.
+
+    ``extra_dirs`` are the profile's owner-granted extra roots (dv-f90c); the
+    denylist check in :func:`validate_image_path` still applies to them.
+    """
     roots: List[Path] = []
     if working_directory:
         roots.append(Path(working_directory))
+    roots.extend(Path(d) for d in extra_dirs)
     roots.extend(session_scratch_roots())
     return roots
 

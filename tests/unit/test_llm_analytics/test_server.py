@@ -104,10 +104,10 @@ def _make_bot_db(path: Path) -> None:
             active_backend TEXT, cumulative_tokens INTEGER,
             last_eval_checkpoint INTEGER, last_checkpoint_message_id INTEGER,
             updated_at TEXT);
-        CREATE TABLE tool_usage (
+        CREATE TABLE tool_calls (
             id INTEGER PRIMARY KEY, session_id TEXT, message_id INTEGER,
-            tool_name TEXT, tool_input TEXT, timestamp TEXT,
-            success INTEGER, error_message TEXT);
+            tool_name TEXT, input_short TEXT, started_at TEXT,
+            ok INTEGER, error TEXT, parent_tool_use_id TEXT);
         CREATE TABLE memory_facts (
             id INTEGER PRIMARY KEY, agent_id TEXT, tier TEXT, label TEXT,
             content TEXT, status TEXT, kind TEXT, created_at TEXT);
@@ -165,7 +165,8 @@ def _make_bot_db(path: Path) -> None:
         ],
     )
     conn.executemany(
-        "INSERT INTO tool_usage VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO tool_calls (id, session_id, message_id, tool_name, input_short,"
+        " started_at, ok, error) VALUES (?,?,?,?,?,?,?,?)",
         [
             (
                 1,

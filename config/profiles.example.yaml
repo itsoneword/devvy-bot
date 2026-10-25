@@ -124,6 +124,15 @@
 # NOT ENFORCED today: the box shares the host network. The key is validated and
 # kept for the future egress proxy. Owner-only profiles.
 #
+# Optional per-profile `sandbox_keys:` (dv-0277) lists key-store services
+# (`/setkey <service> NAME value`) whose keys a SANDBOXED profile's bash gets
+# in its environment. The box launcher reads them outside the box and redacts
+# every value from the output; the store itself never appears in the box.
+# Redaction stops accidental prints, not exfiltration: give such a key its own
+# spend limit. Owner-only profiles. Works on both backends: on Codex the
+# values sit in the shell env and the policy hook wraps each shell command in
+# the launcher's --redact-env mode (dv-28f2).
+#
 #   - slug: markets
 #     ...
 #     sandbox_read_dirs:

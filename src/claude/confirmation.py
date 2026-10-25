@@ -10,6 +10,12 @@ threat model is an *unattended* run, so the decision belongs to the owner, not
 whatever chat (if any) triggered the run.
 
 Fails **closed**: on timeout or with no owner chat configured, the op is denied.
+
+This is the one place every ask card is built -- chat (Claude hook), Codex
+(bridge ``/policy/check``) and background jobs (``/internal/policy/ask``) all
+end in :meth:`ConfirmationManager.request`. The independent explanation
+(dv-af70, ``src/security/ask_explain.py``) is added here too: the card goes out
+at once, and the explanation is edited in under the code when it arrives.
 """
 
 from __future__ import annotations
@@ -36,6 +42,8 @@ class ConfirmationManager:
         chat_ids: Optional[List[int]],
         timeout_seconds: float = 600.0,
         edit_prompt: Optional[Callable[[int, int, str], Awaitable[None]]] = None,
+        explain: Optional[Callable[[str, str], Awaitable[Optional[str]]]] = None,
+        update_prompt: Optional[Callable[[int, int, str, str], Awaitable[None]]] = None,
     ) -> None:
         # send_prompt(chat_id, text, token) -> sends a message with two inline
         # buttons whose callback_data is f"{CALLBACK_PREFIX}:{token}:y|n", and
@@ -45,10 +53,19 @@ class ConfirmationManager:
         # it's resolved by timeout, so stale Approve/Deny buttons don't sit
         # there looking actionable after the decision has already been made.
         self._edit_prompt = edit_prompt
+        # explain(reason, preview) -> an HTML block for under the code, or
+        # None (dv-af70). It sees only the reason and the command, never who
+        # asked. update_prompt(chat_id, message_id, text, token) edits the
+        # card in place and rebuilds the Approve/Deny buttons for the token
+        # (an edit without reply_markup would drop them).
+        self._explain = explain
+        self._update_prompt = update_prompt
         self._chat_ids = list(chat_ids or [])
         self._timeout = timeout_seconds
         self._pending: Dict[str, asyncio.Future[bool]] = {}
         self._pending_messages: Dict[str, Tuple[int, int]] = {}
+        # The card's current text, so a timeout rewrite keeps an explanation.
+        self._pending_texts: Dict[str, str] = {}
 
     async def request(
         self,
@@ -77,14 +94,17 @@ class ConfirmationManager:
         fut: asyncio.Future[bool] = loop.create_future()
         self._pending[token] = fut
 
-        text = (
+        head = (
             "⚠️ <b>Confirm risky action</b>\n"
             + (f"from background job <i>{html.escape(source)}</i>\n" if source else "")
             + f"<b>{html.escape(reason)}</b>\n\n"
             f"<pre>{html.escape(_truncate(preview, 500))}</pre>\n"
+        )
+        tail = (
             "Approve to run it, or deny to block. "
             f"Denied automatically in {_human_duration(timeout)}."
         )
+        text = head + tail
         chat_id = self._chat_ids[0]
         try:
             message_id = await self._send_prompt(chat_id, text, token)
@@ -92,8 +112,14 @@ class ConfirmationManager:
             logger.warning("Failed to send confirmation prompt", error=str(exc))
             self._pending.pop(token, None)
             return False
+        explaining: Optional[asyncio.Task[None]] = None
         if message_id is not None:
             self._pending_messages[token] = (chat_id, message_id)
+            self._pending_texts[token] = text
+            if self._explain and self._update_prompt:
+                explaining = asyncio.create_task(
+                    self._add_explanation(token, reason, preview, head, tail)
+                )
 
         try:
             approved = await asyncio.wait_for(fut, timeout=timeout)
@@ -101,11 +127,39 @@ class ConfirmationManager:
             return approved
         except asyncio.TimeoutError:
             logger.info("Confirmation timed out -> denied", reason=reason)
-            await self._mark_timed_out(token, text)
+            await self._mark_timed_out(token, self._pending_texts.get(token, text))
             return False
         finally:
+            if explaining is not None:
+                explaining.cancel()
             self._pending.pop(token, None)
             self._pending_messages.pop(token, None)
+            self._pending_texts.pop(token, None)
+
+    async def _add_explanation(
+        self, token: str, reason: str, preview: str, head: str, tail: str
+    ) -> None:
+        """Edit the explanation in under the code once it arrives (dv-af70).
+
+        Advisory only: it never resolves the ask. No answer, a failure or an
+        ask already decided leaves the card as it is.
+        """
+        assert self._explain is not None and self._update_prompt is not None
+        try:
+            block = await self._explain(reason, preview)
+        except Exception as exc:
+            logger.info("Ask explanation failed", reason=reason, error=str(exc))
+            return
+        fut = self._pending.get(token)
+        location = self._pending_messages.get(token)
+        if not block or fut is None or fut.done() or location is None:
+            return
+        text = f"{head}{block}\n\n{tail}"
+        self._pending_texts[token] = text
+        try:
+            await self._update_prompt(location[0], location[1], text, token)
+        except Exception as exc:
+            logger.info("Failed to add ask explanation to card", error=str(exc))
 
     async def _mark_timed_out(self, token: str, original_text: str) -> None:
         """Rewrite the prompt in place so it no longer looks actionable."""

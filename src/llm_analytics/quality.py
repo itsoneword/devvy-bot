@@ -14,7 +14,7 @@ carry no prompt/response text.)
 Signals:
 - pinned_facts:        new memory_facts rows with tier='pinned' (each new
                        standing instruction is a user-unhappiness proxy).
-- log_calls:           log_* tool calls (tool_usage), activity denominator.
+- log_calls:           log_* tool calls (tool_calls), activity denominator.
 - claimed_not_logged:  turns whose reply claims «записал/записано/logged»
                        with no log_* tool call in that turn.
 - complaint_hits:      user messages matching a complaint pattern.
@@ -94,7 +94,7 @@ _PROGRAM_NUMBER_RES = (_SET_REP_RE, _WEIGHT_RE, _PERCENT_1RM_RE, _RPE_RE)
 CHEAP_CHECK_MAX = 3
 
 # Search-class tools: each call pulls external content into the turn. A
-# foreground subagent is one row in tool_usage but weighs 2 against the live
+# foreground subagent is one row in tool_calls but weighs 2 against the live
 # budget: one spawn routinely fans out into many nested Web* calls (turn
 # 1817: Agent x1 -> WebSearch x17 + WebFetch x2).
 SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
@@ -215,9 +215,10 @@ def compute_quality_daily(src: sqlite3.Connection) -> list[tuple]:
     logged_message_ids: set[int] = set()
     web_searched_message_ids: set[int] = set()
     tools_by_message: dict[int, list[str]] = defaultdict(list)
-    if "tool_usage" in tables:
+    if "tool_calls" in tables:
         for row in src.execute(
-            "SELECT session_id, message_id, tool_name, timestamp FROM tool_usage"
+            "SELECT session_id, message_id, tool_name, started_at AS timestamp "
+            "FROM tool_calls WHERE parent_tool_use_id IS NULL"
         ):
             if row["message_id"] is not None:
                 tools_by_message[int(row["message_id"])].append(row["tool_name"])

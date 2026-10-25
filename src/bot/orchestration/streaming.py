@@ -14,6 +14,7 @@ from telegram import InputMediaPhoto, Update
 
 from ...claude.sdk_integration import StreamUpdate
 from ..utils.draft_streamer import DraftStreamer
+from ..utils.ephemeral_updater import EphemeralUpdater
 from ..utils.image_extractor import (
     ImageAttachment,
     should_send_as_photo,
@@ -158,12 +159,16 @@ class StreamingMixin(OrchestratorBase):
         mcp_images: Optional[List[ImageAttachment]] = None,
         approved_directory: Optional[Path] = None,
         draft_streamer: Optional[DraftStreamer] = None,
+        updater: Optional[EphemeralUpdater] = None,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
         """Create a stream callback for verbose progress updates.
 
         When *mcp_images* is provided, the callback also intercepts
         ``send_image_to_user`` tool calls and collects validated
         :class:`ImageAttachment` objects for later Telegram delivery.
+
+        When *updater* is given, progress edits are handed to it instead of
+        being awaited inline (the stream reader must never wait on Telegram).
 
         When *draft_streamer* is provided, tool activity and assistant
         text are streamed to the user in real time via
@@ -273,13 +278,22 @@ class StreamingMixin(OrchestratorBase):
                 now = time.time()
                 if (now - last_edit_time[0]) >= 2.0 and tool_log:
                     last_edit_time[0] = now
-                    new_text = self._format_verbose_progress(
-                        tool_log, verbose_level, start_time
-                    )
-                    try:
-                        await progress_msg.edit_text(new_text)
-                    except Exception:
-                        pass
+
+                    async def _edit() -> None:
+                        await progress_msg.edit_text(
+                            self._format_verbose_progress(
+                                tool_log, verbose_level, start_time
+                            )
+                        )
+
+                    if updater is not None:
+                        # Off the reader path: latest wins, formatted at send time.
+                        updater.submit(_edit)
+                    else:
+                        try:
+                            await _edit()
+                        except Exception:
+                            pass
 
         return _on_stream
 

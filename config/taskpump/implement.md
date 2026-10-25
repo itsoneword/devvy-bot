@@ -26,11 +26,13 @@ Task: **{{TASK_ID}} — {{TASK_TITLE}}**
 {{TASK_TEXT}}
 ```
 
-Your own earlier analysis is at `docs/research/{{TASK_ID}}/analysis.md` in this
-worktree. Read it first; it has the file:line detail this summary lacks.
+The analysis, written by an earlier and separate analysis job, is at
+`docs/research/{{TASK_DIR}}/analysis.md` in this worktree. Read it first; it
+has the file:line detail this summary lacks. It is a plan, not proof: where
+the code disagrees with it, the code wins — say so in RESULT.
 
 {{PHASE}}
-{{PROTECTED}}**The human's answers are binding.** They appear in the task file as a
+{{PROTECTED}}{{RETURNED}}**The human's answers are binding.** They appear in the task file as a
 `### @user` comment near the end. Where an answer contradicts your earlier
 plan, the answer wins. Where a question went unanswered, apply the `(default:
 …)` you proposed and note that you did.

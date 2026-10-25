@@ -12,7 +12,17 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import structlog
 
@@ -33,9 +43,16 @@ from src.claude.turn_setup import (
     resolve_turn_context,
 )
 from src.config.settings import Settings
+from src.model_router.trace import current_trace
 from src.storage.codex_sessions import CodexSessionStore, InMemoryCodexSessionStore
 from src.storage.repositories import MessageRepository
-from src.utils.agent_env import agent_child_env, is_env_name, split_mcp_env
+from src.security.bash_box import BashBox, KeyEnvError, load_key_env
+from src.utils.agent_env import (
+    AGENT_CLI_CREDENTIAL_VARS,
+    agent_child_env,
+    is_env_name,
+    split_mcp_env,
+)
 
 from .codex_execpolicy import ensure_rules as ensure_money_guard_rules
 from .codex_sandbox import sandbox_args
@@ -176,11 +193,47 @@ def map_codex_event(event: Dict[str, Any]) -> CodexEventOutcome:
     return CodexEventOutcome()
 
 
+def _feed_codex_trace(
+    trace: Any, event: Dict[str, Any], outcome: "CodexEventOutcome"
+) -> None:
+    """Feed one Codex event to the harness trace. Codex streams a flat list
+    of items: no caller tree (every call is the main agent's) and no subagent
+    results; durations are wall clock between item.started and completed."""
+    try:
+        etype = event.get("type")
+        item = event.get("item") or {}
+        item_id = outcome.item_id or item.get("id")
+        if etype == "item.started" and outcome.stream_update:
+            calls = outcome.stream_update.tool_calls or []
+            if len(calls) == 1:
+                # An item without an id cannot be paired with its completion;
+                # it still gets a row (left "no result" at the end).
+                use_id = str(item_id or f"codex-{len(trace.rows()) + 1}")
+                trace.start(use_id, calls[0]["name"], calls[0].get("input"))
+        elif etype == "item.completed" and item_id:
+            text = (
+                item.get("aggregated_output")
+                or item.get("output")
+                or item.get("result")
+                or ""
+            )
+            trace.finish(
+                str(item_id),
+                text if isinstance(text, str) else str(text),
+                error=outcome.tool_error,
+            )
+    except Exception as exc:  # tracing must never break a turn
+        logger.warning("codex trace feed failed", error=str(exc))
+
+
 def _map_started_item(item: Dict[str, Any]) -> CodexEventOutcome:
     """Progress entry for a tool item that just started."""
     itype = item.get("type")
     if itype == "command_execution":
         cmd = str(item.get("command", ""))
+        # A keyed turn's shell runs in the redaction wrapper (dv-28f2): the
+        # progress view and the trace show what the model asked for.
+        cmd = BashBox.unwrap(cmd) or cmd
         return CodexEventOutcome(
             stream_update=StreamUpdate(
                 type="system",
@@ -277,6 +330,27 @@ def _with_mcp_auto_approval(overrides: List[str]) -> List[str]:
     for name in names:
         out += ["-c", f'mcp_servers.{name}.default_tools_approval_mode="approve"']
     return out
+
+
+def _scrubber(values: Sequence[str]) -> Callable[[str], str]:
+    """Replace every key value (raw and JSON-escaped) with ``<redacted>``.
+
+    The backstop behind the redaction wrapper (dv-28f2): a JSONL line that
+    still carries a key value never reaches the progress view, the trace, the
+    reply or a log.
+    """
+    forms = sorted(
+        {f for v in values if v for f in (v, json.dumps(v)[1:-1])},
+        key=len,
+        reverse=True,
+    )
+
+    def scrub(text: str) -> str:
+        for form in forms:
+            text = text.replace(form, "<redacted>")
+        return text
+
+    return scrub
 
 
 def _strip_provider_prefix(model: str) -> str:
@@ -471,6 +545,7 @@ class CodexCliIntegration:
         resume_id: Optional[str],
         images: Optional[List[Path]] = None,
         user_id: Optional[int] = None,
+        redact_env: Sequence[str] = (),
     ) -> List[str]:
         # Exec-level options must precede the `resume` subcommand — `codex exec
         # resume` does not accept them as its own args (it rejects e.g. `-C`).
@@ -492,6 +567,7 @@ class CodexCliIntegration:
             base += ["-i", str(img)]
         base += _with_mcp_auto_approval(self._mcp_overrides(cwd))
         base += self._policy_hook_args()
+        base += self._shell_env_args(redact_env)
         if resume_id:
             base += ["resume", resume_id]
         return base
@@ -517,6 +593,63 @@ class CodexCliIntegration:
             'hooks.PreToolUse=[{matcher="",hooks=[{type="command",'
             f"command={json.dumps(command)},timeout={hook_timeout}}}]}}]",
         ]
+
+    @staticmethod
+    def _shell_env_args(names: Sequence[str]) -> List[str]:
+        """Shell env lockdown for a keyed turn (dv-28f2); [] for any other.
+
+        The shell snapshot re-sources the codex child's whole env and bypasses
+        ``shell_environment_policy`` (research dv-0277 trap 1), so it goes off;
+        ``include_only`` then hands the shell the allowlisted basics plus the
+        key names, never the bridge token, policy URL, seam or MCP secrets.
+        Hooks still get the full codex env. Only key profiles pay for this
+        (owner, 2026-10-24); every other turn's argv is unchanged.
+        """
+        if not names:
+            return []
+        allowed = {k for k in agent_child_env() if k not in AGENT_CLI_CREDENTIAL_VARS}
+        allowed |= {"TZ", *names}
+        return [
+            "-c",
+            "features.shell_snapshot=false",
+            "-c",
+            'shell_environment_policy.inherit="all"',
+            "-c",
+            "shell_environment_policy.ignore_default_excludes=true",
+            "-c",
+            f"shell_environment_policy.include_only={json.dumps(sorted(allowed))}",
+        ]
+
+    def _sandbox_keys_env(self, cwd: Path) -> "Tuple[Dict[str, str], List[str]]":
+        """(key env, values to redact) for this turn's profile, or empty.
+
+        The Codex half of ``sandbox_keys`` (dv-0277, dv-28f2): the same store
+        read the bash box launcher does (:func:`bash_box.load_key_env`), once
+        per turn. Only a sandboxed profile, as on the Claude path (a
+        full-access profile gets no box there either), and only with the
+        policy hook mounted: without it nothing rewrites the shell into the
+        redaction wrapper, and the raw value would reach the model.
+        """
+        profile = self._profile_for(cwd)
+        services = tuple(getattr(profile, "sandbox_keys", ()) or ())
+        if not services or self._full_access_for(cwd):
+            return {}, []
+        if not self._policy_hook_args():
+            logger.warning(
+                "Codex turn without a policy hook gets no sandbox keys",
+                profile=getattr(profile, "slug", None),
+            )
+            return {}, []
+        try:
+            env, values = load_key_env(services)
+        except KeyEnvError as exc:
+            logger.warning(
+                "Codex sandbox keys unavailable for this turn",
+                profile=getattr(profile, "slug", None),
+                error=str(exc),
+            )
+            return {}, []
+        return {k: v for k, v in env.items() if is_env_name(k)}, values
 
     def _sandbox_args(self, cwd: Path, user_id: Optional[int]) -> List[str]:
         """Per-profile sandbox (dv-e38e): full access only for ``unrestricted``
@@ -620,7 +753,10 @@ class CodexCliIntegration:
             env = {k: v for k, v in env.items() if is_env_name(k)}
             if name == "telegram":
                 env[IMAGE_ROOTS_ENV] = image_roots_env(
-                    self.config.approved_directory, working_directory
+                    self.config.approved_directory,
+                    working_directory,
+                    getattr(self._profile_for(working_directory), "extra_dirs", ())
+                    or (),
                 )
             args = [str(a) for a in (cfg.get("args") or [])]
             out.append((key, str(command), args, env))
@@ -784,15 +920,26 @@ class CodexCliIntegration:
         registry's TTL (src/agent_bridge/tokens.py).
         """
         token: Optional[str] = None
-        turn_vars: Dict[str, str] = {}
+        # sandbox_keys (dv-28f2): values to the child env only, never argv;
+        # the NAMES ride the TurnContext so the policy gate wraps the shell.
+        key_env, key_values = (
+            self._sandbox_keys_env(working_directory)
+            if self.agent_bridge is not None
+            else ({}, [])
+        )
+        redact_env = tuple(sorted(key_env))
+        turn_vars: Dict[str, str] = dict(key_env)
         if self.agent_bridge is not None:
+            from dataclasses import replace
+
             from src.agent_bridge import TOKEN_ENV_VAR
 
-            token = self.agent_bridge.mint(
-                self._turn_context(
-                    working_directory, user_id, requester_chat_id, family_id, role
-                )
+            ctx = self._turn_context(
+                working_directory, user_id, requester_chat_id, family_id, role
             )
+            if redact_env:
+                ctx = replace(ctx, redact_env=redact_env)
+            token = self.agent_bridge.mint(ctx)
             # The ONLY place the token goes: this child's environment. Not the
             # command line (world-readable in /proc), not a config file, not a
             # log line.
@@ -826,6 +973,8 @@ class CodexCliIntegration:
                 model=model or self.default_model(),
                 family_id=family_id,
                 child_env=child_env,
+                redact_env=redact_env,
+                redact_values=key_values,
             )
         finally:
             if token is not None and self.agent_bridge is not None:
@@ -843,6 +992,8 @@ class CodexCliIntegration:
         model: Optional[str] = None,
         family_id: Optional[int] = None,
         child_env: Optional[Dict[str, str]] = None,
+        redact_env: Sequence[str] = (),
+        redact_values: Sequence[str] = (),
     ) -> ClaudeResponse:
         """One turn, with the resume-failed fallback the Claude facade has.
 
@@ -867,6 +1018,8 @@ class CodexCliIntegration:
                 model=model,
                 family_id=family_id,
                 child_env=child_env,
+                redact_env=redact_env,
+                redact_values=redact_values,
             )
         except CodexResumeError as resume_error:
             logger.warning(
@@ -912,6 +1065,8 @@ class CodexCliIntegration:
                 model=model,
                 family_id=family_id,
                 child_env=child_env,
+                redact_env=redact_env,
+                redact_values=redact_values,
             )
             response.session_restarted = True
             return response
@@ -949,6 +1104,8 @@ class CodexCliIntegration:
         model: Optional[str] = None,
         family_id: Optional[int] = None,
         child_env: Optional[Dict[str, str]] = None,
+        redact_env: Sequence[str] = (),
+        redact_values: Sequence[str] = (),
     ) -> ClaudeResponse:
         """One `codex exec` subprocess, start to finish. No retry logic."""
         start = time.time()
@@ -990,8 +1147,10 @@ class CodexCliIntegration:
             resume_id=resume_id,
             images=images,
             user_id=user_id,
+            redact_env=redact_env,
         )
         argv.append(prompt)
+        scrub = _scrubber(redact_values)
 
         thread_id: Optional[str] = resume_id
         usage: Dict[str, Any] = {}
@@ -1003,6 +1162,8 @@ class CodexCliIntegration:
         # any "I saved it" as a mismatch.
         tools_used: List[Dict[str, Any]] = []
         tool_items: Dict[str, Dict[str, Any]] = {}
+        # Harness trace (dv-2260): the router's collector, fed per item.
+        trace = current_trace()
         error_events: List[str] = []
 
         proc = await asyncio.create_subprocess_exec(
@@ -1075,7 +1236,10 @@ class CodexCliIntegration:
                 if not line:
                     break
                 try:
-                    event = json.loads(line.decode().strip())
+                    text = line.decode().strip()
+                    if redact_values:
+                        text = scrub(text)
+                    event = json.loads(text)
                 except (ValueError, UnicodeDecodeError):
                     continue
                 # `codex exec --json` reports API/turn failures HERE, on
@@ -1089,6 +1253,8 @@ class CodexCliIntegration:
                         if isinstance(_err, dict):
                             error_events.append(str(_err.get("message", "")))
                 outcome = map_codex_event(event)
+                if trace is not None and isinstance(event, dict):
+                    _feed_codex_trace(trace, event, outcome)
                 if outcome.thread_id:
                     thread_id = outcome.thread_id
                 if outcome.usage:
@@ -1135,7 +1301,7 @@ class CodexCliIntegration:
                 out_file.unlink()
         except OSError:
             pass
-        answer = answer or (final_fallback or "")
+        answer = scrub(answer or (final_fallback or ""))
 
         if proc.returncode != 0 and not answer and not stopped:
             # NOT `proc.stderr.read()`: the drainer above already consumed the
@@ -1145,7 +1311,7 @@ class CodexCliIntegration:
             # `codex exec --json` puts API failures.
             reason = " | ".join(dict.fromkeys(e for e in error_events if e))
             if not reason:
-                reason = "\n".join(stderr_tail)
+                reason = scrub("\n".join(stderr_tail))
             message = (
                 f"Codex CLI failed (exit {proc.returncode}): "
                 f"{(reason or '(no output)')[-500:]}"

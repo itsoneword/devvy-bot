@@ -97,7 +97,22 @@ async def _facade_section(tmp_path: Path) -> Dict[str, Any]:
             is_error = False
             num_turns = 1
             tools_used = [{"name": "Bash", "input": {"command": "ls"}}]
+            trace_id = "golden-trace"
 
+        await storage.tool_calls.upsert(
+            "golden-trace",
+            [
+                {
+                    "tool_use_id": "u1",
+                    "seq": 1,
+                    "tool_name": "Bash",
+                    "input_short": '{"command": "ls"}',
+                    "ok": 1,
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "detached": 0,
+                }
+            ],
+        )
         message_id = await storage.save_claude_interaction(
             1001, "sess-1", "hi there", _Resp()
         )
@@ -178,7 +193,7 @@ async def _facade_section(tmp_path: Path) -> Dict[str, Any]:
             "users",
             "sessions",
             "messages",
-            "tool_usage",
+            "tool_calls",
             "cost_tracking",
             "audit_log",
             "user_preferences",

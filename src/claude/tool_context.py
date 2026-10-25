@@ -23,9 +23,10 @@ parameter would let any profile read another user's store (dv-6dbc).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -109,6 +110,15 @@ class TurnContext:
     family_agent_id: Optional[str] = None
     user_id: Optional[int] = None
     role: Optional[str] = None
+    # Env var NAMES (never values) of the profile's sandbox_keys that this
+    # turn's Codex child holds (dv-28f2). Non-empty -> the policy gate wraps
+    # every allowed Bash call in the bash box's ``--redact-env`` mode.
+    redact_env: Tuple[str, ...] = ()
+    # One id per turn (the context is built once per turn on both transports).
+    # job_start stamps it on a job as its batch: jobs started in one turn are
+    # digested together (dv-c41e amendment, 2026-10-22).
+    # A per-turn random id, not part of the resolved context (excluded from ==).
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12], compare=False)
 
 
 ToolHandler = Callable[
@@ -155,6 +165,19 @@ def sdk_tool(spec: ToolSpec, services: AgentServices, ctx: TurnContext) -> Any:
 
     @tool(spec.name, spec.description, spec.schema)
     async def _run(args: Dict[str, Any]) -> Dict[str, Any]:
-        return await spec.handler(services, ctx, args)
+        # dv-586f: the CLI blocks on this call; the turn's ledger times it.
+        from .turn_activity import current_activity
+
+        activity = current_activity()
+        token = activity.begin("mcp", spec.name) if activity else 0
+        outcome = "ok"
+        try:
+            return await spec.handler(services, ctx, args)
+        except BaseException as exc:
+            outcome = type(exc).__name__
+            raise
+        finally:
+            if activity:
+                activity.end(token, outcome)
 
     return _run

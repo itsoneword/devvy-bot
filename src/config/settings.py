@@ -17,6 +17,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from src.utils.constants import (
     DEFAULT_ACTIVITY_LOG_MAX_LINES,
+    DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
     DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
     DEFAULT_CLAUDE_MAX_COST_PER_USER,
     DEFAULT_CLAUDE_MAX_COST_PER_USER_GUEST,
@@ -137,7 +138,7 @@ class Settings(BaseSettings):
     # message over this limit (default 1 MiB). One Read of a ~700 KB PNG
     # base64-encodes past that and kills the whole turn, so raise the ceiling.
     claude_max_buffer_size: int = Field(
-        16 * 1024 * 1024,
+        DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
         description="Max bytes for a single SDK stream-json message (stdout)",
     )
     claude_max_cost_per_user: float = Field(

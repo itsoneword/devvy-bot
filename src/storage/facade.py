@@ -20,7 +20,6 @@ from .models import (
     AuditLogModel,
     MessageModel,
     SessionModel,
-    ToolUsageModel,
     UserModel,
 )
 from .pending_notes import PendingNoteRepository
@@ -32,7 +31,6 @@ from .repositories import (
     MessageRepository,
     ProjectThreadRepository,
     SessionRepository,
-    ToolUsageRepository,
     UserPreferencesRepository,
     UserRepository,
 )
@@ -40,6 +38,7 @@ from .scheduler_repository import SchedulerRepository
 from .sent_messages import SentMessageRepository
 from .task_repository import TaskRepository
 from .token_repository import TokenTrackingRepository
+from .tool_calls import ToolCallRepository
 from .user_data import UserDataManager, UserDataRepository
 from .user_repository import BotUserRepository
 from .webhook_repository import WebhookEventRepository
@@ -77,7 +76,7 @@ class Storage:
         self.sessions = SessionRepository(self.db_manager)
         self.project_threads = ProjectThreadRepository(self.db_manager)
         self.messages = MessageRepository(self.db_manager)
-        self.tools = ToolUsageRepository(self.db_manager)
+        self.tool_calls = ToolCallRepository(self.db_manager)
         self.audit = AuditLogRepository(self.db_manager)
         self.costs = CostTrackingRepository(self.db_manager)
         self.analytics = AnalyticsRepository(self.db_manager)
@@ -157,24 +156,11 @@ class Storage:
 
         message_id = await self.messages.save_message(message)
 
-        # Save tool usage
-        if response.tools_used:
-            for tool in response.tools_used:
-                # A backend may mark one call failed (Codex item.completed,
-                # dv-c7d1) even when the turn as a whole succeeded.
-                tool_error = tool.get("error")
-                tool_usage = ToolUsageModel(
-                    id=None,
-                    session_id=session_id,
-                    message_id=message_id,
-                    tool_name=tool["name"],
-                    tool_input=tool.get("input", {}),
-                    timestamp=datetime.now(UTC),
-                    success=not response.is_error and not tool_error,
-                    error_message=tool_error
-                    or (response.error_type if response.is_error else None),
-                )
-                await self.tools.save_tool_usage(tool_usage)
+        # The turn's tool calls were written by the harness trace as it ran
+        # (dv-2260); tie them to this message.
+        trace_id = getattr(response, "trace_id", None)
+        if trace_id:
+            await self.tool_calls.link_message(trace_id, message_id, session_id)
 
         # Update cost tracking
         # None (unpriced turn, dv-0722) is written as 0.0: these are
@@ -354,12 +340,12 @@ class Storage:
             return None
 
         messages = await self.messages.get_session_messages(session_id, limit)
-        tools = await self.tools.get_session_tool_usage(session_id)
+        tools = await self.tool_calls.for_session(session_id)
 
         return {
             "session": session.to_dict(),
             "messages": [m.to_dict() for m in messages],
-            "tool_usage": [t.to_dict() for t in tools],
+            "tool_calls": tools,
         }
 
     async def get_user_dashboard(self, user_id: int) -> Dict[str, Any]:
@@ -408,7 +394,7 @@ class Storage:
         total_costs = await self.costs.get_total_costs(days=30)
 
         # Get tool stats
-        tool_stats = await self.tools.get_tool_stats()
+        tool_stats = await self.tool_calls.get_tool_stats()
 
         return {
             "system_stats": system_stats,

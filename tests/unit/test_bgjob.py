@@ -102,8 +102,9 @@ class TestRunShTemplate:
         job_id = next(tmp_path.glob("*/run.sh")).parent.name
         assert f"pin --exclude {job_id}" in run_sh
         assert "tail -c 1500" in run_sh
-        # Agentic digest turn fires only after the ✅ ping got through.
-        assert "prompt " in run_sh
+        # The batch digest check runs only after the ✅ ping got through
+        # (`bgjob digest`, DECISIONS 2026-10-22 "Jobs is a log").
+        assert f"digest {job_id}" in run_sh
         assert "--profile general" in run_sh
 
 
@@ -222,6 +223,13 @@ class TestSummary:
         body = "\n".join(f"l{i}" for i in range(40))
         out = bgjob.extract_summary(f"<summary>{body}</summary>")
         assert out.splitlines() == [f"l{i}" for i in range(15)]
+
+    def test_image_lines_survive_cap(self, bgjob):
+        body = "\n".join(f"l{i}" for i in range(30))
+        body += "\nimage: /w/a.png\nIMAGE: /w/b.png"
+        out = bgjob.extract_summary(f"<summary>{body}</summary>").splitlines()
+        assert out[:15] == [f"l{i}" for i in range(15)]
+        assert out[15:] == ["image: /w/a.png", "IMAGE: /w/b.png"]
 
     def test_fallback_is_last_15_lines(self, bgjob):
         text = "\n".join(f"l{i}" for i in range(40))
@@ -384,3 +392,302 @@ class TestCmdJobs:
         assert bgjob.cmd_oneline_text(text) == "2 failed, 10 passed in 5.1s"
         assert bgjob.cmd_oneline_text("a\nlast one\n") == "last one"
         assert bgjob.cmd_oneline_text("") == "(no output)"
+
+
+# --------------------------------------------------------------------------
+# dv-5e2f: agent jobs must not reach the user systemd bus from inside bwrap
+# (a `systemd-run --user` service runs outside the box with / writable).
+# --------------------------------------------------------------------------
+
+import os as _os  # noqa: E402
+import re as _re  # noqa: E402
+import shlex as _shlex  # noqa: E402
+import shutil as _shutil  # noqa: E402
+import subprocess as _subprocess  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_UID = _os.getuid()
+_RUN_USER = f"/run/user/{_UID}"
+_BIND_OPTS = {"--bind", "--ro-bind", "--bind-try", "--ro-bind-try", "--dev-bind"}
+_SIZE = {"": 1, "B": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
+
+
+def _bytes(size: str) -> int:
+    m = _re.fullmatch(r"(\d+(?:\.\d+)?)([KMGT]?)B?", size.strip())
+    assert m, f"not a systemd size: {size!r}"
+    return int(float(m.group(1)) * _SIZE[m.group(2)])
+
+
+def _agent_job(bgjob, tmp_path, monkeypatch, python_bin=None, name="t"):
+    """cmd_run for an agent (prompt) job with the REAL bwrap path, nothing
+    launched. Returns (run.sh path, systemd-run argv, python_bin)."""
+    jobs, ws = tmp_path / "jobs", tmp_path / "ws"
+    jobs.mkdir()
+    ws.mkdir()
+    python_bin = python_bin or _sys.executable
+    real_bwrap = _shutil.which("bwrap") or "/usr/bin/bwrap"
+    monkeypatch.setattr(bgjob, "JOBS_ROOT", jobs)
+    monkeypatch.setattr(bgjob, "load_profiles", lambda: {"general": str(ws)})
+    monkeypatch.setattr(bgjob, "load_extra_dirs", lambda slug: [])
+    monkeypatch.setattr(bgjob, "live_jobs", lambda: [])
+    monkeypatch.setattr(bgjob, "_venv_python", lambda: python_bin)
+    monkeypatch.setattr(
+        bgjob.shutil, "which", lambda n: real_bwrap if n == "bwrap" else "/bin/sh"
+    )
+    calls = []
+
+    class R:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    monkeypatch.setattr(
+        bgjob.subprocess, "run", lambda cmd, **kw: calls.append((cmd, kw)) or R()
+    )
+    args = type(
+        "A",
+        (),
+        {
+            "prompt": "do it",
+            "profile": "general",
+            "name": name,
+            "allow_dir": None,
+            "model": "sonnet",
+            "quiet": True,
+        },
+    )()
+    assert bgjob.cmd_run(args) == 0
+    run_sh = next(jobs.glob("*/run.sh"))
+    units = [c for c, _ in calls if c and c[0] == "systemd-run"]
+    assert units, calls
+    return run_sh, units[-1], python_bin
+
+
+def _box_prefix(run_sh, python_bin) -> str:
+    """The bwrap part of run.sh's agentjob line: everything before the python
+    that runs scripts/agentjob."""
+    head = _shlex.quote(python_bin) + " "
+    for line in run_sh.read_text().splitlines():
+        if "agentjob" in line and head in line and "bwrap" in line:
+            return line[: line.index(head)]
+    raise AssertionError("no bwrap ... agentjob line in run.sh")
+
+
+def _run_in_box(prefix: str, probe: str, timeout: int = 60):
+    # Popen: the fixtures may have patched subprocess.run module-wide.
+    script = f"box_cg=''\n{prefix} /bin/sh -c {_shlex.quote(probe)}\n"
+    proc = _subprocess.Popen(
+        ["bash", "-c", script],
+        stdout=_subprocess.PIPE,
+        stderr=_subprocess.PIPE,
+        text=True,
+    )
+    out, err = proc.communicate(timeout=timeout)
+    return proc.returncode, out, err
+
+
+def _ok(argv: list) -> bool:
+    try:
+        r = _subprocess.run(argv, capture_output=True, timeout=30)
+    except (OSError, _subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+_HAVE_BWRAP = bool(_shutil.which("bwrap")) and _ok(
+    ["bwrap", "--ro-bind", "/", "/", "--proc", "/proc", "--die-with-parent", "true"]
+)
+_HAVE_BUS = _os.path.exists(f"{_RUN_USER}/bus")
+_SERVICE_WORKS = (
+    _HAVE_BUS
+    and bool(_shutil.which("systemd-run"))
+    and _ok(["systemd-run", "--user", "--wait", "--quiet", "--collect", "true"])
+)
+
+
+class TestJobBoxHidesUserBus:
+    def test_agent_job_systemd_run_service_fails_and_starts_nothing(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """Scenario 1 (live): inside the real job box,
+        `systemd-run --user --wait --pipe true` fails and no unit runs."""
+        if not (_HAVE_BWRAP and _SERVICE_WORKS):
+            pytest.skip("needs bwrap and a user systemd that starts services")
+        run_sh, _, py = _agent_job(bgjob, tmp_path, monkeypatch)
+        prefix = _box_prefix(run_sh, py)
+        monkeypatch.undo()
+        marker = tmp_path / "escaped"
+        unit = f"dv5e2f-probe-{_os.getpid()}"
+        probe = (
+            "systemd-run --user --wait --pipe true; echo rc1=$?; "
+            f"systemd-run --user --wait --quiet --collect --unit={unit} "
+            f"-- /bin/sh -c 'echo started > {marker}'; echo rc2=$?"
+        )
+        rc, out, err = _run_in_box(prefix, probe)
+        assert rc == 0, err
+        assert "rc1=0" not in out, (out, err)
+        assert "rc2=0" not in out, (out, err)
+        assert not marker.exists(), "a transient service ran outside the box"
+
+    def test_live_probe_real_box_prefix_cannot_reach_user_bus(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """Scenario 5 (the ticket's regression probe): with the real box
+        prefix, the bus socket, systemd's private bus and the bus address are
+        all gone."""
+        if not (_HAVE_BWRAP and _HAVE_BUS):
+            pytest.skip("needs bwrap and a user bus on this host")
+        run_sh, _, py = _agent_job(bgjob, tmp_path, monkeypatch)
+        prefix = _box_prefix(run_sh, py)
+        monkeypatch.undo()
+        probe = (
+            f"test -S {_RUN_USER}/bus && echo BUS; "
+            f"test -e {_RUN_USER}/systemd/private && echo PRIVATE; "
+            'test -n "$DBUS_SESSION_BUS_ADDRESS" && echo ADDR; '
+            'test -n "$XDG_RUNTIME_DIR" && test -S "$XDG_RUNTIME_DIR/bus" '
+            "&& echo XDGBUS; echo done"
+        )
+        rc, out, err = _run_in_box(prefix, probe)
+        assert rc == 0, err
+        assert out.split() == ["done"], out
+
+    def test_box_prefix_masks_run_user_and_unsets_bus_address(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """added (no bwrap needed): the box argv hides /run/user with a tmpfs
+        after `--ro-bind / /`, unsets DBUS_SESSION_BUS_ADDRESS, and no later
+        bind re-exposes anything under /run/user."""
+        run_sh, _, py = _agent_job(bgjob, tmp_path, monkeypatch)
+        toks = [t for t in _shlex.split(_box_prefix(run_sh, py)) if "$" not in t]
+        assert toks[0].endswith("bwrap"), toks
+        ro = next(
+            i
+            for i in range(len(toks) - 2)
+            if toks[i : i + 3] == ["--ro-bind", "/", "/"]
+        )
+        masks = [
+            i
+            for i in range(len(toks) - 1)
+            if toks[i] == "--tmpfs"
+            and toks[i + 1].rstrip("/") in {"/run", "/run/user", _RUN_USER}
+        ]
+        assert masks and masks[0] > ro, toks
+        assert any(
+            toks[i : i + 2] == ["--unsetenv", "DBUS_SESSION_BUS_ADDRESS"]
+            for i in range(len(toks) - 1)
+        ), toks
+        mask = masks[0]
+        for i in range(mask + 2, len(toks) - 2):
+            if toks[i] in _BIND_OPTS:
+                for p in toks[i + 1 : i + 3]:
+                    assert not p.startswith("/run/user"), toks[i : i + 3]
+
+    def test_agent_job_unit_delegates_cgroup_with_room_for_tests(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """added: tests now live inside the job cgroup, so the agent unit gets
+        Delegate=yes, MemoryMax = job cap + test cap, and run.sh carves
+        box/agent and binds box/ rw into the box."""
+        monkeypatch.setattr(bgjob, "JOB_MEMORY_MAX", "1G")
+        monkeypatch.setattr(bgjob, "TEST_MEMORY_MAX", "900M")
+        monkeypatch.setenv("BGJOB_MEMORY_MAX", "1G")
+        monkeypatch.setenv("PUMP_TEST_MEMORY_MAX", "900M")
+        run_sh, argv, py = _agent_job(bgjob, tmp_path, monkeypatch)
+        assert any(a in ("--property=Delegate=yes", "Delegate=yes") for a in argv)
+        caps = [
+            m.group(1)
+            for a in argv
+            if (m := _re.fullmatch(r"(?:--property=)?MemoryMax=(\S+)", a))
+        ]
+        assert caps and _bytes(caps[-1]) == _bytes("1G") + _bytes("900M"), argv
+        text = run_sh.read_text()
+        assert "box/agent" in text and "cgroup.procs" in text, text
+        assert "subtree_control" in text, text
+
+    def test_pump_job_testrun_oom_is_reported_and_agent_survives(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """Scenario 2 (live): the real run.sh in the real unit argv; the
+        'agent' runs scripts/testrun on a 200M allocation under a 64M cap.
+        testrun prints its OOM line, the agent goes on and the job ends rc 0."""
+        if not (_HAVE_BWRAP and _SERVICE_WORKS):
+            pytest.skip("needs bwrap and a user systemd that starts services")
+        testrun = _BGJOB_PATH.parent / "testrun"
+        hog = "b = bytearray(200 * 2**20); b[::4096] = b'x' * len(b[::4096])"
+        stub = tmp_path / "fakepython"
+        stub.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            "  */agentjob)\n"
+            f"    {_shlex.quote(str(testrun))} --mem 64M -- "
+            f"{_shlex.quote(_sys.executable)} -c {_shlex.quote(hog)}\n"
+            '    echo "agent survived rc=$?"\n'
+            "    exit 0 ;;\n"
+            f'  *) exec {_shlex.quote(_sys.executable)} "$@" ;;\n'
+            "esac\n"
+        )
+        stub.chmod(0o755)
+        run_sh, argv, _ = _agent_job(
+            bgjob, tmp_path, monkeypatch, python_bin=str(stub), name="dv5e2f-live"
+        )
+        env = bgjob._env()
+        monkeypatch.undo()
+        live = [argv[0], argv[1], "--wait", *argv[2:]]
+        proc = _subprocess.Popen(
+            live, env=env, stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True
+        )
+        _, err = proc.communicate(timeout=180)
+        d = run_sh.parent
+        assert proc.returncode == 0, err
+        assert (d / "exit_code").read_text().strip() == "0"
+        out = (d / "output.md").read_text()
+        assert "agent survived" in out, out
+        log = (d / "stderr.log").read_text()
+        assert "testrun: OOM-killed at 64M" in log, log
+
+
+class TestCmdJobsKeepTheBus:
+    def test_cmd_job_has_no_box_no_delegate_and_keeps_bus(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """Scenario 4: --cmd jobs are unchanged: no bwrap, no Delegate, the
+        job cap alone, and nothing hides the user bus."""
+        monkeypatch.setattr(bgjob, "JOB_MEMORY_MAX", "1G")
+        monkeypatch.setattr(bgjob, "JOBS_ROOT", tmp_path)
+        monkeypatch.setattr(bgjob, "load_profiles", lambda: {"general": str(tmp_path)})
+        monkeypatch.setattr(bgjob, "live_jobs", lambda: [])
+        calls = []
+
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        monkeypatch.setattr(
+            bgjob.subprocess, "run", lambda cmd, **kw: calls.append((cmd, kw)) or R()
+        )
+        monkeypatch.setattr(bgjob.subprocess, "Popen", lambda *a, **k: None)
+        args = type(
+            "A",
+            (),
+            {
+                "prompt": None,
+                "cmd": "systemd-run --user --scope true",
+                "profile": "general",
+                "name": "full-tests",
+                "allow_dir": None,
+                "model": "sonnet",
+                "quiet": True,
+            },
+        )()
+        assert bgjob.cmd_run(args) == 0
+        text = next(tmp_path.glob("*/run.sh")).read_text()
+        for word in ("bwrap", "DBUS_SESSION_BUS_ADDRESS", "--tmpfs", "cgroup"):
+            assert word not in text, word
+        unit = [(c, kw) for c, kw in calls if c and c[0] == "systemd-run"]
+        assert len(unit) == 1, calls
+        argv, kw = unit[0]
+        assert not any("Delegate" in a for a in argv), argv
+        caps = [a for a in argv if "MemoryMax=" in a]
+        assert caps == ["--property=MemoryMax=1G"], argv
+        assert kw.get("env", {}).get("XDG_RUNTIME_DIR"), kw

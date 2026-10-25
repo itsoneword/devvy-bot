@@ -1379,7 +1379,15 @@ class TestJobToolsRoleGate:
     second, independent gate.
     """
 
-    JOB_TOOLS = ("job_start", "job_list", "job_output", "jobs_refresh_pin")
+    JOB_TOOLS = (
+        "job_start",
+        "job_list",
+        "job_output",
+        "jobs_refresh_pin",
+        "pump_status",
+        "pump_pending",
+        "pump_answer",
+    )
 
     @staticmethod
     def _build_role(
@@ -1544,6 +1552,75 @@ class TestJobStartCommand:
         r = await tools["job_start"].handler({"command": "make test", "name": "t"})
         assert r.get("isError") is not True
         assert "--cmd" in spawned[0] and "make test" in spawned[0]
+
+
+class TestJobStartBoardTask:
+    """dv-a438: job_start(task_id) starts the board pipeline instead of a
+    one-shot bgjob. The caller's PROFILE picks the board (pl and devvy both
+    use dv- ids), looked up through `scripts/taskpump` (the one parser of
+    boards.json), then `scripts/taskpump start <board>:<id>` runs. Every
+    subprocess is faked: a taskpump call without "start" is the board lookup
+    and answers by the profile slug in its argv."""
+
+    BOARDS = {"pl": "pl", "devops": "devvy"}
+
+    @classmethod
+    def _fake(cls, monkeypatch: pytest.MonkeyPatch) -> list:
+        spawned: list = []
+
+        class FakeProc:
+            def __init__(self, rc: int, out: bytes) -> None:
+                self.returncode = rc
+                self._out = out
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return (self._out, b"")
+
+        async def fake_exec(*argv: str, **kw: Any) -> FakeProc:
+            spawned.append(argv)
+            if Path(argv[0]).name == "taskpump" and "start" not in argv:
+                hit = next((b for p, b in cls.BOARDS.items() if p in argv), None)
+                if hit:
+                    return FakeProc(0, hit.encode() + b"\n")
+                return FakeProc(1, b"error: no board for this profile\n")
+            return FakeProc(0, b"started\n")
+
+        monkeypatch.setattr(agent_tools.asyncio, "create_subprocess_exec", fake_exec)
+        return spawned
+
+    @staticmethod
+    def _tools(services, captured, profile: str) -> Dict[str, Any]:
+        build_agent_mcp_server(
+            services, profile, Path("/tmp/ws"), requester_chat_id=555, role="owner"
+        )
+        return captured
+
+    async def test_pl_agent_task_id_runs_taskpump_start_not_bgjob(
+        self, services, captured_tools, monkeypatch
+    ):
+        spawned = self._fake(monkeypatch)
+        tools = self._tools(services, captured_tools, "pl")
+        r = await tools["job_start"].handler(
+            {"prompt": "build the quiz fix", "task_id": "dv-0a1b"}
+        )
+        assert r.get("isError") is not True, r
+        assert not any(Path(a[0]).name == "bgjob" for a in spawned)
+        starts = [a for a in spawned if "start" in a]
+        assert len(starts) == 1
+        assert Path(starts[0][0]).name == "taskpump"
+        assert "pl:dv-0a1b" in starts[0]
+
+    async def test_profile_without_board_gets_a_clear_error(
+        self, services, captured_tools, monkeypatch
+    ):
+        spawned = self._fake(monkeypatch)
+        tools = self._tools(services, captured_tools, "chef")
+        r = await tools["job_start"].handler({"prompt": "do it", "task_id": "dv-0a1b"})
+        assert r.get("isError") is True
+        text = r["content"][0]["text"].lower()
+        assert "no board" in text and "without task_id" in text
+        assert not any("start" in a for a in spawned)
+        assert not any(Path(a[0]).name == "bgjob" for a in spawned)
 
 
 def _build_devops(services: AgentServices, captured: Dict[str, Any]) -> Dict[str, Any]:

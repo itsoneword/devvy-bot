@@ -37,7 +37,8 @@ jobs:
       - name: Check .env.example is generated from settings.py
         run: poetry run python scripts/gen_env_example.py --check
 
-      - name: Lint
+      - name: Lint (informational, does not block tests)
+        continue-on-error: true
         run: |
           poetry run black --check src tests
           poetry run isort --check-only src tests

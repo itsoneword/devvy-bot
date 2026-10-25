@@ -160,9 +160,14 @@ def test_bridge_from_bot_v20_keeps_rows_and_stamps(tmp_path):
         "INSERT INTO messages (session_id, user_id, prompt, response) "
         "VALUES ('s', 1, 'findable prompt', 'r')"
     )
+    conn.execute(
+        "INSERT INTO tool_usage (session_id, message_id, tool_name, tool_input,"
+        " success, error_message) VALUES ('s', 1, 'Bash', '{\"command\": \"ls\"}', 0, 'boom')"
+    )
     conn.commit()
     conn.close()
     counts = _row_counts(path)
+    counts.pop("tool_usage")  # becomes tool_calls (dv-2260), checked below
 
     assert ensure_schema("bot", path) == "bridged"
 
@@ -178,6 +183,17 @@ def test_bridge_from_bot_v20_keeps_rows_and_stamps(tmp_path):
     assert {k: after[k] for k in counts if k != "schema_version"} == {
         k: v for k, v in counts.items() if k != "schema_version"
     }
+    conn = sqlite3.connect(path)
+    copied = conn.execute(
+        "SELECT session_id, message_id, tool_name, input_short, ok, error, trace_id"
+        " FROM tool_calls"
+    ).fetchall()
+    gone = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='tool_usage'"
+    ).fetchone()[0]
+    conn.close()
+    assert copied == [("s", 1, "Bash", '{"command": "ls"}', 0, "boom", None)]
+    assert gone == 0
     assert diff(snapshot(path), _head_snapshot("bot")) == []
     assert len(_backups(path)) == 1 and _backups(path)[0].startswith("bot.")
     assert ensure_schema("bot", path) == "current"

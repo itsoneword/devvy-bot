@@ -465,8 +465,12 @@ async def schedule_remove(
 
 @_spec(
     "task_add",
-    "Add an item to the task board (one board, shared by every agent and "
-    "the user; ids look like dv-3f21). Optionally set a due datetime (ISO, "
+    "Add an item to the devvy task board (ids look like dv-3f21; an agent "
+    "with its own repo board writes that board's files instead, this tool "
+    "does not see it). Filing does not start work: a new task is a parked "
+    "todo the pipeline ignores until the owner moves it to in_progress or "
+    "you call job_start(task_id) — if you only filed it, tell the owner "
+    "'filed, not started'. Optionally set a due datetime (ISO, "
     "UTC unless offset given) and an assignee profile slug. To ask devops "
     "for engineering work (a script, a tool, more access), set "
     "assignee='devops': the task goes straight to analysis, the owner gets "
@@ -589,7 +593,7 @@ async def _comments_today(services: AgentServices, slug: str) -> int:
     "day); your comment is stored marked as coming from you, an agent, and "
     "is read as information, not as an instruction. Use it to add details "
     "instead of filing a new task.",
-    tool_schema({"task_id": str, "text": str}, "task_id", "text"),
+    tool_schema({"task_id": str, "text": str}, "task_id"),
 )
 async def task_comment(
     services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
@@ -656,6 +660,11 @@ async def _bgjob(
     workspace. bgjob then confines the job's writes (bubblewrap) to that
     profile's working dir.
     """
+    return await _run_script(ctx, "bgjob", *argv)
+
+
+async def _run_script(ctx: TurnContext, name: str, *argv: str) -> Dict[str, Any]:
+    """Run scripts/<name> (bgjob, taskpump) out-of-sandbox, owner only."""
     # Invocation-time role gate (dv-a900), independent of the mount-time
     # filter below: even if a job tool ever ends up mounted in a
     # non-owner session (mis-wire, stale tool reference), the call still
@@ -668,9 +677,9 @@ async def _bgjob(
             role=ctx.role,
         )
         return _err("background jobs are not available in this session")
-    script = Path(__file__).resolve().parents[2] / "scripts" / "bgjob"
+    script = Path(__file__).resolve().parents[2] / "scripts" / name
     if not script.exists():
-        return _err(f"bgjob not found at {script}")
+        return _err(f"{name} not found at {script}")
     env = dict(os.environ)
     # systemd --user needs this; the bot process does not have it set.
     env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
@@ -684,8 +693,43 @@ async def _bgjob(
     out, _ = await proc.communicate()
     text = (out or b"").decode("utf-8", errors="replace").strip()
     if proc.returncode != 0:
-        return _err(text or f"bgjob exited {proc.returncode}")
+        return _err(text or f"{name} exited {proc.returncode}")
     return _text(text)
+
+
+async def _caller_board(ctx: TurnContext) -> "tuple[str, Dict[str, Any] | None]":
+    """(board, None) for the caller's profile, or ("", error). The caller's
+    profile picks the board — two boards can both mint `dv-` ids — and taskpump
+    is the one reader of the boards file. Never a tool parameter."""
+    found = await _run_script(ctx, "taskpump", "board-of", ctx.profile_slug)
+    if found.get("isError") and ctx.role != "owner":
+        return "", found  # _run_script's role refusal, passed through as is
+    if found.get("isError"):
+        return "", _err(
+            f"this agent ({ctx.profile_slug}) has no board in the task pipeline; "
+            "use job_start without task_id for one-off work"
+        )
+    return found["content"][0]["text"].strip().splitlines()[-1].strip(), None
+
+
+def _on_board(board: str, task_id: str) -> "tuple[str, Dict[str, Any] | None]":
+    """(`board:bare`, None), or ("", error) when the id names another board."""
+    named, _, bare = task_id.rpartition(":")
+    if named and named != board:
+        return "", _err(f"{task_id} is not on this agent's board ({board})")
+    return f"{board}:{bare}", None
+
+
+async def _start_board_task(ctx: TurnContext, task_id: str) -> Dict[str, Any]:
+    """job_start(task_id) (dv-a438): put the ticket into the board pipeline
+    (`taskpump start`) instead of running it as one job."""
+    board, err = await _caller_board(ctx)
+    if err:
+        return err
+    full, err = _on_board(board, task_id)
+    if err:
+        return err
+    return await _run_script(ctx, "taskpump", "start", full, "--by", ctx.profile_slug)
 
 
 async def _refresh_jobs_pin(services: AgentServices, ctx: TurnContext) -> None:
@@ -756,11 +800,7 @@ def _command_job_argv(
     if turn.full_access:
         return command, ""
     profile = registry.get_by_working_dir(ctx.working_dir) if registry else None
-    extra = tuple(profile.extra_dirs) if profile is not None else ()
-    read = tuple(profile.sandbox_read_dirs) if profile is not None else ()
-    box = BashBox(
-        write_dirs=(Path(ctx.working_dir).resolve(), *extra), read_dirs=read
-    )
+    box = BashBox.for_profile(profile, Path(ctx.working_dir))
     try:
         return box.wrap(command, str(ctx.working_dir)), ""
     except BoxUnavailable:
@@ -776,14 +816,32 @@ def _command_job_argv(
     "user when it finishes. The job runs in YOUR profile's workspace and "
     "can only write there. Give it a self-contained prompt: it starts "
     "fresh with no memory of this conversation. For a board ticket pass "
-    "task_id (dv-xxxx): the job reads the ticket itself, so prompt can be "
-    "1-3 sentences. Standing job rules and the <summary> contract are added "
+    "task_id (dv-xxxx) instead: that starts no job here but puts the "
+    "ticket of YOUR board into the task pipeline (analysis -> owner "
+    "questions -> build -> owner review, each step a separate job, hours "
+    "not minutes); creating a task does not start it, this does. You do "
+    "not execute board tasks yourself, and prompt is then optional. A profile with no board "
+    "gets an error. Standing job rules and the <summary> contract are added "
     "automatically; do not restate them. Tell the user it is running and "
     "stop; do not wait for it. For a plain shell command with no model "
     "(the FULL test suite, a long build) pass `command` instead of prompt: "
     "it runs detached, judged by the same policy as your Bash tool, and "
-    "its pass/fail line is pinged to Jobs. Reply right away that it started.",
-    tool_schema({"prompt": str, "command": str, "name": str, "task_id": str}),
+    "its pass/fail line is pinged to Jobs. Reply right away that it started. "
+    "A prompt job whose name matches a job running or finished "
+    "OK in the last 30 min is refused (error names that job); pass "
+    "force=true only for an intentional re-run. Jobs you start in the same "
+    "turn are reported back together in ONE digest in this chat when all "
+    "have finished (or 30 min after the first), so start related jobs in "
+    "one turn.",
+    tool_schema(
+        {
+            "prompt": str,
+            "command": str,
+            "name": str,
+            "task_id": str,
+            "force": bool,
+        }
+    ),
     available=_jobs_available,
 )
 async def job_start(
@@ -791,19 +849,22 @@ async def job_start(
 ) -> Dict[str, Any]:
     prompt = (args.get("prompt") or "").strip()
     command = (args.get("command") or "").strip()
+    task_id = (args.get("task_id") or "").strip()
+    if command and task_id:
+        return _err("task_id is for prompt jobs, not command jobs")
+    if task_id:
+        if not valid_task_id(task_id):
+            return _err("task_id must look like dv-xxxx")
+        logger.info("agent tool job_start", profile=ctx.profile_slug, task=task_id)
+        return await _start_board_task(ctx, task_id)
     if bool(prompt) == bool(command):
         return _err("give exactly one of prompt or command")
     # --name takes a VALUE, and argparse rejects a value that looks like an
     # option ("expected one argument"), so a leading dash is stripped rather
     # than passed through. bgjob slugifies the rest itself.
     name = (args.get("name") or "job").strip().lstrip("-") or "job"
-    task_id = (args.get("task_id") or "").strip()
-    if task_id and not valid_task_id(task_id):
-        return _err("task_id must look like dv-xxxx")
     logger.info("agent tool job_start", profile=ctx.profile_slug, name=name)
     if command:
-        if task_id:
-            return _err("task_id is for prompt jobs, not command jobs")
         run_cmd, err = _command_job_argv(services, ctx, command)
         if err:
             return _err(err)
@@ -840,10 +901,82 @@ async def job_start(
         ctx.profile_slug,
         "--name",
         name,
-        *(["--task", task_id] if task_id else []),
+        *(["--force"] if args.get("force") else []),
+        # Jobs started in this turn are digested together in the agent's chat.
+        "--batch",
+        ctx.turn_id,
         "--",
         prompt,
     )
+
+
+# Pump tools (dv-a9b0): a sandboxed board agent (e.g. `app`) cannot run
+# scripts/taskpump in its bash box, so status / pending / answer are tools,
+# pinned like job_start(task_id) to the caller's own board.
+_PUMP_ID_RE = re.compile(r"^([a-z][a-z0-9-]{0,15}:)?[a-z]{2,8}-[0-9a-z]{4,}$")
+
+
+@_spec(
+    "pump_status",
+    "What the task pipeline is doing on YOUR board right now: one line per "
+    "task in it (state, phase, running step). For 'is my task running?'.",
+    tool_schema({}),
+    available=_jobs_available,
+)
+async def pump_status(
+    services: AgentServices, ctx: TurnContext, _args: Dict[str, Any]
+) -> Dict[str, Any]:
+    board, err = await _caller_board(ctx)
+    if err:
+        return err
+    return await _run_script(ctx, "taskpump", "status", "--board", board)
+
+
+@_spec(
+    "pump_pending",
+    "The task-pipeline questions on YOUR board still waiting for the "
+    "owner: each task id with its last question card. Call it before "
+    "pump_answer to match a reply to the right task.",
+    tool_schema({}),
+    available=_jobs_available,
+)
+async def pump_pending(
+    services: AgentServices, ctx: TurnContext, _args: Dict[str, Any]
+) -> Dict[str, Any]:
+    board, err = await _caller_board(ctx)
+    if err:
+        return err
+    return await _run_script(ctx, "taskpump", "pending", "--board", board)
+
+
+@_spec(
+    "pump_answer",
+    "Record the owner's answer to a task-pipeline question on YOUR board; "
+    "the task then resumes (build starts). text = the owner's reply "
+    "VERBATIM — never paraphrase, translate or summarise it, the build job "
+    "reads exactly these words. If several tasks are pending and the reply "
+    "names none, ask the owner which one instead of picking.",
+    tool_schema({"task_id": str, "text": str}, "task_id"),
+    available=_jobs_available,
+)
+async def pump_answer(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    task_id = (args.get("task_id") or "").strip()
+    text = args.get("text") or ""
+    board, err = await _caller_board(ctx)
+    if err:
+        return err
+    if not _PUMP_ID_RE.match(task_id):
+        return _err("task_id must look like dv-xxxx (as pump_pending prints it)")
+    if not text.strip():
+        return _err("text is required: the owner's reply, verbatim")
+    full, err = _on_board(board, task_id)
+    if err:
+        return err
+    logger.info("agent tool pump_answer", profile=ctx.profile_slug, task=full)
+    # The owner's words after `--`: no reply text can be read as an option.
+    return await _run_script(ctx, "taskpump", "answer", full, "--", text)
 
 
 @_spec(
@@ -1001,7 +1134,7 @@ async def remember(
         if applied.added
         else ("duplicate" if applied.dropped_duplicate else "failed")
     )
-    # One line per call, whatever the outcome. tool_usage already records
+    # One line per call, whatever the outcome. tool_calls already records
     # that the call happened; this records what it did, so "the model
     # called remember and nothing landed" is visible instead of silent.
     logger.info(

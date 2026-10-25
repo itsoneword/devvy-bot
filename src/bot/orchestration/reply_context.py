@@ -25,7 +25,12 @@ from typing import Any, Optional, Tuple
 
 import structlog
 
-from .job_context import job_envelope, job_id_from_ref
+from .job_context import (
+    job_envelope,
+    job_id_from_ref,
+    pump_envelope,
+    pump_task_from_ref,
+)
 
 logger = structlog.get_logger()
 
@@ -119,6 +124,14 @@ async def build_reply_context(
             "context, do not describe it from memory — say so, or retrieve "
             "it with recall_conversation first.]"
         )
+    elif (
+        # Before scheduled_reminder (dv-a9b0): a pump card that fell back to
+        # the DM is ledgered as one, but it is a pipeline question.
+        is_own_bot
+        and entry is not None
+        and (pump_id := pump_task_from_ref(getattr(entry, "ref", None)))
+    ):
+        envelope = pump_envelope(pump_id)
     elif is_own_bot and entry is not None and entry.kind == "scheduled_reminder":
         # A verbatim scheduled reminder: composed by the profile's agent at
         # schedule time, delivered without an agent turn — so it is in no

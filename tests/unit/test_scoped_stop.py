@@ -194,6 +194,35 @@ async def test_interrupted_run_is_abandoned_without_result(tmp_path, fast):
     client.disconnect.assert_awaited()
 
 
+async def test_interrupted_run_that_keeps_streaming_is_abandoned(tmp_path, fast):
+    """dv-b399: a run still emitting traffic after /stop (sub-agent, long
+    tool) must be cut at the grace deadline, not run to completion."""
+    m = _manager(tmp_path)
+    client = AsyncMock()
+
+    async def receive():
+        while True:
+            await asyncio.sleep(0.01)
+            yield {"type": "system", "subtype": "noise"}
+
+    client._query = AsyncMock()
+    client._query.receive_messages = receive
+    with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+        task = asyncio.create_task(
+            m.execute_command(prompt="x", working_directory=tmp_path, user_id=5)
+        )
+        for _ in range(100):
+            if m._active_runs:
+                break
+            await asyncio.sleep(0.01)
+        (key,) = m._active_runs
+        assert await m.stop_turns(*key) == 1
+        resp = await asyncio.wait_for(task, 5)
+    assert resp.error_type == "interrupted"
+    assert m._active_runs == {}
+    client.disconnect.assert_awaited()
+
+
 async def test_missing_result_after_final_answer_is_abandoned(tmp_path, fast):
     m = _manager(tmp_path)
     final = AssistantMessage(
@@ -208,6 +237,77 @@ async def test_missing_result_after_final_answer_is_abandoned(tmp_path, fast):
         )
     assert "the answer" in resp.content
     assert m._active_runs == {}
+
+
+async def test_missing_result_with_stop_reason_none_is_abandoned(tmp_path, fast):
+    """dv-586f: the CLI leaves stop_reason None on streamed assistant
+    messages; the text-only final message must still start the grace."""
+    from claude_agent_sdk import ToolUseBlock, UserMessage
+
+    m = _manager(tmp_path)
+    msgs = [
+        AssistantMessage(content=[TextBlock(text="narration")], model="m"),
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={})], model="m"
+        ),
+        UserMessage(content="tool output"),
+        AssistantMessage(
+            content=[TextBlock(text="the answer")],
+            model="m",
+            usage={"input_tokens": 7, "output_tokens": 3},
+            message_id="a",
+        ),
+    ]
+    client = _hanging_client(msgs)
+    with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+        resp = await asyncio.wait_for(
+            m.execute_command(prompt="x", working_directory=tmp_path, user_id=5), 5
+        )
+    assert resp.content == "the answer"
+    assert resp.cost == 0.0
+    assert m._active_runs == {}
+
+
+async def test_closing_stream_events_do_not_reset_the_grace(tmp_path, fast):
+    """pl 22.10 17:22: the final message's own message_delta / message_stop
+    arrive after it; they must not cancel the grace, a new block must."""
+    from claude_agent_sdk import StreamEvent
+
+    def ev(kind):
+        return StreamEvent(uuid="u", session_id="s", event={"type": kind})
+
+    m = _manager(tmp_path)
+    msgs = [
+        AssistantMessage(content=[TextBlock(text="the answer")], model="m"),
+        ev("content_block_stop"),
+        ev("message_delta"),
+        ev("message_stop"),
+    ]
+    client = _hanging_client(msgs)
+    with patch("src.claude.sdk_integration.ClaudeSDKClient", return_value=client):
+        resp = await asyncio.wait_for(
+            m.execute_command(prompt="x", working_directory=tmp_path, user_id=5), 5
+        )
+    assert resp.content == "the answer"
+    assert m._active_runs == {}
+
+
+def test_new_generation_events_are_the_reset_set():
+    assert sdk_integration._NEW_GENERATION_EVENTS == {
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+    }
+
+
+def test_is_final_answer():
+    from claude_agent_sdk import ToolUseBlock
+
+    tool = ToolUseBlock(id="t", name="Bash", input={})
+    assert sdk_integration._is_final_answer([TextBlock(text="hi")], None)
+    assert not sdk_integration._is_final_answer([TextBlock(text=" ")], None)
+    assert not sdk_integration._is_final_answer([TextBlock(text="hi"), tool], None)
+    assert not sdk_integration._is_final_answer([tool], "end_turn")
 
 
 async def test_hung_stream_callback_does_not_block_the_stream(

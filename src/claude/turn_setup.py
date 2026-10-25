@@ -237,7 +237,9 @@ async def prepend_items_context(
     return f"{block}\n\n{prompt}" if block else prompt
 
 
-def image_roots_env(approved_directory: Any, working_directory: Path) -> str:
+def image_roots_env(
+    approved_directory: Any, working_directory: Path, extra_dirs: Any = ()
+) -> str:
     """``TELEGRAM_IMAGE_ROOTS`` for this turn: deliverable roots, pathsep-joined.
 
     The roots are the deployment's approved directory (falling back to the
@@ -250,5 +252,7 @@ def image_roots_env(approved_directory: Any, working_directory: Path) -> str:
 
     return os.pathsep.join(
         str(root)
-        for root in allowed_image_roots(approved_directory or working_directory)
+        for root in allowed_image_roots(
+            approved_directory or working_directory, extra_dirs
+        )
     )

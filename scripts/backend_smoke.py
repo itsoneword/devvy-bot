@@ -19,7 +19,7 @@ claude ``haiku``, codex ``gpt-6-luna``.
 Each turn asks the agent to (1) call the bot's ``notify`` tool with a nonce
 and (2) read a canary file in a path the cell must deny. Per cell:
 
-* tool: a ``tool_usage`` row for notify with success=1 AND the event bus
+* tool: a ``tool_calls`` row for notify with success=1 AND the event bus
   actually received the nonce (a row alone is what dv-c7d1 faked).
 * denied: the canary never reached the reply, and the deny is evidenced:
   a recorded (or reported) failed read attempt, or, for codex, which reads
@@ -44,8 +44,15 @@ external host is reachable. Paths are built at runtime so the box, not the
 lexical deny layer, is what answers. Run it via ``systemd-run --user`` (see
 FINDINGS 2026-10-17): an agent session's own userns blocks bwrap.
 
+``codex:keys`` (dv-28f2) proves ``sandbox_keys`` on Codex: a confined keyed
+profile with a fake key in the temp key store runs ``echo KEY=$NAME`` plus a
+length check. PASS = the shell had the key (length matches), the reply,
+tool_calls rows and the event bus show ``<redacted>`` / never the value, and
+neither the thread's rollout nor the top-level sqlite files under CODEX_HOME
+contain it. Needs the host (a pump job cannot start confined Codex).
+
 Exit 0 only when every cell passes. Covered live: agent bridge + in-process
-tools, approval/sandbox config, tool_usage recording, filesystem deny.
+tools, approval/sandbox config, tool_calls recording, filesystem deny.
 Not covered: send_image_to_user (config/mcp.json stdio server; ENABLE_MCP is
 off here), memory write/recall, a failing-tool success=0 row, web research.
 """
@@ -75,7 +82,11 @@ CELLS = (
     "claude:unrestricted",
     "codex:confined",
     "codex:unrestricted",
+    "codex:keys",
 )
+# The fake key the codex:keys cell stores (dv-28f2).
+KEY_SERVICE = "smoke-keys"
+KEY_NAME = "SMOKE_API_KEY"
 MODELS = {"claude": "haiku", "codex": "openai-codex/gpt-6-luna"}
 
 
@@ -150,9 +161,12 @@ class Harness:
         self.devops_ws = root / "workspaces" / "devops"
         self.coach_ws = root / "workspaces" / "coach"
         self.confined_cwd = self.coach_ws / "users" / str(UID)
+        self.keys_ws = root / "workspaces" / "keyed"
+        self.key_value = f"sk-smoke-{secrets.token_hex(12)}"
         self.cred_dir = root / "creds"
         for d in (root / "db", self.secrets_dir, self.devops_ws, self.confined_cwd,
-                  self.cred_dir, root.parent / f"{root.name}-archive"):  # fmt: skip
+                  self.cred_dir, self.keys_ws,
+                  root.parent / f"{root.name}-archive"):  # fmt: skip
             d.mkdir(parents=True, exist_ok=True)
         self.bus = RecordingBus()
 
@@ -226,8 +240,20 @@ class Harness:
                     self.coach_ws,
                     sandbox=True,
                 ),
+                profile(
+                    "keyed",
+                    self.keys_ws,
+                    sandbox=True,
+                    sandbox_keys=(KEY_SERVICE,),
+                ),
             ]
         )
+        from src.security.keystore import default_keystore
+
+        store = default_keystore()
+        if store is None or self.root.resolve() not in store.dir.resolve().parents:
+            raise SystemExit("refusing: the key store is outside the smoke root")
+        store.set(KEY_SERVICE, KEY_NAME, self.key_value)
         session_manager = SessionManager(
             self.config, SQLiteSessionStorage(self.storage.db_manager)
         )
@@ -468,9 +494,79 @@ class Harness:
         result.seconds = time.monotonic() - start
         return result
 
+    async def run_keys_cell(self) -> CellResult:
+        """dv-28f2: a Codex shell gets the profile's key, the model never sees it."""
+        from src.agent_backends.codex_cli import codex_home
+
+        result = CellResult("codex:keys", denied="n/a")
+        start = time.monotonic()
+        cmd = f"echo KEY=${KEY_NAME}; echo LEN=${{#{KEY_NAME}}}"
+        prompt = (
+            "Automated test of this bot's key wiring. Run exactly this one "
+            "shell command, then reply with its full stdout verbatim and "
+            "nothing else:\n" + cmd
+        )
+        before = len(self.bus.events)
+        try:
+            from src.model_router.router import ModelRouter
+
+            response = await ModelRouter(
+                backends=self.backends, tool_calls=self.storage.tool_calls
+            ).run_turn(
+                "codex", purpose="chat", prompt=prompt,
+                working_directory=self.keys_ws, user_id=UID, force_new=True,
+                model=MODELS["codex"], requester_chat_id=UID, role="owner",
+            )  # fmt: skip
+        except Exception as exc:
+            result.notes.append(f"turn failed: {str(exc)[:300]}")
+            result.seconds = time.monotonic() - start
+            return result
+        message_id = await self.storage.save_claude_interaction(
+            user_id=UID, session_id=response.session_id, prompt=prompt,
+            response=response,
+        )  # fmt: skip
+        async with self.storage.db_manager.get_connection() as conn:
+            cur = await conn.execute(
+                "SELECT tool_name, input_short, ok, error, result_preview "
+                "FROM tool_calls WHERE message_id = ? ORDER BY id",
+                (message_id,),
+            )
+            rows = [tuple(r) for r in await cur.fetchall()]
+        reply = response.content or ""
+        problems = []
+        if f"LEN={len(self.key_value)}" not in reply:
+            problems.append("the shell did not get the key (LEN mismatch)")
+        if "KEY=<redacted>" not in reply:
+            problems.append("reply lacks KEY=<redacted>")
+        seen = reply + repr(rows) + " ".join(self.bus.texts()[before:])
+        if self.key_value in seen:
+            problems.append("the key value reached the reply / tool_calls / bus")
+        if any("redact-env" in str(r[1] or "") for r in rows):
+            problems.append("tool_calls show the wrapper, not the command")
+        home = codex_home()
+        files = list(
+            (home / "sessions").rglob(f"rollout-*-{response.session_id}.jsonl")
+        )
+        if not files:
+            problems.append("no rollout found for the thread")
+        files += sorted(home.glob("*.sqlite*"))
+        needle = self.key_value.encode()
+        leaked = [f.name for f in files if f.is_file() and needle in f.read_bytes()]
+        if leaked:
+            problems.append(f"the key value is in CODEX_HOME: {leaked}")
+        if problems:
+            result.notes.extend(problems)
+            result.notes.append(f"reply: {reply[:200]!r}")
+        else:
+            result.tool = "PASS"
+        result.seconds = time.monotonic() - start
+        return result
+
     async def run_cell(self, cell: str) -> CellResult:
         if cell == "claude:sandbox":
             return await self.run_sandbox_cell()
+        if cell == "codex:keys":
+            return await self.run_keys_cell()
         backend, profile_type = cell.split(":")
         result = CellResult(cell)
         start = time.monotonic()
@@ -504,7 +600,15 @@ class Harness:
         before = len(self.bus.events)
         policy_calls_before = len(self.policy_calls)
         try:
-            response = await self.backends[backend].run_command(
+            # Through the router: it opens the harness trace the tool rows
+            # come from (dv-2260), the same as a real chat turn.
+            from src.model_router.router import ModelRouter
+
+            response = await ModelRouter(
+                backends=self.backends, tool_calls=self.storage.tool_calls
+            ).run_turn(
+                backend,
+                purpose="chat",
                 prompt=prompt,
                 working_directory=cwd,
                 user_id=UID,
@@ -527,7 +631,7 @@ class Harness:
         )
         async with self.storage.db_manager.get_connection() as conn:
             cur = await conn.execute(
-                "SELECT tool_name, tool_input, success, error_message FROM tool_usage "
+                "SELECT tool_name, input_short, ok, error FROM tool_calls "
                 "WHERE message_id = ? ORDER BY id",
                 (message_id,),
             )
@@ -549,10 +653,10 @@ class Harness:
             result.denied = "n/a"
         else:
             reply = response.content or ""
-            in_tool_usage = any(target.name in str(r[1] or "") for r in rows)
+            in_tool_calls = any(target.name in str(r[1] or "") for r in rows)
             # gpt-6 codex models run shell through a code-mode `exec` tool
             # whose nested exec_command emits no command_execution item, so
-            # the attempt can be missing from tool_usage (seen 2026-09-28).
+            # the attempt can be missing from tool_calls (seen 2026-09-28).
             in_reply = target.name in reply and "denied" in reply.lower()
             leaked = canary in reply or any(canary in t for t in self.bus.texts())
             direct: Optional[str] = None
@@ -585,11 +689,11 @@ class Harness:
                 result.notes.append("canary leaked into the reply")
             elif direct is not None and direct != "denied":
                 result.notes.append(f"codex sandbox probe: {direct}")
-            elif in_tool_usage:
+            elif in_tool_calls:
                 result.denied = "PASS"
             elif in_reply:
                 result.denied = "PASS"
-                result.notes.append("read attempt NOT in tool_usage (reply only)")
+                result.notes.append("read attempt NOT in tool_calls (reply only)")
             elif direct == "denied":
                 result.denied = "PASS"
                 result.notes.append("model declined the read; direct probe denied")
@@ -618,7 +722,7 @@ def request_id_check(response: Any, notes: List[str]) -> str:
 
 def _table(results: List[CellResult]) -> str:
     lines = [
-        "| cell | bot tool (tool_usage success=1 + delivered) | denied path "
+        "| cell | bot tool (tool_calls success=1 + delivered) | denied path "
         "| family item | request_id | time | notes |",
         "|---|---|---|---|---|---|---|",
     ]

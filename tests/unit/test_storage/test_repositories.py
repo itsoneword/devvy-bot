@@ -12,7 +12,6 @@ from src.storage.models import (
     MessageModel,
     ProjectThreadModel,
     SessionModel,
-    ToolUsageModel,
     UserModel,
 )
 from src.storage.repositories import (
@@ -21,9 +20,9 @@ from src.storage.repositories import (
     MessageRepository,
     ProjectThreadRepository,
     SessionRepository,
-    ToolUsageRepository,
     UserRepository,
 )
+from src.storage.tool_calls import ToolCallRepository
 
 
 @pytest.fixture
@@ -57,8 +56,8 @@ async def message_repo(db_manager):
 
 @pytest.fixture
 async def tool_repo(db_manager):
-    """Create tool usage repository."""
-    return ToolUsageRepository(db_manager)
+    """Create tool call (harness trace) repository."""
+    return ToolCallRepository(db_manager)
 
 
 @pytest.fixture
@@ -632,92 +631,65 @@ class TestProjectThreadRepository:
         assert mapping.is_active is False
 
 
-class TestToolUsageRepository:
-    """Test tool usage repository."""
+def _row(use_id, name="Read", parent=None, **kw):
+    base = {
+        "tool_use_id": use_id,
+        "parent_tool_use_id": parent,
+        "seq": 1,
+        "tool_name": name,
+        "input_short": "{}",
+        "ok": 1,
+        "started_at": datetime.now(UTC),
+        "detached": 0,
+    }
+    base.update(kw)
+    return base
 
-    async def test_save_and_get_tool_usage(self, tool_repo, session_repo, user_repo):
-        """Test saving and retrieving tool usage."""
-        # Setup user and session
-        user = UserModel(
-            user_id=12353,
-            telegram_username="tooluser",
-            first_seen=datetime.now(UTC),
-            last_active=datetime.now(UTC),
-            is_allowed=True,
+
+class TestToolCallRepository:
+    """The harness trace store (dv-2260)."""
+
+    async def test_upsert_updates_in_place_and_keeps_links(self, tool_repo):
+        await tool_repo.upsert("t1", [_row("a", ok=None)])
+        await tool_repo.link_model_call("t1", 7, "s1")
+        # the result arrives later: same key, new state, links untouched
+        await tool_repo.upsert("t1", [_row("a", ok=0, error="boom", duration_ms=5)])
+        rows = await tool_repo.for_model_call(7)
+        assert len(rows) == 1
+        assert rows[0]["ok"] == 0 and rows[0]["error"] == "boom"
+        assert rows[0]["session_id"] == "s1"
+
+    async def test_link_message_and_lookup(self, tool_repo):
+        await tool_repo.upsert("t2", [_row("a"), _row("b", parent="a", seq=2)])
+        await tool_repo.link_message("t2", 42, "s2")
+        rows = await tool_repo.for_message(42)
+        assert [r["tool_use_id"] for r in rows] == ["a", "b"]
+        assert rows[1]["parent_tool_use_id"] == "a"
+        assert await tool_repo.for_session("s2") == rows
+
+    async def test_tool_stats(self, tool_repo):
+        await tool_repo.upsert(
+            "t3",
+            [_row("a"), _row("b", name="Write"), _row("c", ok=0, error="x")],
         )
-        await user_repo.create_user(user)
-
-        session = SessionModel(
-            session_id="tool-session",
-            user_id=12353,
-            project_path="/test/tools",
-            created_at=datetime.now(UTC),
-            last_used=datetime.now(UTC),
-        )
-        await session_repo.create_session(session)
-
-        # Save tool usage
-        tool_usage = ToolUsageModel(
-            session_id="tool-session",
-            tool_name="Read",
-            tool_input={"file_path": "/test/file.py"},
-            timestamp=datetime.now(UTC),
-            success=True,
-        )
-
-        usage_id = await tool_repo.save_tool_usage(tool_usage)
-        assert usage_id is not None
-
-        # Get session tool usage
-        usage_records = await tool_repo.get_session_tool_usage("tool-session")
-        assert len(usage_records) == 1
-        assert usage_records[0].tool_name == "Read"
-        assert usage_records[0].tool_input["file_path"] == "/test/file.py"
-
-    async def test_get_tool_stats(self, tool_repo, session_repo, user_repo):
-        """Test getting tool statistics."""
-        # Setup user and session
-        user = UserModel(
-            user_id=12354,
-            telegram_username="statsuser",
-            first_seen=datetime.now(UTC),
-            last_active=datetime.now(UTC),
-            is_allowed=True,
-        )
-        await user_repo.create_user(user)
-
-        session = SessionModel(
-            session_id="stats-session",
-            user_id=12354,
-            project_path="/test/stats",
-            created_at=datetime.now(UTC),
-            last_used=datetime.now(UTC),
-        )
-        await session_repo.create_session(session)
-
-        # Create multiple tool usages
-        tools = ["Read", "Write", "Read", "Edit", "Read"]
-        for tool in tools:
-            tool_usage = ToolUsageModel(
-                session_id="stats-session",
-                tool_name=tool,
-                timestamp=datetime.now(UTC),
-                success=True,
-            )
-            await tool_repo.save_tool_usage(tool_usage)
-
-        # Get tool stats
         stats = await tool_repo.get_tool_stats()
+        read = next(s for s in stats if s["tool_name"] == "Read")
+        assert read["usage_count"] == 2
+        assert read["success_count"] == 1 and read["error_count"] == 1
 
-        # Find Read tool stats
-        read_stats = next(s for s in stats if s["tool_name"] == "Read")
-        assert read_stats["usage_count"] == 3
-        assert read_stats["success_count"] == 3
-        assert read_stats["error_count"] == 0
+    async def test_prune_drops_only_old_rows(self, tool_repo):
+        from datetime import timedelta
+
+        old = datetime.now(UTC) - timedelta(days=120)
+        await tool_repo.upsert("t4", [_row("old", started_at=old), _row("new")])
+        assert await tool_repo.prune(90) == 1
+        await tool_repo.link_message("t4", 1, "s")
+        assert [r["tool_use_id"] for r in await tool_repo.for_message(1)] == ["new"]
 
 
 class TestAuditLogRepository:
     """Test audit log repository."""
+
 
 class TestAnalyticsRepository:
     """Test analytics repository."""

@@ -482,16 +482,17 @@ class AgentHandler:
         # the chat that owns the job (e.g. a guest's recurring reminder).
         requester_chat_id = event.target_chat_ids[0] if event.target_chat_ids else None
         report_source = scheduled_report_source(event)
-        # A job-finish digest is ledgered with the job so a reply to it maps
-        # back to the job (dv-c41e).
-        job_ref: Optional[str] = None
-        job_profile_slug: Optional[str] = None
-        if report_source == "bgjob:digest" and ":" in event.job_name:
-            from ..bot.orchestration.job_context import job_profile
-
-            jid = event.job_name.split(":", 1)[1]
-            job_ref = f"job:{jid}"
-            job_profile_slug = job_profile(jid)
+        # A job-finish batch digest goes to the profile's own chat, not Jobs
+        # (dv-c41e amendment, 2026-10-22).
+        digest_extra: Dict[str, Any] = {}
+        if report_source == "bgjob:digest":
+            profile = None
+            if self.profile_registry is not None:
+                profile, _ = self.profile_registry.resolve_working_dir(working_dir)
+            digest_extra = {
+                "deliver_profile": profile.slug if profile else None,
+                "ledger_profile_slug": profile.slug if profile else None,
+            }
 
         try:
             # Loop guard (dv-752a): while this scheduler-driven turn runs, the
@@ -523,8 +524,7 @@ class AgentHandler:
                             parse_mode="markdown",
                             originating_event_id=event.id,
                             source=report_source,
-                            ledger_ref=job_ref,
-                            ledger_profile_slug=job_profile_slug,
+                            **digest_extra,
                         )
                     )
 
@@ -537,8 +537,7 @@ class AgentHandler:
                             parse_mode="markdown",
                             originating_event_id=event.id,
                             source=report_source,
-                            ledger_ref=job_ref,
-                            ledger_profile_slug=job_profile_slug,
+                            **digest_extra,
                         )
                     )
         except Exception:

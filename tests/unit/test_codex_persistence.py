@@ -21,6 +21,7 @@ from src.claude.session import SessionManager
 from src.config.settings import Settings
 from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
+from tests.helpers.traced import traced
 
 USER_ID = 4242
 THREAD_ID = "01a06921-833f-7a5e-9c1e-000000000001"
@@ -96,11 +97,14 @@ async def test_codex_turn_writes_session_message_and_cost_rows(
     workdir.mkdir()
     integ = _integration(settings, storage, tmp_path)
 
-    response = await integ.run_command(
-        prompt="привет",
-        working_directory=workdir,
-        user_id=USER_ID,
-        force_new=True,
+    response = await traced(
+        storage,
+        lambda: integ.run_command(
+            prompt="привет",
+            working_directory=workdir,
+            user_id=USER_ID,
+            force_new=True,
+        ),
     )
     assert response.session_id == THREAD_ID
 
@@ -131,7 +135,7 @@ async def test_codex_turn_writes_session_message_and_cost_rows(
         assert row[1] == 17
 
         cur = await conn.execute(
-            "SELECT tool_name FROM tool_usage WHERE message_id = ?", (message_id,)
+            "SELECT tool_name FROM tool_calls WHERE message_id = ?", (message_id,)
         )
         assert [r[0] for r in await cur.fetchall()] == ["Bash"]
 
@@ -208,18 +212,51 @@ def _fake_codex_failed_mcp(tmp_path: Path) -> Path:
     script = tmp_path / "codex_failed_mcp"
     events = [
         {"type": "thread.started", "thread_id": THREAD_ID},
-        {"type": "item.started", "item": {"id": "item_1", "type": "mcp_tool_call",
-            "server": "agent", "tool": "week_summary", "arguments": {},
-            "status": "in_progress"}},
-        {"type": "item.completed", "item": {"id": "item_1", "type": "mcp_tool_call",
-            "server": "agent", "tool": "week_summary", "arguments": {},
-            "result": None, "status": "failed", "error": {"message":
-            "MCP tool call requires approval, but approval policy is never"}}},
-        {"type": "item.started", "item": {"id": "item_2",
-            "type": "command_execution", "command": "ls", "status": "in_progress"}},
-        {"type": "item.completed", "item": {"id": "item_2",
-            "type": "command_execution", "command": "ls", "exit_code": 0,
-            "status": "completed"}},
+        {
+            "type": "item.started",
+            "item": {
+                "id": "item_1",
+                "type": "mcp_tool_call",
+                "server": "agent",
+                "tool": "week_summary",
+                "arguments": {},
+                "status": "in_progress",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "item_1",
+                "type": "mcp_tool_call",
+                "server": "agent",
+                "tool": "week_summary",
+                "arguments": {},
+                "result": None,
+                "status": "failed",
+                "error": {
+                    "message": "MCP tool call requires approval, but approval policy is never"
+                },
+            },
+        },
+        {
+            "type": "item.started",
+            "item": {
+                "id": "item_2",
+                "type": "command_execution",
+                "command": "ls",
+                "status": "in_progress",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "item_2",
+                "type": "command_execution",
+                "command": "ls",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        },
         {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
         {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 3}},
     ]
@@ -252,8 +289,11 @@ async def test_failed_mcp_call_is_stored_as_failure(storage, settings, tmp_path)
             settings, SQLiteSessionStorage(storage.db_manager)
         ),
     )
-    response = await integ.run_command(
-        prompt="week", working_directory=workdir, user_id=USER_ID, force_new=True
+    response = await traced(
+        storage,
+        lambda: integ.run_command(
+            prompt="week", working_directory=workdir, user_id=USER_ID, force_new=True
+        ),
     )
     assert not response.is_error
     message_id = await storage.save_claude_interaction(
@@ -265,7 +305,7 @@ async def test_failed_mcp_call_is_stored_as_failure(storage, settings, tmp_path)
     )
     async with storage.db_manager.get_connection() as conn:
         cur = await conn.execute(
-            "SELECT tool_name, success, error_message FROM tool_usage "
+            "SELECT tool_name, ok, error FROM tool_calls "
             "WHERE message_id = ? ORDER BY id",
             (message_id,),
         )

@@ -5,6 +5,8 @@ Codex runs this before every shell command, file patch and MCP call, with the
 call as JSON on stdin. It forwards the call to the bot's policy endpoint
 (``src/agent_bridge/policy_gate.py``) and prints a deny decision unless the bot
 answered ``allow``. All the rules live in the bot; this file decides nothing.
+An ``allow`` carrying ``updated_input`` (a keyed turn's redaction wrapper,
+dv-28f2) is relayed to Codex as ``updatedInput``.
 
 Standard library only, and it must not import ``src``: it runs as a bare script
 in the Codex child's environment. It fails closed: an unreadable payload,
@@ -76,6 +78,22 @@ def main() -> None:
     except Exception:
         deny("Blocked: the bot's policy service did not answer.")
     if answer.get("decision") == "allow":
+        if "updated_input" not in answer:
+            sys.exit(0)
+        updated = answer.get("updated_input")
+        if not isinstance(updated, dict):
+            deny("Blocked: the bot's policy service sent an unusable rewrite.")
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "updatedInput": updated,
+                    }
+                }
+            )
+        )
         sys.exit(0)
     deny(str(answer.get("reason") or "Blocked by policy."))
 

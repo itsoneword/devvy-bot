@@ -11,7 +11,7 @@ OnBootSec=5min
 # OnBootSec is relative to kernel boot; if the user manager starts later (linger,
 # migration) it is already elapsed and the timer never arms. OnStartupSec fixes that.
 OnStartupSec=5min
-OnUnitActiveSec=10min
+OnUnitActiveSec=5min
 # A tick missed while the machine was off should run once on the way back up,
 # not fire a backlog of them.
 Persistent=true

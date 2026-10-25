@@ -42,8 +42,10 @@ from claude_agent_sdk import (
 )
 
 from src.security import policy
+from src.utils.constants import DEFAULT_CLAUDE_MAX_BUFFER_SIZE
 
 from .harness import CLAUDE_ACCOUNT_ENV, claude_program
+from .trace import TraceCollector
 from .types import CLAUDE_HARNESS, PURPOSES
 
 logger = structlog.get_logger()
@@ -58,6 +60,7 @@ SUBAGENT_MODEL = "sonnet"
 
 ASK_PATH = "/internal/policy/ask"
 MODEL_CALLS_PATH = "/internal/model_calls"
+TOOL_CALLS_PATH = "/internal/tool_calls"
 
 
 @dataclass(frozen=True)
@@ -117,6 +120,26 @@ class BotLink:
             logger.warning("model call not recorded", error=str(exc))
             return False
         return True
+
+
+class RemoteTraceSink:
+    """A job's :class:`TraceSink`: tool-call rows go to the bot as they happen
+    (the job's sandbox cannot write bot.db). A bot that is down loses rows,
+    never the job."""
+
+    def __init__(self, link: BotLink) -> None:
+        self._link = link
+
+    async def upsert(self, trace_id: str, rows: List[Dict[str, Any]]) -> None:
+        try:
+            await asyncio.to_thread(
+                self._link.post,
+                TOOL_CALLS_PATH,
+                {"trace_id": trace_id, "rows": rows},
+                15,
+            )
+        except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+            logger.warning("tool calls not recorded", error=str(exc))
 
 
 class RemoteModelCallRecorder:
@@ -216,6 +239,8 @@ def job_options(spec: JobSpec, link: BotLink) -> ClaudeAgentOptions:
             ]
         },
         stderr=lambda line: print(line, file=sys.stderr, flush=True),
+        # Same ceiling as bot turns: a job reading a screenshot died at 1 MiB.
+        max_buffer_size=DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
     )
 
 
@@ -234,10 +259,12 @@ async def run_job(spec: JobSpec, link: BotLink, out: Any = None) -> int:
     final: Optional[ResultMessage] = None
     texts: List[str] = []
     error: Optional[str] = None
+    trace = TraceCollector(RemoteTraceSink(link))
     try:
         await client.connect()
         await client.query(spec.prompt)
         async for message in client.receive_response():
+            trace.feed_sdk(message)
             if isinstance(message, SystemMessage) and message.subtype == "init":
                 version = message.data.get("claude_code_version") or version
                 model = message.data.get("model") or model
@@ -268,6 +295,8 @@ async def run_job(spec: JobSpec, link: BotLink, out: Any = None) -> int:
         print(f"agentjob failed: {reason}", file=sys.stderr, flush=True)
         outcome, code, error = "error", 1, reason[:500]
 
+    trace.close("job ended")
+    await trace.flush()
     usage = (final.usage if final is not None else None) or {}
     await link.record(
         {
@@ -287,6 +316,7 @@ async def run_job(spec: JobSpec, link: BotLink, out: Any = None) -> int:
             "duration_ms": int((time.monotonic() - started) * 1000),
             "outcome": outcome,
             "error": error,
+            "trace_id": trace.trace_id if trace.rows() else None,
         }
     )
     return code

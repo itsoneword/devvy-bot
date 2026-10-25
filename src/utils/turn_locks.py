@@ -31,6 +31,7 @@ class Waiter:
     profile_id: Optional[str] = None
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     jumped: bool = False  # user pressed "interrupt and run this" (dv-8b49)
+    stopping: bool = False  # that press's stop is still running (dv-b399)
     note_due: bool = False  # a running turn was really stopped for this one
     gate: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -59,6 +60,9 @@ def take_interrupt_note() -> bool:
 
 CHAT_HOLDER = "your previous message"
 
+# Longest an internal prompt yields to parked user messages (dv-b399).
+_INTERNAL_YIELD_MAX_SECONDS = 1800.0
+
 
 class TrackedLock(asyncio.Lock):
     """asyncio.Lock that remembers its holder label and its waiters."""
@@ -67,9 +71,27 @@ class TrackedLock(asyncio.Lock):
         super().__init__()
         self.holder: Optional[str] = None
         self.waiters: List[Waiter] = []
+        # Set while no user message is parked. Unregistered acquirers
+        # (job-finish digests, scheduler, webhooks) wait for it, so a user's
+        # queued message is never overtaken by an internal prompt (dv-b399).
+        self.no_waiters = asyncio.Event()
+        self.no_waiters.set()
+
+    def add_waiter(self, waiter: Waiter) -> None:
+        self.waiters.append(waiter)
+        self.no_waiters.clear()
 
     async def acquire(self) -> Literal[True]:
         waiter = _current_waiter.get()
+        if waiter is None:
+            # Bounded: a parked waiter whose task died before acquire() must
+            # not hold internal prompts back forever.
+            try:
+                await asyncio.wait_for(
+                    self.no_waiters.wait(), _INTERNAL_YIELD_MAX_SECONDS
+                )
+            except asyncio.TimeoutError:
+                pass
         try:
             if waiter is not None and waiter in self.waiters:
                 # Registered waiters go one at a time, in ``waiters`` order
@@ -83,6 +105,8 @@ class TrackedLock(asyncio.Lock):
                 _held_waiter.set(waiter)
                 if waiter in self.waiters:
                     self.waiters.remove(waiter)
+                if not self.waiters:
+                    self.no_waiters.set()
                 if not self.locked():
                     self._promote()  # a cancelled head must not strand the rest
 
@@ -138,7 +162,7 @@ class TurnLocks:
         waiter = Waiter(
             user_id=user_id, chat_id=chat_id, kind=kind, profile_id=profile_id
         )
-        self.get(user_id, profile_id).waiters.append(waiter)
+        self.get(user_id, profile_id).add_waiter(waiter)
         _current_waiter.set(waiter)
         return waiter
 

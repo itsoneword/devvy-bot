@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Run a job's tests under their own memory cap.
+
+Usage:
+  testrun [--mem 1500M] -- <cmd…>
+
+Output and exit code are the command's. A test run that outgrows the cap is
+OOM-killed on its own: the agent that called testrun is not in the tests'
+cgroup, survives, and reads the last line,
+`testrun: OOM-killed at <mem> (peak X)` or `testrun: peak X`.
+
+Why (dv-c5ac): a pump job's agent and the test processes it started shared one
+bgjob cgroup, so a heavy suite (~2 GB peak) OOM-killed the whole job with an
+empty output.md.
+
+Three backends, picked at runtime (dv-5e2f):
+
+1. **Delegated cgroup** (inside an agent job). The job unit has Delegate=yes,
+   run.sh moved the agent into `<unit>/box/agent` and bound `box/` rw into the
+   box; testrun makes `box/testrun-<pid>-<ts>` with memory.max = the cap. The
+   unit's MemoryMax is the job cap plus this cap.
+2. **`systemd-run --user --scope`** when the user bus is reachable (the
+   owner's shell, chat). A scope runs the command in place, so it keeps the
+   caller's mounts. Never a service (`--wait`/`--pipe`): that is started by
+   the user manager outside any sandbox, with `/` writable. Inside a job box
+   the bus is hidden (docs/FINDINGS.md 2026-10-24), so this is not even
+   attempted there: a "Failed to connect to bus" must never come back as the
+   tests' exit code.
+3. **Direct**, with a warning and a per-process address-space limit of the
+   cap (RLIMIT_AS): weaker than a cgroup, but never uncapped. Inside a job
+   the unit's MemoryMax still bounds the total.
+
+The cap defaults to PUMP_TEST_MEMORY_MAX, else 1500M.
+"""
+
+import os
+import re
+import resource
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+DEFAULT_MEM = "1500M"
+# The scope's last journal lines can land a moment after it exits.
+JOURNAL_WAIT_SECONDS = 2.0
+# TESTRUN_CGROUP_ROOT points the cgroup lookups elsewhere (tests).
+CGROUP_ROOT = os.environ.get("TESTRUN_CGROUP_ROOT") or "/sys/fs/cgroup"
+POLL_SECONDS = 0.25
+
+
+def usage() -> "None":
+    sys.exit("usage: testrun [--mem 1500M] -- <cmd…>")
+
+
+def parse(argv: list[str]) -> tuple[str, list[str]]:
+    mem = os.environ.get("PUMP_TEST_MEMORY_MAX") or DEFAULT_MEM
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            i += 1
+            break
+        if a == "--mem" and i + 1 < len(argv):
+            mem = argv[i + 1]
+            i += 2
+        elif a.startswith("--mem="):
+            mem = a.split("=", 1)[1]
+            i += 1
+        elif a in {"-h", "--help"}:
+            print(__doc__)
+            sys.exit(0)
+        else:
+            break  # no `--`: the command starts here
+    cmd = argv[i:]
+    if not cmd or not mem:
+        usage()
+    return mem, cmd
+
+
+def env() -> dict:
+    e = dict(os.environ)
+    e.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return e
+
+
+def rc_of(code: int) -> int:
+    """A signal death as a shell reports it (SIGKILL → 137)."""
+    return 128 - code if code < 0 else code
+
+
+def journal(unit: str) -> str:
+    try:
+        r = subprocess.run(
+            ["journalctl", "--user", "-u", unit, "-o", "cat", "--no-pager", "-n", "50"],
+            capture_output=True,
+            text=True,
+            env=env(),
+            timeout=15,
+        )
+    except Exception:
+        return ""
+    return r.stdout or ""
+
+
+def outcome(unit: str, wait: bool) -> tuple[str, str]:
+    """(systemd result, memory peak) from the finished scope's journal; ("",
+    "") unknown. Same parse as taskpump's unit_outcome. A scope logs its result
+    ('oom-kill') but, unlike a service, no "memory peak" line: that one comes
+    from `Peak` below."""
+    deadline = time.monotonic() + (JOURNAL_WAIT_SECONDS if wait else 0)
+    while True:
+        out = journal(unit)
+        if "Failed with result" in out or time.monotonic() >= deadline:
+            break
+        time.sleep(0.3)
+    result = re.findall(r"Failed with result '([\w-]+)'", out)
+    peak = re.findall(r"([\d.]+[KMGT]?B?) memory peak", out)
+    return (result[-1] if result else ""), (peak[-1] if peak else "")
+
+
+def human(n: int) -> str:
+    """Bytes the way systemd prints them: 2G, 310.5M."""
+    for unit, size in (("T", 2**40), ("G", 2**30), ("M", 2**20), ("K", 2**10)):
+        if n >= size:
+            return f"{n / size:.1f}".removesuffix(".0") + unit
+    return f"{n}B"
+
+
+class Peak(threading.Thread):
+    """Polls the scope's cgroup while it lives: its memory.peak and its
+    oom_kill count. The cgroup is gone the moment the scope exits, so the last
+    reading is what is left. Only a cgroup named after our unit counts: without
+    a real scope (stubbed systemd-run) /proc/<pid>/cgroup is the caller's."""
+
+    def __init__(self, pid: int, unit: str) -> None:
+        super().__init__(daemon=True)
+        self.pid, self.unit = pid, unit
+        self.peak = 0
+        self.oom_kills = 0
+        self.done = threading.Event()
+
+    def cgroup(self) -> str:
+        try:
+            with open(f"/proc/{self.pid}/cgroup") as f:
+                path = f.read().split("::", 1)[1].strip()
+        except (OSError, IndexError):
+            return ""
+        return CGROUP_ROOT + path if path.endswith("/" + self.unit) else ""
+
+    def read(self, cg: str) -> None:
+        try:
+            with open(cg + "/memory.peak") as f:
+                self.peak = max(self.peak, int(f.read().split()[0]))
+            with open(cg + "/memory.events") as f:
+                ev = dict(line.split() for line in f if line.strip())
+            self.oom_kills = int(ev.get("oom_kill", self.oom_kills))
+        except (OSError, ValueError, IndexError):
+            pass
+
+    def run(self) -> None:
+        cg = ""
+        while not self.done.wait(POLL_SECONDS if cg else 0.05):
+            cg = cg or self.cgroup()
+            if cg:
+                self.read(cg)
+
+
+def bus_reachable() -> bool:
+    """Whether systemd-run --user can find a bus: the session bus address,
+    $XDG_RUNTIME_DIR/bus or systemd's private socket. All are gone inside an
+    agent job's box."""
+    rt = env()["XDG_RUNTIME_DIR"]
+    paths = [os.path.join(rt, "bus"), os.path.join(rt, "systemd", "private")]
+    for part in os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").split(";"):
+        m = re.match(r"unix:path=([^,]+)", part)
+        if m:
+            paths.append(m.group(1))
+    return any(os.path.exists(p) for p in paths)
+
+
+def size_bytes(size: str) -> "int | None":
+    """A systemd size ("1500M", "2G") in bytes; None for anything else."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGT]?)B?", size.strip())
+    if not m:
+        return None
+    mult = {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}[m.group(2)]
+    return int(float(m.group(1)) * mult)
+
+
+def own_cgroup() -> str:
+    """This process's cgroup v2 path ("/user.slice/..."), "" if unknown."""
+    try:
+        with open("/proc/self/cgroup") as f:
+            return f.read().split("::", 1)[1].strip()
+    except (OSError, IndexError):
+        return ""
+
+
+def delegated_box() -> str:
+    """`<unit cgroup>/box` when we run in an agent job's delegated
+    `box/agent` and may make leaves beside it; "" otherwise."""
+    path = own_cgroup()
+    if not path.endswith("/box/agent"):
+        return ""
+    box = CGROUP_ROOT + path.removesuffix("/agent")
+    try:
+        with open(box + "/cgroup.subtree_control") as f:
+            if "memory" not in f.read().split():
+                return ""
+    except OSError:
+        return ""
+    return box if os.access(box + "/cgroup.procs", os.W_OK) else ""
+
+
+def _write(path: str, value: str) -> None:
+    with open(path, "w") as f:
+        f.write(value)
+
+
+def _read_int(path: str, key: str = "") -> int:
+    """memory.peak's number, or one key of memory.events; 0 when unreadable."""
+    try:
+        with open(path) as f:
+            if not key:
+                return int(f.read().split()[0])
+            ev = dict(line.split() for line in f if line.strip())
+        return int(ev.get(key, 0))
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _remove_leaf(leaf: str) -> None:
+    # Whatever the run left behind (a server a test forgot) goes with it;
+    # the leaf can only be removed once it is empty.
+    try:
+        _write(leaf + "/cgroup.kill", "1")
+    except OSError:
+        pass
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            os.rmdir(leaf)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                print(f"testrun: could not remove {leaf}", file=sys.stderr)
+                return
+            time.sleep(0.1)
+
+
+def run_in_cgroup(box: str, mem: str, cmd: list[str]) -> "tuple[int, int, int] | None":
+    """Backend 1: the command in its own leaf under box/. (rc, oom_kills,
+    peak bytes), or None when the leaf cannot be set up (caller falls back)."""
+    limit = size_bytes(mem)
+    leaf = f"{box}/testrun-{os.getpid()}-{int(time.time())}"
+    try:
+        os.mkdir(leaf)
+    except OSError:
+        return None
+    try:
+        _write(leaf + "/memory.max", str(limit) if limit is not None else mem)
+    except OSError:
+        _remove_leaf(leaf)
+        return None
+    try:
+        _write(leaf + "/memory.swap.max", "0")
+    except OSError:
+        pass  # no swap accounting: memory.max alone is the cap
+    procs = leaf + "/cgroup.procs"
+    try:
+        # The child joins the leaf before exec, so no part of the test run
+        # ever counts against the agent's cgroup.
+        proc = subprocess.Popen(cmd, preexec_fn=lambda: _write(procs, "0"))
+    except (OSError, subprocess.SubprocessError):
+        _remove_leaf(leaf)
+        return None
+    rc = rc_of(proc.wait())
+    oom = _read_int(leaf + "/memory.events", "oom_kill")
+    peak = _read_int(leaf + "/memory.peak")
+    _remove_leaf(leaf)
+    return rc, oom, peak
+
+
+def run_direct(mem: str, cmd: list[str], why: str) -> int:
+    """Backend 3: no cgroup of our own. Each process gets RLIMIT_AS = the cap,
+    so a runaway allocation fails inside the tests instead of growing
+    unbounded."""
+    limit = size_bytes(mem)
+
+    def cap() -> None:
+        if limit is not None:
+            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+
+    print(
+        f"testrun: {why}, running with a per-process limit of {mem} only",
+        file=sys.stderr,
+        flush=True,
+    )
+    return rc_of(subprocess.run(cmd, preexec_fn=cap).returncode)
+
+
+def report(mem: str, rc: int, oom: bool, peak: str) -> int:
+    """Print the last line and return the run's rc (137 for an OOM kill)."""
+    if oom:
+        # An OOM kill means the cgroup reached its cap; a poll can lag the
+        # last allocation, so the cap is the honest peak.
+        line = f"testrun: OOM-killed at {mem} (peak {peak or mem})"
+        rc = rc or 137
+    elif peak:
+        line = f"testrun: peak {peak} (cap {mem})"
+    else:
+        line = f"testrun: peak unknown (cap {mem})"
+    print(line, file=sys.stderr, flush=True)
+    return rc
+
+
+def main(argv: list[str]) -> int:
+    mem, cmd = parse(argv)
+    # A host without systemd-run has no systemd to delegate a cgroup either.
+    if not shutil.which("systemd-run"):
+        return run_direct(mem, cmd, "no systemd-run")
+    box = delegated_box()
+    if box:
+        got = run_in_cgroup(box, mem, cmd)
+        if got is not None:
+            rc, oom_kills, peak = got
+            sys.stdout.flush()
+            return report(mem, rc, oom_kills > 0, human(peak) if peak else "")
+    if not bus_reachable():
+        return run_direct(mem, cmd, "no user bus and no delegated cgroup")
+
+    unit = f"testrun-{os.getpid()}-{int(time.time())}.scope"
+    argv_run = [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        f"--unit={unit}",
+        "-p",
+        f"MemoryMax={mem}",
+        "-p",
+        "MemorySwapMax=0",
+        "--",
+        *cmd,
+    ]
+    proc = subprocess.Popen(argv_run, env=env())
+    poll = Peak(proc.pid, unit)
+    poll.start()
+    rc = rc_of(proc.wait())
+    poll.done.set()
+    poll.join(timeout=1)
+    sys.stdout.flush()
+    result, peak = outcome(unit, wait=rc != 0)
+    oom = result == "oom-kill" or poll.oom_kills > 0
+    return report(mem, rc, oom, peak or (human(poll.peak) if poll.peak else ""))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

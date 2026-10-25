@@ -35,7 +35,18 @@ from src.claude.tool_context import AgentServices, TurnContext
 from src.profiles.registry import ProfileDefinition, ProfileRegistry
 
 # The owner-only surface; ``agent_tools._jobs_available`` is the gate.
-JOB_TOOLS = frozenset({"job_start", "job_list", "job_output", "jobs_refresh_pin"})
+JOB_TOOLS = frozenset(
+    {
+        "job_start",
+        "job_list",
+        "job_output",
+        "jobs_refresh_pin",
+        # dv-a9b0: the board agent's pump tools, owner-only like jobs.
+        "pump_status",
+        "pump_pending",
+        "pump_answer",
+    }
+)
 
 OWNER = 111
 GUEST = 222
@@ -224,15 +235,11 @@ class TestOwnerPath:
 
         (argv,) = spawned
         assert argv[0].endswith("/scripts/bgjob")
-        assert list(argv[1:]) == [
-            "run",
-            "--profile",
-            "coach",
-            "--name",
-            "audit",
-            "--",
-            "audit the repo",
-        ]
+        # --batch carries the turn id (jobs of one turn share one digest)
+        assert list(argv[1:4]) == ["run", "--profile", "coach"]
+        assert argv[4:6] == ("--name", "audit")
+        assert argv[6] == "--batch" and argv[7]
+        assert list(argv[8:]) == ["--", "audit the repo"]
 
     async def test_nothing_model_supplied_can_become_a_flag(
         self, bridge: AgentBridge, workspace: Path, spawned: List[Tuple[str, ...]]

@@ -21,6 +21,10 @@ from telegram.error import TelegramError
 
 from ..events.types import AgentResponseEvent
 
+# Ledger refs whose reply is inbound in a reply-only topic (dv-c41e jobs,
+# 2026-10-20 pump questions).
+REPLY_REF_PREFIXES = ("job:", "pump:")
+
 logger = structlog.get_logger()
 
 _TOPIC_UNUSABLE_MARKERS = (
@@ -44,13 +48,13 @@ def is_topic_unusable_error(error: TelegramError) -> bool:
 SLUG_PREFIX = "reports:"
 
 # Sources that are DM-only no matter what the routing map says: the owner has
-# to see them on the device they answer from. "taskpump:ask" is the pump's
-# question/blocked/failed card (status cards are "taskpump:status"); the rest
-# are reminders / item jobs, family notices and the routing's own errors.
+# to see them on the device they answer from: reminders / item jobs, family
+# notices and the routing's own errors. "taskpump:ask" (the pump's
+# question/blocked/failed card) left this list on 2026-10-20: it goes to the
+# Pump topic with a "pump:<id>" ref, so a reply reaches the devops session.
 # Interactive prompts (tool-call approvals, watchdog) are sent directly by the
 # bot with inline keyboards and never pass through this service at all.
 ALWAYS_DM_SOURCES = (
-    "taskpump:ask",
     "reminder",
     "item",
     "family",
@@ -68,8 +72,8 @@ def source_matches(source: str, key: str) -> bool:
 # A plain post in a reply-only topic gets one hint per this many seconds.
 HINT_INTERVAL_S = 600.0
 JOBS_HINT = (
-    "This topic is read-only: reply to a job message (start, finish or "
-    "digest) to talk to its agent."
+    "This topic is read-only: reply to a job message (start or finish) "
+    "or a pump question to talk to its agent."
 )
 
 
@@ -184,7 +188,25 @@ class ReportsRouter:
             logger.warning("Jobs reply ledger lookup failed", error=str(e))
             return None
         ref = getattr(entry, "ref", None)
-        return entry if isinstance(ref, str) and ref.startswith("job:") else None
+        return (
+            entry
+            if isinstance(ref, str) and ref.startswith(REPLY_REF_PREFIXES)
+            else None
+        )
+
+    def profile_topic(self, slug: Optional[str]) -> Optional[str]:
+        """The topic that is this profile's own chat: bound to it, and neither
+        reply-only (Jobs, Pump) nor a report destination (Monitoring). None =
+        no such topic, or more than one (ambiguous) -> the caller uses the DM."""
+        if not slug:
+            return None
+        out = {v.lower() for v in self.routes.values()}
+        found = [
+            t
+            for t, p in self.bindings.items()
+            if p == slug.lower() and t not in self.reply_only and t.lower() not in out
+        ]
+        return found[0] if len(found) == 1 else None
 
     def hint_due(self, topic: str, now: Optional[float] = None) -> bool:
         """True at most once per ``HINT_INTERVAL_S`` per topic (and records it)."""
@@ -201,6 +223,13 @@ class ReportsRouter:
         """Topic name for this event, or None = stay where it was addressed."""
         if not self.enabled or target_chat_id == self.chat_id:
             return None
+        if event.deliver_profile:
+            # The profile's own chat (its bound topic), else the DM.
+            return (
+                self.profile_topic(event.deliver_profile)
+                if target_chat_id in self.owner_chat_ids
+                else None
+            )
         if event.ledger_kind:  # reminders: replies must be attributable in DM
             return None
         # Only the owner's notification chats (NOTIFICATION_CHAT_IDS) have reports;

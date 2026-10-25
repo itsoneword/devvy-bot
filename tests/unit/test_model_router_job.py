@@ -154,3 +154,72 @@ async def test_job_router_records_through_the_bot() -> None:
     row = link.record.call_args.args[0]
     assert row["purpose"] == "screen" and row["harness"] == "typesafe"
     assert row["input_tokens"] == 5
+
+
+async def test_run_job_sends_its_trace_and_links_it(monkeypatch) -> None:
+    """dv-2260: a job's tool calls go to the bot as they happen and the
+    model_calls row carries the trace id; an interrupted job keeps them."""
+    import io
+
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ResultMessage,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+
+    from src.model_router import job as job_mod
+
+    stream = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "ls"})],
+            model="m",
+        ),
+        UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="a b")]),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="js",
+            total_cost_usd=0.1,
+            usage={},
+            result="done",
+        ),
+    ]
+
+    class FakeClient:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        async def connect(self) -> None: ...
+        async def query(self, _: str) -> None: ...
+        async def disconnect(self) -> None: ...
+
+        async def receive_response(self):
+            for m in stream:
+                yield m
+
+    monkeypatch.setattr(job_mod, "ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr(job_mod, "job_options", lambda *_: None)
+    link = BotLink("http://127.0.0.1:1", "s")
+    posted = []
+    link.post = lambda path, body, timeout: posted.append((path, body)) or {}  # type: ignore[method-assign]
+    spec = job_mod.JobSpec(
+        purpose="background_job",
+        name="j",
+        prompt="p",
+        model="sonnet",
+        working_directory=Path("/tmp"),
+        full_access=False,
+        unrestricted=False,
+    )
+    code = await job_mod.run_job(spec, link, out=io.StringIO())
+    assert code == 0
+    tool_posts = [b for p, b in posted if p == "/internal/tool_calls"]
+    (call_post,) = [b for p, b in posted if p == "/internal/model_calls"]
+    assert tool_posts[-1]["rows"][0]["tool_name"] == "Bash"
+    assert tool_posts[-1]["rows"][0]["ok"] == 1
+    assert call_post["trace_id"] == tool_posts[-1]["trace_id"]

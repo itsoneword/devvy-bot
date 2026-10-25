@@ -184,48 +184,6 @@ class MessageModel:
 
 
 @dataclass
-class ToolUsageModel:
-    """Tool usage data model."""
-
-    session_id: str
-    tool_name: str
-    timestamp: datetime
-    id: Optional[int] = None
-    message_id: Optional[int] = None
-    tool_input: Optional[Dict[str, Any]] = None
-    success: bool = True
-    error_message: Optional[str] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
-        data = asdict(self)
-        # Convert datetime to ISO format
-        if data["timestamp"]:
-            data["timestamp"] = data["timestamp"].isoformat()
-        # Convert tool_input to JSON string if present
-        if data["tool_input"]:
-            data["tool_input"] = json.dumps(data["tool_input"])
-        return data
-
-    @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> "ToolUsageModel":
-        """Create from database row."""
-        data = dict(row)
-
-        # Parse datetime fields
-        data["timestamp"] = _parse_datetime(data.get("timestamp"))
-
-        # Parse JSON fields
-        if data.get("tool_input"):
-            try:
-                data["tool_input"] = json.loads(data["tool_input"])
-            except (json.JSONDecodeError, TypeError):
-                data["tool_input"] = {}
-
-        return cls(**data)
-
-
-@dataclass
 class AuditLogModel:
     """Audit log data model."""
 

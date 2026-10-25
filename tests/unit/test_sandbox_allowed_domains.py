@@ -91,6 +91,7 @@ def test_sdk_maps_profile_dirs_into_bash_box(tmp_path):
                 extra_dirs=(extra,),
                 sandbox_read_dirs=(tool,),
                 sandbox_allowed_domains=("api.hyperliquid.xyz", "pypi.org"),
+                sandbox_keys=("pl-openrouter",),
             ),
         ]
     )
@@ -98,6 +99,7 @@ def test_sdk_maps_profile_dirs_into_bash_box(tmp_path):
     box = mgr._bash_box_for(ws)
     assert box.write_dirs == (ws.resolve(), extra)
     assert box.read_dirs == (tool,)
+    assert box.keys == ("pl-openrouter",)
 
 
 def test_sandbox_read_dirs_parsed_and_refused_for_guests(tmp_path):
@@ -129,3 +131,18 @@ async def test_unlisted_host_ask_is_denied():
         MagicMock(),
     )
     assert result.__class__.__name__ == "PermissionResultDeny"
+
+
+def test_sandbox_keys_parsed_validated_refused_for_guests(tmp_path):
+    """dv-0277: key-store service names, owner-only."""
+    reg = _load(tmp_path, "    sandbox_keys: [pl-openrouter, pl-openrouter]\n")
+    assert reg.get_by_slug("markets").sandbox_keys == ("pl-openrouter",)
+    assert reg.get_by_slug("devops").sandbox_keys == ()
+    with pytest.raises(ValueError, match="sandbox_keys"):
+        _load(tmp_path, "    sandbox_keys: [OPENROUTER_API_KEY]\n")
+    with pytest.raises(ValueError, match="guest"):
+        _load(
+            tmp_path,
+            "    sandbox_keys: [pl-openrouter]\n"
+            "    permission_policy:\n      allowed_roles: [owner, guest]\n",
+        )

@@ -51,6 +51,23 @@ def _bash(command: str) -> Tuple[str, Dict[str, Any]]:
     return "Bash", {"command": command}
 
 
+# dv-af70: the owner's 08:13 card (job pump-dv-58db-analyze), in both shapes.
+_KILL_IN_SQL_C = (
+    'python3 -c "import sqlite3; '
+    "c = sqlite3.connect('file:data/db/bot.db?mode=ro', uri=True); "
+    "print(c.execute(\\\"SELECT id FROM tool_calls WHERE input LIKE '%kill %'\\\")"
+    '.fetchall())"'
+)
+_KILL_IN_SQL_HEREDOC = (
+    "python3 - <<'EOF'\n"
+    "import sqlite3\n"
+    "c = sqlite3.connect('file:data/db/bot.db?mode=ro', uri=True)\n"
+    "print(c.execute(\"SELECT id FROM tool_calls WHERE input LIKE '%kill %'\")"
+    ".fetchall())\n"
+    "EOF"
+)
+
+
 # (label, (tool_name, tool_input), full_access, expected action)
 CASES: List[Tuple[str, Tuple[str, Dict[str, Any]], bool, str]] = [
     ("everyday command", _bash("ls -la"), True, ALLOW),
@@ -102,6 +119,37 @@ CASES: List[Tuple[str, Tuple[str, Dict[str, Any]], bool, str]] = [
         ASK,
     ),
     ("service control", _bash("systemctl restart nginx"), True, ASK),
+    # dv-af70: command-word rules match commands, not text inside literals.
+    # The 08:13 false positive: a read-only SELECT whose SQL says LIKE '%kill %'.
+    (
+        "08:13 case: kill inside a python -c SQL string",
+        _bash(_KILL_IN_SQL_C),
+        True,
+        ALLOW,
+    ),
+    (
+        "08:13 case: kill inside a python heredoc",
+        _bash(_KILL_IN_SQL_HEREDOC),
+        True,
+        ALLOW,
+    ),
+    ("kill a pid", _bash("kill 123"), True, ASK),
+    ("kill through bash -c", _bash("bash -c 'kill 1'"), True, ASK),
+    ("kill through xargs", _bash("pgrep -f stuck | xargs kill"), True, ASK),
+    ("kill through $() in double quotes", _bash('echo "$(pkill -f x)"'), True, ASK),
+    ("SQL drop in a literal", _bash('sqlite3 data/x.db "DROP TABLE users"'), True, ASK),
+    # added (architect build note): masking must not hide these nested shells.
+    ("kill through su -c", _bash("su -c 'kill 1'"), True, ASK),
+    ("kill through watch", _bash("watch 'pkill -f x'"), True, ASK),
+    (
+        "kill through find -exec sh -c",
+        _bash("find . -name '*.pid' -exec sh -c 'kill $(cat {})' \\;"),
+        True,
+        ASK,
+    ),
+    # added: `2>/dev/null)` inside $(...) is not a redirect into "/dev/null)".
+    ("stderr to /dev/null inside $()", _bash("echo $(ls x 2>/dev/null)"), True, ALLOW),
+    ("redirect into a system path", _bash("echo hi > /etc/hosts"), True, ASK),
     # dv-535b: the pump flagged this agent-filed branch (see _pump_board).
     ("merge a flagged pump branch", _bash("git merge pump/dv-ab12"), True, ASK),
     ("merge an unflagged pump branch", _bash("git merge pump/dv-cd34"), True, ALLOW),

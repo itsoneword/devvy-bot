@@ -26,6 +26,7 @@ Usage:
   bgjob output <id> [--tail N | --full]   (default: summary.md)
   bgjob summarize <id>
   bgjob cancel <id>
+  bgjob digest <id>   (batch digest check; run by a finishing job)
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -52,11 +54,14 @@ SUMMARY_LINES = 15
 SUMMARY_CHARS = 1500
 _SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.DOTALL)
 
-# Conservative defaults for small hosts (a 3.8G host once OOM-rebooted from
-# parallel claude processes). Bigger hosts raise them via BGJOB_MAX_CONCURRENT /
-# BGJOB_MEMORY_MAX in the environment of the bot and taskpump units.
+# Conservative defaults for small hosts (this host had 3.8G when it once
+# OOM-rebooted from parallel claude processes; it has 11G now). Bigger hosts
+# raise them via BGJOB_MAX_CONCURRENT / BGJOB_MEMORY_MAX in the environment of
+# the bot and taskpump units.
 MAX_CONCURRENT = int(os.environ.get("BGJOB_MAX_CONCURRENT", "2"))
 JOB_MEMORY_MAX = os.environ.get("BGJOB_MEMORY_MAX", "1G")
+# scripts/testrun's cap (unset = its 1500M); an agent job's unit holds both.
+TEST_MEMORY_MAX = os.environ.get("PUMP_TEST_MEMORY_MAX", "")
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
 
@@ -66,6 +71,75 @@ def _env() -> dict:
     env = dict(os.environ)
     env["XDG_RUNTIME_DIR"] = RUNTIME_DIR
     return env
+
+
+_SIZE_UNITS = {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
+
+
+def _size_bytes(size: str) -> int | None:
+    """A systemd size ("1G", "1500M", "2048") in bytes; None for anything else
+    ("infinity", "50%")."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGT]?)B?", size.strip())
+    return int(float(m.group(1)) * _SIZE_UNITS[m.group(2)]) if m else None
+
+
+def agent_unit_memory_max() -> str:
+    """An agent job's unit cap. scripts/testrun puts the job's tests in their
+    own cgroup INSIDE the unit (dv-5e2f), so the unit holds the agent's cap
+    plus the test cap; the agent's own share is box/agent/memory.max."""
+    job = _size_bytes(JOB_MEMORY_MAX)
+    test = _size_bytes(TEST_MEMORY_MAX or "1500M")
+    if job is None or test is None:
+        return JOB_MEMORY_MAX
+    return str(job + test)
+
+
+def job_box_prefix(bwrap_bin: str, write_paths: list[str]) -> str:
+    """The bwrap argv an agent job runs in: / read-only, write_paths rw.
+
+    `--ro-bind / /` alone leaves the user bus connectable (a read-only mount
+    does not stop connect() on a unix socket), and through it
+    `systemd-run --user` starts a service OUTSIDE the box with / writable
+    (dv-5e2f). So the runtime dir is a private empty tmpfs and the bus address
+    is unset. No bind may land under /run/user after the tmpfs. `$box_cg` is
+    run.sh's bind of the job's delegated cgroup (empty without delegation)."""
+    uid = os.getuid()
+    run_user = f"/run/user/{uid}" if Path(f"/run/user/{uid}").is_dir() else "/run/user"
+    binds = " ".join(f"--bind {shlex.quote(w)} {shlex.quote(w)}" for w in write_paths)
+    return (
+        f"{shlex.quote(bwrap_bin)} --ro-bind / / --tmpfs {run_user} "
+        f"--unsetenv DBUS_SESSION_BUS_ADDRESS {binds} $box_cg "
+        f"--bind /tmp /tmp --dev /dev --proc /proc --die-with-parent"
+    )
+
+
+def cgroup_carveout(agent_max: str, log: Path) -> str:
+    """run.sh lines that split an agent job's delegated cgroup (Delegate=yes)
+    into box/agent (this shell and everything it starts, capped at the job's
+    own cap) and room for scripts/testrun's box/testrun-* leaves. Only box/ is
+    bound rw into the box, so the unit's own memory.max stays out of reach.
+
+    cgroup v2 forbids processes in a cgroup that hands out controllers: the
+    shell moves into the leaf before +memory is written. Without delegation
+    box_cg stays empty and testrun falls back to RLIMIT_AS inside the unit cap."""
+    limit = _size_bytes(agent_max)
+    write_max = (
+        f'  echo {limit} > "$cg/box/agent/memory.max"\n' if limit is not None else ""
+    )
+    return (
+        "box_cg=''\n"
+        'cg="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)"\n'
+        'if mkdir -p "$cg/box/agent" 2>/dev/null \\\n'
+        '   && echo $$ > "$cg/box/agent/cgroup.procs" \\\n'
+        '   && echo +memory > "$cg/cgroup.subtree_control" \\\n'
+        '   && echo +memory > "$cg/box/cgroup.subtree_control"; then\n'
+        f"{write_max}"
+        '  box_cg="--bind $cg/box $cg/box"\n'
+        "else\n"
+        '  echo "bgjob: no cgroup delegation; tests share the job cap" '
+        f">> {str(log)!r}\n"
+        "fi 2>/dev/null\n"
+    )
 
 
 _REGISTRY_DUMP = """
@@ -119,9 +193,14 @@ def extract_summary(text: str) -> str:
     crashed job or one that ignored the contract still yields a summary."""
     found = _SUMMARY_RE.findall(text)
     if found:
-        body = found[-1].strip()
-        lines = body.splitlines()[:SUMMARY_LINES]
-        return "\n".join(lines)[:SUMMARY_CHARS]
+        body = found[-1].strip().splitlines()
+        # `image:` lines are delivery instructions (dv-f90c: notify reads them
+        # from summary.md), not prose: exempt them from the cap, else a long
+        # summary silently drops the screenshots it lists at the end.
+        images = [ln for ln in body if ln.lower().startswith("image:")][:10]
+        text = [ln for ln in body if not ln.lower().startswith("image:")]
+        out = "\n".join(text[:SUMMARY_LINES])[:SUMMARY_CHARS]
+        return "\n".join([out, *images]) if images else out
     lines = text.strip().splitlines()[-SUMMARY_LINES:]
     if not lines:
         return ""
@@ -209,7 +288,12 @@ def unit_active(unit: str) -> bool:
 def all_jobs() -> list:
     if not JOBS_ROOT.exists():
         return []
-    return sorted((p.name for p in JOBS_ROOT.iterdir() if p.is_dir()), reverse=True)
+    # Only dirs bgjob created (meta.json); other tools' scratch dirs that land
+    # here (release_public --out) otherwise list as "failed(rc=?) 0B".
+    return sorted(
+        (p.name for p in JOBS_ROOT.iterdir() if (p / "meta.json").is_file()),
+        reverse=True,
+    )
 
 
 def job_progress(unit: str) -> str:
@@ -291,6 +375,220 @@ def _venv_python() -> str:
     return str(python)
 
 
+DUP_WINDOW_S = 30 * 60
+
+
+def find_duplicate(name: str, task: str | None, now: float | None = None) -> str:
+    """Why a new prompt job duplicates a recent one ("" = it does not).
+
+    Same name or same ticket as a job that is RUNNING or finished OK within
+    DUP_WINDOW_S. A failed job does not count (re-running it is the fix), and
+    neither do plain --cmd jobs (e.g. full-tests are rerun on purpose).
+    """
+    now = time.time() if now is None else now
+    for jid in all_jobs():
+        meta = read_meta(jid)
+        if meta.get("cmd"):
+            continue
+        same_name = meta.get("name") == name
+        same_task = bool(task) and meta.get("task") == task
+        if not (same_name or same_task):
+            continue
+        what = "same name" if same_name else f"same task {task}"
+        ec = job_dir(jid) / "exit_code"
+        if not ec.exists():
+            if unit_active(meta.get("unit", "")):
+                return f"job {jid} is RUNNING ({what})"
+            continue
+        if ec.read_text().strip() != "0":
+            continue
+        age = now - ec.stat().st_mtime
+        if age < DUP_WINDOW_S:
+            return f"job {jid} finished {int(age // 60)} min ago ({what})"
+    return ""
+
+
+BATCH_CAP_S = 30 * 60
+BATCH_POLL_S = 30
+BATCH_WATCH_MAX_S = 3 * 3600
+
+
+def batch_dir() -> Path:
+    return JOBS_ROOT / ".batches"
+
+
+def batch_jobs(batch: str) -> list:
+    """Ids of the digestable jobs in a batch (a job with no batch is its own)."""
+    out = []
+    for jid in all_jobs():
+        meta = read_meta(jid)
+        if meta.get("cmd") or meta.get("quiet"):
+            continue
+        if meta.get("batch", jid) == batch:
+            out.append(jid)
+    return sorted(out)
+
+
+def plan_digest(
+    finished: list, running: list, sent: list, first_finished: float | None, now: float
+) -> tuple:
+    """What to do for one batch: ("none",) | ("wait",) | ("send", ids, running).
+
+    A digest goes out when nothing in the batch is running any more, or when
+    BATCH_CAP_S passed since the first not-yet-reported job finished (then it
+    names the jobs still running; those get their own digest when they end).
+    """
+    unsent = [j for j in finished if j not in set(sent)]
+    if not unsent:
+        return ("none",)
+    if not running:
+        return ("send", unsent, [])
+    if first_finished is not None and now - first_finished >= BATCH_CAP_S:
+        return ("send", unsent, list(running))
+    return ("wait",)
+
+
+def _job_rc(jid: str) -> str:
+    ec = job_dir(jid) / "exit_code"
+    try:
+        return ec.read_text().strip() or "?"
+    except OSError:
+        return "?"
+
+
+def build_digest_prompt(unsent: list, running: list) -> str:
+    """The one turn that reports a batch to the owner, in the agent's own chat."""
+    lines = []
+    for jid in unsent:
+        name = read_meta(jid).get("name") or jid
+        rc = _job_rc(jid)
+        state = "finished OK" if rc == "0" else f"FAILED (exit code {rc})"
+        lines.append(
+            f'- "{name}" (id {jid}): {state}; summary {job_dir(jid) / "summary.md"}'
+        )
+    many = len(unsent) > 1
+    text = (
+        "[Background jobs you started have finished:\n"
+        + "\n".join(lines)
+        + "\nRead each summary (job_output tool returns it); the full output "
+        "only if the summary is not enough. Report to the user in ONE message"
+        + (" covering all of them" if many else "")
+        + ": the result, any problems, and every question for the user, so "
+        "they can answer in a single reply. The user already sees each job's "
+        "short summary in Jobs and may already have commented on these jobs "
+        "there; those replies are earlier in this conversation. Take what "
+        "they said into account and do NOT ask again what they already "
+        "answered. Not a re-dump of the summaries."
+    )
+    if running:
+        names = ", ".join(f'"{read_meta(j).get("name") or j}" ({j})' for j in running)
+        text += (
+            f" Still running, each gets its own digest when it ends: {names}; "
+            "say so in your message."
+        )
+    return text + "]"
+
+
+def _agentctl_prompt(profile: str, text: str, name: str) -> bool:
+    r = subprocess.run(
+        [str(AGENTCTL), "prompt", text, "--profile", profile, "--name", name],
+        capture_output=True,
+        text=True,
+    )
+    return r.returncode == 0
+
+
+def _spawn_watcher(batch: str) -> None:
+    """A separate transient unit (not a job: it is not listed or counted) that
+    re-checks the batch until its digest is out. A Popen from run.sh would be
+    killed with that job's cgroup."""
+    unit = f"bgbatch-{batch}"
+    if unit_active(unit):
+        return
+    subprocess.run(
+        [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            f"--unit={unit}",
+            "--collect",
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "digest-watch",
+            batch,
+        ],
+        capture_output=True,
+        text=True,
+        env=_env(),
+    )
+
+
+def digest_batch(batch: str, now: float | None = None, spawn: bool = True) -> str:
+    """One check of a batch; sends its digest when due. Returns what happened:
+    "sent" | "none" | "wait" | "failed". Serialized per batch (flock), so the
+    finishing jobs and the watcher never send twice."""
+    import fcntl
+
+    now = time.time() if now is None else now
+    bd = batch_dir()
+    bd.mkdir(parents=True, exist_ok=True)
+    with open(bd / f"{batch}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        sp = bd / f"{batch}.json"
+        try:
+            state = json.loads(sp.read_text())
+        except (OSError, ValueError):
+            state = {}
+        jobs = batch_jobs(batch)
+        finished, running = [], []
+        for jid in jobs:
+            if (job_dir(jid) / "exit_code").exists():
+                finished.append(jid)
+            elif unit_active(read_meta(jid).get("unit", "")):
+                running.append(jid)
+            else:
+                finished.append(jid)  # died without an exit code: report it
+        sent = list(state.get("sent", []))
+        first = state.get("first_finished")
+        if first is None and [j for j in finished if j not in sent]:
+            first = now
+        plan = plan_digest(finished, running, sent, first, now)
+        if plan[0] == "send":
+            profile = read_meta(plan[1][0]).get("profile") or ""
+            text = build_digest_prompt(plan[1], plan[2])
+            if not profile or not _agentctl_prompt(
+                profile, text, f"job-finish:{batch}"
+            ):
+                result = "failed"
+            else:
+                sent += plan[1]
+                first = None
+                result = "sent"
+        else:
+            result = plan[0]
+        sp.write_text(json.dumps({"sent": sent, "first_finished": first}))
+    if result == "wait" and spawn:
+        _spawn_watcher(batch)
+    return result
+
+
+def cmd_digest(args: argparse.Namespace) -> int:
+    """Called by a finishing job's run.sh: digest its batch if it is complete."""
+    batch = read_meta(args.id).get("batch", args.id)
+    print(digest_batch(batch))
+    return 0
+
+
+def cmd_digest_watch(args: argparse.Namespace) -> int:
+    """Poll one batch until its digest is out (bounded; see BATCH_WATCH_MAX_S)."""
+    deadline = time.time() + BATCH_WATCH_MAX_S
+    while time.time() < deadline:
+        if digest_batch(args.batch, spawn=False) in ("sent", "none"):
+            return 0
+        time.sleep(BATCH_POLL_S)
+    return 1
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     profiles = load_profiles()
     cwd = profiles.get(args.profile)
@@ -334,7 +632,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         ticket = r.stdout.strip()
         if r.returncode != 0 or not ticket:
-            sys.exit(f"error: unknown task {task}: {r.stderr.strip()[:200]}")
+            sys.exit(
+                f"error: unknown task {task}: task_id only knows this repo's "
+                f"(devvy) board, not other agents' boards. For any other "
+                f"ticket, name it in the prompt and omit task_id. "
+                f"{r.stderr.strip()[:200]}"
+            )
+    if not quiet and not command and not getattr(args, "force", False):
+        dup = find_duplicate(args.name, task)
+        if dup:
+            sys.exit(
+                f"error: duplicate job refused: {dup}. Same name or task within "
+                f"{DUP_WINDOW_S // 60} min is blocked; if a re-run is intended "
+                f"pass --force (job_start force=true)."
+            )
     if not quiet and not command:
         parts = []
         try:
@@ -374,6 +685,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         meta["cmd"] = command[:2000]
     if task:
         meta["task"] = task
+    if quiet:
+        meta["quiet"] = True
+    if not command and not quiet:
+        # Jobs started in one agent turn share a batch (job_start passes the
+        # turn id); any other launch is a batch of one.
+        meta["batch"] = getattr(args, "batch", None) or job_id
     (d / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     if command:
@@ -407,11 +724,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             sys.exit(f"error: --allow-dir does not exist: {p}")
         write_paths.append(str(p))
 
-    binds = " ".join(f"--bind {shlex.quote(w)} {shlex.quote(w)}" for w in write_paths)
-    bwrap_prefix = (
-        f"{shlex.quote(bwrap_bin)} --ro-bind / / {binds} "
-        f"--bind /tmp /tmp --dev /dev --proc /proc --die-with-parent"
-    )
+    bwrap_prefix = job_box_prefix(bwrap_bin, write_paths)
 
     # Everything after the claude call is reporting, and --quiet drops all of
     # it: taskpump-launched jobs write a structured report their caller renders
@@ -452,26 +765,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         # still discoverable instead of silently lost.
         f"sent=0\n"
         f"for i in $(seq 1 30); do\n"
-        f'  if {str(AGENTCTL)!r} notify --source bgjob --markdown --ref job:{job_id} --profile {args.profile} "$msg" >>{str(d / "notify.log")!r} 2>&1; then\n'
+        f'  if {str(AGENTCTL)!r} notify --source bgjob --markdown --ref job:{job_id} --profile {args.profile} --images-from {str(d / "summary.md")!r} "$msg" >>{str(d / "notify.log")!r} 2>&1; then\n'
         f"    sent=1; break\n"
         f"  fi\n"
         f"  sleep 10\n"
         f"done\n"
         f'if [ "$sent" != "1" ]; then echo "$msg" > {str(d / "PENDING_NOTIFY")!r}; fi\n'
-        # Agentic digest: run one resumed turn in the owning profile's
-        # conversation so the transcript itself records the finish (kills the
-        # "still running" hallucination class) and the user gets a digested
-        # result, not just a raw tail. Best-effort on top of the ✅ ping above,
-        # which stays as the guaranteed/bot-down-fallback delivery.
+        # Batch digest: the ✅ ping above is the whole Jobs-side report. The
+        # agent's own chat gets ONE digest turn per batch, sent by whichever
+        # finishing job (or the batch watcher) sees the batch complete.
         f'if [ "$sent" = "1" ]; then\n'
-        f"  {str(AGENTCTL)!r} prompt "
-        f'"[Background job \\"{args.name}\\" (id: {job_id}) finished with '
-        f"exit code $rc. Read its summary at {str(d / 'summary.md')} (job_output "
-        f"tool returns it); the full output is at {str(output)} only if "
-        f"the summary is not enough. Report the outcome to the user. The "
-        f"user already saw the summary -- give the digested result, "
-        f'not a re-dump.]" '
-        f"--profile {args.profile} --name job-finish:{job_id} "
+        f"  {shlex.quote(python_bin)} {str(Path(__file__).resolve())!r} "
+        f"digest {shlex.quote(job_id)} "
         f">>{str(d / 'notify.log')!r} 2>&1 || true\n"
         f"fi\n"
         # Retire/refresh the pinned status: this job is no longer running, and
@@ -495,7 +800,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         "t0=$(date +%s)\n"
         "started_h=$(date -u '+%H:%M UTC')\n"
         f"cd {cwd!r} || exit 1\n"
-        f"{bwrap_prefix} {shlex.quote(python_bin)} {str(agentjob)!r} "
+        + cgroup_carveout(JOB_MEMORY_MAX, d / "stderr.log")
+        + f"{bwrap_prefix} {shlex.quote(python_bin)} {str(agentjob)!r} "
         f"--profile {shlex.quote(args.profile)} --cwd {cwd!r} "
         f"--prompt-file {str(d / 'prompt.txt')!r} "
         f"--model {shlex.quote(args.model)} --name {shlex.quote(args.name)} "
@@ -509,7 +815,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     runner.chmod(0o755)
 
-    return _start_unit(args, job_id, unit, runner, output, quiet)
+    return _start_unit(args, job_id, unit, runner, output, quiet, delegate=True)
 
 
 def _launch_cmd_job(
@@ -555,8 +861,7 @@ def _launch_cmd_job(
         f"> {str(output)!r} 2>&1 < /dev/null\n"
         "rc=$?\n"
         f'echo "$rc" > {str(d / "exit_code")!r}\n'
-        f"{py} {me} summarize {shlex.quote(job_id)} >/dev/null 2>&1 || true\n"
-        + notify,
+        f"{py} {me} summarize {shlex.quote(job_id)} >/dev/null 2>&1 || true\n" + notify,
         encoding="utf-8",
     )
     runner.chmod(0o755)
@@ -570,17 +875,31 @@ def _start_unit(
     runner: Path,
     output: Path,
     quiet: bool,
+    delegate: bool = False,
 ) -> int:
-    """Start run.sh as a transient unit and announce it (agent and --cmd jobs)."""
+    """Start run.sh as a transient unit and announce it (agent and --cmd jobs).
+
+    delegate (agent jobs): the unit's cgroup is handed to run.sh, which carves
+    box/agent and the test leaves out of it; see cgroup_carveout. --cmd jobs
+    keep a plain unit: no box, the bus and testrun's scope stay usable."""
+    mem = agent_unit_memory_max() if delegate else JOB_MEMORY_MAX
     cmd = [
         "systemd-run",
         "--user",
         "--quiet",
         f"--unit={unit}",
         "--collect",
-        f"--property=MemoryMax={JOB_MEMORY_MAX}",
+        f"--property=MemoryMax={mem}",
+        *(["--property=Delegate=yes"] if delegate else []),
         "--property=CPUWeight=50",
         "--property=NoNewPrivileges=yes",
+        # A transient unit gets the user manager's environment, not ours:
+        # forward the test cap so scripts/testrun in the job sees it (dv-c5ac).
+        *(
+            [f"--setenv=PUMP_TEST_MEMORY_MAX={TEST_MEMORY_MAX}"]
+            if TEST_MEMORY_MAX
+            else []
+        ),
         "/bin/bash",
         str(runner),
     ]
@@ -730,8 +1049,10 @@ def cmd_output(args: argparse.Namespace) -> int:
     # Default: the short summary. A running job has no output yet (it is
     # written once at the end), so say so instead of printing nothing.
     if not (d / "exit_code").exists():
-        print(f"job {args.id} is still running; no output yet. "
-              "Use job_list / bgjob status.")
+        print(
+            f"job {args.id} is still running; no output yet. "
+            "Use job_list / bgjob status."
+        )
         return 0
     sf = d / "summary.md"
     summary = (
@@ -836,7 +1157,9 @@ def cmd_flush(_args: argparse.Namespace) -> int:
         marker = job_dir(jid) / "PENDING_NOTIFY"
         msg = marker.read_text(encoding="utf-8").strip()
         r = subprocess.run(
-            [str(AGENTCTL), "notify", "--source", "bgjob", "--markdown", msg], capture_output=True, text=True
+            [str(AGENTCTL), "notify", "--source", "bgjob", "--markdown", msg],
+            capture_output=True,
+            text=True,
         )
         if r.returncode == 0:
             marker.unlink()
@@ -910,7 +1233,28 @@ def main() -> int:
         help="board ticket id (dv-xxxx); the job is told to read it itself. "
         "Resolved by `taskpump path`.",
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="start even if a job with the same name or task is running or "
+        "finished within the last 30 minutes",
+    )
+    p.add_argument(
+        "--batch",
+        metavar="ID",
+        default=None,
+        help="batch id (job_start passes the agent turn id): jobs sharing it "
+        "are reported in one digest in the agent's chat",
+    )
     p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("digest", help="digest a finished job's batch if complete")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_digest)
+
+    p = sub.add_parser("digest-watch", help="wait for a batch, then digest it")
+    p.add_argument("batch")
+    p.set_defaults(fn=cmd_digest_watch)
 
     p = sub.add_parser("list", help="list jobs")
     p.add_argument("--compact", action="store_true", help="one short line per job")

@@ -13,7 +13,6 @@ from typing import Any, Callable, Dict, Optional
 import structlog
 from telegram import Update
 from telegram.ext import (
-    AIORateLimiter,
     Application,
     ContextTypes,
     Defaults,
@@ -23,12 +22,31 @@ from telegram.ext import (
 
 from ..config.settings import Settings
 from ..exceptions import ClaudeCodeTelegramError
-from ..security.auth import fallback_role
 from ..notifications.routing import JOBS_HINT
+from ..security.auth import fallback_role
+from ..utils.loop_lag import monitor_loop_lag
 from .features.registry import FeatureRegistry
 from .orchestrator import MessageOrchestrator
+from .rate_limit import DevvyRateLimiter
+from .telegram_retry import is_transient_network_error, with_telegram_retry
 
 logger = structlog.get_logger()
+
+_STALE_CALLBACK_MARKERS = (
+    "query is too old",
+    "query id is invalid",
+)
+
+
+def is_stale_callback_error(error: object) -> bool:
+    """Telegram refused answerCallbackQuery because the button press expired
+    (answered later than ~15 s) -- harmless, and not a security event."""
+    from telegram.error import BadRequest
+
+    if not isinstance(error, BadRequest):
+        return False
+    text = str(error).lower()
+    return any(marker in text for marker in _STALE_CALLBACK_MARKERS)
 
 
 class ClaudeCodeBot:
@@ -54,7 +72,7 @@ class ClaudeCodeBot:
         builder = Application.builder()
         builder.token(self.settings.telegram_token_str)
         builder.defaults(Defaults(do_quote=self.settings.reply_quote))
-        builder.rate_limiter(AIORateLimiter(max_retries=1))
+        builder.rate_limiter(DevvyRateLimiter(max_retries=1))
 
         # Process updates concurrently so callback queries (e.g. the
         # destructive-op confirmation buttons) can be dispatched while a
@@ -353,6 +371,7 @@ class ClaudeCodeBot:
             "Starting bot", mode="webhook" if self.settings.webhook_url else "polling"
         )
 
+        lag_task = asyncio.create_task(monitor_loop_lag())
         try:
             self.is_running = True
 
@@ -382,6 +401,7 @@ class ClaudeCodeBot:
             logger.error("Error running bot", error=str(e))
             raise ClaudeCodeTelegramError(f"Failed to start bot: {str(e)}") from e
         finally:
+            lag_task.cancel()
             self.is_running = False
 
     async def stop(self) -> None:
@@ -418,6 +438,45 @@ class ClaudeCodeBot:
     ) -> None:
         """Handle errors globally."""
         error = context.error
+        if is_stale_callback_error(error):
+            # An expired button press is Telegram's doing, not a bot fault or
+            # an attack: no error reply, no security_violation row (dv-b399).
+            logger.info(
+                "Stale callback query ignored",
+                error=str(error),
+                user_id=(
+                    update.effective_user.id
+                    if update and getattr(update, "effective_user", None)
+                    else None
+                ),
+            )
+            return
+        if is_transient_network_error(error):
+            # Telegram network timeout: not a bot fault, not an attack. Tell
+            # the user the message was lost so they resend it; no audit row
+            # (dv-2e34).
+            logger.warning(
+                "Telegram network error, update not processed",
+                error=str(error),
+                user_id=(
+                    update.effective_user.id
+                    if update and getattr(update, "effective_user", None)
+                    else None
+                ),
+            )
+            msg = update.effective_message if update else None
+            if msg is not None:
+                try:
+                    await with_telegram_retry(
+                        lambda: msg.reply_text(
+                            "⚠️ Telegram timed out: your message was NOT "
+                            "processed. Please resend it."
+                        ),
+                        what="network error notice",
+                    )
+                except Exception:
+                    logger.exception("Failed to send network error notice")
+            return
         logger.error(
             "Global error handler triggered",
             error=str(error),

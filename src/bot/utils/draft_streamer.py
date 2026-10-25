@@ -2,12 +2,15 @@
 
 import secrets
 import time
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import structlog
 import telegram
 
 from src.utils.constants import TELEGRAM_MAX_MESSAGE_LENGTH
+
+if TYPE_CHECKING:
+    from .ephemeral_updater import EphemeralUpdater
 
 logger = structlog.get_logger()
 
@@ -51,6 +54,7 @@ class DraftStreamer:
         draft_id: int,
         message_thread_id: Optional[int] = None,
         throttle_interval: float = 0.3,
+        updater: Optional["EphemeralUpdater"] = None,
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
@@ -62,24 +66,32 @@ class DraftStreamer:
         self._accumulated_text = ""
         self._last_send_time = 0.0
         self._enabled = True
+        self.failures = 0
+        # With an updater, append_* only records state and hands the send to
+        # the per-turn background worker (never blocks the SDK reader).
+        self._updater = updater
+
+    async def _maybe_send(self) -> None:
+        if (time.time() - self._last_send_time) < self.throttle_interval:
+            return
+        if self._updater is not None:
+            self._updater.submit(self._send_draft)
+        else:
+            await self._send_draft()
 
     async def append_tool(self, line: str) -> None:
         """Append a tool activity line and send a draft if throttled."""
         if not self._enabled or not line:
             return
         self._tool_lines.append(line)
-        now = time.time()
-        if (now - self._last_send_time) >= self.throttle_interval:
-            await self._send_draft()
+        await self._maybe_send()
 
     async def append_text(self, text: str) -> None:
         """Append streamed text and send a draft if throttle interval elapsed."""
         if not self._enabled or not text:
             return
         self._accumulated_text += text
-        now = time.time()
-        if (now - self._last_send_time) >= self.throttle_interval:
-            await self._send_draft()
+        await self._maybe_send()
 
     async def flush(self) -> None:
         """Force-send the current accumulated text as a draft."""
@@ -128,7 +140,8 @@ class DraftStreamer:
             await self.bot.send_message_draft(**kwargs)
             self._last_send_time = time.time()
         except Exception:
-            logger.debug(
+            self.failures += 1
+            logger.warning(
                 "Draft send failed, disabling streamer",
                 chat_id=self.chat_id,
             )

@@ -332,8 +332,22 @@ def build_app(config: AnalyticsConfig) -> FastAPI:
             raise HTTPException(status_code=404, detail="chain not found")
         return result
 
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+    app.mount("/", _RevalidatingStatic(directory=STATIC_DIR, html=True), name="static")
     return app
+
+
+class _RevalidatingStatic(StaticFiles):
+    """Static files the browser must revalidate on every load.
+
+    The UI is unbundled ES modules: without this, browsers heuristically cache
+    views/*.js and keep showing an old chart after a deploy (25.10). The etag
+    keeps revalidation a cheap 304.
+    """
+
+    def file_response(self, *args: Any, **kwargs: Any) -> Any:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 # ---------------------------------------------------------------------------

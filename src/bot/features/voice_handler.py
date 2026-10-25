@@ -13,6 +13,7 @@ import structlog
 from telegram import Voice
 
 from src.config.settings import Settings
+from src.bot.telegram_retry import with_telegram_retry
 from src.config.voice import voice_api_key
 
 logger = structlog.get_logger(__name__)
@@ -70,7 +71,7 @@ class VoiceHandler:
         self._ensure_allowed_file_size(initial_file_size)
 
         # Resolve Telegram file metadata before downloading bytes.
-        file = await voice.get_file()
+        file = await with_telegram_retry(voice.get_file, what="getFile")
         resolved_file_size = getattr(file, "file_size", None)
         self._ensure_allowed_file_size(resolved_file_size)
 
@@ -84,7 +85,9 @@ class VoiceHandler:
             )
 
         # Download voice data
-        voice_bytes = bytes(await file.download_as_bytearray())
+        voice_bytes = bytes(
+            await with_telegram_retry(file.download_as_bytearray, what="download")
+        )
         self._ensure_allowed_file_size(len(voice_bytes))
 
         logger.info(

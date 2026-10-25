@@ -73,6 +73,21 @@ class TestStorageFacade:
             duration_ms=1500,
             num_turns=1,
             tools_used=[{"name": "Read", "input": {"file_path": "/test/file.py"}}],
+            trace_id="trace-1",
+        )
+        # The harness trace wrote the row while the turn ran (dv-2260).
+        await storage.tool_calls.upsert(
+            "trace-1",
+            [
+                {
+                    "tool_use_id": "tu1",
+                    "seq": 1,
+                    "tool_name": "Read",
+                    "input_short": '{"file_path": "/test/file.py"}',
+                    "ok": 1,
+                    "detached": 0,
+                }
+            ],
         )
 
         # Save interaction
@@ -92,9 +107,10 @@ class TestStorageFacade:
         assert messages[0].cost == 0.05
 
         # Check tool usage was saved
-        tool_usage = await storage.tools.get_session_tool_usage("claude-session")
-        assert len(tool_usage) == 1
-        assert tool_usage[0].tool_name == "Read"
+        tool_calls = await storage.tool_calls.for_session("claude-session")
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["tool_name"] == "Read"
+        assert tool_calls[0]["message_id"] == messages[0].message_id
 
         # Check user stats were updated
         updated_user = await storage.users.get_user(12347)
@@ -170,7 +186,13 @@ class TestStorageFacade:
                 duration_ms=1000,
                 num_turns=1,
                 tools_used=[{"name": "Read", "input": {}}] if i == 0 else [],
+                trace_id="hist-trace" if i == 0 else None,
             )
+            if i == 0:
+                await storage.tool_calls.upsert(
+                    "hist-trace",
+                    [{"tool_use_id": "u", "tool_name": "Read", "detached": 0}],
+                )
 
             await storage.save_claude_interaction(
                 user_id=12351,
@@ -183,7 +205,7 @@ class TestStorageFacade:
         history = await storage.get_session_history("history-session")
         assert history is not None
         assert len(history["messages"]) == 2
-        assert len(history["tool_usage"]) == 1  # Only first message had tools
+        assert len(history["tool_calls"]) == 1  # Only first message had tools
         assert history["session"]["session_id"] == "history-session"
 
     async def test_log_security_event(self, storage):

@@ -377,8 +377,8 @@ async def test_full_window_seed_lists_tool_names_per_turn(storage, tmp_path):
         first_id = (await cur.fetchone())[0]
         for name in ["WebSearch", "WebFetch", "WebSearch", "product_find"]:
             await conn.execute(
-                "INSERT INTO tool_usage (session_id, message_id, tool_name, "
-                "tool_input) VALUES ('s', ?, ?, '{\"secret\": \"input\"}')",
+                "INSERT INTO tool_calls (session_id, message_id, tool_name, "
+                "input_short) VALUES ('s', ?, ?, '{\"secret\": \"input\"}')",
                 (first_id, name),
             )
         await conn.commit()

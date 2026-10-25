@@ -6,6 +6,7 @@ through the Telegram bot API with rate limiting (1 msg/sec per chat).
 
 import asyncio
 import re
+from pathlib import Path
 from typing import Any, List, Optional
 
 import structlog
@@ -40,6 +41,15 @@ _MD_CHUNK = 3400
 def _sanitize_text(text: str) -> str:
     """Replace lone surrogates with U+FFFD so the text is always sendable."""
     return _LONE_SURROGATE.sub("\ufffd", text)
+
+
+# Edit errors that mean the pinned message no longer exists (dv-3d3d).
+_PIN_GONE_MARKERS = (
+    "message to edit not found",
+    "message can't be edited",
+    "message_id_invalid",
+    "not found",
+)
 
 
 class NotificationService:
@@ -155,6 +165,10 @@ class NotificationService:
         """
         router = self.reports_router
         topic = router.topic_for(event, chat_id) if router else None
+        if event.deliver_profile and topic is None and not event.ledger_kind:
+            # DM fallback of a profile-addressed delivery: ledgered like a
+            # reminder so a reply to it runs on that profile.
+            event.ledger_kind = "scheduled_reminder"
         if router is None or topic is None:
             await self._rate_limited_send(chat_id, event)
             return
@@ -261,6 +275,9 @@ class NotificationService:
                 if len(chunks) > 1:
                     await asyncio.sleep(SEND_INTERVAL_SECONDS)
 
+            if event.image_paths:
+                await self._send_images(chat_id, event.image_paths, topic_kw)
+
             logger.info(
                 "Notification sent",
                 chat_id=chat_id,
@@ -277,6 +294,41 @@ class NotificationService:
                 error=str(e),
                 event_id=event.id,
             )
+
+    async def _send_images(
+        self, chat_id: int, paths: List[str], topic_kw: dict[str, Any]
+    ) -> None:
+        """Send already-validated files after the text (dv-f90c): raster
+        photos as one album, everything else as documents. Best-effort: a
+        failed image never loses the text that was already delivered."""
+        from telegram import InputMediaPhoto
+
+        from ..bot.utils.image_extractor import should_send_as_photo
+
+        photos = [Path(p) for p in paths if should_send_as_photo(Path(p))]
+        docs = [Path(p) for p in paths if not should_send_as_photo(Path(p))]
+        try:
+            if len(photos) == 1:
+                with open(photos[0], "rb") as f:
+                    await self.bot.send_photo(chat_id=chat_id, photo=f, **topic_kw)
+            elif photos:
+                handles = [open(p, "rb") for p in photos[:10]]  # noqa: SIM115
+                try:
+                    await self.bot.send_media_group(
+                        chat_id=chat_id,
+                        media=[InputMediaPhoto(media=h) for h in handles],
+                        **topic_kw,
+                    )
+                finally:
+                    for h in handles:
+                        h.close()
+            for doc in docs:
+                with open(doc, "rb") as f:
+                    await self.bot.send_document(
+                        chat_id=chat_id, document=f, filename=doc.name, **topic_kw
+                    )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Notification images failed", chat_id=chat_id, error=str(e))
 
     async def _send_markdown_chunk(
         self, chat_id: int, chunk: str, **kwargs: Any
@@ -349,10 +401,24 @@ class NotificationService:
                 )
                 return
             except TelegramError as e:
-                # Message gone (user deleted it) or unchanged text -- only
-                # re-create in the former case.
-                if "not modified" in str(e).lower():
+                # Re-create only when the message is really gone (user deleted
+                # it). Anything else (timeout, 429, Bad Gateway) waits for the
+                # next push: re-posting then would leave the old pin orphaned
+                # next to a new one (dv-3d3d).
+                err = str(e).lower()
+                if "not modified" in err:
                     return
+                if not any(m in err for m in _PIN_GONE_MARKERS):
+                    logger.warning(
+                        "pinned status edit failed", chat_id=chat_id, error=str(e)
+                    )
+                    return
+                try:
+                    await self.bot.unpin_chat_message(
+                        chat_id=chat_id, message_id=existing
+                    )
+                except TelegramError:
+                    pass
                 self._pinned_messages.pop(key, None)
                 await self._save_pin(key)
 
@@ -368,6 +434,16 @@ class NotificationService:
                 raise
             logger.warning("pinned status update failed", chat_id=chat_id, error=str(e))
             return
+        if thread_id is not None:
+            # A new pin in a bot-owned reports topic clears whatever else is
+            # pinned there (e.g. the stray 15.10 pin in Pump), so the topic
+            # shows exactly one status. Best-effort.
+            try:
+                await self.bot.unpin_all_forum_topic_messages(
+                    chat_id=chat_id, message_thread_id=thread_id
+                )
+            except TelegramError as e:
+                logger.warning("topic unpin-all failed", chat_id=chat_id, error=str(e))
         try:
             await self.bot.pin_chat_message(
                 chat_id=chat_id,

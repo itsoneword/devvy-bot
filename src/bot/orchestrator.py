@@ -55,6 +55,7 @@ OWNER_ONLY_COMMANDS = frozenset(
         "delkey",
         "voice",
         "setup",
+        "trace",
     }
 )
 
@@ -119,6 +120,11 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
     ),
     CommandSpec("servercheck", "Run server health check now", "diagnostics"),
     CommandSpec(
+        "trace",
+        "Show what a turn did: tool-call tree (/trace [id|last])",
+        "diagnostics",
+    ),
+    CommandSpec(
         "diag",
         "Show profile lifecycle diagnostics",
         "diagnostics",
@@ -164,7 +170,15 @@ class MessageOrchestrator(
         runtime KeyError.
         """
         from .features import server_monitor
-        from .orchestration.commands import auth, keys, reminders, setup, system, voice
+        from .orchestration.commands import (
+            auth,
+            keys,
+            reminders,
+            setup,
+            system,
+            trace,
+            voice,
+        )
 
         return {
             "start": self.agentic_start,
@@ -197,6 +211,7 @@ class MessageOrchestrator(
             "delkey": keys.delkey_command,
             "voice": voice.voice_command,
             "setup": setup.setup_command,
+            "trace": trace.trace_command,
         }
 
     def _available_commands(self) -> List[CommandSpec]:

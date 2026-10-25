@@ -105,3 +105,77 @@ def test_round_trip(tmp_path, bwrap_works) -> None:
     assert (ws / "in.txt").read_text() == "ok\n"
     assert not (outside / "w").exists()
     assert "nope" not in res.stdout
+
+
+# --- keys (dv-0277) -------------------------------------------------------
+
+SECRET = "sk-or-test-0123456789abcdef"
+
+
+def test_wrap_passes_key_services(tmp_path) -> None:
+    ws, box = _box(tmp_path, keys=("pl-openrouter",))
+    words = shlex.split(box.wrap("echo hi"))
+    assert words[words.index("--key") + 1] == "pl-openrouter"
+    assert SECRET not in box.wrap("echo hi")  # names only, never values
+
+
+def test_for_profile_reads_sandbox_keys(tmp_path) -> None:
+    class P:
+        extra_dirs = (tmp_path / "x",)
+        sandbox_read_dirs = ()
+        sandbox_keys = ("svc",)
+
+    box = BashBox.for_profile(P(), tmp_path)
+    assert box.keys == ("svc",)
+    assert box.write_dirs == (tmp_path.resolve(), tmp_path / "x")
+    assert BashBox.for_profile(None, tmp_path).keys == ()
+
+
+def _keyed_run(tmp_path: Path, command: str, service: str = "demo"):
+    import os
+
+    root = tmp_path / "data"
+    store = root / "secrets" / "tools"
+    store.mkdir(parents=True)
+    (store / "demo.env").write_text(f"DEMO_KEY={SECRET}\n")
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    box = BashBox(write_dirs=(ws,), keys=(service,))
+    env = {**os.environ, "DEVVY_DATA_ROOT": str(root)}
+    res = subprocess.run(
+        ["/bin/bash", "-c", box.wrap(command, str(ws))],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    return res, store
+
+
+def test_key_in_env_and_redacted(tmp_path, bwrap_works) -> None:
+    res, _ = _keyed_run(tmp_path, 'echo "k=$DEMO_KEY"; echo "$DEMO_KEY" >&2; exit 3')
+    assert res.returncode == 3
+    assert SECRET not in res.stdout + res.stderr
+    assert res.stdout.count("k=<redacted>") == 1
+    assert res.stdout.count("<redacted>") == 2  # stderr merged and scrubbed
+
+
+def test_store_not_visible_inside_box(tmp_path, bwrap_works) -> None:
+    from src.security import bash_box
+
+    launcher = Path(bash_box.__file__).resolve()
+    probe = tmp_path / "data" / "secrets" / "tools" / "demo.env"
+    res, _ = _keyed_run(
+        tmp_path,
+        f"cat {probe}; {sys.executable} {launcher} --key demo -- 'echo $DEMO_KEY'",
+    )
+    # The boxed command cannot read the store, and the launcher (repo, venv)
+    # is not even mounted, so it cannot re-launch itself with another key.
+    assert SECRET not in res.stdout + res.stderr
+    assert "demo.env: No such file" in res.stdout
+
+
+def test_unknown_service_fails_closed(tmp_path, bwrap_works) -> None:
+    res, _ = _keyed_run(tmp_path, "echo ran", service="missing")
+    assert res.returncode == 126
+    assert "ran" not in res.stdout

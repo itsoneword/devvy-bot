@@ -3,7 +3,7 @@
 
 Runs the EXACT production detector (imported from
 ``src.bot.orchestration.save_honesty``) over historical ``messages`` rows
-joined with ``tool_usage`` — same code online and offline, or the measured
+joined with ``tool_calls`` — same code online and offline, or the measured
 false-positive rate says nothing about production (dv-7783).
 
 Modes:
@@ -79,7 +79,8 @@ def load_turns(conn: sqlite3.Connection, where: str, params: tuple) -> list[dict
         tools = [
             r[0]
             for r in conn.execute(
-                "SELECT tool_name FROM tool_usage WHERE message_id=?", (mid,)
+                "SELECT tool_name FROM tool_calls WHERE message_id=? "
+                "AND parent_tool_use_id IS NULL", (mid,)
             )
         ]
         turns.append(
