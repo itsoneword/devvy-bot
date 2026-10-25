@@ -643,6 +643,18 @@ class TestConfirmationGateInHook:
     def _bash(command: str) -> dict:  # type: ignore[type-arg]
         return {"tool_name": "Bash", "tool_input": {"command": command}}
 
+    @pytest.fixture(autouse=True)
+    def _exchange_scripts_on_disk(self, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        # Bare names gate via a disk lookup under ~/tools; give a clean
+        # checkout (CI, a contributor) the same files our server has.
+        from src.security import destructive
+
+        tools = tmp_path / "tools"
+        (tools / "fetchcrypto").mkdir(parents=True)
+        for name in ("perp", "transfer"):
+            (tools / "fetchcrypto" / f"{name}.js").write_text("")
+        monkeypatch.setattr(destructive, "_exchange_tools_root", lambda: tools)
+
     @pytest.mark.asyncio
     async def test_order_script_denied_without_approval(self, tmp_path: Path) -> None:
         confirm = _FakeConfirm(approve=False)

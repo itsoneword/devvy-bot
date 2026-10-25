@@ -497,6 +497,8 @@ def _ok(argv: list) -> bool:
 _HAVE_BWRAP = bool(_shutil.which("bwrap")) and _ok(
     ["bwrap", "--ro-bind", "/", "/", "--proc", "/proc", "--die-with-parent", "true"]
 )
+# The job box binds ~/.claude; a clean checkout (CI, a contributor) has none.
+_HAVE_BWRAP = _HAVE_BWRAP and (Path.home() / ".claude").is_dir()
 _HAVE_BUS = _os.path.exists(f"{_RUN_USER}/bus")
 _SERVICE_WORKS = (
     _HAVE_BUS
