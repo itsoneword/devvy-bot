@@ -295,8 +295,7 @@ async def handle_text(
         return
 
     # Free form (intro), an answer the buttons cannot parse, or a follow-up.
-    settings = context.bot_data["settings"]
-    await core.extract_answers(text, sess.answers, settings.evaluator_model)
+    await core.extract_answers(text, sess.answers)
     if sess.phase == "followup":
         await _confirm(sess, send)
         return

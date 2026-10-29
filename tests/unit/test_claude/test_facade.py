@@ -980,7 +980,7 @@ class TestResumeFailureClassification:
             async def record(self, profile, event, detail):
                 recorded.append((event, detail))
 
-        facade = ClaudeIntegration(
+        ClaudeIntegration(
             config=config,
             sdk_manager=MagicMock(),
             session_manager=session_manager,

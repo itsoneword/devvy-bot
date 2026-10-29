@@ -16,13 +16,13 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from src.utils.constants import (
+    CONFIRMATION_MARGIN_SECONDS,
     DEFAULT_ACTIVITY_LOG_MAX_LINES,
     DEFAULT_CLAUDE_MAX_BUFFER_SIZE,
     DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
     DEFAULT_CLAUDE_MAX_COST_PER_USER,
     DEFAULT_CLAUDE_MAX_COST_PER_USER_GUEST,
     DEFAULT_CLAUDE_MAX_TURNS,
-    CONFIRMATION_MARGIN_SECONDS,
     DEFAULT_CLAUDE_TIMEOUT_SECONDS,
     DEFAULT_DATABASE_URL,
     DEFAULT_MAX_SESSIONS_PER_USER,
@@ -42,7 +42,6 @@ from src.utils.constants import (
     DEFAULT_WATCHDOG_MAX_TURNS_PER_HOUR,
 )
 from src.utils.paths import DataLayout, sqlite_url
-
 
 # Single source of the window-refresh default; window_repository, llm_analytics
 # and the session state import it instead of repeating the literal.
@@ -266,8 +265,8 @@ class Settings(BaseSettings):
     evaluator_model: str = Field(
         "sonnet",
         description=(
-            "Model alias for the memory evaluator's Claude CLI call "
-            "(e.g. 'sonnet', 'haiku', or a full model id)."
+            "Deprecated (dv-781f): set purposes.extraction.models.claude in "
+            "models.yaml. Model alias for the memory evaluator's Claude call."
         ),
     )
     # Extraction on the Codex backend used to pass no model and ran whatever
@@ -276,8 +275,8 @@ class Settings(BaseSettings):
     evaluator_codex_model: str = Field(
         "openai-codex/gpt-6-sol",
         description=(
-            "Model for the memory evaluator's extraction call when the active "
-            "backend is Codex."
+            "Deprecated (dv-781f): set purposes.extraction.models.openai_codex "
+            "in models.yaml. Evaluator extraction model on the Codex backend."
         ),
     )
     # Runaway guard, not a cost lever. The delta embeds everything since
@@ -436,8 +435,8 @@ class Settings(BaseSettings):
     fact_quality_check_model: str = Field(
         "haiku",
         description=(
-            "Model alias for the daily fact-quality judge call "
-            "(FACT_QUALITY_CHECK_MODEL)."
+            "Deprecated (dv-781f): set purposes.fact_quality.models.claude in "
+            "models.yaml. Model for the daily fact-quality judge call."
         ),
     )
     # Save-honesty check (dv-7783): flags replies that claim a durable write
@@ -619,6 +618,12 @@ class Settings(BaseSettings):
         description="Per-user data store (data.db, dv-5f3a): logs, products, "
         "portions, issues, docs — separate file from bot.db",
     )
+    trace_retention_days: int = Field(
+        90,
+        ge=1,
+        description="Harness trace (dv-2260): tool_calls rows older than this "
+        "are deleted at startup and once a day after",
+    )
     # The host runs UTC; "today" for a tracking log is the user's local day,
     # so a UTC boundary would roll the digest mid-evening (dv-df45).
     user_timezone: str = Field(
@@ -792,14 +797,48 @@ class Settings(BaseSettings):
     # Pressure valve, not a cap (dv-5e2a, owner D6): when a window bundle's
     # facts snapshot exceeds this, the bundle is composed and injected anyway
     # and a consolidation run is requested -- never truncation, never
-    # rejection. Default sits below the worst measured scope (devops,
-    # 17,313 ch on 2026-08-05) so the valve demonstrably fires once.
+    # rejection. Counts pinned + general + conflicts + family, not pointers.
+    # 12k (2026-08-05 measurement) became 24k with the 60-fact cap (dv-cf07):
+    # at 60 general the largest scope (gymbro, 26.10.26) counts ~22.9k ch,
+    # and 12k would have fired the valve every window.
     bundle_facts_budget_chars: int = Field(
-        12_000,
+        24_000,
         ge=1_000,
         description=(
             "Character budget for the facts snapshot inside a frozen window "
             "bundle; exceeding it triggers a memory consolidation pass."
+        ),
+    )
+    # Facts per window (dv-cf07, owner 27.10.26: 60/60). Measured on 26.10.26
+    # the whole facts block at 60/60 is 19-26k ch (~5.5-10k tokens) per
+    # scope; older rows stay reachable via recall(). Both the frozen bundle
+    # and the per-turn fallback retriever read these.
+    memory_snapshot_general_cap: int = Field(
+        60,
+        ge=1,
+        description=(
+            "General-tier user facts injected per window (newest first); "
+            "pinned and core facts are never capped."
+        ),
+    )
+    memory_pointer_cap: int = Field(
+        60,
+        ge=0,
+        description=(
+            "Newest conversation_result pointers injected per window; older "
+            "ones are reachable via recall()."
+        ),
+    )
+    # A window rotation (roll or /new) runs the final extraction, then a
+    # stale-fact sweep of the scope (dv-cf07). The new window's first turn
+    # waits up to this long for it before freezing its snapshot (analysis
+    # estimate: final eval + sweep ~40 s on average), then goes on without.
+    memory_sweep_wait_seconds: float = Field(
+        60,
+        ge=0,
+        description=(
+            "Seconds a new window's first turn waits for the rotation's "
+            "stale-fact sweep before freezing its facts snapshot."
         ),
     )
 
@@ -840,6 +879,13 @@ class Settings(BaseSettings):
     log_level: str = Field("INFO", description="Logging level")
     enable_telemetry: bool = Field(False, description="Enable anonymous telemetry")
     sentry_dsn: Optional[str] = Field(None, description="Sentry DSN for error tracking")
+    # Phoenix exporter (dv-87d8): finished model_calls + tool_calls rows go to
+    # Phoenix REST as OpenInference spans. Must be the local URL (Phoenix has
+    # no auth of its own); unset = exporter off.
+    phoenix_url: Optional[str] = Field(
+        None, description="Phoenix base URL, e.g. http://127.0.0.1:6006"
+    )
+    phoenix_project: str = Field("devvy", description="Phoenix project for traces")
 
     # Development
     debug: bool = Field(False, description="Enable debug mode")
@@ -959,6 +1005,18 @@ class Settings(BaseSettings):
     profiles_config_path: Optional[Path] = Field(
         default=None,
         description="Path to profiles YAML registry. If unset, single-profile mode.",
+    )
+    # Plain-call routes per purpose (dv-781f): harness + model for every
+    # non-turn model call. A file, like profiles.yaml: a nested table does
+    # not fit an env var. Absent = built-in routes (= behaviour before
+    # dv-781f). Read once at boot; a bad file = built-in routes + owner alert.
+    model_routes_path: Optional[Path] = Field(
+        default=Path("config/models.yaml"),
+        description=(
+            "Plain-call route table (MODEL_ROUTES_PATH); a relative path is "
+            "from the repo root. Missing file = built-in routes. See "
+            "config/models.example.yaml."
+        ),
     )
 
     model_config = SettingsConfigDict(

@@ -134,7 +134,7 @@ folders) and scaffolds the profile. See
   or `scripts/trace`.
 - Background jobs run `scripts/agentjob`, the same turn out of process, so they are recorded
   the same way.
-- `/usage` reads that ledger (`/limits` shows Codex account limits). Rolling-24h caps per owner and per guest use the
+- `/usage` reads that ledger (`/limits`, owner-only, shows live Claude and Codex limits and routes background jobs between them). Rolling-24h caps per owner and per guest use the
   reported cost; **Codex reports none, so caps do not bite there.**
 - `tests/unit/test_no_stray_model_calls.py` fails the build if code starts a model CLI outside
   the router.
@@ -219,7 +219,11 @@ on a `pump/<id>` branch in a git worktree. Separate **architect** (checks the pl
 **review** (can send a build back once) and **acceptance** (runs the product) jobs
 bracket the build, and small tasks skip what they do not need. `deps:` and `start_at:`
 in a task's frontmatter hold its launch, and a pinned status post shows what runs, what
-needs you and what waits. Merging stays yours. It is off until
+needs you and what waits. Several builds run in parallel; the owner `/menu` Pump screen
+lists what waits for you and can freeze, thaw or prioritise. Each stage's model comes from
+`config/models.yaml` (`jobs:`). UI work can use the **design loop**: label a card
+`designloop` and run `taskpump design run <board:id>` — Claude variants at phone width, a
+render/checks gate and critic rounds, then you pick one. Merging stays yours. It is off until
 you enable the timer (`deploy/taskpump.timer.template`, rendered by
 `scripts/render_deploy.py`); other repos' boards are listed in your own
 `config/taskpump/boards.json` (see `boards.example.json`). Details:
@@ -383,7 +387,8 @@ Bot: ✏️ Edit: http_client.py
 ```
 
 Commands, in the Telegram menu: `/start`, `/new`, `/agents`, `/stop`, `/resume`, `/restart`,
-`/help`, `/status`, `/usage`, `/model`, `/tasks`. Owner-only `/trace` shows what a turn did.
+`/help`, `/status`, `/usage`, `/model`, `/tasks`. Owner-only: `/menu` (Usage, Pump, Models, Settings
+hub, no model call), `/limits` (outage panel) and `/trace` (what a turn did).
 
 Registered but unlisted — type them and they work: `/auth`, `/verbose`, `/memory`, `/repo`,
 `/servercheck`, `/schedules`, `/sessions`, `/adduser`, `/rmuser`, `/family`, `/diag`,

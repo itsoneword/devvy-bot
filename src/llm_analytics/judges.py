@@ -1,8 +1,9 @@
 """Judge providers for Tier-2 answer scoring (dv-300d).
 
 Two interchangeable judges behind one `complete(prompt) -> raw text`
-interface, selected by `scripts/score_answers.py --provider`. Both make their
-call through the model router (purpose `scorer`):
+interface, selected by `scripts/score_answers.py --provider` or, without it,
+by the `scorer` call route (models.yaml, dv-781f). Both make their call
+through the model router (purpose `scorer`):
 
 - ``openrouter`` (default): a different model family than the one being
   judged, which is the whole point — same-family judges are documented to
@@ -29,7 +30,7 @@ from src.model_router import (
     CallRequest,
     get_router,
 )
-from src.model_router.openrouter_plain import openrouter_key
+from src.model_router.routes import openrouter_key
 
 logger = structlog.get_logger(__name__)
 
@@ -59,11 +60,18 @@ class JudgeProvider(Protocol):
 
 
 class ClaudeCliJudge:
-    """The local Claude CLI as judge, through the model router."""
+    """A local CLI as judge (Claude by default), through the model router."""
 
-    def __init__(self, model: str = "opus", timeout_seconds: float = 120) -> None:
-        self.model_name = f"claude-cli:{model}"
+    def __init__(
+        self,
+        model: str = "opus",
+        timeout_seconds: float = 120,
+        harness: str = CLAUDE_HARNESS,
+    ) -> None:
+        prefix = "claude-cli" if harness == CLAUDE_HARNESS else harness
+        self.model_name = f"{prefix}:{model}"
         self._model = model
+        self._harness = harness
         self._timeout = timeout_seconds
         self.last_cost_usd: Optional[float] = None
 
@@ -76,7 +84,7 @@ class ClaudeCliJudge:
         result = await get_router().complete(
             CallRequest(
                 purpose="scorer",
-                harness=CLAUDE_HARNESS,
+                harness=self._harness,
                 prompt=prompt,
                 model=self._model,
                 system_prompt=_JUDGE_SYSTEM_PROMPT,
@@ -93,8 +101,8 @@ class OpenRouterJudge:
     def __init__(self, model: Optional[str] = None) -> None:
         if not openrouter_key():
             raise RuntimeError(
-                "OPENROUTER_API_KEY is not set (checked the environment only — "
-                "credential files are never read). Set it, or run with "
+                "OPENROUTER_API_KEY is not set (key store: /setkey openrouter "
+                "OPENROUTER_API_KEY, or the environment). Set it, or run with "
                 "--provider claude_cli."
             )
         self._explicit_model = model or os.environ.get("SCORER_MODEL")
@@ -189,7 +197,21 @@ class OpenRouterJudge:
         return result.text
 
 
-def build_judge(provider: str, model: Optional[str] = None) -> JudgeProvider:
+def build_judge(
+    provider: Optional[str] = None, model: Optional[str] = None
+) -> JudgeProvider:
+    """The judge for ``provider``; None = the ``scorer`` route's harness.
+
+    The one caller outside the router that reads a route: the OpenRouter
+    judge picks its model from the live catalogue before it calls.
+    """
+    if provider is None:
+        from src.model_router.routes import process_call_routes
+
+        route = process_call_routes().resolve("scorer")
+        if route.harness == OPENROUTER_HARNESS:
+            return OpenRouterJudge(model=model or route.model)
+        return ClaudeCliJudge(model=model or str(route.model), harness=route.harness)
     if provider == "openrouter":
         return OpenRouterJudge(model=model)
     if provider == "claude_cli":

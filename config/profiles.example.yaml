@@ -246,6 +246,8 @@ profiles:
       allowed_roles: [owner, guest]
     family_memory: false      # health data never joins the family-shared scope
     personal_memory: true     # …and every user gets their own private scope
+    user_data_tools: [logs, products, portions, export]  # the persona's log_* tools
+    today_digest: true        # per-turn <today_state> block
 
   - slug: pm
     name: Project Manager

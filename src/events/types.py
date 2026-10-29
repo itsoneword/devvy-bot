@@ -72,6 +72,10 @@ class AgentResponseEvent(Event):
     # status is over" -> unpin and forget. Used by the background-job status
     # pin so a long job's state is visible without scrolling.
     pin_as: Optional[str] = None
+    # With pin_as: once per UTC day send the status as a NEW message at the
+    # bottom, pin it, unpin the old one (dv-6646). Later pushes the same day
+    # edit in place as usual.
+    repin: bool = False
     # When ledger_kind is set, the delivery layer records each sent Telegram
     # message in the sent_messages ledger under this kind (e.g.
     # 'scheduled_reminder'), so a later reply to it can be attributed and

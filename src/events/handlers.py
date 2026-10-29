@@ -20,6 +20,7 @@ from typing import (
 
 import structlog
 
+from ..agent_backends.protocol import CLAUDE_BACKEND, policy_for
 from ..claude.facade import ClaudeIntegration
 from ..items.loop_guard import automated_turn
 from ..model_router import get_router
@@ -206,7 +207,8 @@ class AgentHandler:
                     role=self._role_for(self.default_user_id),
                 )
 
-            if response.content:
+            image_paths = self._sent_files(response, self.default_working_directory)
+            if response.content or image_paths:
                 # We don't know which chat to send to from a webhook alone.
                 # The notification service needs configured target chats.
                 # Publish with chat_id=0 — the NotificationService
@@ -214,10 +216,11 @@ class AgentHandler:
                 await self.event_bus.publish(
                     AgentResponseEvent(
                         chat_id=0,
-                        text=response.content,
+                        text=response.content or "",
                         parse_mode="markdown",
                         originating_event_id=event.id,
                         source=f"webhook:{event.provider}",
+                        image_paths=image_paths,
                     )
                 )
         except Exception:
@@ -389,7 +392,8 @@ class AgentHandler:
             except Exception as e:
                 logger.warning("model pref lookup failed", error=str(e))
         configured = (prefs or {}).get("agent_model") or self.default_agent_model
-        return configured if configured in ("sonnet", "opus") else None
+        # The one Claude tier gate (agent_backends/protocol.py), not a copy.
+        return policy_for(CLAUDE_BACKEND).resolve_model(configured)
 
     async def handle_scheduled(self, event: Event) -> None:
         """Process a scheduled event through Claude."""
@@ -515,15 +519,19 @@ class AgentHandler:
                         model=await self._owner_model_pref(owner_id),
                     )
 
-            if response.content:
+            # send_image_to_user / send_file_to_user calls of this turn: no
+            # stream intercept runs here, so read them back (dv-ff39).
+            image_paths = self._sent_files(response, working_dir)
+            if response.content or image_paths:
                 for chat_id in event.target_chat_ids:
                     await self.event_bus.publish(
                         AgentResponseEvent(
                             chat_id=chat_id,
-                            text=response.content,
+                            text=response.content or "",
                             parse_mode="markdown",
                             originating_event_id=event.id,
                             source=report_source,
+                            image_paths=image_paths,
                             **digest_extra,
                         )
                     )
@@ -533,10 +541,11 @@ class AgentHandler:
                     await self.event_bus.publish(
                         AgentResponseEvent(
                             chat_id=0,
-                            text=response.content,
+                            text=response.content or "",
                             parse_mode="markdown",
                             originating_event_id=event.id,
                             source=report_source,
+                            image_paths=image_paths,
                             **digest_extra,
                         )
                     )
@@ -546,6 +555,28 @@ class AgentHandler:
                 job_id=event.job_id,
                 event_id=event.id,
             )
+
+    def _sent_files(self, response: Any, working_dir: Optional[Path]) -> List[str]:
+        """Validated paths the turn sent with send_image/send_file (dv-ff39).
+
+        Same roots as the MCP tool enforced (``turn_setup.image_roots_env``):
+        the working dir, the profile's extra_dirs and the session scratch.
+        """
+        from ..bot.utils.image_extractor import (
+            allowed_image_roots,
+            attachments_from_tools_used,
+        )
+
+        tools_used = getattr(response, "tools_used", None)
+        if not isinstance(tools_used, list) or not tools_used:
+            return []
+        extra_dirs: List[Path] = []
+        if self.profile_registry is not None and working_dir is not None:
+            profile, _ = self.profile_registry.resolve_working_dir(working_dir)
+            if profile is not None:
+                extra_dirs = list(profile.extra_dirs)
+        roots = allowed_image_roots(working_dir, extra_dirs)
+        return [str(a.path) for a in attachments_from_tools_used(tools_used, roots)]
 
     async def _deliver_verbatim(
         self,
@@ -591,30 +622,17 @@ class AgentHandler:
         saved_message_id: Optional[int] = None
         if self.storage is not None:
             try:
-                sessions = await self.storage.sessions.get_sessions_by_project(
-                    str(working_dir)
-                )
-                session = next((s for s in sessions if s.user_id == user_id), None)
-                if session is not None:
-                    window_id = None
-                    if self.window_repo is not None:
-                        state = await self.window_repo.get_or_create(
-                            user_id, working_dir
-                        )
-                        window_id = state.window_id
-                    from ..storage.models import MessageModel
+                from ..storage.delivered import persist_delivered_text
 
-                    saved_message_id = await self.storage.messages.save_message(
-                        MessageModel(
-                            session_id=session.session_id,
-                            user_id=user_id,
-                            timestamp=datetime.now(UTC),
-                            prompt=f"[scheduled reminder "
-                            f"'{event.job_name}' delivered {delivered_at}]",
-                            response=text,
-                            window_id=window_id,
-                        )
-                    )
+                saved_message_id = await persist_delivered_text(
+                    self.storage,
+                    self.window_repo,
+                    user_id,
+                    working_dir,
+                    prompt=f"[scheduled reminder "
+                    f"'{event.job_name}' delivered {delivered_at}]",
+                    response=text,
+                )
             except Exception as e:
                 logger.warning("reminder messages-row persist failed", error=str(e))
             try:

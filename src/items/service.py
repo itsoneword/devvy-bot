@@ -30,10 +30,10 @@ import structlog
 from .loop_guard import is_automated
 from .repository import (
     DELIVERIES,
-    STATUSES,
-    Item,
     NOTE_KINDS,
     NOTE_SOURCES,
+    STATUSES,
+    Item,
     ItemRepository,
     Member,
     now_iso,

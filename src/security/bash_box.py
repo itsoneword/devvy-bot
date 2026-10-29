@@ -112,6 +112,10 @@ def build_bwrap_argv(
     argv += ["--proc", "/proc", "--dev", "/dev"]
     argv += ["--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", "/var/tmp"]
     argv += ["--symlink", "../run", "/var/run"]
+    if os.environ.get("TMPDIR"):
+        # A job's TMPDIR is its job dir (dv-1a02), which is not bound here:
+        # point mktemp at the box's own private /tmp instead.
+        argv += ["--setenv", "TMPDIR", "/tmp"]
     for raw in _RUN_KEEP:
         if Path(raw).exists():
             argv += ["--ro-bind", raw, raw]

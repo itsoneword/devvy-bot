@@ -27,6 +27,10 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+# Defaults only (dv-cf07): the live caps are the settings
+# MEMORY_SNAPSHOT_GENERAL_CAP / MEMORY_POINTER_CAP (60/60), passed in by
+# src/main.py. These 20s remain for callers that pass nothing (tests,
+# scripts/compose_candidate_seed.py).
 GENERAL_INJECTION_CAP = 20
 # Family-shared facts get their own (small) budget so they can never starve
 # the member's private facts out of the prompt.
@@ -34,11 +38,12 @@ FAMILY_INJECTION_CAP = 5
 # Newest conversation_result pointers surfaced per scope (owner default D7).
 POINTER_CAP = 20
 # Cap on general user_facts in the window-bundle snapshot (dv-7517 step 4,
-# owner decision 2026-08-15: 20, may drop to 10 after observation). Injected
-# facts are so the agent knows who it is speaking with, not a history dump —
-# everything older is reachable via recall(). A backstop, not a target: the
-# 12k-char consolidation valve in window_bundle still fires first for healthy
-# scopes. Pinned stays uncapped.
+# owner decision 2026-08-15: 20; raised to a 60 setting by dv-cf07 on
+# 2026-10-27, because at 20 most of devops' ~90 active rows were never seen).
+# Injected facts are so the agent knows who it is speaking with, not a
+# history dump -- everything older is reachable via recall(). A backstop, not
+# a target: the consolidation valve in window_bundle still fires first for
+# healthy scopes. Pinned and core stay uncapped.
 SNAPSHOT_GENERAL_CAP = 20
 
 
@@ -276,8 +281,8 @@ class MemoryRepository:
         self, agent_id: str, cutoff: datetime
     ) -> List[MemoryFact]:
         """Facts invalidated before ``cutoff`` and not yet marked expired --
-        the consolidation report's and the daily fact-quality check's age-only
-        expiry list."""
+        an age-only expiry list. The weekly consolidation report no longer
+        uses it (dv-cf07 dropped its EXPIRE section); kept for ad-hoc audits."""
         async with self._db.get_connection() as conn:
             cur = await conn.execute(
                 f"SELECT {_fact_columns()} FROM memory_facts "
@@ -412,6 +417,48 @@ class MemoryRepository:
             await conn.commit()
             return cur.rowcount > 0
 
+    async def close_superseded(
+        self, old_id: int, by_id: int, agent_id: str, source: str = "sweep"
+    ) -> bool:
+        """Close ``old_id`` in favour of an *existing* newer row (dv-cf07).
+
+        ``supersede_fact`` without the insert: same columns, content untouched.
+        Both rows must be in ``agent_id``; ``old_id`` must still be open and
+        ``by_id`` active. Returns False when nothing matched. Reversible with
+        :meth:`reopen_fact`.
+        """
+        now = datetime.now(UTC).isoformat()
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(
+                "UPDATE memory_facts SET status='superseded', invalid_at=?, "
+                "superseded_by=?, invalidated_by=?, updated_at=? "
+                "WHERE id=? AND agent_id=? AND invalid_at IS NULL AND id != ? "
+                "AND EXISTS (SELECT 1 FROM memory_facts n WHERE n.id=? "
+                "AND n.agent_id=? AND n.invalid_at IS NULL AND n.status='active')",
+                (now, by_id, source, now, old_id, agent_id, by_id, by_id, agent_id),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
+
+    async def reopen_fact(self, fact_id: int, agent_id: str) -> bool:
+        """Undo a sweep/consolidation closure: the row is active again.
+
+        Only rows closed by ``sweep`` or ``consolidation``; an owner's
+        ``memory_forget`` (``user_request``) or an evaluator supersede stays
+        closed. Returns False when nothing matched.
+        """
+        now = datetime.now(UTC).isoformat()
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(
+                "UPDATE memory_facts SET status='active', invalid_at=NULL, "
+                "superseded_by=NULL, invalidated_by=NULL, updated_at=? "
+                "WHERE id=? AND agent_id=? AND invalid_at IS NOT NULL "
+                "AND invalidated_by IN ('sweep', 'consolidation')",
+                (now, fact_id, agent_id),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
+
     async def flag_conflict(self, id_a: int, id_b: int, agent_id: str) -> None:
         """Mark two facts as a safety conflict; BOTH stay active (review R1).
 
@@ -524,10 +571,20 @@ class MemoryRepository:
                 _pointer_from_fact(MemoryFact(*row)) for row in await cur.fetchall()
             ]
 
-    async def facts_snapshot(self, agent_id: str) -> FactsSnapshot:
+    async def facts_snapshot(
+        self,
+        agent_id: str,
+        general_cap: int = SNAPSHOT_GENERAL_CAP,
+        pointer_cap: int = POINTER_CAP,
+    ) -> FactsSnapshot:
         """One-call read of everything injectable for a scope (dv-5e2a's
         frozen window bundle consumes this; dv-c5d9's reconciler reads the
-        same snapshot)."""
+        same snapshot).
+
+        ``general_cap`` limits general user_facts and ``pointer_cap`` the
+        conversation_result pointers; pinned and core are never capped. The
+        bundle passes the MEMORY_* settings (dv-cf07).
+        """
         async with self._db.get_connection() as conn:
             cur = await conn.execute(
                 f"SELECT {_fact_columns()} "
@@ -555,7 +612,7 @@ class MemoryRepository:
                 "FROM memory_facts WHERE agent_id=? AND kind='user_fact' "
                 "AND invalid_at IS NULL AND tier='general' "
                 "ORDER BY recorded_at DESC, id DESC LIMIT ?",
-                (agent_id, SNAPSHOT_GENERAL_CAP),
+                (agent_id, general_cap),
             )
             general = core + [MemoryFact(*row) for row in await cur.fetchall()]
             cur = await conn.execute(
@@ -576,7 +633,7 @@ class MemoryRepository:
             for a, b in zip(group[::2], group[1::2]):
                 conflicts.append((a, b))
 
-        pointers = await self.get_pointers(agent_id)
+        pointers = await self.get_pointers(agent_id, cap=pointer_cap)
         return FactsSnapshot(
             pinned=pinned, general=general, conflicts=conflicts, pointers=pointers
         )
@@ -598,10 +655,12 @@ class MemoryRetriever:
         repo: MemoryRepository,
         general_cap: int = GENERAL_INJECTION_CAP,
         family_cap: int = FAMILY_INJECTION_CAP,
+        pointer_cap: int = POINTER_CAP,
     ) -> None:
         self._repo = repo
         self._cap = general_cap
         self._family_cap = family_cap
+        self._pointer_cap = pointer_cap
 
     async def select(
         self, agent_id: str, query: str
@@ -612,7 +671,7 @@ class MemoryRetriever:
         # selection and outside its cap (mirrors facts_snapshot).
         core = await self._repo.get_facts(agent_id, tier="core", kind="user_fact")
         general = await self._repo.search_general(agent_id, query, limit=self._cap)
-        pointers = await self._repo.get_pointers(agent_id)
+        pointers = await self._repo.get_pointers(agent_id, cap=self._pointer_cap)
         return (
             [render_fact_line(f) for f in pinned],
             [render_fact_line(f) for f in core + general],

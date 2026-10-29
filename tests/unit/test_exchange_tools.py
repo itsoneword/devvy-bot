@@ -13,17 +13,16 @@ import pytest
 
 from src.claude.agent_tools import ALL_TOOL_SPECS, available_tool_specs
 from src.claude.exchange_tools import (
-    SCRIPTS_DIR,
     ACTIONS,
     EXCHANGE_SPECS,
+    ONCHAIN_SPECS,
     READ_ACTIONS,
+    SCRIPTS_DIR,
     VENUES,
     BadArgs,
-    ONCHAIN_SPECS,
     ExchangeClient,
     Unsupported,
 )
-from src.security.keystore import KeyStore
 from src.claude.tool_context import AgentServices, TurnContext
 from src.profiles.registry import (
     ProfileDefinition,
@@ -36,6 +35,7 @@ from src.security.destructive import (
     EXCHANGE_TOOL_DIRS,
     exchange_tool_ask,
 )
+from src.security.keystore import KeyStore
 
 NAMES = {s.name for s in EXCHANGE_SPECS}
 SIGNER_KEY = "0x" + "ab" * 32

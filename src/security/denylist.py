@@ -42,6 +42,14 @@ DEFAULT_DENIED_PATHS: List[str] = [
     str(Path.home() / ".claude") + "/",
 ]
 
+# The stream pseudo-files under the denied ``/dev/`` prefix: there is no data
+# behind them to read or damage (unlike /dev/sda, /dev/mem, /dev/zero). Exact
+# matches only -- ``curl -o /dev/null`` was denied 11x in one week (dv-d760).
+# destructive.py uses the same set for its redirect check.
+STREAM_PSEUDO_FILES = frozenset(
+    {"/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"}
+)
+
 DEFAULT_DENIED_PATTERNS: List[str] = [
     "*.pem",
     "*.key",
@@ -151,6 +159,9 @@ class DenylistValidator:
         from src.security.read_scope import _is_claude_internal_path
 
         if _is_claude_internal_path(file_path, include_readonly_dirs=True):
+            return True, None
+
+        if file_path in STREAM_PSEUDO_FILES:
             return True, None
 
         # Check against denied directory prefixes

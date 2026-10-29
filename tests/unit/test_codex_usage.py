@@ -70,7 +70,18 @@ def test_format_codex_limits_is_compact_and_does_not_dump_daily_buckets():
     assert "999,999,999" not in text
 
 
-async def test_limits_command_reads_provider_state_without_a_model_turn():
+async def test_limits_command_reads_provider_state_without_a_model_turn(monkeypatch):
+    # dv-f6af: Codex limits show only when Codex ran in the last 7 days.
+    from src.storage import model_calls
+
+    async def _used(db, harness, days):
+        return harness == "openai_codex"
+
+    async def _no_spend(db):
+        return []
+
+    monkeypatch.setattr(model_calls, "harness_used_since", _used)
+    monkeypatch.setattr(model_calls, "paid_spend", _no_spend)
     backend = SimpleNamespace(
         read_account_limits=AsyncMock(
             return_value={
@@ -88,7 +99,11 @@ async def test_limits_command_reads_provider_state_without_a_model_turn():
     )
     update = SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()))
     context = SimpleNamespace(
-        bot_data={"backends": {"openai_codex": backend}}, user_data={}
+        bot_data={
+            "backends": {"openai_codex": backend},
+            "storage": SimpleNamespace(db_manager=object()),
+        },
+        user_data={},
     )
 
     await InfoCommandsMixin.agentic_limits(object(), update, context)

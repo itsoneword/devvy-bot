@@ -6,6 +6,7 @@ at runtime, outside the git checkout::
     <root>/db/          bot.db, data.db, llm_analytics.db, channel_intel.db
     <root>/workspaces/  one dir per agent: persona.md, memory/, users/, guests/
     <root>/secrets/     model_auth/ (Codex OAuth), later bot env + MCP tokens
+    <root>/grafana/     devvy.db: the restricted export Grafana mounts (dv-e005)
 
 There is no ``state/`` area (owner decision 2026-09-26, dv-ebde): Codex
 thread bookkeeping and pinned status messages live in bot.db, consolidation
@@ -116,6 +117,12 @@ class DataLayout:
         return self._area("secrets")
 
     @property
+    def grafana_dir(self) -> Path:
+        """``<root>/grafana``: the only data dir Grafana mounts (read-only).
+        Holds the restricted usage export, never a DB of the bot (dv-e005)."""
+        return self._area("grafana")
+
+    @property
     def workspaces_dir(self) -> Optional[Path]:
         """``<root>/workspaces``. None in the legacy layout: there, workspace
         paths are whatever profiles.yaml says (absolute, or relative to the
@@ -204,6 +211,18 @@ class DataLayout:
             return self.legacy_dir / "taskpump-outbox"
         return self.root / "workspaces" / "devops" / "taskpump" / "outbox"
 
+    # --- model availability ---------------------------------------------
+
+    @property
+    def model_quota(self) -> Path:
+        """The runtime model-availability record (dv-7ad9, dv-d63d): the last
+        usage-limit hit and the owner's job switch (``job_route``), read before
+        every model job. Each writer rewrites only its own keys
+        (``src/model_router/quota.py``)."""
+        if self.root is None:
+            return self.legacy_dir / "model_quota.json"
+        return self.root / "workspaces" / "devops" / "model_quota.json"
+
     # --- legacy files, read-only ------------------------------------------
 
     @property
@@ -267,6 +286,33 @@ def archive_dir(
         layout = data_layout(env=env, dotenv=dotenv)
     base = layout.root.parent if layout.root is not None else REPO_ROOT.parent
     return base / "archive"
+
+
+def bot_claude_md_excludes(
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    dotenv: Optional[Path] = None,
+) -> Tuple[str, ...]:
+    """CLAUDE.md files no bot chat or job may load (dv-fe02, owner 3.1).
+
+    The CLI walks up from the cwd and loads every CLAUDE.md it finds, plus the
+    owner's ``~/.claude/CLAUDE.md``, even with ``setting_sources=["project"]``:
+    a chat in ``<root>/workspaces/chef`` got the owner's CLI style rules and
+    the install dir's notes (4082 chars, docs/FINDINGS.md 2026-10-25). Passed
+    as the CLI's ``claudeMdExcludes`` setting by both option builders. Only
+    these two absolute paths: a working dir's own CLAUDE.md still loads.
+
+    Derived, never hardcoded: ``$HOME`` and the install dir, which is the
+    data root's parent and, in the documented layout, also the checkout's
+    parent (``~/Devvybot`` for both); both are named, so the legacy layout
+    (no data root) is covered too.
+    """
+    root = read_data_root(env, dotenv)
+    found = [str(Path.home() / ".claude" / "CLAUDE.md")]
+    for install in (root.parent if root is not None else None, REPO_ROOT.parent):
+        if install is not None and str(install / "CLAUDE.md") not in found:
+            found.append(str(install / "CLAUDE.md"))
+    return tuple(found)
 
 
 def taskpump_lock_path(env: Optional[Mapping[str, str]] = None) -> Path:

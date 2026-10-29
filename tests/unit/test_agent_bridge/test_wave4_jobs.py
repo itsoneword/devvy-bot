@@ -45,6 +45,8 @@ JOB_TOOLS = frozenset(
         "pump_status",
         "pump_pending",
         "pump_answer",
+        # dv-b17e: freeze / thaw / urgent, global across boards.
+        "pump_control",
     }
 )
 

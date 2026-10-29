@@ -8,6 +8,7 @@ import pytest
 
 from src.claude.sdk_integration import ClaudeResponse
 from src.storage.facade import Storage
+from tests.helpers.traced import trace_row
 
 
 @pytest.fixture
@@ -78,16 +79,7 @@ class TestStorageFacade:
         # The harness trace wrote the row while the turn ran (dv-2260).
         await storage.tool_calls.upsert(
             "trace-1",
-            [
-                {
-                    "tool_use_id": "tu1",
-                    "seq": 1,
-                    "tool_name": "Read",
-                    "input_short": '{"file_path": "/test/file.py"}',
-                    "ok": 1,
-                    "detached": 0,
-                }
-            ],
+            [trace_row("tu1", "Read", input='{"file_path": "/test/file.py"}')],
         )
 
         # Save interaction
@@ -109,7 +101,7 @@ class TestStorageFacade:
         # Check tool usage was saved
         tool_calls = await storage.tool_calls.for_session("claude-session")
         assert len(tool_calls) == 1
-        assert tool_calls[0]["tool_name"] == "Read"
+        assert tool_calls[0]["tool"] == "Read"
         assert tool_calls[0]["message_id"] == messages[0].message_id
 
         # Check user stats were updated
@@ -189,10 +181,7 @@ class TestStorageFacade:
                 trace_id="hist-trace" if i == 0 else None,
             )
             if i == 0:
-                await storage.tool_calls.upsert(
-                    "hist-trace",
-                    [{"tool_use_id": "u", "tool_name": "Read", "detached": 0}],
-                )
+                await storage.tool_calls.upsert("hist-trace", [trace_row("u", "Read")])
 
             await storage.save_claude_interaction(
                 user_id=12351,

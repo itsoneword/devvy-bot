@@ -17,7 +17,7 @@ Task: **{{TASK_ID}} — {{TASK_TITLE}}**
 {{TASK_TEXT}}
 ```
 
-## What you read
+{{PHASE}}## What you read
 
 - The plan the owner will see: `.pump/QUESTIONS.md` (PLAN, WRITES,
   SCENARIOS, QUESTIONS; a SPLIT plan has PHASE blocks).
@@ -62,30 +62,18 @@ a label, a one-function bug fix), skip the six-point deep read. Confirm the
 plan touches what it says, answer `PASS` with one finding
 `1. small change, no architectural decision: <why>`, and write 1-3 criteria.
 
-Never take the fast path, and never lower the acceptance level below, for a
+Never take the fast path, and never lower the acceptance level, for a
 change that touches **data isolation between users or accounts** (one
 user's data shown to, saved over, or lost for another; e.g. "the second
 account's training is not saved"), auth or security, migrations or schema,
 or money. Those always get the full check and `ACCEPTANCE full`.
 
-## The acceptance level
-
-On a board with an acceptance run, the `ACCEPTANCE` line's level decides how
-much of it runs after review (review always runs):
-
-- `ACCEPTANCE full` — the whole command; the default, also for a bare `ACCEPTANCE`.
-- `ACCEPTANCE light` — the lighter run: a visible effect, no data or logic risk.
-- `ACCEPTANCE skip` — none; review's PASS finishes the task. Only when nothing
-  is observable beyond what review reads (copy, comments, docs, a config value).
-
-When unsure, `full`; the owner can override it on the card.
-
-Then write **acceptance criteria**: 3-8 observable behaviours the finished
+{{ACCEPT}}Write **acceptance criteria**: 3-8 observable behaviours the finished
 work must show, which the owner could check by hand or a test could assert
 (what a user sees, what a command prints, a measured limit). Not
 implementation steps. Write them on a PASS and on a RETURN alike.
 
-## The report format — obey it literally
+{{TRIAGE}}## The report format — obey it literally
 
 Write it to `{{OUTFILE}}`. First line, alone: `PASS` or `RETURN analyze`.
 Then numbered findings, one per line with evidence (on a PASS: what you

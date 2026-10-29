@@ -7,6 +7,7 @@ import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -47,6 +48,7 @@ from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk.types import McpHttpServerConfig, StreamEvent
 
 from ..config.settings import Settings
+from ..model_router import quota
 from ..model_router.harness import CLAUDE_ACCOUNT_ENV
 from ..model_router.routes import (
     PROVIDER_ANTHROPIC_SUB,
@@ -65,9 +67,11 @@ from ..model_router.turn_cost import (
     TurnCostMeter,
 )
 from ..security import policy
+from ..security.ask_explain import AskContext
 from ..security.bash_box import BashBox, BoxUnavailable
 from ..security.read_scope import ReadScope, build_read_scope
 from ..security.validators import SecurityValidator
+from ..utils.paths import bot_claude_md_excludes
 from .exceptions import (
     ClaudeMCPError,
     ClaudeParsingError,
@@ -492,7 +496,7 @@ def _tool_result_error_text(content: Any) -> str:
 
     ``content`` is a str, a list of content-block dicts (usually
     ``{"type": "text", "text": ...}``), or None. Truncated so one runaway
-    tool error (e.g. a dumped stack trace) doesn't bloat tool_usage rows.
+    tool error (e.g. a dumped stack trace) doesn't bloat tool_calls rows.
     """
     if content is None:
         text = ""
@@ -582,9 +586,11 @@ class ClaudeResponse:
     # (dv-d2f6): the router records them instead of the harness defaults.
     provider: Optional[str] = None
     model: Optional[str] = None
-    # The harness trace of this turn (dv-2260), set by the router; the storage
-    # facade ties its tool_calls rows to the saved message by it.
+    # Set by the router (dv-2260): this turn's harness trace and its
+    # ``model_calls`` row; the storage facade ties the trace's tool_calls
+    # rows to the saved message by ``trace_id``.
     trace_id: Optional[str] = None
+    model_call_id: Optional[int] = None
     # Third-party routes only (dv-d2f6): "estimate" while any call is priced
     # from tokens, "exact" once every call has OpenRouter's total_cost.
     # ``cost_settlement`` resolves to the final figure (~6 s after the last
@@ -654,6 +660,7 @@ def _make_pre_tool_use_hook(
     confirmation_manager: Optional["ConfirmationManager"] = None,
     verification_budget: Optional[VerificationBudget] = None,
     bash_box: Optional[BashBox] = None,
+    ask_context: Optional[AskContext] = None,
 ) -> Any:
     """Deny secrets / multi-tenant stores for EVERY tool call.
 
@@ -687,6 +694,9 @@ def _make_pre_tool_use_hook(
     ``bash_box`` (dv-98f2): a sandboxed profile's Bash commands are rewritten
     here, via ``updatedInput``, to run inside bwrap (``src/security/bash_box.py``).
     The CLI's own sandbox cannot start on this host, so this is the OS boundary.
+
+    ``ask_context`` (dv-781f) goes with every ask to the explainer: a chat turn
+    passes its profile.
     """
     turn = policy.TurnPolicy(
         working_directory=working_directory,
@@ -729,7 +739,7 @@ def _make_pre_tool_use_hook(
             )
         if decision.action == policy.ASK and confirmation_manager is not None:
             approved = await confirmation_manager.request(
-                decision.reason, decision.preview
+                decision.reason, decision.preview, context=ask_context
             )
             if not approved:
                 logger.warning(
@@ -1848,6 +1858,13 @@ class ClaudeSDKManager:
                     "enabled": False,
                     "autoAllowBashIfSandboxed": False,
                 },
+                # Neither the owner's global CLAUDE.md nor the install dir's
+                # (dv-fe02): the CLI's upward walk loads both from any cwd
+                # under $HOME, project source or not. The SDK merges this
+                # with `sandbox` above into one --settings value.
+                settings=json.dumps(
+                    {"claudeMdExcludes": list(bot_claude_md_excludes())}
+                ),
                 system_prompt=base_prompt,
                 setting_sources=["project"],
                 stderr=_stderr_callback,
@@ -1936,6 +1953,11 @@ class ClaudeSDKManager:
                                         if sandbox_enabled
                                         else None
                                     ),
+                                    ask_context=AskContext(
+                                        profile=self._profile_slug_for(
+                                            working_directory, user_id
+                                        )
+                                    ),
                                 ),
                             )
                         ],
@@ -2001,6 +2023,9 @@ class ClaudeSDKManager:
                 final_at: Optional[float] = None
                 post_final_seen: List[str] = []
                 next_msg: Optional["asyncio.Future[Any]"] = None
+                # dv-55ad: the turn's last rate_limit_event (raw info, seen at),
+                # recorded once in the finally, never inside this loop.
+                latest_usage: Optional[Tuple[Any, datetime]] = None
                 try:
                     await client.connect()
                     await client.query(
@@ -2069,6 +2094,11 @@ class ClaudeSDKManager:
                         last_activity = time.monotonic()
                         if isinstance(raw_data, dict):
                             activity.note_raw(raw_data)
+                            if raw_data.get("type") == "rate_limit_event":
+                                latest_usage = (
+                                    raw_data.get("rate_limit_info"),
+                                    datetime.now(UTC),
+                                )
                         # Cost per model call, read from the RAW event: the
                         # SDK's AssistantMessage drops ``request_id`` (dv-d2f6).
                         # Over the cap and asking for a tool = the turn would
@@ -2120,7 +2150,6 @@ class ClaudeSDKManager:
                             message, "parent_tool_use_id", None
                         ):
                             blocks = message.content if message.content else []
-                            has_tool = any(isinstance(b, ToolUseBlock) for b in blocks)
                             # The CLI leaves AssistantMessage.stop_reason None
                             # (only the ResultMessage carries "end_turn"; probed
                             # CLI 2.1.302 / SDK 0.2.123), so a top-level message
@@ -2179,6 +2208,12 @@ class ClaudeSDKManager:
                             finally:
                                 activity.end(cb_token)
                 finally:
+                    # First and not awaited: a second cancel during the
+                    # disconnect below cannot skip it (dv-55ad).
+                    if latest_usage is not None and not route.is_third_party:
+                        quota.record_usage_soon(
+                            latest_usage[0], "claude-turn", latest_usage[1]
+                        )
                     activity.log_summary(reason=abandoned[0] if abandoned else "end")
                     if next_msg is not None and not next_msg.done():
                         next_msg.cancel()
@@ -2220,6 +2255,7 @@ class ClaudeSDKManager:
             claude_session_id = None
             result_content = None
             result_subtype = None
+            result_is_error = False
             input_tokens = 0
             output_tokens = 0
             cache_read_tokens = 0
@@ -2228,6 +2264,7 @@ class ClaudeSDKManager:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     result_subtype = getattr(message, "subtype", None)
+                    result_is_error = bool(getattr(message, "is_error", False))
                     # Extract token usage. Everything here is a per-turn SUM
                     # across API calls -- correct for spend, wrong for size.
                     # The size level comes from _peak_context_tokens (dv-9f31).
@@ -2244,7 +2281,7 @@ class ClaudeSDKManager:
                     # dv-73e2: a ToolUseBlock alone carries no outcome. Pair
                     # each one against its ToolResultBlock (by tool_use_id) so
                     # a failed/denied call is recorded with its error instead
-                    # of silently landing in tool_usage as success=1.
+                    # of silently counting as a success in tools_used.
                     tool_errors = _tool_result_errors(messages)
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
@@ -2462,6 +2499,24 @@ class ClaudeSDKManager:
             if was_interrupted and not stop_reason:
                 stop_reason = "interrupted"
 
+            # A subscription limit (dv-7ad9) ends in an error result whose
+            # text is the CLI's limit line and 0 tokens; it used to log as an
+            # ok turn. Checked once on the final result, never per event.
+            limit = (
+                quota.parse_limit(result_content or "")
+                if result_is_error or not output_tokens
+                else None
+            )
+            if limit is not None:
+                stop_reason = "quota"
+                quota.record(limit, "claude-turn")
+                logger.warning(
+                    "Claude run hit a usage limit",
+                    session_id=final_session_id,
+                    kind=limit.kind,
+                    until=limit.until.isoformat(),
+                )
+
             return ClaudeResponse(
                 content=content,
                 session_id=final_session_id,
@@ -2473,6 +2528,7 @@ class ClaudeSDKManager:
                 api_calls=len(meter.calls),
                 request_ids_missing=meter.missing_request_ids,
                 duration_ms=duration_ms,
+                is_error=limit is not None,
                 error_type=stop_reason,
                 num_turns=len(
                     [

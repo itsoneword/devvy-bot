@@ -2,6 +2,84 @@
 
 Release notes for Devvy. Newest first.
 
+## 1.6 — 2026-10-28
+
+### Owner menu and limits
+- Owner-only `/menu` (no model call) is a four-button hub: **Usage**, **Pump**,
+  **Models**, **Settings**. The Pump screen is fast (one status call) and lists
+  what waits for you first, with actions per task (run first, urgent, freeze).
+  Settings edit the Pump caps, background-job slots and per-stage models as
+  `name: value [−] [+]` rows, validated, with a log line per change.
+- `/limits` is the outage panel: live Claude subscription usage (5 h / weekly %),
+  Codex account limits, whether the Pump is frozen, and a switch that sends
+  background jobs to Claude, Codex or OpenRouter. Spend per day and model is
+  in Usage / `/usage`.
+- `/model` shows short labels, a tick on the current pick and three Codex
+  models next to the Claude row. Fable is selectable like Opus and Sonnet.
+
+### Models and routing
+- `config/models.yaml` has a `jobs:` table: each background-job purpose (and
+  each Pump stage) gets its own harness and model, with the same JSON contract
+  on every route. `config/models.example.yaml` documents every key. Codex can
+  run background jobs (`codex exec` with a job-local policy endpoint).
+- A model-limit hit ends a job with a dedicated exit code; the Pump freezes,
+  keeps unfinished work in a WIP commit, and thaws itself when the limit lifts.
+  Jobs and tasks refuse to start new model runs while the shared limit record
+  is set.
+- The "Confirm risky action" explainer runs on Sonnet and sees the task context.
+
+### Task pump
+- **Design loop** for UI work: a card labelled `designloop` is never taken by
+  the tick; `taskpump design run <board:id>` produces Claude design variants
+  at phone width, passes them through a render and checks gate, runs critic
+  rounds (Codex, with images) and stops on "ready", three rounds, or the same
+  notes twice. The brief comes from the project's own design docs; you pick one
+  of the finished variants in chat. `scripts/designloop_calibrate` calibrates the critic.
+- Parallel builds: the L-size hold is gone, L tasks build in parallel with the
+  rest and conflicts are resolved at merge. The launch cap counts only launches
+  in a row that produced no new commit, so a progressing task is not capped.
+- Hold alerts, review age in the pin and an hourly "waiting on you" summary
+  (`PUMP_REVIEW_HOURS`); a daily per-board digest of what reached production
+  and what is merged but not deployed.
+- Freeze / urgent lane / thaw (`taskpump freeze|thaw|urgent`), a `pump_first`
+  mark that takes the first free slot, titles next to ids in status, pin and
+  digest.
+- Acceptance: the Pump runs the acceptance command itself before the agent,
+  and separates environment failures from a real acceptance failure. Mechanically
+  failed stages (tests failing, no report) retry automatically. Jobs run only
+  the tests a task needs and keep scratch files out of commits.
+- Before review the Pump renders the bot screens a task changed and checks them
+  at phone width; the reviewer sees the images.
+
+### Screens, images and tools
+- Bot screens have a model: `scripts/screens check|render` truncation-checks
+  every handler's text and keyboard at phone width and renders a PNG.
+- `view_image` is the only way agents look at images (Claude and Codex, bot
+  turns and background jobs); a raw `Read` of an image is blocked.
+- `send_image_to_user` works from scheduled turns.
+- `restart_bot` restarts the service after the turn's reply is saved; the turn
+  is no longer lost. `/restart` no longer gets swallowed by the embedded API
+  server's signal handling.
+
+### Memory
+- Facts injected per window are settings: `MEMORY_SNAPSHOT_GENERAL_CAP` and
+  `MEMORY_POINTER_CAP`, both default 60 (older rows stay reachable via `recall`).
+- Task-status chatter ("merged", "started") is no longer stored as a fact.
+- A stale-fact sweep runs after each window rotation and closes facts
+  superseded by newer ones on the same subject; owner rules and pinned facts
+  are never closed.
+
+### Observability and operations
+- A 1-minute host and container sampler, and per-source attribution of usage
+  (agent / Pump / job / CLI / other) in the Overview.
+- Daily `/tmp` sweep timer template (`scripts/tmpsweep`); Pump worktrees and
+  test databases no longer leak disk.
+- Dependencies upgraded; the policy hook is faster on simple Bash commands.
+
+### Upgrade
+- One new schema migration for `tool_calls` (status and input columns) applies on start.
+- New optional keys in `config/models.yaml` (`jobs:`); no change needed if unset.
+
 ## 1.5 — 2026-10-25
 
 ### Tracing

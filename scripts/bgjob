@@ -21,6 +21,8 @@ Usage:
   bgjob run "<prompt>" [--profile general] [--name research]
   bgjob run --cmd "<shell command>" [--name N] [--cwd DIR]  (no model call)
   bgjob run --task dv-xxxx "<short instruction>"   (job reads the ticket)
+  bgjob run "<prompt>" --pre-cmd "<shell>" --pre-log F [--pre-timeout S]
+                                       (command to completion, then the turn)
   bgjob list [--compact] [--limit N]
   bgjob status <id>
   bgjob output <id> [--tail N | --full]   (default: summary.md)
@@ -62,6 +64,23 @@ MAX_CONCURRENT = int(os.environ.get("BGJOB_MAX_CONCURRENT", "2"))
 JOB_MEMORY_MAX = os.environ.get("BGJOB_MEMORY_MAX", "1G")
 # scripts/testrun's cap (unset = its 1500M); an agent job's unit holds both.
 TEST_MEMORY_MAX = os.environ.get("PUMP_TEST_MEMORY_MAX", "")
+# What agentjob reads to resolve the job's route (dv-d63d): the route table's
+# path and the legacy per-stage models (src/model_router/routes.py
+# LEGACY_JOB_ENV_NAMES), forwarded into the transient unit.
+ROUTE_ENV = (
+    "MODEL_ROUTES_PATH",
+    "PUMP_ACCEPTANCE_MODEL",
+    "PUMP_ANALYZE_MODEL",
+    "PUMP_ARCHITECT_MODEL",
+    "PUMP_IMPLEMENT_MODEL",
+    "PUMP_REVIEW_MODEL",
+    "PUMP_TESTDESIGN_MODEL",
+)
+
+# An agent job's --pre-cmd step (dv-2514): default timeout, and the grace
+# between timeout's TERM and its KILL (acceptance.py tears down on TERM).
+PRE_TIMEOUT_S = 3600
+PRE_KILL_AFTER_S = 120
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
 
@@ -74,6 +93,57 @@ def _env() -> dict:
 
 
 _SIZE_UNITS = {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
+
+
+def _quota():
+    """src/model_router/quota.py (stdlib only), or None if it cannot load: the
+    usage-limit record must never be what stops bgjob (dv-7ad9)."""
+    if str(REPO) not in sys.path:
+        sys.path.insert(0, str(REPO))
+    try:
+        from src.model_router import quota
+    except Exception:
+        return None
+    return quota
+
+
+def record_job_limit(job_id: str) -> None:
+    """A job that ended on a usage limit (agentjob exit QUOTA_EXIT plus its
+    quota line) records it, so every later model job, the pump's included,
+    knows the limit is out until the reset. Any job's agentjob usage line
+    (last Claude subscription usage, dv-55ad) is recorded whatever the exit:
+    the job's box cannot write the record itself."""
+    quota = _quota()
+    if quota is None:
+        return
+    d = job_dir(job_id)
+    try:
+        rc = int((d / "exit_code").read_text().strip())
+        err = (d / "stderr.log").read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return
+    source = f"bgjob:{read_meta(job_id).get('name') or job_id}"
+    usage = quota.find_usage(err[-8000:])
+    if usage is not None:
+        quota.record_usage(usage[0], source, usage[1])
+    if rc != quota.QUOTA_EXIT:
+        return
+    limit = quota.find_limit(err[-8000:], datetime.now(UTC))
+    if limit is not None:
+        quota.record(limit, source)
+
+
+def refuse_on_limit() -> None:
+    """Exit if a usage limit is recorded and not reset yet: a model job
+    started now would only hit it (dv-7ad9). --force skips this."""
+    quota = _quota()
+    limit = quota.active() if quota is not None else None
+    if limit is not None:
+        sys.exit(
+            f"error: Claude usage limit exhausted until "
+            f"{limit.until.strftime('%H:%M UTC')} ({limit.message[:120]}); "
+            f"--force to try anyway"
+        )
 
 
 def _size_bytes(size: str) -> int | None:
@@ -111,6 +181,59 @@ def job_box_prefix(bwrap_bin: str, write_paths: list[str]) -> str:
         f"--unsetenv DBUS_SESSION_BUS_ADDRESS {binds} $box_cg "
         f"--bind /tmp /tmp --dev /dev --proc /proc --die-with-parent"
     )
+
+
+def pre_step_lines(d: Path, bwrap_prefix: str, pre: dict) -> str:
+    """run.sh lines for an agent job's pre-agent command step (dv-2514).
+
+    taskpump runs a board's acceptance command this way: the agent's Bash
+    tool stops at 600 s, a full suite does not. The command runs in the same
+    box as the agent (it is code the build wrote), output to pre["log"],
+    under `timeout`, which signals its whole process group. A finished step,
+    any exit code, hands over to the agent: failing scenarios are the agent's
+    to judge. Past the timeout it is a hang: `pre_timed_out`, exit_code 124,
+    no agent turn. An exit 124 of the command itself before the timeout is
+    not a hang, hence the elapsed check. The `if` opened here is closed after
+    the agent line by cmd_run."""
+    log = shlex.quote(pre["log"])
+    secs = int(pre["timeout"])
+    return (
+        f"mkdir -p {shlex.quote(str(Path(pre['log']).parent))}\n"
+        "pre_t0=$(date +%s)\n"
+        f"timeout --kill-after={PRE_KILL_AFTER_S} {secs} {bwrap_prefix} "
+        # The unit's PATH is minimal; the step's tools (taskset, poetry) are
+        # where the --cmd runner finds them.
+        'env PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH" '
+        f'/bin/bash -c "$(cat {str(d / "pre_cmd.txt")!r})" '
+        f"> {log} 2>&1 < /dev/null\n"
+        "pre_rc=$?\n"
+        "pre_d=$(( $(date +%s) - pre_t0 ))\n"
+        f'echo "$pre_rc" > {str(d / "pre_exit_code")!r}\n'
+        'echo "pre-step: exit $pre_rc after '
+        '$(printf "%dm%02ds" $((pre_d/60)) $((pre_d%60)))" '
+        f">> {log}\n"
+        f'if {{ [ "$pre_rc" -eq 124 ] || [ "$pre_rc" -eq 137 ]; }} '
+        f'&& [ "$pre_d" -ge {secs} ]; then\n'
+        f'  echo {secs} > {str(d / "pre_timed_out")!r}\n'
+        f'  echo "pre-step: killed by the {secs}s hang guard" >> {log}\n'
+        "  rc=124\n"
+        "else\n"
+    )
+
+
+def job_tmpdir_lines(d: Path) -> tuple[str, str]:
+    """run.sh head and tail that give a job its own TMPDIR (dv-1a02).
+
+    /tmp is tmpfs (RAM, user quota): scratch a job leaves there (test DBs,
+    copied venvs) used to pile up until the CLI hit EDQUOT. Under the job dir
+    it is on disk and the tail removes it. CLAUDE_CODE_TMPDIR keeps the CLI's
+    scratch and bash_box.scratch_dir() (from gettempdir()) on the same path.
+    The tail is the last line, after the ping, so a summary image is still
+    there when it is sent; a killed unit leaves it on disk, not in RAM."""
+    tmp = shlex.quote(str(d / "tmp"))
+    export = f"export TMPDIR={tmp} CLAUDE_CODE_TMPDIR={tmp}\n"
+    head = export + 'mkdir -m 700 -p "$TMPDIR"\n'
+    return head, f"rm -rf {tmp}\n"
 
 
 def cgroup_carveout(agent_max: str, log: Path) -> str:
@@ -341,12 +464,50 @@ def job_elapsed(jid: str) -> str:
 
 
 def live_jobs() -> list:
+    """Jobs holding a slot: unit active and not QUEUED (waiting for one)."""
     out = []
     for jid in all_jobs():
+        if (job_dir(jid) / "QUEUED").exists():
+            continue
         meta = read_meta(jid)
         if meta.get("unit") and unit_active(meta["unit"]):
             out.append(jid)
     return out
+
+
+# A --queue job waits this long for a slot, then gives up with SLOT_TIMEOUT_RC
+# (EX_TEMPFAIL) instead of waiting forever behind a stuck job (dv-5432).
+SLOT_WAIT_MAX_S = 2 * 3600
+SLOT_POLL_S = 30
+SLOT_TIMEOUT_RC = 75
+
+
+def cmd_wait_slot(args: argparse.Namespace) -> int:
+    """Block a queued job until a slot is free, then take it (drop QUEUED).
+
+    Runs first in a --queue job's run.sh. The check-and-take is under one
+    flock, so two waiters never both pass on the same free slot; the lock is
+    not held while sleeping, so a queued job never blocks the others' check.
+    """
+    import fcntl
+
+    marker = job_dir(args.id) / "QUEUED"
+    deadline = time.monotonic() + SLOT_WAIT_MAX_S
+    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    while True:
+        with open(JOBS_ROOT / ".slot.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            holders = [j for j in live_jobs() if j != args.id]
+            if len(holders) < MAX_CONCURRENT:
+                marker.unlink(missing_ok=True)
+                return 0
+        if time.monotonic() >= deadline:
+            print(
+                f"no job slot in {SLOT_WAIT_MAX_S // 3600}h (cap {MAX_CONCURRENT})",
+                file=sys.stderr,
+            )
+            return SLOT_TIMEOUT_RC
+        time.sleep(SLOT_POLL_S)
 
 
 def _venv_python() -> str:
@@ -462,7 +623,15 @@ def build_digest_prompt(unsent: list, running: list) -> str:
     for jid in unsent:
         name = read_meta(jid).get("name") or jid
         rc = _job_rc(jid)
-        state = "finished OK" if rc == "0" else f"FAILED (exit code {rc})"
+        state = (
+            "finished OK"
+            if rc == "0"
+            else (
+                "INCOMPLETE (background work killed, exit code 3)"
+                if rc == "3"
+                else f"FAILED (exit code {rc})"
+            )
+        )
         lines.append(
             f'- "{name}" (id {jid}): {state}; summary {job_dir(jid) / "summary.md"}'
         )
@@ -589,6 +758,26 @@ def cmd_digest_watch(args: argparse.Namespace) -> int:
     return 1
 
 
+def job_harness(python_bin: str, agentjob: Path, args: argparse.Namespace) -> str:
+    """The harness the job's route resolves to (`agentjob --print-route`,
+    dv-d63d), so the box can be built for it; "" when the probe fails (the
+    job then reports the route error itself)."""
+    cmd = [python_bin, str(agentjob), "--print-route"]
+    if getattr(args, "route", None):
+        cmd += ["--route", args.route]
+    if getattr(args, "model", None):
+        cmd += ["--model", args.model]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        route = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        route = {}
+    if not isinstance(route, dict) or not route.get("harness"):
+        print("warning: job route probe failed; box built for Claude", file=sys.stderr)
+        return ""
+    return str(route["harness"])
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     profiles = load_profiles()
     cwd = profiles.get(args.profile)
@@ -609,8 +798,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             sys.exit(f"error: --cwd does not exist: {override}")
         cwd = str(override)
 
+    command = getattr(args, "cmd", None)
+    queue = getattr(args, "queue", False)
+    if queue and not command:
+        # A model turn that starts an hour late is usually stale: prompt jobs
+        # are refused at the cap, never queued (dv-5432).
+        sys.exit("error: --queue is for --cmd jobs only")
     running = live_jobs()
-    if len(running) >= MAX_CONCURRENT:
+    queued = queue and len(running) >= MAX_CONCURRENT
+    if len(running) >= MAX_CONCURRENT and not queued:
         sys.exit(
             f"error: {len(running)} job(s) already running "
             f"(cap {MAX_CONCURRENT}, set by BGJOB_MAX_CONCURRENT). "
@@ -618,11 +814,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
 
     quiet = getattr(args, "quiet", False)
-    command = getattr(args, "cmd", None)
     if command and (args.prompt or getattr(args, "task", None)):
         sys.exit("error: --cmd takes no prompt and no --task")
     if not command and not args.prompt:
         sys.exit("error: a prompt (or --cmd) is required")
+    pre_cmd = getattr(args, "pre_cmd", None)
+    if pre_cmd and command:
+        # A --cmd job IS a command; the step exists to run one before a turn.
+        sys.exit("error: --pre-cmd is for model-turn jobs only, not --cmd")
+    if pre_cmd and not getattr(args, "pre_log", None):
+        sys.exit("error: --pre-cmd needs --pre-log")
     task = getattr(args, "task", None)
     ticket = ""
     if task:
@@ -638,6 +839,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                 f"ticket, name it in the prompt and omit task_id. "
                 f"{r.stderr.strip()[:200]}"
             )
+    if not command and not getattr(args, "force", False):
+        refuse_on_limit()
     if not quiet and not command and not getattr(args, "force", False):
         dup = find_duplicate(args.name, task)
         if dup:
@@ -679,10 +882,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         "unit": unit,
         "created": datetime.now(UTC).isoformat(),
         "model": args.model,
+        "route": getattr(args, "route", None),
         "prompt": args.prompt[:2000],
     }
     if command:
         meta["cmd"] = command[:2000]
+    if pre_cmd:
+        (d / "pre_cmd.txt").write_text(pre_cmd, encoding="utf-8")
+        meta["pre"] = {
+            "cmd": pre_cmd[:2000],
+            "log": str(args.pre_log),
+            "timeout": int(getattr(args, "pre_timeout", None) or PRE_TIMEOUT_S),
+        }
+    if queued:
+        meta["queued"] = True
+        # Written before the unit starts so live_jobs() never counts it;
+        # `wait-slot` removes it when the job takes a slot.
+        (d / "QUEUED").write_text("", encoding="utf-8")
     if task:
         meta["task"] = task
     if quiet:
@@ -694,7 +910,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     (d / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     if command:
-        return _launch_cmd_job(args, job_id, d, cwd, unit, output, quiet)
+        return _launch_cmd_job(args, job_id, d, cwd, unit, output, quiet, queued)
 
     # The turn runs through the model router (scripts/agentjob, dv-ef90): same
     # tool-call policy as chat, asks go to the owner over the bot, and the call
@@ -714,6 +930,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         sys.exit("error: bwrap not found; refusing to run a job unconfined")
 
     write_paths = [str(d), cwd, str(Path.home() / ".claude")]
+    # dv-d63d: a Codex job writes its sessions/rollouts and refreshes its
+    # login under ~/.codex; a Claude job keeps today's write set.
+    if job_harness(python_bin, agentjob, args) == "openai_codex":
+        write_paths.append(str(Path.home() / ".codex"))
     allow_dirs = list(args.allow_dir or [])
     if not getattr(args, "cwd", None):
         # --cwd jobs (taskpump worktrees) keep their explicit write set.
@@ -725,6 +945,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         write_paths.append(str(p))
 
     bwrap_prefix = job_box_prefix(bwrap_bin, write_paths)
+    # Only an explicit --setting-sources reaches agentjob (taskpump: project);
+    # without it agentjob keeps its own default, user + project (dv-fe02).
+    setting_sources = getattr(args, "setting_sources", None)
+    sources_flag = (
+        f"--setting-sources {shlex.quote(setting_sources)} " if setting_sources else ""
+    )
 
     # Everything after the claude call is reporting, and --quiet drops all of
     # it: taskpump-launched jobs write a structured report their caller renders
@@ -734,11 +960,35 @@ def cmd_run(args: argparse.Namespace) -> int:
         "d=$(( $(date +%s) - t0 ))\n"
         'dur=$(printf "%dm%02ds" $((d/60)) $((d%60)))\n'
         'if [ $rc -eq 0 ]; then icon="✅"; s="finished"; '
+        # agentjob exit 3 (dv-b6dd): the answer came, but work the job had
+        # started in the background was still running and was killed.
+        'elif [ $rc -eq 3 ]; then icon="⚠️"; '
+        's="INCOMPLETE (background work was still running and was killed)"; '
+        # agentjob exit 4 (dv-7ad9): the usage limit ran out. Not a failure of
+        # the work; the reset comes from agentjob's quota line.
+        f"elif [ $rc -eq 4 ]; then icon=\"⏸\"; "
+        "until_iso=$(sed -n 's/^agentjob quota: .* until \\([^ ]*\\)[[:space:]]*$/\\1/p' "
+        f"{str(d / 'stderr.log')!r} 2>/dev/null | tail -n 1); "
+        'at=$(date -u -d "$until_iso" "+%H:%M UTC" 2>/dev/null || echo "?"); '
+        's="stopped on usage limit (resets $at)"; '
         'else icon="❌"; s="FAILED (rc=$rc)"; fi\n'
         f'msg="$icon {args.profile} · job \\"{args.name}\\" $s\n'
         f"started $started_h · ran $dur\n"
         f"id: {job_id}\n"
         f'output: {str(output)}"\n'
+        # A job that dies half-way through a merge or rebase leaves its tree
+        # that way (26.10: a merge job stopped on the limit left MERGE_HEAD in
+        # the live checkout). Only a warning: nothing aborts it by hand.
+        f"jcwd={shlex.quote(cwd)}\n"
+        'if [ $rc -ne 0 ]; then\n'
+        "  for g in MERGE_HEAD:merge rebase-merge:rebase rebase-apply:rebase; do\n"
+        '    gp=$(git -C "$jcwd" rev-parse --path-format=absolute '
+        '--git-path "${g%%:*}" 2>/dev/null)\n'
+        '    if [ -n "$gp" ] && [ -e "$gp" ]; then\n'
+        '      msg="$msg\n⚠ $jcwd is mid-${g#*:} — resolve by hand"; break\n'
+        "    fi\n"
+        "  done\n"
+        "fi\n"
         # The ping must carry the ANSWER, not just say "there is a file". Tail
         # capped so _split_message doesn't chunk the notification; the header
         # above already names the full output path for the truncated case.
@@ -789,8 +1039,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     if getattr(args, "quiet", False):
         notify_tail = ""
 
+    # dv-d63d: the job route names the models.yaml `jobs:` row agentjob runs
+    # on; no --model unless the caller gave one (it would beat the row).
+    route = getattr(args, "route", None)
+    route_flags = (f"--route {shlex.quote(route)} " if route else "") + (
+        f"--model {shlex.quote(args.model)} " if args.model else ""
+    )
+
+    # dv-781f: the task context for the ask explainer, verbatim from taskpump.
+    ask_context = getattr(args, "ask_context", None)
+    ask_flag = f"--ask-context {shlex.quote(ask_context)} " if ask_context else ""
+
+    pre_step = pre_step_lines(d, bwrap_prefix, meta["pre"]) if pre_cmd else ""
     # The wrapper keeps claude's stdout streaming into output.md so partial
     # work survives a crash, records the exit code, then pings Telegram.
+    tmp_head, tmp_tail = job_tmpdir_lines(d)
     runner = d / "run.sh"
     runner.write_text(
         "#!/bin/bash\n"
@@ -800,17 +1063,26 @@ def cmd_run(args: argparse.Namespace) -> int:
         "t0=$(date +%s)\n"
         "started_h=$(date -u '+%H:%M UTC')\n"
         f"cd {cwd!r} || exit 1\n"
+        + tmp_head
         + cgroup_carveout(JOB_MEMORY_MAX, d / "stderr.log")
+        + pre_step
         + f"{bwrap_prefix} {shlex.quote(python_bin)} {str(agentjob)!r} "
         f"--profile {shlex.quote(args.profile)} --cwd {cwd!r} "
         f"--prompt-file {str(d / 'prompt.txt')!r} "
-        f"--model {shlex.quote(args.model)} --name {shlex.quote(args.name)} "
+        f"{route_flags}--name {shlex.quote(args.name)} "
+        f"{sources_flag}"
+        f"{ask_flag}"
+        f"--session-file {str(d / 'session_id')!r} "
+        f"{'--ignore-quota ' if getattr(args, 'force', False) else ''}"
         # stdout is the answer; the runner's log lines go to their own file.
         f">> {str(output)!r} 2>> {str(d / 'stderr.log')!r}\n"
         "rc=$?\n"
-        f'echo "$rc" > {str(d / "exit_code")!r}\n'
+        + ("fi\n" if pre_cmd else "")
+        + f'echo "$rc" > {str(d / "exit_code")!r}\n'
         f"{shlex.quote(python_bin)} {str(Path(__file__).resolve())!r} "
-        f"summarize {shlex.quote(job_id)} >/dev/null 2>&1 || true\n" + notify_tail,
+        f"summarize {shlex.quote(job_id)} >/dev/null 2>&1 || true\n"
+        + notify_tail
+        + tmp_tail,
         encoding="utf-8",
     )
     runner.chmod(0o755)
@@ -826,6 +1098,7 @@ def _launch_cmd_job(
     unit: str,
     output: Path,
     quiet: bool,
+    queued: bool = False,
 ) -> int:
     """A plain-command job: same unit, job dir, limits and Telegram surface as an
     agent job, but no model call. The caller (job_start tool / the owner's own
@@ -852,20 +1125,32 @@ def _launch_cmd_job(
             + f"{str(d / 'PENDING_NOTIFY')!r}; fi\n"
             + f"{me} pin --exclude {job_id} >/dev/null 2>&1 || true\n"
         )
+    run = (
+        f'/bin/bash -c "$(cat {str(d / "cmd.txt")!r})" '
+        f"> {str(output)!r} 2>&1 < /dev/null\n"
+        "rc=$?\n"
+    )
+    if queued:
+        # Started with the cap full (--queue): wait for a slot first. On
+        # timeout the command never runs; the ✅/❌ ping carries the reason.
+        wait = f"{py} {me} wait-slot {shlex.quote(job_id)} 2> {str(output)!r}"
+        run = f"if {wait}; then\n{run}else\n  rc={SLOT_TIMEOUT_RC}\nfi\n"
+    tmp_head, tmp_tail = job_tmpdir_lines(d)
     runner = d / "run.sh"
     runner.write_text(
         "#!/bin/bash\n"
         'export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"\n'
         f"cd {cwd!r} || exit 1\n"
-        f'/bin/bash -c "$(cat {str(d / "cmd.txt")!r})" '
-        f"> {str(output)!r} 2>&1 < /dev/null\n"
-        "rc=$?\n"
-        f'echo "$rc" > {str(d / "exit_code")!r}\n'
-        f"{py} {me} summarize {shlex.quote(job_id)} >/dev/null 2>&1 || true\n" + notify,
+        + tmp_head
+        + run
+        + f'echo "$rc" > {str(d / "exit_code")!r}\n'
+        f"{py} {me} summarize {shlex.quote(job_id)} >/dev/null 2>&1 || true\n"
+        + notify
+        + tmp_tail,
         encoding="utf-8",
     )
     runner.chmod(0o755)
-    return _start_unit(args, job_id, unit, runner, output, quiet)
+    return _start_unit(args, job_id, unit, runner, output, quiet, queued=queued)
 
 
 def _start_unit(
@@ -876,6 +1161,7 @@ def _start_unit(
     output: Path,
     quiet: bool,
     delegate: bool = False,
+    queued: bool = False,
 ) -> int:
     """Start run.sh as a transient unit and announce it (agent and --cmd jobs).
 
@@ -900,6 +1186,18 @@ def _start_unit(
             if TEST_MEMORY_MAX
             else []
         ),
+        # dv-d63d: agentjob resolves the job's route from models.yaml; the
+        # table's path and the legacy PUMP_*_MODEL stage models set for
+        # taskpump must reach it too.
+        *(
+            [
+                f"--setenv={name}={os.environ[name]}"
+                for name in ROUTE_ENV
+                if os.environ.get(name)
+            ]
+            if delegate
+            else []
+        ),
         "/bin/bash",
         str(runner),
     ]
@@ -913,6 +1211,9 @@ def _start_unit(
     # cron) silently produced no start message at all -- which is exactly the
     # "did it actually start?" ambiguity this whole mechanism exists to kill.
     started_at = datetime.now(UTC).strftime("%H:%M UTC")
+    verb = "started"
+    if queued:
+        verb = f"queued: cap {MAX_CONCURRENT} full, starts when a slot frees"
     if not quiet:
         subprocess.run(
             [
@@ -924,7 +1225,7 @@ def _start_unit(
                 f"job:{job_id}",
                 "--profile",
                 args.profile,
-                f'🚀 {args.profile} · job "{args.name}" started\n'
+                f'🚀 {args.profile} · job "{args.name}" {verb}\n'
                 f"at {started_at}\nid: {job_id}",
             ],
             capture_output=True,
@@ -955,7 +1256,7 @@ def _start_unit(
             start_new_session=True,
         )
 
-    print(f"started {job_id}  (unit {unit})")
+    print(f"{'queued' if queued else 'started'} {job_id}  (unit {unit})")
     print(f"  output: {output}")
     print(f"  status: bgjob status {job_id}")
     return 0
@@ -964,6 +1265,8 @@ def _start_unit(
 def _job_state(jid: str, meta: dict) -> str:
     unit = meta.get("unit", "")
     if unit and unit_active(unit):
+        if (job_dir(jid) / "QUEUED").exists():
+            return "RUNNING (queued for a slot)"
         prog = job_progress(unit)
         return f"RUNNING ({prog})" if prog else "RUNNING"
     ec = job_dir(jid) / "exit_code"
@@ -1017,6 +1320,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_summarize(args: argparse.Namespace) -> int:
+    record_job_limit(args.id)
     write_summary(args.id)
     return 0
 
@@ -1081,6 +1385,8 @@ def render_jobs_status(exclude: str | None = None) -> str:
         unit = meta.get("unit", "")
         if unit and unit_active(unit):
             bits = [b for b in (job_elapsed(jid), job_progress(unit)) if b]
+            if (job_dir(jid) / "QUEUED").exists():
+                bits = [b for b in (job_elapsed(jid), "queued") if b]
             tail = f" ({' · '.join(bits)})" if bits else ""
             prof = meta.get("profile", "?")
             lines.append(f"• {prof} · {meta.get('name', jid)}{tail}")
@@ -1198,10 +1504,18 @@ def main() -> int:
     p.add_argument("--name", default="job")
     p.add_argument(
         "--model",
-        default="sonnet",
-        help="model for the detached claude run (default: sonnet). Without an "
-        "explicit flag jobs would silently inherit the CLI's global default "
-        "(opus) — sonnet is the deliberate cost floor for background work.",
+        default=None,
+        help="explicit Claude model for the run. Default: the job route's "
+        "model from config/models.yaml `jobs:` (built-in: sonnet, the cost "
+        "floor for background work). Ignored, with a log line, when the "
+        "route is not Claude on the subscription.",
+    )
+    p.add_argument(
+        "--route",
+        default=None,
+        metavar="NAME",
+        help="job route row in config/models.yaml `jobs:` (harness, provider, "
+        "model): background_job (default), monitor, pump_<stage>",
     )
     p.add_argument(
         "--allow-dir",
@@ -1246,7 +1560,55 @@ def main() -> int:
         help="batch id (job_start passes the agent turn id): jobs sharing it "
         "are reported in one digest in the agent's chat",
     )
+    p.add_argument(
+        "--ask-context",
+        metavar="JSON",
+        default=None,
+        help="model-turn jobs only: {task_id, task_title, stage} handed to "
+        "agentjob for the ask card's explainer (taskpump, dv-781f)",
+    )
+    p.add_argument(
+        "--queue",
+        action="store_true",
+        help="--cmd jobs only: with the job cap full, start anyway and wait "
+        "(up to 2h) for a slot instead of being refused. Used by job_start "
+        "for command jobs (release check, full suite).",
+    )
+    p.add_argument(
+        "--setting-sources",
+        metavar="LIST",
+        default=None,
+        help="comma list of CLI setting sources for the model turn (default: "
+        "agentjob's user,project). taskpump passes 'project' so stages get "
+        "no user plugins, skills or hooks (dv-fe02).",
+    )
+    p.add_argument(
+        "--pre-cmd",
+        metavar="COMMAND",
+        default=None,
+        help="model-turn jobs only: run this shell command in the job's box "
+        "BEFORE the turn, to completion (no 600 s Bash cap). taskpump runs a "
+        "board's acceptance command this way (dv-2514).",
+    )
+    p.add_argument(
+        "--pre-log",
+        metavar="FILE",
+        default=None,
+        help="--pre-cmd's stdout+stderr; last line 'pre-step: exit N after …'",
+    )
+    p.add_argument(
+        "--pre-timeout",
+        metavar="SECONDS",
+        type=int,
+        default=PRE_TIMEOUT_S,
+        help="hang guard for --pre-cmd (default 3600): past it the command is "
+        "killed, `pre_timed_out` is written and the turn does not run",
+    )
     p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("wait-slot", help="wait for a job slot (queued jobs' run.sh)")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_wait_slot)
 
     p = sub.add_parser("digest", help="digest a finished job's batch if complete")
     p.add_argument("id")

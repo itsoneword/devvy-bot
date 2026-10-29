@@ -13,6 +13,9 @@ ExecStart=@DEVVY_ROOT@/scripts/taskpump tick
 # and XDG_RUNTIME_DIR is what lets `systemd-run --user` find the user manager.
 Environment=PATH=@SERVICE_PATH@
 
+# Question triage on the plan card (dv-84c2): off | shadow (default) | on.
+# Environment=PUMP_TRIAGE=shadow
+
 # A tick is bookkeeping — the actual work happens in detached bgjob units, so
 # this process should never sit around.
 TimeoutStartSec=300

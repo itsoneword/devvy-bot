@@ -1,0 +1,137 @@
+# Plain-call and background-job model routes — REFERENCE (dv-781f, dv-d63d).
+#
+# Every model call that is not an agent turn (memory extraction, reconcile,
+# consolidation, fact-quality judge, onboarding, the ask explanation, the
+# answer scorer, the screen, the design critic) picks its harness and model here, by purpose.
+# Agent turns route per profile in profiles.yaml, not here.
+#
+# You do not need this file. Without config/models.yaml the bot runs on the
+# built-in routes (src/model_router/routes.py, DEFAULT_CALL_ROUTES), which
+# are exactly the table below. Copy this file to config/models.yaml only to
+# change something, and keep only the lines you change: the file is an
+# overlay on the built-in rows, not a replacement.
+#
+# Read once at boot: an edit takes effect on /restart. Check an edit first:
+#   poetry run python scripts/show_config.py routes   # exit 1 + reason if bad
+# A bad file at boot does not stop the bot: it runs on the built-in routes
+# and sends the owner one message saying why.
+#
+# Precedence for one call: an explicit harness/model in the code (offline A/B
+# tools only) > the purpose row > default. A harness missing from a purpose's
+# `models` takes default.models[harness].
+#
+# harness:  claude        Claude Code CLI on the subscription
+#           openai_codex  Codex CLI on the OpenAI account
+#           openrouter    OpenRouter HTTP API (key: /setkey openrouter
+#                         OPENROUTER_API_KEY), any model it lists, priced from
+#                         config/llm_pricing.json
+#           backend       (purposes only) the chat's agent backend
+# provider: optional, for readability; must match the harness
+#           (claude=anthropic_sub, openai_codex=openai, openrouter=openrouter)
+# fallback: optional {harness, model}: run once more there when the call
+#           fails or times out. None by default.
+# json:     optional {harness: native|validate} for schema calls: native
+#           (default) sends the schema, validate keeps prompt-only JSON.
+
+default:
+  harness: claude
+  models:
+    claude: sonnet
+    openai_codex: openai-codex/gpt-6-sol
+    # openrouter: z-ai/glm-5.3
+  # fallback: {harness: openai_codex}
+
+purposes:
+  extraction:        {harness: backend, json: {claude: validate}}  # follows the chat
+  screen_extraction: {harness: backend, json: {claude: validate}}
+  reconcile:         {models: {claude: haiku}}
+  consolidation:     {models: {claude: haiku}}
+  fact_quality:      {models: {claude: haiku}}
+  onboarding:        {}                          # = default (sonnet)
+  ask_explain:       {models: {claude: sonnet}}
+  scorer:                                        # a different family on purpose
+    harness: openrouter
+    models: {openrouter: null, claude: opus}     # null = live best Qwen pick
+  screen:            {models: {claude: haiku}}   # decide's LLM leg (off today)
+  design_critic:                                 # dv-9133: judges Claude's mockups,
+    harness: openai_codex                        # so another family; takes images
+    fallback: null                               # never Claude (only Codex sees -i)
+
+# --- Background jobs (dv-d63d) -------------------------------------------
+#
+# bgjob / job_start (background_job), the server monitor (monitor) and each
+# Pump stage (pump_<stage>) run on the row named here. Same row keys as
+# purposes, except fallback: a job never falls back to another harness, a
+# failed job is reported (owner 2026-10-26). jobs.default is the jobs' own
+# default row; the top-level default above is for plain calls only.
+#
+# Read by each job when it starts: an edit applies to the next job, no
+# /restart. An explicit model (bgjob --model, job_start) beats the row only
+# on harness claude; elsewhere it is ignored with a log line.
+#
+# harness:  claude        Claude CLI on the subscription
+#           openrouter    the same Claude CLI pointed at OpenRouter (key:
+#                         /setkey openrouter OPENROUTER_API_KEY); the model
+#                         must have a rule in config/llm_pricing.json, the
+#                         job's cost is tokens x that rule
+#           openai_codex  Codex CLI on the OpenAI account
+#
+# The old PUMP_ANALYZE_MODEL / PUMP_REVIEW_MODEL / ... env still sets the
+# claude model of its stage, below this file, with a warning.
+
+jobs:
+  default:
+    harness: claude
+    models:
+      claude: sonnet
+      openai_codex: openai-codex/gpt-6-sol
+      # openrouter: z-ai/glm-5.3
+  background_job:  {}                         # = jobs.default (sonnet)
+  monitor:         {}
+  pump_analyze:    {models: {claude: opus}}
+  pump_architect:  {models: {claude: sonnet}}
+  pump_testdesign: {models: {claude: opus}}
+  pump_implement:  {models: {claude: opus}}
+  pump_review:     {models: {claude: sonnet}}
+  pump_acceptance: {models: {claude: sonnet}}
+  design_generate: {models: {claude: sonnet}}  # dv-9133 design variants; not opus
+
+# --- Presets: put ONE of these in config/models.yaml -----------------------
+#
+# The design critic stays on Codex in every preset: it is the only harness
+# that takes images, and its point is a family other than the generator's.
+#
+# Everything on Codex (purposes that pin claude models keep them only on
+# claude, so they move too; extraction would otherwise follow the chat):
+#
+#   default:
+#     harness: openai_codex
+#     models: {openai_codex: openai-codex/gpt-6-sol}
+#   purposes:
+#     extraction:        {harness: openai_codex}
+#     screen_extraction: {harness: openai_codex}
+#
+# Everything on OpenRouter (the scorer already is):
+#
+#   default:
+#     harness: openrouter
+#     models: {openrouter: z-ai/glm-5.3}
+#   purposes:
+#     extraction:        {harness: openrouter}
+#     screen_extraction: {harness: openrouter}
+#
+# The Pump's review stage on OpenRouter, every other job unchanged:
+#
+#   jobs:
+#     pump_review: {harness: openrouter, models: {openrouter: z-ai/glm-5.3}}
+#
+# Every job on OpenRouter (the job rows name no harness, so they all take
+# the jobs default's; their claude models stay for when you move back):
+#
+#   jobs:
+#     default: {harness: openrouter, models: {openrouter: z-ai/glm-5.3}}
+#
+# Opus for the ask explanation, the rest unchanged:
+#
+#   purposes:
+#     ask_explain: {models: {claude: opus}}

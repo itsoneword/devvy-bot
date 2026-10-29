@@ -15,7 +15,7 @@ async def test_per_call_timeout_and_source_appear_in_the_prompt() -> None:
     )
     await asyncio.sleep(0.05)  # longer than the default; the call's own applies
     assert not task.done()
-    (chat_id, text, token) = send.await_args.args
+    chat_id, text, token = send.await_args.args
     assert chat_id == 7 and "pump-1" in text and "in 5s" in text
     manager.resolve(token, True)
     assert await task is True

@@ -40,7 +40,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import CallToolResult, ContentBlock, TextContent
+from mcp.types import CallToolResult, ContentBlock, ImageContent, TextContent
 from mcp.types import Tool as MCPTool
 from src.claude import agent_tools
 from src.claude.agent_tools import available_tool_specs
@@ -124,11 +124,19 @@ def _to_result(payload: Dict[str, Any]) -> CallToolResult:
     tool reporting success for a refused write is the one failure this
     project keeps coming back to.
     """
-    blocks: List[ContentBlock] = [
-        TextContent(type="text", text=str(item.get("text", "")))
-        for item in payload.get("content") or []
-        if item.get("type") == "text"
-    ]
+    blocks: List[ContentBlock] = []
+    for item in payload.get("content") or []:
+        if item.get("type") == "text":
+            blocks.append(TextContent(type="text", text=str(item.get("text", ""))))
+        elif item.get("type") == "image" and item.get("data"):
+            # view_image (dv-275f): dropped before, so Codex saw nothing.
+            blocks.append(
+                ImageContent(
+                    type="image",
+                    data=str(item["data"]),
+                    mimeType=str(item.get("mimeType") or "image/png"),
+                )
+            )
     is_error = bool(payload.get("is_error") or payload.get("isError"))
     return CallToolResult(content=blocks, isError=is_error)
 
@@ -356,6 +364,8 @@ class AgentBridge:
         """
         import uvicorn
 
+        from src.utils.embedded_uvicorn import EmbeddedServer
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -370,7 +380,7 @@ class AgentBridge:
             log_level="warning",
             access_log=False,
         )
-        self._server = uvicorn.Server(config)
+        self._server = EmbeddedServer(config)
         self._task = asyncio.create_task(
             self._server.serve(sockets=[sock]), name="agent-bridge"
         )

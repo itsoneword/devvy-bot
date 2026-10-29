@@ -51,9 +51,7 @@ def test_prose_without_list_or_quantities_never_needs_retry():
 
 
 def test_parse_ok_verdict():
-    verdict, summary, body = parse_retry_verdict(
-        "[OK]\nПовар.ру подтвердил пропорции."
-    )
+    verdict, summary, body = parse_retry_verdict("[OK]\nПовар.ру подтвердил пропорции.")
     assert verdict == "ok"
     assert summary == "Повар.ру подтвердил пропорции."
     assert body == ""
@@ -89,9 +87,7 @@ def test_parse_tag_not_on_first_line_returns_none():
 
 
 def test_parse_trailing_text_on_tag_line_returns_none():
-    verdict, summary, body = parse_retry_verdict(
-        "[OK] Источник: Повар.ру\nещё текст"
-    )
+    verdict, summary, body = parse_retry_verdict("[OK] Источник: Повар.ру\nещё текст")
     assert (verdict, summary, body) == (None, None, None)
 
 

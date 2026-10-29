@@ -89,8 +89,7 @@ def _user(ts: str, text: str, *, entrypoint: str = "sdk-py", cwd: str = PROJ) ->
 
 def _make_bot_db(path: Path) -> None:
     conn = sqlite3.connect(path)
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE sessions (
             session_id TEXT PRIMARY KEY, user_id INTEGER, project_path TEXT,
             created_at TEXT, last_used TEXT, total_cost REAL,
@@ -106,13 +105,12 @@ def _make_bot_db(path: Path) -> None:
             updated_at TEXT);
         CREATE TABLE tool_calls (
             id INTEGER PRIMARY KEY, session_id TEXT, message_id INTEGER,
-            tool_name TEXT, input_short TEXT, started_at TEXT,
-            ok INTEGER, error TEXT, parent_tool_use_id TEXT);
+            tool TEXT, input TEXT, started_at TEXT,
+            status TEXT, error TEXT, parent_tool_use_id TEXT);
         CREATE TABLE memory_facts (
             id INTEGER PRIMARY KEY, agent_id TEXT, tier TEXT, label TEXT,
             content TEXT, status TEXT, kind TEXT, created_at TEXT);
-        """
-    )
+        """)
     conn.executemany(
         "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?)",
         [
@@ -165,8 +163,8 @@ def _make_bot_db(path: Path) -> None:
         ],
     )
     conn.executemany(
-        "INSERT INTO tool_calls (id, session_id, message_id, tool_name, input_short,"
-        " started_at, ok, error) VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO tool_calls (id, session_id, message_id, tool, input,"
+        " started_at, status, error) VALUES (?,?,?,?,?,?,?,?)",
         [
             (
                 1,
@@ -175,10 +173,10 @@ def _make_bot_db(path: Path) -> None:
                 "mcp__agent__log_food",
                 "{}",
                 "2026-08-01T09:59:29+00:00",
-                1,
+                "ok",
                 None,
             ),
-            (2, S1, 1, "Bash", "{}", "2026-08-01T09:59:29+00:00", 1, None),
+            (2, S1, 1, "Bash", "{}", "2026-08-01T09:59:29+00:00", "ok", None),
         ],
     )
     conn.executemany(
@@ -601,3 +599,40 @@ class TestChains:
             params={"user_id": 999, "working_dir": "/nope"},
         )
         assert response.status_code == 404
+
+
+class TestSourceAttribution:
+    """dv-d2a3: the API reads the attributed source, not the cwd label."""
+
+    def test_by_source_sums_to_totals(self, client: TestClient) -> None:
+        body = client.get("/api/overview").json()
+        rows = body["by_source"]
+        assert sum(r["api_calls"] for r in rows) == body["totals"]["api_calls"]
+        assert sum(r["est_cost_usd"] for r in rows) == pytest.approx(
+            body["totals"]["est_cost_usd"]
+        )
+        assert {(r["group"], r["key"]) for r in rows} >= {("agent", "proj")}
+
+    def test_profile_link_equals_agent_source(self, client: TestClient) -> None:
+        old = client.get("/api/overview", params={"profile": "proj"}).json()
+        new = client.get("/api/overview", params={"source": "agent/proj"}).json()
+        assert old["totals"] == new["totals"]
+        assert old["totals"]["api_calls"] == 5  # S1 (incl. subagents) + S2
+
+    def test_sessions_source_filter(self, client: TestClient) -> None:
+        body = client.get("/api/sessions", params={"source": "cli"}).json()
+        assert [s["session_id"] for s in body["sessions"]] == [CLI]
+        assert body["sessions"][0]["attr_group"] == "cli"
+        body = client.get("/api/sessions", params={"source": "agent/proj"}).json()
+        assert {s["session_id"] for s in body["sessions"]} == {S1, S2}
+
+    def test_filters_profiles_are_live_agents_sources_listed(
+        self, client: TestClient
+    ) -> None:
+        body = client.get("/api/filters").json()
+        assert body["profiles"] == ["proj"]
+        groups = [s["group"] for s in body["sources"]]
+        assert groups == sorted(
+            groups, key=["agent", "pump", "job", "cli", "other"].index
+        )
+        assert {"group": "cli", "key": "proj", "archived": 0} in body["sources"]

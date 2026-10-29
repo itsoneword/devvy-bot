@@ -1,5 +1,7 @@
 """Tests for EvaluatorService (op-based, DB-backed memory)."""
 
+import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -618,3 +620,73 @@ class TestEvaluatorTrigger:
             last_eval_checkpoint=1,
         )
         assert session.should_run_evaluator() is False
+
+
+class TestTaskStatusIsNotAFact:
+    """dv-cf07 phase 1: the extraction prompt tells the model to skip pure
+    task status; decisions, findings, lessons and owner rules still land."""
+
+    async def _run_capturing_prompt(self, service, ops_json: str) -> str:
+        with patch.object(service, "_invoke_cli", new_callable=AsyncMock) as mock_cli:
+            mock_cli.return_value = ops_json
+            ok = await service.run(
+                session_id="s-status",
+                user_id=123,
+                conversation_text="User: please keep notes on the pump work",
+                cumulative_tokens=55000,
+                agent_id="devops",
+            )
+        assert ok is True
+        return str(mock_cli.await_args.args[0])
+
+    async def test_extraction_prompt_skips_merged_started_raised(self, service):
+        prompt = await self._run_capturing_prompt(service, "[]")
+        # Only the instructions count, never the conversation being scanned.
+        lower = prompt.lower().split("## conversation")[0]
+        # One rule bullet names the status shapes the evaluator kept writing.
+        bullets = re.split(r"\n\s*- ", lower)
+        status_rule = [b for b in bullets if "merged" in b]
+        assert status_rule, "no rule mentions 'merged'"
+        rule = status_rule[0]
+        for word in ("started", "raised", "status"):
+            assert word in rule, word
+        # The general tier no longer reads as permission to store status.
+        assert "history, status" not in lower
+
+    async def test_decisions_findings_lessons_owner_rules_still_extracted(
+        self, service, repo
+    ):
+        ops = [
+            {
+                "op": "add",
+                "kind": "conversation_result",
+                "tier": "general",
+                "content": "Decision: the stale-fact sweep lives in ConsolidationService",
+            },
+            {
+                "op": "add",
+                "kind": "conversation_result",
+                "tier": "general",
+                "content": "Finding: the remember tool bypasses the reconciler",
+            },
+            {
+                "op": "add",
+                "kind": "user_fact",
+                "tier": "general",
+                "content": "Lesson: run make test-core before every restart",
+            },
+            {
+                "op": "add",
+                "kind": "user_fact",
+                "tier": "pinned",
+                "content": "Never run git stash in the shared working tree",
+            },
+        ]
+        prompt = await self._run_capturing_prompt(service, json.dumps(ops))
+        # The prompt still invites decisions as facts.
+        assert "decision" in prompt.lower()
+
+        facts = await repo.get_facts("devops")
+        stored = {(f.content, f.kind, f.tier) for f in facts}
+        for op in ops:
+            assert (op["content"], op["kind"], op["tier"]) in stored, op["content"]

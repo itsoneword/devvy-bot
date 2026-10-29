@@ -75,6 +75,15 @@ class AgentServices:
     # Optional["ItemService"] (dv-752a): family todos & reminders. None ->
     # the item_* tools are not mounted.
     items: Any = None
+    # Optional["Storage"] facade + "WindowRepository" (dv-da50): a direct
+    # ``notify`` is saved to the user's chat history through
+    # ``storage.delivered.persist_delivered_text``. None -> notify only sends.
+    storage: Any = None
+    window_repo: Any = None
+    # async (reason, ctx) -> "scheduled" | "already scheduled" (dv-da50):
+    # main.py's closure over the process's TurnLocks and
+    # ``commands.system.request_restart``. None -> restart_bot not mounted.
+    request_restart: Optional[Callable[[str, "TurnContext"], Awaitable[str]]] = None
 
 
 @dataclass(frozen=True)

@@ -144,7 +144,7 @@ def test_unknown_event_type_is_inert():
     assert out.stream_update is None and out.thread_id is None and out.usage is None
 
 
-# dv-c7d1: failed tool items must reach tool_usage as success=0.
+# dv-c7d1: failed tool items must reach tool_calls as status=error.
 
 
 def _completed(item):

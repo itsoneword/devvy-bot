@@ -790,3 +790,340 @@ class TestScheduledModelPref:
         )
 
         assert mock_claude.run_command.call_args.kwargs["model"] is None
+
+    async def test_fable_pref_passed_to_run_command(
+        self, event_bus: EventBus, mock_claude: AsyncMock
+    ) -> None:
+        """dv-d63d: fable is a Claude tier for scheduled turns too."""
+        mock_claude.run_command.return_value = MagicMock(content="ok")
+        handler = self._handler(event_bus, mock_claude, {"agent_model": "fable"})
+
+        await handler.handle_scheduled(
+            ScheduledEvent(job_name="r", prompt="p", target_chat_ids=[1])
+        )
+
+        assert mock_claude.run_command.call_args.kwargs["model"] == "fable"
+
+    async def test_fable_config_default_used_when_no_pref(
+        self, event_bus: EventBus, mock_claude: AsyncMock
+    ) -> None:
+        mock_claude.run_command.return_value = MagicMock(content="ok")
+        handler = self._handler(event_bus, mock_claude, None, default_model="fable")
+
+        await handler.handle_scheduled(
+            ScheduledEvent(job_name="r", prompt="p", target_chat_ids=[1])
+        )
+
+        assert mock_claude.run_command.call_args.kwargs["model"] == "fable"
+
+    def test_handlers_has_no_tier_list_of_its_own(self) -> None:
+        """The tier gate is one list (protocol.py); handlers.py must not keep
+        a second literal copy that drifts when a tier is added."""
+        import src.events.handlers as handlers_mod
+
+        source = Path(handlers_mod.__file__).read_text()
+        assert '("sonnet", "opus")' not in source
+        assert "('sonnet', 'opus')" not in source
+
+
+class TestScheduledTurnDeliversSentImages:
+    """dv-ff39: send_image_to_user / send_file_to_user calls made in a
+    scheduled (job-finish) or webhook turn reach the user.
+
+    The chat path collects them through the stream intercept; the event
+    path must read ``response.tools_used`` after the turn and carry the
+    validated files on ``AgentResponseEvent.image_paths``.
+    """
+
+    @staticmethod
+    def _png(p: Path) -> Path:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 200)
+        return p
+
+    @staticmethod
+    def _call(name: str, path: Path, **extra) -> dict:  # type: ignore[no-untyped-def]
+        entry = {"name": name, "input": {"file_path": str(path), "caption": ""}}
+        entry.update(extra)
+        return entry
+
+    def _gymbro(self, event_bus, mock_claude, tmp_path):  # type: ignore[no-untyped-def]
+        from src.profiles.registry import ProfileDefinition, ProfileRegistry
+
+        profile = ProfileDefinition(
+            slug="gymbro",
+            name="GymBro",
+            working_dir=tmp_path / "gymbro",
+            memory_dir=tmp_path / "gymbro" / "memory",
+            persona=tmp_path / "gymbro" / "persona.md",
+            personal_memory=False,
+        )
+        (tmp_path / "gymbro").mkdir(parents=True, exist_ok=True)
+        store = MagicMock()
+        store.get_role_cached = MagicMock(return_value="owner")
+        return AgentHandler(
+            event_bus=event_bus,
+            claude_integration=mock_claude,
+            default_working_directory=tmp_path / "gymbro",
+            default_user_id=111111111,
+            profile_registry=ProfileRegistry([profile]),
+            user_store=store,
+        )
+
+    @staticmethod
+    def _capture(event_bus: EventBus) -> list:
+        published: list = []
+
+        async def capture_publish(event):  # type: ignore[no-untyped-def]
+            published.append(event)
+
+        event_bus.publish = capture_publish  # type: ignore[assignment]
+        return published
+
+    @staticmethod
+    def _job_finish(tmp_path: Path) -> ScheduledEvent:
+        return ScheduledEvent(
+            job_id="jf1",
+            job_name="job-finish:3ffad5b69afc",
+            prompt="job finished",
+            working_directory=tmp_path / "gymbro",
+            target_chat_ids=[111111111],
+        )
+
+    @staticmethod
+    def _resolved(paths) -> list:  # type: ignore[no-untyped-def]
+        return [str(Path(p).resolve()) for p in paths]
+
+    async def test_job_finish_turn_delivers_eight_pngs_to_gymbro_topic(
+        self, event_bus, mock_claude, tmp_path
+    ) -> None:
+        handler = self._gymbro(event_bus, mock_claude, tmp_path)
+        design = tmp_path / "gymbro" / "design" / "2026-10-26"
+        pngs = [self._png(design / f"a{i}_dark.png") for i in range(8)]
+        mock_claude.run_command.return_value = MagicMock(
+            content="Here are the 8 designs",
+            tools_used=[
+                self._call("mcp__telegram__send_image_to_user", p) for p in pngs
+            ],
+        )
+        published = self._capture(event_bus)
+
+        await handler.handle_scheduled(self._job_finish(tmp_path))
+
+        events = [e for e in published if isinstance(e, AgentResponseEvent)]
+        assert len(events) == 1
+        ev = events[0]
+        assert ev.text == "Here are the 8 designs"
+        assert ev.source == "bgjob:digest"
+        assert ev.deliver_profile == "gymbro"
+        assert self._resolved(ev.image_paths) == self._resolved(pngs)
+
+        # ...and the notification service sends them as one album into the
+        # GymBro topic (message_thread_id).
+        from src.notifications.service import NotificationService
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=MagicMock(chat=MagicMock(id=-100)))
+        bot.send_photo = AsyncMock()
+        bot.send_media_group = AsyncMock()
+        bot.send_document = AsyncMock()
+        svc = NotificationService(EventBus(), bot, default_chat_ids=[-100])
+        await svc._rate_limited_send(-100, ev, thread_id=77)
+        bot.send_media_group.assert_awaited_once()
+        kw = bot.send_media_group.call_args.kwargs
+        assert kw["message_thread_id"] == 77
+        assert len(kw["media"]) == 8
+
+    async def test_invalid_send_image_calls_dropped_valid_kept(
+        self, event_bus, mock_claude, tmp_path
+    ) -> None:
+        handler = self._gymbro(event_bus, mock_claude, tmp_path)
+        good1 = self._png(tmp_path / "gymbro" / "design" / "good1.png")
+        good2 = self._png(tmp_path / "gymbro" / "design" / "good2.png")
+        outside = self._png(tmp_path / "elsewhere" / "outside.png")
+        missing = tmp_path / "gymbro" / "design" / "missing.png"
+        errored = self._png(tmp_path / "gymbro" / "design" / "errored.png")
+        mock_claude.run_command.return_value = MagicMock(
+            content="sent",
+            tools_used=[
+                self._call("mcp__telegram__send_image_to_user", good1),
+                self._call("mcp__telegram__send_image_to_user", outside),
+                self._call("mcp__telegram__send_image_to_user", missing),
+                self._call(
+                    "mcp__telegram__send_image_to_user",
+                    errored,
+                    error="path outside allowed roots",
+                ),
+                self._call("send_image_to_user", good2),
+                {"name": "Read", "input": {"file_path": str(good1)}},
+            ],
+        )
+        published = self._capture(event_bus)
+
+        await handler.handle_scheduled(self._job_finish(tmp_path))
+
+        events = [e for e in published if isinstance(e, AgentResponseEvent)]
+        assert len(events) == 1
+        assert self._resolved(events[0].image_paths) == self._resolved([good1, good2])
+
+    async def test_image_only_turn_still_delivers_images(
+        self, event_bus, mock_claude, tmp_path
+    ) -> None:
+        handler = self._gymbro(event_bus, mock_claude, tmp_path)
+        img = self._png(tmp_path / "gymbro" / "design" / "only.png")
+        mock_claude.run_command.return_value = MagicMock(
+            content="",
+            tools_used=[self._call("mcp__telegram__send_image_to_user", img)],
+        )
+        published = self._capture(event_bus)
+
+        await handler.handle_scheduled(self._job_finish(tmp_path))
+
+        events = [e for e in published if isinstance(e, AgentResponseEvent)]
+        assert len(events) == 1
+        assert self._resolved(events[0].image_paths) == self._resolved([img])
+
+        # Delivery: Telegram rejects an empty text message; the photo must
+        # still be sent.
+        from telegram.error import BadRequest
+
+        from src.notifications.service import NotificationService
+
+        async def send_message(**kw):  # type: ignore[no-untyped-def]
+            if not str(kw.get("text", "")).strip():
+                raise BadRequest("Message text is empty")
+            return MagicMock(chat=MagicMock(id=-100))
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(side_effect=send_message)
+        bot.send_photo = AsyncMock()
+        bot.send_media_group = AsyncMock()
+        bot.send_document = AsyncMock()
+        svc = NotificationService(EventBus(), bot, default_chat_ids=[-100])
+        await svc._rate_limited_send(-100, events[0], thread_id=77)
+        bot.send_photo.assert_awaited_once()
+        assert bot.send_photo.call_args.kwargs["message_thread_id"] == 77
+
+    async def test_send_file_pdf_in_scheduled_turn_delivered_as_document(
+        self, event_bus, mock_claude, tmp_path
+    ) -> None:
+        handler = self._gymbro(event_bus, mock_claude, tmp_path)
+        pdf = tmp_path / "gymbro" / "plan.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n" + b"0" * 100)
+        mock_claude.run_command.return_value = MagicMock(
+            content="plan attached",
+            tools_used=[self._call("mcp__telegram__send_file_to_user", pdf)],
+        )
+        published = self._capture(event_bus)
+
+        await handler.handle_scheduled(self._job_finish(tmp_path))
+
+        events = [e for e in published if isinstance(e, AgentResponseEvent)]
+        assert len(events) == 1
+        assert self._resolved(events[0].image_paths) == self._resolved([pdf])
+
+        from src.notifications.service import NotificationService
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=MagicMock(chat=MagicMock(id=-100)))
+        bot.send_photo = AsyncMock()
+        bot.send_media_group = AsyncMock()
+        bot.send_document = AsyncMock()
+        svc = NotificationService(EventBus(), bot, default_chat_ids=[-100])
+        await svc._rate_limited_send(-100, events[0], thread_id=77)
+        bot.send_document.assert_awaited_once()
+        assert bot.send_document.call_args.kwargs["filename"] == "plan.pdf"
+        bot.send_photo.assert_not_awaited()
+
+    async def test_webhook_turn_with_send_image_delivers_image(
+        self, event_bus, mock_claude, tmp_path
+    ) -> None:
+        wd = tmp_path / "wd"
+        img = self._png(wd / "chart.png")
+        handler = AgentHandler(
+            event_bus=event_bus,
+            claude_integration=mock_claude,
+            default_working_directory=wd,
+            default_user_id=42,
+        )
+        mock_claude.run_command.return_value = MagicMock(
+            content="Build chart",
+            tools_used=[self._call("mcp__telegram__send_image_to_user", img)],
+        )
+        published = self._capture(event_bus)
+
+        await handler.handle_webhook(
+            WebhookEvent(
+                provider="github",
+                event_type_name="push",
+                payload={"ref": "refs/heads/main"},
+                delivery_id="del-ff39",
+            )
+        )
+
+        events = [e for e in published if isinstance(e, AgentResponseEvent)]
+        assert len(events) == 1
+        assert events[0].text == "Build chart"
+        assert self._resolved(events[0].image_paths) == self._resolved([img])
+
+    # --- added ---------------------------------------------------------
+
+    async def test_turn_without_text_or_images_publishes_nothing(
+        self, event_bus, mock_claude, tmp_path
+    ) -> None:
+        """Empty case: no text, no sends -> no empty notification."""
+        handler = self._gymbro(event_bus, mock_claude, tmp_path)
+        mock_claude.run_command.return_value = MagicMock(content="", tools_used=[])
+        published = self._capture(event_bus)
+
+        await handler.handle_scheduled(self._job_finish(tmp_path))
+
+        assert not [e for e in published if isinstance(e, AgentResponseEvent)]
+
+    async def test_same_image_sent_twice_delivered_once(
+        self, event_bus, mock_claude, tmp_path
+    ) -> None:
+        """Duplicate: the agent re-sends the same file -> one photo."""
+        handler = self._gymbro(event_bus, mock_claude, tmp_path)
+        img = self._png(tmp_path / "gymbro" / "design" / "dup.png")
+        mock_claude.run_command.return_value = MagicMock(
+            content="sent",
+            tools_used=[
+                self._call("mcp__telegram__send_image_to_user", img),
+                self._call("mcp__telegram__send_image_to_user", img),
+            ],
+        )
+        published = self._capture(event_bus)
+
+        await handler.handle_scheduled(self._job_finish(tmp_path))
+
+        events = [e for e in published if isinstance(e, AgentResponseEvent)]
+        assert len(events) == 1
+        assert self._resolved(events[0].image_paths) == self._resolved([img])
+
+    async def test_more_than_cap_images_truncated(
+        self, event_bus, mock_claude, tmp_path
+    ) -> None:
+        """Regression guard: at most MAX_IMAGES_PER_RESPONSE files per reply."""
+        from src.bot.utils.image_extractor import MAX_IMAGES_PER_RESPONSE
+
+        handler = self._gymbro(event_bus, mock_claude, tmp_path)
+        pngs = [
+            self._png(tmp_path / "gymbro" / "many" / f"{i:02d}.png")
+            for i in range(MAX_IMAGES_PER_RESPONSE + 3)
+        ]
+        mock_claude.run_command.return_value = MagicMock(
+            content="lots",
+            tools_used=[
+                self._call("mcp__telegram__send_image_to_user", p) for p in pngs
+            ],
+        )
+        published = self._capture(event_bus)
+
+        await handler.handle_scheduled(self._job_finish(tmp_path))
+
+        events = [e for e in published if isinstance(e, AgentResponseEvent)]
+        assert len(events) == 1
+        assert self._resolved(events[0].image_paths) == self._resolved(
+            pngs[:MAX_IMAGES_PER_RESPONSE]
+        )

@@ -51,7 +51,8 @@ aiofiles = "^24.1.0"
 aiosqlite = "^0.21.0"
 anthropic = "^0.40.0"
 claude-agent-sdk = "^0.2.123"
-fastapi = "^0.115.0"
+mcp = ">=1.30.0,<2"
+fastapi = ">=0.115.0,<1"
 uvicorn = {version = "^0.34.0", extras = ["standard"]}
 apscheduler = "^3.10"
 PyYAML = "^6.0.2"
@@ -61,16 +62,20 @@ openai = {version = "^1.0.0", optional = true}
 httpx = "^0.28.1"
 sqlalchemy = {version = "^2.0.30", extras = ["asyncio"]}
 alembic = "^1.16"
+# Host-metrics sampler -> Postgres observability DB (dv-e005 phase 3).
+psycopg = {version = "^3.2", extras = ["binary"]}
+# Bot screens drawn at phone width for the Pump UI gate (dv-4cd8).
+pillow = "^13.0.0"
 
 [tool.poetry.extras]
 voice = ["mistralai", "openai"]
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.4.0"
+pytest = "^9.0.3"
 pytest-asyncio = "^1.0.0"
 pytest-cov = "^6.1.1"
 pytest-mock = "^3.14.1"
-black = "^25.1.0"
+black = "^26.10.1"
 isort = "^6.0.1"
 flake8 = "^7.2.0"
 mypy = "^1.16.0"
@@ -91,6 +96,7 @@ addopts = "-v --cov=src --cov-report=html --cov-report=term-missing"
 asyncio_mode = "auto"
 markers = [
     "core: fast core-mechanics subset, run before every restart (make test-core)",
+    "timing: wall-clock upper bound; load-dependent, skipped by the release tests gate",
 ]
 
 [tool.mypy]
@@ -98,6 +104,13 @@ python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+
+# types-PyYAML is not a dependency. Without this the yaml import errors are
+# reported for a varying subset of files, so the error count (the baseline in
+# tests/unit/test_dependencies.py) differed between the repo and its export.
+[[tool.mypy.overrides]]
+module = "yaml"
+ignore_missing_imports = true
 
 [tool.flake8]
 max-line-length = 88

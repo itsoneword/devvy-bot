@@ -79,8 +79,9 @@ def load_turns(conn: sqlite3.Connection, where: str, params: tuple) -> list[dict
         tools = [
             r[0]
             for r in conn.execute(
-                "SELECT tool_name FROM tool_calls WHERE message_id=? "
-                "AND parent_tool_use_id IS NULL", (mid,)
+                "SELECT tool FROM tool_calls WHERE message_id=?"
+                " AND parent_tool_use_id IS NULL",
+                (mid,),
             )
         ]
         turns.append(

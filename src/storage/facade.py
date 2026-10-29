@@ -38,7 +38,7 @@ from .scheduler_repository import SchedulerRepository
 from .sent_messages import SentMessageRepository
 from .task_repository import TaskRepository
 from .token_repository import TokenTrackingRepository
-from .tool_calls import ToolCallRepository
+from .tool_calls import TRACE_RETENTION_DAYS, ToolCallRepository
 from .user_data import UserDataManager, UserDataRepository
 from .user_repository import BotUserRepository
 from .webhook_repository import WebhookEventRepository
@@ -54,6 +54,7 @@ class Storage:
         database_url: str,
         tasks_dir: Optional[Path] = None,
         user_database_url: Optional[str] = None,
+        trace_retention_days: int = TRACE_RETENTION_DAYS,
     ):
         """Initialize storage with database URL.
 
@@ -76,7 +77,7 @@ class Storage:
         self.sessions = SessionRepository(self.db_manager)
         self.project_threads = ProjectThreadRepository(self.db_manager)
         self.messages = MessageRepository(self.db_manager)
-        self.tool_calls = ToolCallRepository(self.db_manager)
+        self.tool_calls = ToolCallRepository(self.db_manager, trace_retention_days)
         self.audit = AuditLogRepository(self.db_manager)
         self.costs = CostTrackingRepository(self.db_manager)
         self.analytics = AnalyticsRepository(self.db_manager)
@@ -103,6 +104,9 @@ class Storage:
         await self.db_manager.initialize()
         if self.user_data_manager:
             await self.user_data_manager.initialize()
+        # Harness trace retention (dv-2260): the startup prune; the write path
+        # repeats it once a day.
+        await self.tool_calls.prune_if_due()
         logger.info("Storage system initialized")
 
     async def close(self):
@@ -159,7 +163,7 @@ class Storage:
         # The turn's tool calls were written by the harness trace as it ran
         # (dv-2260); tie them to this message.
         trace_id = getattr(response, "trace_id", None)
-        if trace_id:
+        if isinstance(trace_id, str) and trace_id:
             await self.tool_calls.link_message(trace_id, message_id, session_id)
 
         # Update cost tracking

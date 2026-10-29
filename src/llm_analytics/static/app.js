@@ -9,7 +9,8 @@ const POLL_MS = 45_000;
 
 // Shared cross-view state (filters survive navigation within the page life).
 const appState = {
-  filters: { user_id: "", profile: "", range: "7d" }, // range: 24h|7d|30d|all
+  filters: { user_id: "", source: "", range: "7d" }, // range: 24h|7d|30d|all; source: group[/key]
+  sourceView: { expanded: new Set(), archive: false }, // Overview "By source" card
   sessionsSort: { sort: "last_ts", order: "desc" },
   sessionView: {}, // per-session UI state, keyed by session id
   auditView: { user_id: null, working_dir: null, preset: "7d", from: "", to: "", window_id: null },

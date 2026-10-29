@@ -77,7 +77,9 @@ def test_shared_caps_tell_agent_to_file_and_start_board_task_with_id() -> None:
 def test_builder_personas_start_board_tasks_with_job_start_task_id() -> None:
     for slug, path in BUILDER_PERSONAS.items():
         text = path.read_text(encoding="utf-8")
-        assert "job_start(task_id)" in text, f"{slug} persona: start = job_start(task_id)"
+        assert (
+            "job_start(task_id)" in text
+        ), f"{slug} persona: start = job_start(task_id)"
 
 
 # -- Scenario 2: only filed -> tell the owner "filed, not started" -------------
@@ -90,9 +92,9 @@ def test_shared_caps_say_filing_does_not_start_and_report_filed_not_started() ->
         'not started"'
     )
     board_blocks = [p for p in _paragraphs(_caps()) if "job_start(task_id)" in p]
-    assert any(_NOT_START.search(p) for p in board_blocks), (
-        "shared caps must say that filing a task does not start it"
-    )
+    assert any(
+        _NOT_START.search(p) for p in board_blocks
+    ), "shared caps must say that filing a task does not start it"
 
 
 def test_task_add_description_says_it_does_not_start_work() -> None:
@@ -140,9 +142,9 @@ def test_builder_personas_name_their_key_service_but_do_not_restate_contract() -
         text = path.read_text(encoding="utf-8")
         assert PERSONA_KEY_SERVICE[slug] in text, f"{slug} persona names its service"
         assert "/setkey" not in text, f"{slug} persona restates /setkey (use Keys)"
-        assert "scripts/withkeys" not in text, (
-            f"{slug} persona restates the withkeys contract (use Keys)"
-        )
+        assert (
+            "scripts/withkeys" not in text
+        ), f"{slug} persona restates the withkeys contract (use Keys)"
 
 
 # -- Scenario 5: shared caps shorter; false "one board" claim gone -------------
@@ -174,9 +176,9 @@ def test_builder_personas_do_not_job_start_board_tasks_as_prompts() -> None:
 def test_job_start_description_says_filing_does_not_start() -> None:
     desc = _tool_description("job_start")
     assert "task_id" in desc
-    assert _NOT_START.search(desc) and re.search(r"fil(e|ing)|creat", desc), (
-        "job_start description: creating a task does not start it"
-    )
+    assert _NOT_START.search(desc) and re.search(
+        r"fil(e|ing)|creat", desc
+    ), "job_start description: creating a task does not start it"
 
 
 def test_shared_caps_keep_verbatim_pump_answer_rule() -> None:
@@ -185,3 +187,23 @@ def test_shared_caps_keep_verbatim_pump_answer_rule() -> None:
     assert "pump_pending" in caps
     assert "pump_answer" in caps
     assert "verbatim" in caps.lower()
+
+
+# --- dv-cf07: task status is not a memory fact (remember surfaces) ---------
+
+
+def test_remember_tells_model_task_status_is_not_a_fact():
+    """dv-cf07: the remember tool wrote both members of the stale pump
+    concurrency pair (3 vs 5). Its description must say task/ticket status
+    (merged, started, raised X to N) belongs on the board, and 'general' no
+    longer advertises status."""
+    desc = _tool_description("remember").lower()
+    for word in ("merged", "started", "raised"):
+        assert word in desc, word
+    assert "board" in desc
+    assert "history, status" not in desc
+
+    caps = _caps()
+    block = next(p for p in _paragraphs(caps) if "save a fact yourself" in p)
+    assert "history, status" not in block
+    assert "merged" in block and "board" in block

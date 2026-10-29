@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 import structlog
 
 from src.storage.memory_repository import (
+    POINTER_CAP,
+    SNAPSHOT_GENERAL_CAP,
     FactsSnapshot,
     render_fact_line,
     render_pointer_line,
@@ -69,8 +71,11 @@ class WindowBundleProvider:
         memory_repo: "MemoryRepository",
         profile_registry: Optional["ProfileRegistry"] = None,
         default_composer: Optional[PromptComposer] = None,
-        facts_budget_chars: int = 12_000,
+        facts_budget_chars: int = 24_000,
+        general_cap: int = SNAPSHOT_GENERAL_CAP,
+        pointer_cap: int = POINTER_CAP,
         sandbox_default: bool = True,
+        sweep_wait_seconds: float = 60.0,
     ) -> None:
         self._window_repo = window_repo
         self._bundle_repo = bundle_repo
@@ -78,7 +83,14 @@ class WindowBundleProvider:
         self._registry = profile_registry
         self._default_composer = default_composer
         self._facts_budget_chars = facts_budget_chars
+        # Facts per window: MEMORY_SNAPSHOT_GENERAL_CAP / MEMORY_POINTER_CAP
+        # from src/main.py (dv-cf07); pinned and core are never capped.
+        self._general_cap = general_cap
+        self._pointer_cap = pointer_cap
         self._sandbox_default = sandbox_default
+        # Bounded wait for the outgoing window's stale-fact sweep
+        # (MEMORY_SWEEP_WAIT_SECONDS, dv-cf07) before the snapshot freezes.
+        self._sweep_wait_seconds = sweep_wait_seconds
         self._consolidation: Optional["ConsolidationService"] = None
         self._profile_composers: Dict[str, PromptComposer] = {}
         # Last materialized/reused bundle per (user_id, working_dir) -- feeds
@@ -90,7 +102,8 @@ class WindowBundleProvider:
         self._valve_fired: Set[Tuple[str, int]] = set()
 
     def attach_consolidation(self, service: "ConsolidationService") -> None:
-        """Wire the pressure valve target (post-startup; scheduler-owned)."""
+        """Wire the consolidation service (post-startup): pressure valve
+        target and the per-rotation sweep the new window waits for."""
         self._consolidation = service
 
     def last_meta(
@@ -167,7 +180,10 @@ class WindowBundleProvider:
         )
 
         agent_id = agent_id_for_working_dir(self._registry, working_directory, user_id)
-        snapshot = await self._memory_repo.facts_snapshot(agent_id)
+        await self._wait_for_sweep(agent_id)
+        snapshot = await self._memory_repo.facts_snapshot(
+            agent_id, general_cap=self._general_cap, pointer_cap=self._pointer_cap
+        )
 
         conflict_ids = {fact.id for pair in snapshot.conflicts for fact in pair}
         pinned_lines = [
@@ -185,7 +201,11 @@ class WindowBundleProvider:
         if family_id is not None:
             family_scope = family_agent_id_for_agent(agent_id, family_id)
             family_lines = self._family_lines(
-                await self._memory_repo.facts_snapshot(family_scope)
+                await self._memory_repo.facts_snapshot(
+                    family_scope,
+                    general_cap=self._general_cap,
+                    pointer_cap=self._pointer_cap,
+                )
             )
 
         text = composer.compose(
@@ -263,6 +283,25 @@ class WindowBundleProvider:
                 seen.add(fact.id)
                 lines.append(render_fact_line(fact))
         return lines
+
+    async def _wait_for_sweep(self, agent_id: str) -> None:
+        """Let the rotation's stale-fact sweep land before the snapshot is
+        frozen (dv-cf07). Bounded: on timeout the window goes on with what is
+        there and the sweep's closures show from the next window."""
+        wait = getattr(self._consolidation, "wait_rotation", None)
+        if wait is None:
+            return
+        try:
+            if not await wait(agent_id, timeout=self._sweep_wait_seconds):
+                logger.warning(
+                    "Rotation sweep still running; bundle frozen without it",
+                    agent_id=agent_id,
+                    waited_seconds=self._sweep_wait_seconds,
+                )
+        except Exception as e:  # never block a turn on the sweep
+            logger.warning(
+                "Rotation sweep wait failed", agent_id=agent_id, error=str(e)
+            )
 
     def _check_budget(self, agent_id: str, window_id: int, facts_chars: int) -> None:
         """Pressure valve: over budget triggers consolidation, never drops."""

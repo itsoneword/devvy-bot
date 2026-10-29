@@ -45,7 +45,11 @@ the answer wins.
      exception, retry instead of a fix); changes no task line asks for;
      "should work" with no command, log or file:line; padding.
 3. Run the tests the build reports. {{TEST_RUN}}
-   A red test the build called green is a RETURN.
+   A red test the build called green is a RETURN. A test red only because of
+   the environment (timeout, missing service, sandbox denial, OOM, auth in
+   setup): rerun it once; if still red, write it as a finding, not a RETURN by
+   itself. If the branch's own test or fixture is what is broken, that is a
+   code defect: `RETURN build`.
 4. Write the report to `{{OUTFILE}}` in exactly the format below.
 
 Return only for real defects you can point at (file:line, a failing command,
@@ -75,6 +79,9 @@ or
 PASS
 1. <what you checked, one line>
 ```
+
+A UI step's review adds a `## Screens` section after the comments (see the
+UI block above); the pump stops reading comments at the first `## ` heading.
 
 The pump reads only the first line for the verdict. Anything else there —
 including no report at all — is treated as a review that failed to run and

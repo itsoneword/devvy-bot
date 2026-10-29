@@ -3,6 +3,7 @@ idempotency, locking, backups, post-baseline revisions, FTS trigger guard."""
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import threading
@@ -15,7 +16,6 @@ from alembic import command
 from src.storage.schema import migrate
 from src.storage.schema.legacy import LEGACY_HEAD, build_legacy, schema_version
 from src.storage.schema.migrate import (
-    BASELINE,
     DB_NAMES,
     SchemaMismatchError,
     alembic_config,
@@ -160,14 +160,10 @@ def test_bridge_from_bot_v20_keeps_rows_and_stamps(tmp_path):
         "INSERT INTO messages (session_id, user_id, prompt, response) "
         "VALUES ('s', 1, 'findable prompt', 'r')"
     )
-    conn.execute(
-        "INSERT INTO tool_usage (session_id, message_id, tool_name, tool_input,"
-        " success, error_message) VALUES ('s', 1, 'Bash', '{\"command\": \"ls\"}', 0, 'boom')"
-    )
     conn.commit()
     conn.close()
     counts = _row_counts(path)
-    counts.pop("tool_usage")  # becomes tool_calls (dv-2260), checked below
+    counts.pop("tool_usage")  # becomes tool_calls (dv-2260)
 
     assert ensure_schema("bot", path) == "bridged"
 
@@ -183,17 +179,6 @@ def test_bridge_from_bot_v20_keeps_rows_and_stamps(tmp_path):
     assert {k: after[k] for k in counts if k != "schema_version"} == {
         k: v for k, v in counts.items() if k != "schema_version"
     }
-    conn = sqlite3.connect(path)
-    copied = conn.execute(
-        "SELECT session_id, message_id, tool_name, input_short, ok, error, trace_id"
-        " FROM tool_calls"
-    ).fetchall()
-    gone = conn.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name='tool_usage'"
-    ).fetchone()[0]
-    conn.close()
-    assert copied == [("s", 1, "Bash", '{"command": "ls"}', 0, "boom", None)]
-    assert gone == 0
     assert diff(snapshot(path), _head_snapshot("bot")) == []
     assert len(_backups(path)) == 1 and _backups(path)[0].startswith("bot.")
     assert ensure_schema("bot", path) == "current"
@@ -476,3 +461,107 @@ def test_schema_diff_cli(tmp_path, capsys):
     assert main([str(drifted), "fresh", "--db", "data"]) == 1
     assert "local_hack" in capsys.readouterr().out
     assert main(["--dir", str(tmp_path)]) == 1  # data differs; others missing
+
+
+# --- dv-2260: tool_usage -> tool_calls -------------------------------------
+
+
+def _db_at_0004_with_tool_usage(path: Path) -> None:
+    """A bot.db exactly like the live one before dv-2260: Alembic at 0004,
+    tool_usage holding an ok and a failed call for one message."""
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        migrate._run_alembic(conn, "bot", command.upgrade, "0004")
+        conn.execute("COMMIT")
+        conn.execute("INSERT INTO users (user_id) VALUES (1)")
+        conn.execute(
+            "INSERT INTO sessions (session_id, user_id, project_path) "
+            "VALUES ('s', 1, '/p')"
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, user_id, prompt, response, window_id)"
+            " VALUES ('s', 1, 'q', 'a', 1)"
+        )
+        mid = conn.execute("SELECT message_id FROM messages").fetchone()[0]
+        conn.execute(
+            "INSERT INTO tool_usage (session_id, message_id, tool_name, tool_input,"
+            " timestamp, success, error_message) VALUES "
+            "('s', ?, 'Read', '{\"file_path\": \"/p/a.py\"}', "
+            "'2026-10-01 10:00:00', 1, NULL),"
+            "('s', ?, 'Bash', '{\"command\": \"false\"}', "
+            "'2026-10-01 10:00:05', 0, 'exit code 1')",
+            (mid, mid),
+        )
+    finally:
+        conn.close()
+
+
+def test_tool_usage_rows_copied_into_tool_calls_and_table_dropped(tmp_path):
+    path = tmp_path / "bot.db"
+    _db_at_0004_with_tool_usage(path)
+
+    assert ensure_schema("bot", path) == "upgraded"
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "tool_usage" not in tables
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT message_id, session_id, tool, input, status, error, "
+                "started_at, model_call_id, parent_tool_use_id "
+                "FROM tool_calls ORDER BY seq"
+            )
+        ]
+        mid = conn.execute("SELECT message_id FROM messages").fetchone()[0]
+    finally:
+        conn.close()
+    assert [(r["tool"], r["status"], r["error"]) for r in rows] == [
+        ("Read", "ok", None),
+        ("Bash", "error", "exit code 1"),
+    ]
+    assert all(r["message_id"] == mid and r["session_id"] == "s" for r in rows)
+    assert all(r["model_call_id"] is None for r in rows)
+    assert all(r["parent_tool_use_id"] is None for r in rows)
+    assert "2026-10-01" in str(rows[0]["started_at"])
+    # Input stays parseable JSON (the migrate scripts read file_path).
+    assert json.loads(rows[0]["input"])["file_path"] == "/p/a.py"
+    # Fresh install and the upgraded live DB end up with the same structure.
+    fresh = tmp_path / "fresh" / "bot.db"
+    ensure_schema("bot", fresh)
+    assert diff(snapshot(fresh), snapshot(path)) == []
+
+
+async def test_tool_readers_still_work_after_tool_usage_is_migrated(tmp_path):
+    """The repointed readers (window rebuild, user + system stats) return the
+    migrated history."""
+    from src.storage.facade import Storage
+    from src.storage.window_repository import WindowRepository
+
+    path = tmp_path / "bot.db"
+    _db_at_0004_with_tool_usage(path)
+    st = Storage(f"sqlite:///{path}")
+    await st.initialize()
+    try:
+        turns = await WindowRepository(st.db_manager).window_turns_with_tools(
+            1, "/p", 1
+        )
+        assert turns == [("q", "a", ["Read", "Bash"])]
+
+        def names(rows):
+            return {
+                (r.get("tool_name") or r.get("tool")): r["usage_count"] for r in rows
+            }
+
+        user = await st.analytics.get_user_stats(1)
+        assert names(user["top_tools"]) == {"Read": 1, "Bash": 1}
+        system = await st.analytics.get_system_stats()
+        assert names(system["tool_stats"]) == {"Read": 1, "Bash": 1}
+    finally:
+        await st.close()

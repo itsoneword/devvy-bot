@@ -142,9 +142,7 @@ def test_aster_report_is_not_gated():
     assert _bash("node /home/testuser/tools/fetchcrypto/orders.js wallet1") is None
     assert _bash("node /home/testuser/tools/fetchcrypto/query_trades.js") is None
     assert _bash("node /home/testuser/tools/fetchmexc/analytics.js") is None
-    assert (
-        _bash("cd /home/testuser/tools/fetchcrypto && node index.js wallet1") is None
-    )
+    assert _bash("cd /home/testuser/tools/fetchcrypto && node index.js wallet1") is None
 
 
 def test_mexc_order_scripts_are_also_gated():

@@ -1,17 +1,22 @@
 """The harness trace (dv-2260): every tool call of a model turn, who made it
 (main agent or a subagent), how it ended, with a short preview of the result.
 
-One mechanism for bot turns, background jobs and the task pump: the router
-(bot) or ``run_job`` (job process) opens a :class:`TraceCollector`, a backend
-feeds it the stream it already reads, and rows go to a :class:`TraceSink`
-*as they happen*, so a turn that is interrupted, times out or crashes keeps
-what it did. Rows are keyed ``(trace_id, tool_use_id)``; ``parent_tool_use_id``
-(null = main agent) links a subagent's calls to the ``Agent`` call that started
-them. The router later links the trace to its ``model_calls`` row, the storage
-facade to the ``messages`` row.
+The router opens a :class:`TraceCollector` per turn, the backend feeds it the
+stream it already reads, and rows go to a :class:`TraceSink` *as they happen*,
+so a turn that is interrupted, times out or crashes keeps what it did. Rows are
+keyed ``(trace_id, tool_use_id)``; ``parent_tool_use_id`` (NULL = main agent)
+links a subagent's calls to the ``Agent`` call that started them. The router
+links the trace to its ``model_calls`` row, the storage facade to its
+``messages`` row.
 
 A backend reaches the collector through :func:`current_trace` (a contextvar),
 so no ``run_command`` signature changes.
+
+Row ``status``: ``ok`` / ``error`` once the result arrived; ``detached`` for a
+subagent still running when the turn ended (backgrounded: its result arrives
+after ``ResultMessage``, which nobody reads); ``unfinished`` for a call that
+never got a result (interrupt, timeout, crash) -- also the state of a call
+still running while the turn streams.
 """
 
 from __future__ import annotations
@@ -27,24 +32,31 @@ from typing import Any, Dict, Iterator, List, Optional, Protocol
 
 import structlog
 
-from src.utils.log_redaction import redact_secrets
+from src.utils.log_redaction import redact, redact_secrets
 
 logger = structlog.get_logger()
 
-INPUT_MAX = 300
+INPUT_VALUE_MAX = 300
 RESULT_PREVIEW_MAX = 200
 SUBAGENT_RESULT_MAX = 4000
+ERROR_MAX = 500
 # Claude Code calls the subagent tool `Agent`; older builds `Task`.
 SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
 _DETACHED_MARK = "Async agent launched"
+
+OK, ERROR, DETACHED, UNFINISHED = "ok", "error", "detached", "unfinished"
 
 
 class TraceSink(Protocol):
     async def upsert(self, trace_id: str, rows: List[Dict[str, Any]]) -> None: ...
 
 
+def scrub(text: str) -> str:
+    return redact_secrets(redact(text))
+
+
 def _clip(text: str, limit: int) -> str:
-    text = redact_secrets(text.strip())
+    text = scrub(text.strip())
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
@@ -65,18 +77,25 @@ def content_text(content: Any) -> str:
     return str(content)
 
 
-def short_input(tool_input: Any) -> str:
+def _cap_values(value: Any) -> Any:
+    if isinstance(value, str):
+        return _clip(value, INPUT_VALUE_MAX)
+    if isinstance(value, dict):
+        return {str(k): _cap_values(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_cap_values(v) for v in value]
+    return value
+
+
+def short_input(tool_input: Any) -> Optional[str]:
+    """The call's input as JSON, every string value capped and scrubbed.
+    Stays parseable, so readers can still pick out ``file_path`` etc."""
     if tool_input in (None, {}, ""):
-        return ""
+        return None
     try:
-        text = (
-            tool_input
-            if isinstance(tool_input, str)
-            else json.dumps(tool_input, ensure_ascii=False, default=str)
-        )
+        return json.dumps(_cap_values(tool_input), ensure_ascii=False, default=str)
     except (TypeError, ValueError):
-        text = str(tool_input)
-    return _clip(text, INPUT_MAX)
+        return json.dumps(_clip(str(tool_input), INPUT_VALUE_MAX))
 
 
 class TraceCollector:
@@ -86,6 +105,7 @@ class TraceCollector:
         self.trace_id = uuid.uuid4().hex
         self._sink = sink
         self._rows: Dict[str, Dict[str, Any]] = {}
+        self._done: set = set()
         self._clock: Dict[str, float] = {}
         self._dirty: Dict[str, None] = {}
         self._writer: Optional["asyncio.Task[None]"] = None
@@ -100,28 +120,25 @@ class TraceCollector:
         tool_input: Any,
         parent: Optional[str] = None,
     ) -> None:
-        if tool_use_id in self._rows:
+        if not tool_use_id or tool_use_id in self._rows:
             return
         self._seq += 1
         subagent_type = None
-        detached = 0
         if name in SUBAGENT_TOOLS and isinstance(tool_input, dict):
             subagent_type = tool_input.get("subagent_type") or None
-            detached = 1 if tool_input.get("run_in_background") else 0
         self._rows[tool_use_id] = {
             "tool_use_id": tool_use_id,
             "parent_tool_use_id": parent or None,
             "seq": self._seq,
-            "tool_name": name or "unknown",
+            "tool": name or "unknown",
             "subagent_type": subagent_type,
-            "input_short": short_input(tool_input),
-            "ok": None,
+            "input": short_input(tool_input),
+            "status": UNFINISHED,
             "error": None,
-            "started_at": datetime.now(UTC).isoformat(),
+            "started_at": datetime.now(UTC),
             "duration_ms": None,
             "result_bytes": None,
             "result_preview": None,
-            "detached": detached,
         }
         self._clock[tool_use_id] = time.monotonic()
         self._mark(tool_use_id)
@@ -134,40 +151,42 @@ class TraceCollector:
         error: Optional[str] = None,
     ) -> None:
         row = self._rows.get(tool_use_id)
-        if row is None or row["ok"] is not None:
+        if row is None or tool_use_id in self._done:
             return
+        self._done.add(tool_use_id)
         text = content_text(content)
-        limit = (
-            SUBAGENT_RESULT_MAX
-            if row["tool_name"] in SUBAGENT_TOOLS
-            else RESULT_PREVIEW_MAX
-        )
+        subagent = row["tool"] in SUBAGENT_TOOLS
+        limit = SUBAGENT_RESULT_MAX if subagent else RESULT_PREVIEW_MAX
         failed = bool(is_error or error)
-        row["ok"] = 0 if failed else 1
-        row["duration_ms"] = int((time.monotonic() - self._clock[tool_use_id]) * 1000)
+        row["duration_ms"] = self._elapsed(tool_use_id)
         row["result_bytes"] = len(text.encode("utf-8", "replace"))
         row["result_preview"] = _clip(text, limit) if text.strip() else None
         if failed:
-            row["error"] = _clip(
-                error or text or "tool call failed", RESULT_PREVIEW_MAX
-            )
-        if row["tool_name"] in SUBAGENT_TOOLS and text.startswith(_DETACHED_MARK):
-            row["detached"] = 1
+            row["status"] = ERROR
+            row["error"] = _clip(error or text or "tool call failed", ERROR_MAX)
+        elif subagent and text.startswith(_DETACHED_MARK):
+            row["status"] = DETACHED
+        else:
+            row["status"] = OK
         self._mark(tool_use_id)
 
-    def close(self, reason: str = "turn ended") -> None:
+    def close(self, completed: bool = True) -> None:
         """The stream is over: whatever has no result yet gets its final
-        state. A subagent still running was launched detached; anything else
-        was cut off (interrupt, timeout, crash)."""
+        state. After a turn that completed, a subagent still running was
+        launched detached; anything else was cut off."""
         for use_id, row in self._rows.items():
-            if row["ok"] is not None:
+            if use_id in self._done:
                 continue
-            if row["tool_name"] in SUBAGENT_TOOLS:
-                row["detached"] = 1
+            self._done.add(use_id)
+            if completed and row["tool"] in SUBAGENT_TOOLS:
+                row["status"] = DETACHED
             else:
-                row["error"] = f"no result ({reason})"
-            row["duration_ms"] = int((time.monotonic() - self._clock[use_id]) * 1000)
+                row["status"] = UNFINISHED
+            row["duration_ms"] = self._elapsed(use_id)
             self._mark(use_id)
+
+    def _elapsed(self, tool_use_id: str) -> int:
+        return int((time.monotonic() - self._clock[tool_use_id]) * 1000)
 
     # -- feeding -----------------------------------------------------------
 

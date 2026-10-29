@@ -1,5 +1,6 @@
 // views/overview.js — Overview screen (#/): filter bar, stat tiles, daily
-// stacked token bars + output line, est-$ trend, model breakdown, sessions table.
+// stacked token bars + output line, est-$ trend, by-source tree, model
+// breakdown, sessions table.
 
 import { api } from "../api.js";
 import {
@@ -30,7 +31,7 @@ const QUALITY_LINE = { label: "log_* calls", color: "var(--s-fresh)" };
 
 const TABLE_COLUMNS = [
   { key: "session_id", label: "Session", sortable: false },
-  { key: "profile", label: "Profile", sortable: false },
+  { key: "source", label: "Source", sortable: false },
   { key: "entrypoint", label: "Entry", sortable: false },
   { key: "last_ts", label: "Last activity", sortable: true },
   { key: "api_call_count", label: "Calls", sortable: true, num: true },
@@ -41,6 +42,73 @@ const TABLE_COLUMNS = [
   { key: "subagent_count", label: "Agents", sortable: true, num: true },
   { key: "turn_count", label: "Turns", sortable: true, num: true },
 ];
+
+// Attributed sources (dv-d2a3, names from dv-87d8). The indexer writes
+// attr_group / attr_key / attr_detail per session; the UI only nests them.
+// Agents sit at the top level themselves; the other groups are one row each.
+const GROUP_LABELS = {
+  pump: "Pump", job: "Jobs", cli: "Owner CLI", other: "Other",
+};
+const GROUP_ORDER = ["agent", "pump", "job", "cli", "other"];
+
+// Path of a source below its group: pump detail "<task>/<stage>" is two
+// levels (board > task > stage); every other detail is one.
+function sourcePath(group, key, detail) {
+  const parts = [key || "?"];
+  if (detail) parts.push(...(group === "pump" ? detail.split("/") : [detail]));
+  return parts;
+}
+
+// One line for a session's source, e.g. "Pump · gymbro · gb-1a72 · implement-p1".
+export function sourceLabel(s) {
+  if (!s.attr_group) return s.profile || "–";
+  if (s.attr_group === "agent") {
+    return (s.attr_key || "?") + (s.attr_archived ? " · archived" : "");
+  }
+  const label = GROUP_LABELS[s.attr_group] || s.attr_group;
+  return [label, ...sourcePath(s.attr_group, s.attr_key, s.attr_detail)].join(" · ");
+}
+
+// by_source rows -> tree of {id, label, children, totals}. Archived rows
+// (agent slugs not in profiles.yaml) go to a separate list of top nodes.
+function buildSourceTree(rows) {
+  const make = (id, label) => ({
+    id, label, children: new Map(), est_cost_usd: 0, sessions: 0, api_calls: 0,
+  });
+  const live = new Map();
+  const archive = new Map();
+  for (const r of rows) {
+    const tops = r.archived ? archive : live;
+    // Agents are top-level rows; other groups get one row holding their keys.
+    let path = sourcePath(r.group, r.key, r.detail);
+    let topId = r.group + "/" + path[0];
+    let topLabel = path[0];
+    if (r.group !== "agent") {
+      topId = r.group;
+      topLabel = GROUP_LABELS[r.group] || r.group;
+    } else {
+      path = path.slice(1);
+    }
+    if (!tops.has(topId)) tops.set(topId, { ...make(topId, topLabel), group: r.group });
+    let node = tops.get(topId);
+    const chain = [node];
+    for (const part of path) {
+      const id = node.id + "/" + part;
+      if (!node.children.has(id)) node.children.set(id, make(id, part));
+      node = node.children.get(id);
+      chain.push(node);
+    }
+    for (const n of chain) {
+      n.est_cost_usd += r.est_cost_usd || 0;
+      n.sessions += r.sessions || 0;
+      n.api_calls += r.api_calls || 0;
+    }
+  }
+  const order = (nodes) => [...nodes.values()].sort((a, b) =>
+    GROUP_ORDER.indexOf(a.group) - GROUP_ORDER.indexOf(b.group) ||
+    b.est_cost_usd - a.est_cost_usd);
+  return { live: order(live), archive: order(archive) };
+}
 
 function rangeParams(range) {
   const days = RANGES.find(([name]) => name === range)?.[1];
@@ -62,15 +130,12 @@ export async function renderOverview(view, state) {
       // offer a user/profile that would show an empty view.
       filterOptions = await api.filters(rangeParams(state.filters.range));
     } catch (e) {
-      filterOptions = { users: [], profiles: [] };
+      filterOptions = { users: [], profiles: [], sources: [] };
     }
     // A previously selected value may fall outside the new range — keep it
     // selectable rather than silently dropping the active filter.
     if (state.filters.user_id !== "" && !(filterOptions.users || []).some((u) => String(u) === state.filters.user_id)) {
       filterOptions.users = [...(filterOptions.users || []), state.filters.user_id];
-    }
-    if (state.filters.profile !== "" && !(filterOptions.profiles || []).includes(state.filters.profile)) {
-      filterOptions.profiles = [...(filterOptions.profiles || []), state.filters.profile];
     }
     buildFilterBar();
   }
@@ -101,35 +166,74 @@ export async function renderOverview(view, state) {
     userSel.value = state.filters.user_id;
     filterBar.append(userSel);
 
-    const profSel = el("select", {
-      "aria-label": "Profile",
-      onchange: () => { state.filters.profile = profSel.value; loadContent(); },
+    // Source: agents, then each group (whole group or one key), archived
+    // agents last. Values are the API's source=group[/key].
+    const srcSel = el("select", {
+      "aria-label": "Source",
+      onchange: () => { state.filters.source = srcSel.value; loadContent(); },
     });
-    profSel.append(el("option", { value: "", text: "All profiles" }));
-    for (const p of filterOptions.profiles || []) {
-      profSel.append(el("option", { value: p, text: p }));
+    srcSel.append(el("option", { value: "", text: "All sources" }));
+    const sources = filterOptions.sources || [];
+    const optgroups = [];
+    const live = sources.filter((s) => s.group === "agent" && !s.archived);
+    if (live.length) optgroups.push(["Agents", live.map((s) => [`agent/${s.key}`, s.key])]);
+    for (const group of GROUP_ORDER.slice(1)) {
+      const keys = sources.filter((s) => s.group === group);
+      if (!keys.length) continue;
+      const label = GROUP_LABELS[group];
+      optgroups.push([label, [
+        [group, `${label} · all`],
+        ...keys.map((s) => [`${group}/${s.key}`, `${label} · ${s.key}`]),
+      ]]);
     }
-    profSel.value = state.filters.profile;
-    filterBar.append(profSel);
+    const archived = sources.filter((s) => s.group === "agent" && s.archived);
+    if (archived.length) optgroups.push(["Archive", archived.map((s) => [`agent/${s.key}`, s.key])]);
+    const offered = new Set();
+    for (const [label, opts] of optgroups) {
+      const og = el("optgroup", { label });
+      for (const [value, text] of opts) {
+        og.append(el("option", { value, text }));
+        offered.add(value);
+      }
+      srcSel.append(og);
+    }
+    // Keep an active filter selectable even when the range has no traffic for it.
+    if (state.filters.source !== "" && !offered.has(state.filters.source)) {
+      srcSel.append(el("option", { value: state.filters.source, text: state.filters.source }));
+    }
+    srcSel.value = state.filters.source;
+    filterBar.append(srcSel);
   }
 
   function filterParams() {
     const p = { ...rangeParams(state.filters.range) };
     if (state.filters.user_id !== "") p.user_id = state.filters.user_id;
-    if (state.filters.profile !== "") p.profile = state.filters.profile;
+    if (state.filters.source !== "") p.source = state.filters.source;
     return p;
+  }
+
+  // Tier-1 quality is per bot profile: an agent source narrows it, any
+  // other source has no bot turns, so the card is skipped.
+  function qualityParams(params) {
+    const { source, ...rest } = params;
+    if (!source) return rest;
+    const [group, key] = source.split("/");
+    if (group !== "agent" || !key) return null;
+    return { ...rest, profile: key };
   }
 
   async function loadContent() {
     content.textContent = "";
     content.append(loadingState());
     const params = filterParams();
+    const qParams = qualityParams(params);
     let overview, sessionsPage, quality;
     try {
       [overview, sessionsPage, quality] = await Promise.all([
         api.overview(params),
         api.sessions({ ...params, ...state.sessionsSort, limit: 50 }),
-        api.quality(params).catch(() => null), // best-effort: card is skipped
+        // best-effort: card is skipped
+        qParams ? api.quality(qParams).catch(() => null) : null,
       ]);
     } catch (e) {
       content.textContent = "";
@@ -154,6 +258,7 @@ export async function renderOverview(view, state) {
     renderTiles(content, overview);
     renderDaily(content, overview);
     if (quality) renderQuality(content, quality);
+    renderSources(content, overview);
     renderModels(content, overview);
     renderSessions(content, sessionsPage);
   }
@@ -278,6 +383,64 @@ export async function renderOverview(view, state) {
     parent.append(card);
   }
 
+  // By source: live agents, Pump > board > task > stage, Jobs, Owner CLI,
+  // Other. A row with children expands on click; archived agents only show
+  // with the Archive toggle. Expand state lives in state.sourceView.
+  function renderSources(parent, overview) {
+    const card = el("div", { class: "card" });
+    const body = el("div", { class: "src-tree" });
+    const tree = buildSourceTree(overview.by_source || []);
+    const view = state.sourceView;
+    const head = el("div", { class: "card-head" });
+    head.append(el("h2", { text: "By source" }));
+    head.append(el("div", { class: "card-sub", text: "est-$ in range · ▸ expands" }));
+    head.append(el("span", { class: "spacer" }));
+    if (tree.archive.length) {
+      const box = el("input", {
+        type: "checkbox",
+        onchange: () => { view.archive = box.checked; draw(); },
+      });
+      box.checked = view.archive;
+      head.append(el("label", { class: "src-archive" }, box, ` Show archive (${tree.archive.length})`));
+    }
+    card.append(head, body);
+    parent.append(card);
+
+    function row(node, depth) {
+      const kids = [...node.children.values()].sort((a, b) => b.est_cost_usd - a.est_cost_usd);
+      const open = view.expanded.has(node.id);
+      const attrs = { class: "src-row" + (kids.length ? " expandable" : ""), style: `padding-left: ${depth * 18 + 4}px` };
+      if (kids.length) {
+        attrs.onclick = () => {
+          if (open) view.expanded.delete(node.id); else view.expanded.add(node.id);
+          draw();
+        };
+      }
+      const r = el("div", attrs);
+      r.append(el("span", { class: "src-caret", text: kids.length ? (open ? "▾" : "▸") : "" }));
+      r.append(el("span", { class: "src-label", text: node.label }));
+      r.append(el("span", { class: "src-cost num", text: fmtUsd(node.est_cost_usd) }));
+      r.append(el("span", { class: "src-meta num", text: `${fmtInt(node.sessions)} sess · ${fmtCompact(node.api_calls)} calls` }));
+      const out = [r];
+      if (open) for (const k of kids) out.push(...row(k, depth + 1));
+      return out;
+    }
+
+    function draw() {
+      body.textContent = "";
+      if (!tree.live.length && !tree.archive.length) {
+        body.append(emptyState("No API calls in this range."));
+        return;
+      }
+      for (const node of tree.live) body.append(...row(node, 0));
+      if (view.archive && tree.archive.length) {
+        body.append(el("div", { class: "src-section", text: "Archive · not in profiles.yaml" }));
+        for (const node of tree.archive) body.append(...row(node, 0));
+      }
+    }
+    draw();
+  }
+
   function renderModels(parent, overview) {
     const card = el("div", { class: "card" });
     card.append(el("h2", { text: "By model" }));
@@ -353,7 +516,7 @@ export async function renderOverview(view, state) {
         idCell.append(" ", el("span", { class: "badge warn", text: "no transcript" }));
       }
       tr.append(idCell);
-      tr.append(el("td", { text: s.profile || "–" }));
+      tr.append(el("td", { text: sourceLabel(s), title: s.profile ? "cwd: " + s.profile : null }));
       tr.append(el("td", {}, el("span", { class: "badge ep-" + (s.entrypoint || "unknown"), text: s.entrypoint || "?" })));
       tr.append(el("td", { text: fmtDateTime(s.last_ts) }));
       tr.append(el("td", { class: "num", text: fmtInt(s.api_call_count) }));

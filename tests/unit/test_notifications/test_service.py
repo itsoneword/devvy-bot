@@ -2,9 +2,8 @@
 
 from unittest.mock import AsyncMock
 
-from telegram.error import BadRequest
-
 import pytest
+from telegram.error import BadRequest
 
 from src.events.bus import EventBus
 from src.events.types import AgentResponseEvent
@@ -324,7 +323,7 @@ class TestLoneSurrogates:
         self, service: NotificationService, mock_bot: AsyncMock
     ) -> None:
         mock_bot.send_message.side_effect = self._strict_encode
-        text = "✅ devops · job \"t\" finished — 😀 👨‍👩‍👧 done…"
+        text = '✅ devops · job "t" finished — 😀 👨‍👩‍👧 done…'
         await self._deliver(service, AgentResponseEvent(chat_id=100, text=text))
 
         mock_bot.send_message.assert_called_once()

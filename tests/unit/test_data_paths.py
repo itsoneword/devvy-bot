@@ -149,7 +149,9 @@ def test_settings_root_moves_soul_memory_to_devops_workspace(tmp_path):
     # dv-4030: the global activity log / soul.md must not keep writing into
     # the retired data/ tree once the root is set.
     legacy = _settings()
-    assert legacy.memory_path.name == "memory" and legacy.memory_path.parent.name == "data"
+    assert (
+        legacy.memory_path.name == "memory" and legacy.memory_path.parent.name == "data"
+    )
     s = _settings(devvy_data_root=str(tmp_path))
     assert s.memory_path == tmp_path / "workspaces" / "devops" / "memory"
     assert s.soul_md_path == tmp_path / "workspaces" / "devops" / "soul.md"

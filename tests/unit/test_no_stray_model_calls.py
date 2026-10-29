@@ -26,6 +26,7 @@ ALLOWED: Dict[str, Set[str]] = {
     r"[\"']exec[\"'],\s*\n?\s*[\"']--json[\"']": {
         "src/agent_backends/codex_cli.py",  # the Codex turn adapter
         "src/model_router/codex_plain.py",  # the Codex plain-call adapter
+        "src/model_router/job_codex.py",  # the Codex background-job adapter
     },
     r"openrouter\.ai/api/v1/chat": {"src/model_router/openrouter_plain.py"},
     r"api\.typesafe\.ai": {"src/model_router/typesafe_decide.py"},

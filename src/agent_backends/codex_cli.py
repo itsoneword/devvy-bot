@@ -43,10 +43,10 @@ from src.claude.turn_setup import (
     resolve_turn_context,
 )
 from src.config.settings import Settings
-from src.model_router.trace import current_trace
+from src.model_router.trace import TraceCollector, content_text, current_trace
+from src.security.bash_box import BashBox, KeyEnvError, load_key_env
 from src.storage.codex_sessions import CodexSessionStore, InMemoryCodexSessionStore
 from src.storage.repositories import MessageRepository
-from src.security.bash_box import BashBox, KeyEnvError, load_key_env
 from src.utils.agent_env import (
     AGENT_CLI_CREDENTIAL_VARS,
     agent_child_env,
@@ -194,11 +194,12 @@ def map_codex_event(event: Dict[str, Any]) -> CodexEventOutcome:
 
 
 def _feed_codex_trace(
-    trace: Any, event: Dict[str, Any], outcome: "CodexEventOutcome"
+    trace: TraceCollector, event: Dict[str, Any], outcome: CodexEventOutcome
 ) -> None:
-    """Feed one Codex event to the harness trace. Codex streams a flat list
-    of items: no caller tree (every call is the main agent's) and no subagent
-    results; durations are wall clock between item.started and completed."""
+    """Feed one Codex event to the harness trace (dv-2260). Codex streams a
+    flat list of items: no caller tree (every call is the main agent's) and no
+    subagent results; durations are wall clock between item.started and
+    item.completed."""
     try:
         etype = event.get("type")
         item = event.get("item") or {}
@@ -207,19 +208,21 @@ def _feed_codex_trace(
             calls = outcome.stream_update.tool_calls or []
             if len(calls) == 1:
                 # An item without an id cannot be paired with its completion;
-                # it still gets a row (left "no result" at the end).
+                # it still gets a row (left unfinished at the end).
                 use_id = str(item_id or f"codex-{len(trace.rows()) + 1}")
                 trace.start(use_id, calls[0]["name"], calls[0].get("input"))
         elif etype == "item.completed" and item_id:
-            text = (
-                item.get("aggregated_output")
-                or item.get("output")
-                or item.get("result")
-                or ""
-            )
+            output: Any = item.get("aggregated_output") or item.get("output")
+            if output is None:
+                result = item.get("result")
+                output = (
+                    content_text(result.get("content"))
+                    if isinstance(result, dict)
+                    else result
+                )
             trace.finish(
                 str(item_id),
-                text if isinstance(text, str) else str(text),
+                output if isinstance(output, str) else str(output or ""),
                 error=outcome.tool_error,
             )
     except Exception as exc:  # tracing must never break a turn
@@ -274,7 +277,7 @@ def _map_started_item(item: Dict[str, Any]) -> CodexEventOutcome:
         # exec JSONL adapter has used both camelCase and snake_case item
         # names across releases, so accept both.  Keep the persisted
         # input deliberately small: the child prompt is already part of
-        # the rollout and copying it into tool_usage would recreate the
+        # the rollout and copying it into tool_calls would recreate the
         # context-amplification problem this telemetry is meant to expose.
         details = {
             "tool": item.get("tool"),
@@ -351,6 +354,19 @@ def _scrubber(values: Sequence[str]) -> Callable[[str], str]:
         return text
 
     return scrub
+
+
+def policy_hook_args(hook_timeout: int) -> List[str]:
+    """``codex exec`` args mounting ``codex_policy_hook.py`` as the PreToolUse
+    hook, ``hook_timeout`` seconds per call. One builder for the chat turn and
+    the Codex background job (dv-d63d); the child env carries the endpoint."""
+    command = f"{sys.executable} {_POLICY_HOOK_SCRIPT}"
+    return [
+        "--dangerously-bypass-hook-trust",
+        "-c",
+        'hooks.PreToolUse=[{matcher="",hooks=[{type="command",'
+        f"command={json.dumps(command)},timeout={hook_timeout}}}]}}]",
+    ]
 
 
 def _strip_provider_prefix(model: str) -> str:
@@ -444,7 +460,7 @@ class CodexCliIntegration:
         self.bundle_provider = bundle_provider
         # Optional ItemService (dv-752a): per-turn <family_reminders>.
         self.items_service: Any = None
-        # The `sessions` table is the FK parent of `messages`, `tool_usage`
+        # The `sessions` table is the FK parent of `messages`
         # and every downstream reader (evaluator conversation text, window
         # seeding, /sessions). Codex threads used to live ONLY in the JSON
         # store above, so `save_claude_interaction` inserted a message row
@@ -553,6 +569,10 @@ class CodexCliIntegration:
         base += [
             "-c",
             "agents.max_concurrent_threads_per_session=2",
+            # Codex's own view_image never sees our image roots; images are
+            # looked at through mcp__agent__view_image (dv-275f).
+            "-c",
+            "features.view_image=false",
             "--json",
             "-C",
             str(cwd),
@@ -585,14 +605,7 @@ class CodexCliIntegration:
         """
         if not getattr(self.agent_bridge, "policy_url", None):
             return []
-        command = f"{sys.executable} {_POLICY_HOOK_SCRIPT}"
-        hook_timeout = self.config.confirmation_hook_timeout_seconds
-        return [
-            "--dangerously-bypass-hook-trust",
-            "-c",
-            'hooks.PreToolUse=[{matcher="",hooks=[{type="command",'
-            f"command={json.dumps(command)},timeout={hook_timeout}}}]}}]",
-        ]
+        return policy_hook_args(self.config.confirmation_hook_timeout_seconds)
 
     @staticmethod
     def _shell_env_args(names: Sequence[str]) -> List[str]:
@@ -1157,7 +1170,7 @@ class CodexCliIntegration:
         final_fallback: Optional[str] = None
         # Tool activity, in the ClaudeResponse shape. Codex only reports it as
         # `item.started` stream events, so without this the turn persists no
-        # `tool_usage` rows and the save-honesty check (which reads
+        # `tool_calls` rows and the save-honesty check (which reads
         # response.tools_used) sees every Codex turn as tool-less and flags
         # any "I saved it" as a mismatch.
         tools_used: List[Dict[str, Any]] = []
@@ -1263,7 +1276,7 @@ class CodexCliIntegration:
                     final_fallback = outcome.final_message
                 if outcome.tool_error and outcome.item_id in tool_items:
                     # dv-c7d1: a failed MCP call / non-zero shell exit is
-                    # stored as success=0 with this message in tool_usage.
+                    # stored as status=error with this message in tool_calls.
                     tool_items[outcome.item_id]["error"] = outcome.tool_error
                 if outcome.stream_update:
                     calls = outcome.stream_update.tool_calls or []

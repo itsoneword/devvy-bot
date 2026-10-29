@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 import structlog
 
-from ..model_router import CLAUDE_HARNESS, CODEX_HARNESS, CallRequest, get_router
+from ..model_router import CallRequest, get_router
 from ..profiles.registry import family_agent_id_for_agent
 from ..storage.extraction_repository import MemoryExtractionRepository
 from ..storage.repositories import MessageRepository
@@ -61,6 +61,39 @@ EXTRACTION_SYSTEM_PROMPT = (
     "format in the user message exactly and reply with JSON only."
 )
 
+# The extraction answer's contract: validate_evaluator_output's op list.
+# Only ``op`` is required; the other keys are optional with their real types
+# (an explicit null = absent there). Route-agnostic: the router wraps the
+# array root and makes it strict for OpenAI-style structured outputs (the
+# dv-0c01 rule), and drops null optional keys from the answer.
+_OP_PROPERTIES: Dict[str, Any] = {
+    "op": {
+        "type": "string",
+        "enum": ["add", "supersede", "invalidate", "flag_conflict"],
+    },
+    # Absent on the metadata-only ops (invalidate/flag_conflict).
+    "tier": {"type": "string", "enum": ["pinned", "general"]},
+    "content": {"type": "string"},
+    "label": {"type": "string"},
+    "supersedes_id": {"type": "integer"},
+    "kind": {"type": "string", "enum": ["user_fact", "conversation_result"]},
+    "source_ref": {"type": "string"},
+    "target_id": {"type": "integer"},
+    "ids": {"type": "array", "items": {"type": "integer"}},
+    "scope": {"type": "string", "enum": ["private", "family"]},
+    # Screen path (dv-7e11); absent on the classic path.
+    "revokes": {"type": "boolean"},
+    "conflicts_with_id": {"type": "integer"},
+}
+EXTRACTION_SCHEMA: Dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": _OP_PROPERTIES,
+        "required": ["op"],
+    },
+}
+
 RECONCILE_SYSTEM_PROMPT = (
     "You reconcile candidate facts against an agent's saved facts. Follow the "
     "output format in the user message exactly and reply with JSON only."
@@ -77,11 +110,8 @@ class EvaluatorService:
         token_tracker: "TokenTracker",
         db: "DatabaseManager",
         notify_callback: Optional[Callable] = None,
-        model: str = "sonnet",
-        codex_model: str = "openai-codex/gpt-6-sol",
         max_delta_chars: int = 120_000,
         timeout_seconds: int = 120,
-        reconcile_model: str = "haiku",
         reconcile_enabled: bool = True,
         episodic_guard_enabled: bool = True,
         jev_gate: Optional[JevGateConfig] = None,
@@ -94,17 +124,14 @@ class EvaluatorService:
         self._extractions = MemoryExtractionRepository(db)
         self._messages = MessageRepository(db)
         self._notify = notify_callback  # async fn(user_id, message, agent_id)
-        self._model = model
-        # Extraction on the Codex backend. Always passed to the CLI: without
-        # it the call ran whatever ~/.codex/config.toml named.
-        self._codex_model = codex_model
+        # Models: the extraction / screen_extraction / reconcile call routes
+        # (models.yaml, dv-781f). Extraction follows the chat's backend.
         self._max_delta_chars = max_delta_chars
         # A timeout stops the CLI child (it used to leak) and surfaces as a
         # 'timeout ...' error_message so the rate is queryable (plan D6).
         self._timeout = timeout_seconds
-        # Reconciler is a second haiku call (owner D4); haiku needs no gate
-        # here — "a comparison between two short texts, mechanical".
-        self._reconcile_model = reconcile_model
+        # Reconciler is a second, haiku-routed call (owner D4); haiku needs no
+        # gate here — "a comparison between two short texts, mechanical".
         self._reconcile_enabled = reconcile_enabled
         # Deterministic episodic backstop (dv-7517 step 3). Kill switch:
         # EVALUATOR_EPISODIC_GUARD=false — kept for the first weeks in case
@@ -924,146 +951,45 @@ class EvaluatorService:
     async def _invoke_cli(
         self, prompt: str, backend: str = "claude", purpose: str = "extraction"
     ) -> str:
-        """Dispatch the extraction to whichever backend is active. ``purpose``
-        is only ever non-default for the screen's shadow call, so its cost is
-        separable in ``model_calls``."""
-        extra: Dict[str, Any] = {} if purpose == "extraction" else {"purpose": purpose}
-        if backend == "openai_codex":
-            return await self._invoke_codex_cli(prompt, **extra)
-        return await self._invoke_claude_cli(prompt, **extra)
+        """One extraction call through the model router; returns the op list
+        as a bare JSON array.
 
-    async def _invoke_reconcile_cli(self, prompt: str) -> str:
-        """The reconciler's transport: always Claude on the reconcile model
-        (haiku, owner D4): a verdict list needs no tools and no project
-        context, whatever backend extraction used."""
-        return await self._invoke_claude_cli(
-            prompt,
-            model=self._reconcile_model,
-            system_prompt=RECONCILE_SYSTEM_PROMPT,
-            purpose="reconcile",
-        )
-
-    async def _invoke_claude_cli(
-        self,
-        prompt: str,
-        model: Optional[str] = None,
-        system_prompt: Optional[str] = None,
-        purpose: str = "extraction",
-    ) -> str:
-        """One plain Claude call through the model router (dv-ef90).
-
-        The router strips the harness (no CLAUDE.md, skills, MCP servers or
-        tools; measured 2026-08-04, that floor was ~42k tokens on runs that
-        returned ``[]``), sends the prompt over stdin, stops the child on
-        timeout and records the call.
+        ``backend`` is the chat's agent backend, a hint for the route
+        (extraction follows the chat by default). The route's harness, model
+        and structured-output form are the router's business: it wraps and
+        strictifies :data:`EXTRACTION_SCHEMA` where a harness needs it, and
+        unwraps the answer (dv-781f). It also strips the harness (no
+        CLAUDE.md, skills, MCP servers or tools; measured 2026-08-04, that
+        floor was ~42k tokens on runs that returned ``[]``), stops the child
+        on timeout and records the call. ``purpose`` is only ever
+        non-default for the screen's shadow call, so its cost is separable
+        in ``model_calls``.
         """
         result = await get_router().complete(
             CallRequest(
                 purpose=purpose,
-                harness=CLAUDE_HARNESS,
+                backend=backend,
                 prompt=prompt,
-                model=model or self._model,
-                system_prompt=system_prompt or EXTRACTION_SYSTEM_PROMPT,
+                system_prompt=EXTRACTION_SYSTEM_PROMPT,
+                json_schema=EXTRACTION_SCHEMA,
                 timeout_seconds=self._timeout,
             )
         )
         return result.text
 
-    def _codex_output_schema(self) -> dict:
-        """JSON Schema matching validate_evaluator_output's op contract.
-
-        OpenAI structured outputs reject a top-level ``type: "array"`` schema
-        (the root must be an object), so the op list is wrapped under
-        ``extractions`` and unwrapped again in :meth:`_unwrap_codex_output`.
-        Every object node sets ``additionalProperties: False`` (OpenAI rule).
-
-        Every property of the op object is also listed in ``required`` — that
-        is the OTHER OpenAI strict-mode rule, and violating it is what made
-        every Codex evaluator run fail (dv-0c01). The server answered 400
-        ``invalid_json_schema``: "'required' is required to be supplied and to
-        be an array including every key in properties. Missing 'label'."
-        Optionality is expressed by the ``"null"`` member of each type union,
-        never by omitting the key from ``required``; ``validate_evaluator_output``
-        already treats an explicit null exactly like an absent field.
-        """
-        op_properties: dict = {
-            "op": {
-                "type": "string",
-                "enum": ["add", "supersede", "invalidate", "flag_conflict"],
-            },
-            # tier/content are nullable: the metadata-only ops
-            # (invalidate/flag_conflict) carry neither.
-            "tier": {
-                "type": ["string", "null"],
-                "enum": ["pinned", "general", None],
-            },
-            "content": {"type": ["string", "null"]},
-            "label": {"type": ["string", "null"]},
-            "supersedes_id": {"type": ["integer", "null"]},
-            "kind": {
-                "type": ["string", "null"],
-                "enum": ["user_fact", "conversation_result", None],
-            },
-            "source_ref": {"type": ["string", "null"]},
-            "target_id": {"type": ["integer", "null"]},
-            "ids": {
-                "type": ["array", "null"],
-                "items": {"type": "integer"},
-            },
-            "scope": {
-                "type": ["string", "null"],
-                "enum": ["private", "family", None],
-            },
-            # Screen path (dv-7e11); null/absent on the classic path.
-            "revokes": {"type": ["boolean", "null"]},
-            "conflicts_with_id": {"type": ["integer", "null"]},
-        }
-        return {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["extractions"],
-            "properties": {
-                "extractions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": list(op_properties),
-                        "properties": op_properties,
-                    },
-                }
-            },
-        }
-
-    @staticmethod
-    def _unwrap_codex_output(text: str) -> str:
-        """Unwrap the object-wrapped Codex response back to a bare JSON array.
-
-        Tolerates a response that is already a bare array (defensive)."""
-        try:
-            parsed = json.loads(text)
-        except (ValueError, TypeError):
-            return text
-        if isinstance(parsed, dict) and "extractions" in parsed:
-            return json.dumps(parsed["extractions"])
-        return text
-
-    async def _invoke_codex_cli(self, prompt: str, purpose: str = "extraction") -> str:
-        """One plain Codex call through the model router, constrained to the
-        evaluator JSON schema. The router runs it read-only in a throwaway
-        directory on ``codex_model``."""
+    async def _invoke_reconcile_cli(self, prompt: str) -> str:
+        """The reconciler's transport: the reconcile route (Claude haiku by
+        default, owner D4), whatever backend extraction used: a verdict list
+        needs no tools and no project context."""
         result = await get_router().complete(
             CallRequest(
-                purpose=purpose,
-                harness=CODEX_HARNESS,
+                purpose="reconcile",
                 prompt=prompt,
-                model=self._codex_model,
-                system_prompt="",
-                json_schema=self._codex_output_schema(),
+                system_prompt=RECONCILE_SYSTEM_PROMPT,
                 timeout_seconds=self._timeout,
             )
         )
-        return self._unwrap_codex_output(result.text) if result.text else "[]"
+        return result.text
 
     async def _handle_failure(
         self,

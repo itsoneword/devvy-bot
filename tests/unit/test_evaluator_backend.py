@@ -1,13 +1,31 @@
+"""The evaluator's model calls hold no route knowledge (dv-781f phase 2).
+
+Before phase 2 the evaluator wrapped its op schema for Codex
+(``_codex_output_schema``) and unwrapped the answer
+(``_unwrap_codex_output``). Wrapping, strictifying and unwrapping now live in
+``src/model_router/json_contract.py``; the evaluator passes one array-root
+``EXTRACTION_SCHEMA`` + a purpose (+ the chat backend as a hint) through
+``_invoke_cli`` and gets a bare JSON array back on any route. The dv-0c01
+strict-shape regression moved to ``tests/unit/test_json_contract.py``.
+"""
+
 import json
+import re
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
-from src.evaluator.service import EvaluatorService
+from src.evaluator.service import EXTRACTION_SYSTEM_PROMPT, EvaluatorService
+from src.model_router import CallResult, ModelRouter, set_router
+
+REPO = Path(__file__).resolve().parents[2]
+SERVICE = REPO / "src" / "evaluator" / "service.py"
 
 
 @pytest.fixture
 def service():
-    # These tests exercise schema/unwrap/dispatch only; run() deps unused.
+    # These tests exercise the model-call path only; run() deps unused.
     return EvaluatorService(
         memory_repo=None,
         writer=None,
@@ -16,118 +34,89 @@ def service():
     )
 
 
-def test_codex_output_schema_is_object_wrapping_array(service):
-    # OpenAI structured outputs reject a top-level array schema; the root must
-    # be an object. We wrap the op list under "extractions".
-    schema = service._codex_output_schema()
-    assert schema["type"] == "object"
-    assert "extractions" in schema["properties"]
-    # OpenAI strict structured outputs require additionalProperties:false on
-    # every object node (verified against the live API).
-    assert schema["additionalProperties"] is False
-    items = schema["properties"]["extractions"]["items"]
-    assert items["additionalProperties"] is False
-    assert items["properties"]["op"]["enum"] == [
+def test_evaluator_has_no_codex_specific_code_left():
+    source = SERVICE.read_text(encoding="utf-8")
+    for needle in (
+        "openai_codex",
+        "CODEX_HARNESS",
+        "_codex_output_schema",
+        "_unwrap_codex_output",
+        "_invoke_codex_cli",
+    ):
+        assert needle not in source, needle
+    # No branch on a harness/backend name either.
+    assert not re.search(r"backend\s*==\s*['\"]", source)
+
+
+def test_extraction_schema_is_one_route_agnostic_array_schema():
+    from src.evaluator.service import EXTRACTION_SCHEMA
+
+    assert EXTRACTION_SCHEMA["type"] == "array"
+    item = EXTRACTION_SCHEMA["items"]
+    assert item["type"] == "object"
+    # The caller's real contract: only ``op`` is required; the strict-mode
+    # "every key required + null" form is the router's business.
+    assert item["required"] == ["op"]
+    assert item["properties"]["op"]["enum"] == [
         "add",
         "supersede",
         "invalidate",
         "flag_conflict",
     ]
-    # Nullable: the metadata-only ops (invalidate/flag_conflict) carry no tier.
-    assert items["properties"]["tier"]["enum"] == ["pinned", "general", None]
-    # OpenAI strict mode also requires EVERY property to be listed in
-    # `required`; optionality is expressed by the "null" type member alone.
-    # Listing only {op, tier, content} made the server answer 400
-    # invalid_json_schema ("Missing 'label'") and every Codex evaluator run
-    # died with `Codex CLI failed (exit 1):` and an empty stderr (dv-0c01).
-    assert set(items["required"]) == set(items["properties"])
+    # The screen path's fields are part of the contract (dv-7e11).
+    assert {"revokes", "conflicts_with_id", "ids", "scope"} <= set(item["properties"])
 
 
-def test_unwrap_codex_output_extracts_array(service):
-    # The object-wrapped Codex response is unwrapped back to the bare array
-    # the validator expects.
-    wrapped = json.dumps(
-        {"extractions": [{"op": "add", "tier": "general", "content": "x"}]}
-    )
-    out = service._unwrap_codex_output(wrapped)
-    parsed = json.loads(out)
-    assert isinstance(parsed, list)
-    assert parsed[0]["op"] == "add"
-
-
-def test_unwrap_codex_output_passes_through_bare_array(service):
-    bare = json.dumps([{"op": "add", "tier": "general", "content": "y"}])
-    assert json.loads(service._unwrap_codex_output(bare)) == json.loads(bare)
-
-
-async def test_invoke_cli_dispatches_to_codex(service, monkeypatch):
-    calls = {}
-
-    async def fake_codex(prompt):
-        calls["codex"] = prompt
-        return json.dumps([{"op": "add", "tier": "general", "content": "x"}])
-
-    async def fake_claude(prompt):
-        calls["claude"] = prompt
-        return "[]"
-
-    monkeypatch.setattr(service, "_invoke_codex_cli", fake_codex)
-    monkeypatch.setattr(service, "_invoke_claude_cli", fake_claude)
-
-    out = await service._invoke_cli("PROMPT", backend="openai_codex")
-    assert "codex" in calls and "claude" not in calls
-    assert json.loads(out)[0]["op"] == "add"
-
-
-def test_codex_schema_every_op_field_is_nullable_except_op(service):
-    """Strict mode forces every field into `required`, so every field that a
-    metadata-only op does not carry MUST accept null — otherwise requiring
-    them would make `invalidate`/`flag_conflict` unrepresentable."""
-    items = service._codex_output_schema()["properties"]["extractions"]["items"]
-    for name, spec in items["properties"].items():
-        if name == "op":
-            assert spec["type"] == "string"
-            continue
-        assert "null" in spec["type"], name
-
-
-async def test_invoke_codex_cli_asks_the_router_with_schema_and_model(
-    service, monkeypatch
-):
-    """Extraction on Codex is a plain router call: explicit model, the op
-    schema, and the object wrapper stripped from the answer."""
-    from unittest.mock import AsyncMock
-
-    from src.model_router import CallResult, ModelRouter, set_router
-
-    caller = AsyncMock(return_value=CallResult(text='{"extractions": []}'))
-    set_router(ModelRouter(plain_callers={"openai_codex": caller}))
-    try:
-        result = await service._invoke_codex_cli("PROMPT")
-    finally:
-        set_router(None)
-
-    request = caller.await_args.args[0]
-    assert request.purpose == "extraction" and request.harness == "openai_codex"
-    assert request.model == "openai-codex/gpt-6-sol"
-    assert request.json_schema == service._codex_output_schema()
-    assert json.loads(result) == []
-
-
-async def test_invoke_claude_cli_asks_the_router(service):
-    from unittest.mock import AsyncMock
-
-    from src.model_router import CallResult, ModelRouter, set_router
-
+async def test_claude_extraction_call_unchanged(service):
+    """Claude extraction is today's call: Sonnet, the extraction system
+    prompt, the prompt as is, no output_format (``json: validate``)."""
     caller = AsyncMock(return_value=CallResult(text="[]"))
     set_router(ModelRouter(plain_callers={"claude": caller}))
     try:
-        assert await service._invoke_claude_cli("PROMPT") == "[]"
-        await service._invoke_reconcile_cli("PROMPT")
+        out = await service._invoke_cli("PROMPT", backend="claude")
+        await service._invoke_cli(
+            "PROMPT2", backend="claude", purpose="screen_extraction"
+        )
+        await service._invoke_reconcile_cli("RPROMPT")
     finally:
         set_router(None)
 
-    extraction, reconcile = (c.args[0] for c in caller.await_args_list)
-    assert extraction.purpose == "extraction" and extraction.model == "sonnet"
-    assert reconcile.purpose == "reconcile" and reconcile.model == "haiku"
+    assert json.loads(out) == []
+    extraction, screen, reconcile = (c.args[0] for c in caller.await_args_list)
+    assert extraction.purpose == "extraction"
+    assert (extraction.harness, extraction.model) == ("claude", "sonnet")
+    assert extraction.prompt == "PROMPT"
+    assert extraction.system_prompt == EXTRACTION_SYSTEM_PROMPT
+    assert extraction.json_schema is None
     assert extraction.timeout_seconds == service._timeout
+    assert screen.purpose == "screen_extraction" and screen.json_schema is None
+    assert reconcile.purpose == "reconcile" and reconcile.model == "haiku"
+
+
+async def test_codex_extraction_gets_the_strict_schema_and_a_bare_array(service):
+    """On Codex the router (not the evaluator) sends a strict object-root
+    schema and unwraps the answer back to the bare array."""
+    seen = []
+
+    async def codex(request):
+        seen.append(request)
+        schema = request.json_schema
+        (key,) = schema["required"]
+        return CallResult(
+            text=json.dumps(
+                {key: [{"op": "add", "tier": "general", "content": "x", "label": None}]}
+            )
+        )
+
+    set_router(ModelRouter(plain_callers={"openai_codex": codex}))
+    try:
+        out = await service._invoke_cli("PROMPT", backend="openai_codex")
+    finally:
+        set_router(None)
+
+    (request,) = seen
+    assert request.purpose == "extraction"
+    assert request.model == "openai-codex/gpt-6-sol"
+    assert request.json_schema["type"] == "object"
+    assert request.json_schema["additionalProperties"] is False
+    assert json.loads(out) == [{"op": "add", "tier": "general", "content": "x"}]

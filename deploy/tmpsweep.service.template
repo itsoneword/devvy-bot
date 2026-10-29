@@ -1,0 +1,20 @@
+-- rendered by scripts/render_deploy.py; do not install this file directly --
+# Opt-in: enable tmpsweep.timer by hand (docs/systemd-operations.md, dv-1a02).
+[Unit]
+Description=tmpsweep — remove our stale /tmp entries (tmpfs = RAM)
+Documentation=file:@DEVVY_ROOT@/docs/systemd-operations.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=@DEVVY_ROOT@
+ExecStart=@DEVVY_ROOT@/scripts/tmpsweep --notify
+Environment=PATH=@SERVICE_PATH@
+
+# No PrivateTmp/ProtectSystem (SECURITY.md section 7 exception): PrivateTmp
+# would hide the real /tmp, the one thing this unit exists to sweep, and the
+# user manager does not enforce mount hardening anyway (scripts/bgjob).
+NoNewPrivileges=yes
+TimeoutStartSec=600
+MemoryMax=256M
+Nice=10
+IOSchedulingClass=idle

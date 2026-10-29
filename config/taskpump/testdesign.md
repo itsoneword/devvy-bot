@@ -29,7 +29,7 @@ The full analysis is at `docs/research/{{TASK_DIR}}/analysis.md` in this
 worktree. Read it first: it names the files, functions and test files.
 
 {{PHASE}}
-The owner's answers (a `### @user` comment near the end of the task file) are
+{{INTERRUPTED}}The owner's answers (a `### @user` comment near the end of the task file) are
 binding; where one contradicts the plan, the answer wins.
 
 ## What you must do
@@ -39,6 +39,10 @@ binding; where one contradicts the plan, the answer wins.
    behaviour the scenario names through the code's real entry point, the way
    the neighbouring tests do — follow their idiom, fixtures and file layout.
    Prefer adding to the existing test file for that code over a new file.
+   For a user flow: one end-to-end test through the real entry point (a
+   browser test if the repo has that idiom) plus one bad-sequence /
+   existing-data case: a second account with existing rows, saving the same
+   thing twice, adding a duplicate.
 2. **Then add any obvious scenario you judge missing** (a likely regression,
    the empty/zero case) — at most 3, each listed as `added:` in the report.
 3. **Run them.** {{TEST_RUN}}
@@ -59,6 +63,9 @@ SCENARIOS
 - <approved scenario, short> → <test function name> → fails
 - <…> → <test name> → passes
 - added: <your extra scenario> → <test name> → fails
+
+CHANGED
+CHANGED <protected test path> — <reason>   (only on a rerun that changed one)
 
 TESTS
 <one line, e.g. "7 tests: 5 fail now (new behaviour), 2 pass (guards)">

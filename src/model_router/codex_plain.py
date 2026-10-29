@@ -36,11 +36,16 @@ class CodexPlainCaller:
             "-C",
             str(workdir),
             "-m",
-            request.model.removeprefix(_MODEL_PREFIX),
+            # Never None here: the router resolves a model for every Codex route.
+            (request.model or "").removeprefix(_MODEL_PREFIX),
             "-s",
             "read-only",
             "--skip-git-repo-check",
         ]
+        # One `-i` per image (dv-9133). The flag takes several values, so a
+        # later flag must close it before the `-`: `-o` always does.
+        for image in request.images:
+            argv += ["-i", str(image)]
         if request.json_schema is not None:
             schema_path = workdir / "schema.json"
             schema_path.write_text(json.dumps(request.json_schema))

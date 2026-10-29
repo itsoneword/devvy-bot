@@ -58,13 +58,17 @@ logger = structlog.get_logger()
 
 
 def augment_prompt_with_images(prompt: str, images: Any) -> str:
-    """Reference attached image files so Claude's Read tool can view them."""
+    """Reference attached image files so Claude's view_image tool can show them.
+
+    Not ``Read``: the policy denies Read of raster files (dv-275f).
+    """
     if not images:
         return prompt
     paths = "\n".join(f"- {p}" for p in images)
     return (
         f"{prompt}\n\n"
-        "Attached image file(s) — use the Read tool to view them:\n"
+        "Attached image file(s) — use the view_image tool to look at them "
+        "(several at once: one `paths` call gives a side-by-side sheet):\n"
         f"{paths}"
     )
 

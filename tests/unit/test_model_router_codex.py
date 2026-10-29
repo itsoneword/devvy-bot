@@ -157,3 +157,41 @@ async def test_timeout_kills_the_process_group_and_is_labelled(monkeypatch):
 
     assert killed == [(4242, signal.SIGKILL)]
     process.wait.assert_awaited()
+
+
+# --- dv-9133: images ride along as `-i <file>` -------------------------------
+
+
+async def test_images_go_as_one_dash_i_each_and_the_prompt_stays_on_stdin(
+    monkeypatch, tmp_path
+):
+    """`codex exec -i, --image <FILE>...` attaches images to the prompt. Each
+    image gets its own `-i`; the `-` (prompt over stdin) is never swallowed as
+    an image value, so a flag other than `-i` sits right before it."""
+    a = tmp_path / "v1-dark.png"
+    b = tmp_path / "ref-dark.png"
+    a.write_bytes(b"\x89PNG")
+    b.write_bytes(b"\x89PNG")
+    captured = {}
+    process = _FakeProcess()
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = list(args)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    await CodexPlainCaller()(_request(purpose="design_critic", images=(str(a), str(b))))
+
+    args = captured["args"]
+    assert args.count("-i") == 2
+    values = [args[i + 1] for i, tok in enumerate(args) if tok == "-i"]
+    assert values == [str(a), str(b)]
+    assert args[-1] == "-"
+    assert args[-3].startswith("-") and args[-3] != "-i"
+    assert process.received_input == b"PROMPT"
+
+
+def test_no_images_no_dash_i(tmp_path):
+    argv = CodexPlainCaller().argv(_request(), tmp_path)
+    assert "-i" not in argv and "--image" not in argv

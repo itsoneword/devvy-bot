@@ -32,6 +32,7 @@ import structlog
 
 from src.claude.tool_context import TurnContext
 from src.security import policy
+from src.security.ask_explain import AskContext
 
 logger = structlog.get_logger()
 
@@ -127,7 +128,9 @@ class PolicyGate:
                 "which is not available"
             )
         approved = await self._confirmation_manager.request(
-            decision.reason, decision.preview
+            decision.reason,
+            decision.preview,
+            context=AskContext(profile=ctx.profile_slug),
         )
         if not approved:
             logger.warning(

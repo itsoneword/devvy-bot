@@ -35,9 +35,7 @@ def _run(command: str, env: dict) -> subprocess.CompletedProcess:
 
 
 def test_redact_env_merges_streams_keeps_exit_code_longest_first() -> None:
-    wrapped = BashBox.wrap_env(
-        'echo "out=$A"; echo "err=$B" >&2; exit 3', ("A", "B")
-    )
+    wrapped = BashBox.wrap_env('echo "out=$A"; echo "err=$B" >&2; exit 3', ("A", "B"))
     res = _run(wrapped, {"A": LONG, "B": SHORT})
     assert res.returncode == 3
     assert "out=<redacted>" in res.stdout

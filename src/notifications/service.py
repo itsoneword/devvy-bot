@@ -6,6 +6,7 @@ through the Telegram bot API with rate limiting (1 msg/sec per chat).
 
 import asyncio
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -83,6 +84,10 @@ class NotificationService:
         # again) and the next job pins a second. Loaded in start().
         self._pin_store = pin_store
         self._pinned_messages: dict[tuple[int, str], int] = {}
+        # (chat_id, pin_as) -> UTC date (YYYY-MM-DD) the current pin message was
+        # created. Persisted as pinned_messages.updated_at; gates the daily
+        # repin so a restart or a retry never repins twice in a day (dv-6646).
+        self._pin_dates: dict[tuple[int, str], str] = {}
         self._running = False
         self._sender_task: Optional[asyncio.Task[None]] = None
 
@@ -91,9 +96,11 @@ class NotificationService:
             return
         try:
             self._pinned_messages = await self._pin_store.load_all()
+            self._pin_dates = await self._pin_store.load_dates()
         except Exception as e:
             logger.warning("pin state unreadable, starting empty", error=str(e))
             self._pinned_messages = {}
+            self._pin_dates = {}
 
     async def _save_pin(self, key: tuple[int, str]) -> None:
         """Write one key's current state (present = upsert, absent = delete)."""
@@ -241,6 +248,9 @@ class NotificationService:
                 if is_md
                 else self._split_message(text)
             )
+            # An image-only reply (dv-ff39) has no text; Telegram rejects an
+            # empty message and the error would skip the images.
+            chunks = [c for c in chunks if c.strip()]
 
             for chunk in chunks:
                 if is_md:
@@ -394,6 +404,14 @@ class NotificationService:
                 await self._save_pin(key)
             return
 
+        if (
+            existing
+            and event.repin
+            and self._pin_dates.get(key) != datetime.now(UTC).strftime("%Y-%m-%d")
+            and await self._repin(key, existing, text, thread_id)
+        ):
+            return
+
         if existing:
             try:
                 await self.bot.edit_message_text(
@@ -427,13 +445,50 @@ class NotificationService:
                 {"message_thread_id": thread_id} if thread_id is not None else {}
             )
             msg = await self.bot.send_message(chat_id=chat_id, text=text, **topic_kw)
-            self._pinned_messages[key] = msg.message_id
+            self._remember_pin(key, msg.message_id)
             await self._save_pin(key)
         except TelegramError as e:
             if reraise and thread_id is not None:
                 raise
             logger.warning("pinned status update failed", chat_id=chat_id, error=str(e))
             return
+        await self._pin_new(chat_id, msg.message_id, thread_id)
+
+    def _remember_pin(self, key: tuple[int, str], message_id: int) -> None:
+        self._pinned_messages[key] = message_id
+        self._pin_dates[key] = datetime.now(UTC).strftime("%Y-%m-%d")
+
+    async def _repin(
+        self,
+        key: tuple[int, str],
+        old_id: int,
+        text: str,
+        thread_id: Optional[int],
+    ) -> bool:
+        """Daily repin (dv-6646): the live status goes out as a NEW message at
+        the bottom, gets pinned, the old one is unpinned. True = done; False =
+        the send failed and the old pin stays (caller edits it in place)."""
+        chat_id = key[0]
+        topic_kw: dict[str, Any] = (
+            {"message_thread_id": thread_id} if thread_id is not None else {}
+        )
+        try:
+            msg = await self.bot.send_message(chat_id=chat_id, text=text, **topic_kw)
+        except TelegramError as e:
+            logger.warning("status repin failed, keeping old pin", error=str(e))
+            return False
+        self._remember_pin(key, msg.message_id)
+        await self._save_pin(key)
+        await self._pin_new(chat_id, msg.message_id, thread_id)
+        try:
+            await self.bot.unpin_chat_message(chat_id=chat_id, message_id=old_id)
+        except TelegramError:
+            pass
+        return True
+
+    async def _pin_new(
+        self, chat_id: int, message_id: int, thread_id: Optional[int]
+    ) -> None:
         if thread_id is not None:
             # A new pin in a bot-owned reports topic clears whatever else is
             # pinned there (e.g. the stray 15.10 pin in Pump), so the topic
@@ -447,7 +502,7 @@ class NotificationService:
         try:
             await self.bot.pin_chat_message(
                 chat_id=chat_id,
-                message_id=msg.message_id,
+                message_id=message_id,
                 disable_notification=True,
             )
         except TelegramError as e:

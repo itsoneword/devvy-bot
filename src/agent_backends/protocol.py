@@ -55,7 +55,9 @@ _CODEX_PINNED_MODELS = (
     _CODEX_DEFAULT_MODEL,
 )
 
-_CLAUDE_TIERS = ("sonnet", "opus")
+# The Claude CLI tier aliases /model and scheduled turns accept (dv-d63d:
+# fable). Anything else is stored as the "claude" config-default sentinel.
+_CLAUDE_TIERS = ("sonnet", "opus", "fable")
 
 
 def codex_supported_models() -> frozenset:

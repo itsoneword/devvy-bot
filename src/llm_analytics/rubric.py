@@ -317,8 +317,7 @@ def build_batch_judge_prompt(
                 f"[{c.role}] {c.text}" for c in turn.context_turns
             )
         tools_block = ", ".join(turn.tool_calls) if turn.tool_calls else "(none)"
-        blocks.append(
-            f"""### TURN {turn.message_id}
+        blocks.append(f"""### TURN {turn.message_id}
 
 Prior turns (context only, do not score these):
 {context_block}
@@ -327,8 +326,7 @@ Prior turns (context only, do not score these):
 
 [assistant] {turn.response}
 
-Tool calls made while producing this response: {tools_block}"""
-        )
+Tool calls made while producing this response: {tools_block}""")
     turns_block = "\n\n---\n\n".join(blocks)
     ids = ", ".join(str(t.message_id) for t in turns)
 

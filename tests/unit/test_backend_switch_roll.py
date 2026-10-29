@@ -375,11 +375,13 @@ async def test_full_window_seed_lists_tool_names_per_turn(storage, tmp_path):
             "SELECT message_id FROM messages WHERE prompt='find a pan'"
         )
         first_id = (await cur.fetchone())[0]
-        for name in ["WebSearch", "WebFetch", "WebSearch", "product_find"]:
+        for seq, name in enumerate(
+            ["WebSearch", "WebFetch", "WebSearch", "product_find"]
+        ):
             await conn.execute(
-                "INSERT INTO tool_calls (session_id, message_id, tool_name, "
-                "input_short) VALUES ('s', ?, ?, '{\"secret\": \"input\"}')",
-                (first_id, name),
+                "INSERT INTO tool_calls (session_id, message_id, seq, tool, "
+                "input, status) VALUES ('s', ?, ?, ?, '{\"secret\": \"input\"}', 'ok')",
+                (first_id, seq, name),
             )
         await conn.commit()
 

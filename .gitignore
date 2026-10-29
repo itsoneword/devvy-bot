@@ -177,6 +177,8 @@ uploads/
 config/mcp.json
 # Personal deployment config, not source. Ship config/profiles.example.yaml instead (dv-2f70).
 config/profiles.yaml
+# Owner overlay on the built-in plain-call routes (dv-781f); ship config/models.example.yaml.
+config/models.yaml
 
 # gg derived graph
 docs/planning/items/.graph.json

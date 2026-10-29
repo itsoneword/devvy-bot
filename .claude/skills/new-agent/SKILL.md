@@ -41,6 +41,9 @@ Rules you enforce, and say so if the user asks for the opposite:
   configure.
 - Running code in another project = that project's path in `extra_dirs` + a
   persona line saying where the project lives and how to run it.
+- An agent that builds or changes a service gets a persona line: "follow
+  `docs/standards/observability.md` in the devvy repo" (events, LLM usage,
+  spans, health).
 
 ## 2. Scaffold
 

@@ -131,10 +131,32 @@ rows before trusting it).
 | Fact-quality check | `src/evaluator/fact_quality.py` | `0 7 * * *`, off unless `FACT_QUALITY_CHECK_ENABLED` | `claude` CLI, haiku |
 | Reminders / items | `scheduled_jobs` table, `src/scheduler/` | per row | `deliver=agent`: an agent turn; `message`: none |
 | Task pump | user `taskpump.timer` → `scripts/taskpump tick` | every 10 min | tick: none; spawns agent jobs (`docs/taskpump.md`) |
+| /tmp sweep | user `tmpsweep.timer` → `scripts/tmpsweep --notify` | every 15 min; sweeps only when /tmp >70% or last sweep ≥23h | none |
 | Your own host jobs (backups, monitors) | user crontab or systemd timers | as you set them | outside the bot |
 
 `src/evaluator/refresh.py` (`ContextRefreshService`) is constructed in
 `main.py` but never called.
+
+### /tmp sweep (dv-1a02)
+
+/tmp is tmpfs (RAM, user quota); when it fills, the CLI fails with EDQUOT.
+`scripts/tmpsweep` removes our top-level entries with nothing modified for
+12h. It keeps sockets, `*.lock`, `codex-*`, anything a live process of ours
+has open or as cwd, and sweeps only the children of `pytest-of-<user>`,
+`claude-<uid>/<slug>/` and `claude_bot_files`. One devops line when >500 MB
+was freed or /tmp is still >70% (that alert at most every 6h). Background
+jobs get `TMPDIR=<job dir>/tmp` (`scripts/bgjob`), removed when run.sh ends.
+
+Install (read `~/devops/SECURITY.md` first), in the live checkout:
+
+```bash
+python3 scripts/render_deploy.py
+cp deploy/rendered/tmpsweep.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now tmpsweep.timer
+scripts/tmpsweep --dry-run          # eyeball what would go
+python3 scripts/intrusion_watch.py --accept
+~/devops/security-audit.sh quick
+```
 
 ## Troubleshooting
 

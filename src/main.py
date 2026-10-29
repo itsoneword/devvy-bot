@@ -5,7 +5,6 @@ import asyncio
 import logging
 import signal
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -42,7 +41,6 @@ from src.storage.facade import Storage
 from src.storage.hold_repository import HoldStore
 from src.storage.model_calls import ModelCallRepository
 from src.storage.session_storage import SQLiteSessionStorage
-from src.storage.tool_calls import ToolCallRepository
 from src.utils.log_redaction import install_secret_redaction
 from src.utils.turn_locks import report_dropped_messages
 
@@ -136,6 +134,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         config.database_url,
         tasks_dir=config.deviz_tasks_dir,
         user_database_url=config.user_database_url,
+        trace_retention_days=config.trace_retention_days,
     )
     await storage.initialize()
 
@@ -269,8 +268,6 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         writer=memory_writer,
         token_tracker=token_tracker,
         db=storage.db_manager,
-        model=config.evaluator_model,
-        codex_model=config.evaluator_codex_model,
         max_delta_chars=config.evaluator_max_delta_chars,
         timeout_seconds=config.evaluator_timeout_seconds,
         episodic_guard_enabled=config.evaluator_episodic_guard,
@@ -296,7 +293,11 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # Selects pinned + FTS-matched general facts per agent_id each turn.
     from src.storage.memory_repository import MemoryRetriever
 
-    memory_retriever = MemoryRetriever(storage.memory_repository)
+    memory_retriever = MemoryRetriever(
+        storage.memory_repository,
+        general_cap=config.memory_snapshot_general_cap,
+        pointer_cap=config.memory_pointer_cap,
+    )
 
     # Profile registry (multi-persona routing). Unset = single-profile mode.
     profile_registry = None
@@ -352,7 +353,10 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         profile_registry=profile_registry,
         default_composer=prompt_composer,
         facts_budget_chars=config.bundle_facts_budget_chars,
+        general_cap=config.memory_snapshot_general_cap,
+        pointer_cap=config.memory_pointer_cap,
         sandbox_default=config.sandbox_enabled,
+        sweep_wait_seconds=config.memory_sweep_wait_seconds,
     )
 
     # Create Claude SDK manager and integration facade
@@ -486,6 +490,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     from src.model_router.claude_plain import ClaudePlainCaller
     from src.model_router.codex_plain import CodexPlainCaller
     from src.model_router.openrouter_plain import OpenRouterPlainCaller
+    from src.model_router.routes import boot_call_routes, legacy_route_models
     from src.model_router.types import CLAUDE_HARNESS, CODEX_HARNESS, OPENROUTER_HARNESS
     from src.model_router.typesafe_decide import (
         TypesafeDecider,
@@ -498,21 +503,28 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         profile = profile_registry.get_by_working_dir(working_dir)
         return profile.slug if profile is not None else None
 
+    # Plain-call routes (dv-781f): built-in rows < the deprecated scalar
+    # settings < models.yaml. A bad file never stops the boot; the owner is
+    # told once the bot can send (run_application).
+    call_routes, model_routes_alert = boot_call_routes(
+        config.model_routes_path, legacy=legacy_route_models(config)
+    )
     model_router = ModelRouter(
         backends=backends,
+        call_routes=call_routes,
         plain_callers={
             CLAUDE_HARNESS: ClaudePlainCaller(cli_path=config.claude_cli_path or None),
             CODEX_HARNESS: CodexPlainCaller(codex_bin=codex_integration.codex_bin),
             OPENROUTER_HARNESS: OpenRouterPlainCaller(),
         },
         recorder=ModelCallRepository(storage.db_manager),
+        tool_calls=storage.tool_calls,
         versions=HarnessVersions(
             claude_path=config.claude_cli_path or None,
             codex_bin=codex_integration.codex_bin,
         ),
         profile_resolver=_profile_slug_for,
         decider=TypesafeDecider(),
-        tool_calls=ToolCallRepository(storage.db_manager),
     )
     set_router(model_router)
     # dv-e690: the key lives in Settings (scrubbed from os.environ), so hand
@@ -569,6 +581,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "evaluator_service": evaluator_service,
         "refresh_service": refresh_service,
         "bundle_provider": bundle_provider,
+        "model_routes_alert": model_routes_alert,
         # Separate writer instance for the in-session `remember` tool: same
         # repo and the same duplicate suppression, but stamped
         # source="agent_tool" and counted separately from the batch evaluator.
@@ -636,28 +649,15 @@ async def run_application(app: Dict[str, Any]) -> None:
             )
             if profile is None:
                 return
-            working_dir = str(profile.working_dir)
-            sessions = await storage.sessions.get_sessions_by_project(working_dir)
-            session = next((s for s in sessions if s.user_id == user_id), None)
-            if session is None:
-                return  # no conversation yet — nothing for the agent to see
-            window_id = None
-            if _notify_window_repo is not None:
-                state = await _notify_window_repo.get_or_create(
-                    user_id, profile.working_dir
-                )
-                window_id = state.window_id
-            from src.storage.models import MessageModel
+            from src.storage.delivered import persist_delivered_text
 
-            await storage.messages.save_message(
-                MessageModel(
-                    session_id=session.session_id,
-                    user_id=user_id,
-                    timestamp=datetime.now(UTC),
-                    prompt="",
-                    response=f"[memory system] {message}",
-                    window_id=window_id,
-                )
+            await persist_delivered_text(
+                storage,
+                _notify_window_repo,
+                user_id,
+                profile.working_dir,
+                prompt="",
+                response=f"[memory system] {message}",
             )
 
         async def _notify_user(
@@ -694,6 +694,11 @@ async def run_application(app: Dict[str, Any]) -> None:
         refresh_service = app.get("refresh_service")
         if refresh_service:
             refresh_service._notify = _notify_user
+
+        # A bad models.yaml booted on the built-in routes (dv-781f): say so.
+        if app.get("model_routes_alert"):
+            for chat_id in config.notification_chat_ids or []:
+                await _notify_user(chat_id, app["model_routes_alert"])
 
         # Start event bus
         await event_bus.start()
@@ -736,6 +741,33 @@ async def run_application(app: Dict[str, Any]) -> None:
         bot_task = asyncio.create_task(bot.start())
         tasks.append(bot_task)
 
+        # Stale-fact sweep (dv-cf07; was the dv-4c6f report-only pass). Not
+        # scheduler-bound: window rotations (refresh_window / /new, via
+        # bot_data) and the bundle valve call it; the scheduler below only
+        # adds the weekly all-scope run.
+        from src.consolidation.service import ConsolidationService
+
+        async def _notify_owner(message: str) -> None:
+            for chat_id in config.notification_chat_ids or []:
+                await _notify_user(chat_id, message)
+
+        consolidation_service = ConsolidationService(
+            memory_repo=storage.memory_repository,
+            db=storage.db_manager,
+            notify_callback=_notify_owner,
+            board=storage.tasks,
+            report_dir=config.data_layout.consolidation_dir,
+        )
+        app["consolidation_service"] = consolidation_service
+        bot.deps["consolidation_service"] = consolidation_service
+
+        # Bundle (dv-5e2a): a facts snapshot over budget requests a sweep
+        # instead of being truncated, and a new window's snapshot waits for
+        # the rotation's sweep.
+        bundle_provider = app.get("bundle_provider")
+        if bundle_provider is not None:
+            bundle_provider.attach_consolidation(consolidation_service)
+
         # Scheduler (if enabled) — created before the API server so the
         # /internal/schedule endpoints can register jobs live.
         if features.scheduler_enabled:
@@ -747,30 +779,8 @@ async def run_application(app: Dict[str, Any]) -> None:
             await scheduler.start()
             logger.info("Job scheduler enabled")
 
-            # Weekly memory consolidation pass (dv-4c6f): report-only, native
-            # async job — a report generator needs DB reads + one haiku call,
-            # not an agent turn with tools.
-            from src.consolidation.service import ConsolidationService
-
-            async def _notify_owner(message: str) -> None:
-                for chat_id in config.notification_chat_ids or []:
-                    await _notify_user(chat_id, message)
-
-            consolidation_service = ConsolidationService(
-                memory_repo=storage.memory_repository,
-                db=storage.db_manager,
-                notify_callback=_notify_owner,
-                board=storage.tasks,
-                report_dir=config.data_layout.consolidation_dir,
-            )
-            app["consolidation_service"] = consolidation_service
-
-            # Wire the bundle pressure valve (dv-5e2a): a facts snapshot over
-            # budget requests a consolidation run instead of being truncated.
-            bundle_provider = app.get("bundle_provider")
-            if bundle_provider is not None:
-                bundle_provider.attach_consolidation(consolidation_service)
-
+            # Weekly sweep over every scope (dv-cf07), native async job:
+            # catches scopes that rarely rotate.
             async def _weekly_consolidation() -> None:
                 try:
                     await consolidation_service.run()
@@ -792,7 +802,6 @@ async def run_application(app: Dict[str, Any]) -> None:
                 enabled=config.fact_quality_check_enabled,
                 cron_expression=config.fact_quality_check_cron,
                 notify_callback=_notify_owner,
-                model=config.fact_quality_check_model,
             )
 
             # Daily OpenRouter backstop (dv-d2f6): our recorded OR total vs
@@ -805,19 +814,16 @@ async def run_application(app: Dict[str, Any]) -> None:
                 notify_callback=_notify_owner,
             )
 
-        # Harness trace retention (dv-2260): tool_calls older than 90 days.
-        from src.storage.tool_calls import RETENTION_DAYS
+        # devvy -> Phoenix (dv-87d8): settled model_calls + tool_calls rows as
+        # OpenInference spans, every minute. Off while PHOENIX_URL is unset.
+        from src.observability.phoenix import register_phoenix_export
 
-        _trace_store = ToolCallRepository(storage.db_manager)
-
-        async def _prune_tool_calls() -> None:
-            try:
-                n = await _trace_store.prune(RETENTION_DAYS)
-                logger.info("tool_calls pruned", rows=n, days=RETENTION_DAYS)
-            except Exception as e:
-                logger.error("tool_calls prune failed", error=str(e))
-
-        scheduler.add_native_job("tool-calls-prune", "30 4 * * *", _prune_tool_calls)
+        register_phoenix_export(
+            scheduler,
+            storage.db_manager,
+            config.phoenix_url,
+            project=config.phoenix_project,
+        )
 
         # Wire in-process agent MCP tools (schedule/notify/task). Done here —
         # not at SDK-manager construction — because the scheduler is created
@@ -839,7 +845,22 @@ async def run_application(app: Dict[str, Any]) -> None:
                 audit_memory_writer=app.get("audit_memory_writer"),
                 user_data=storage.user_data,
                 user_timezone=config.user_timezone,
+                storage=storage,
+                window_repo=_notify_window_repo,
             )
+
+            # restart_bot (dv-da50): drain on the one process-wide TurnLocks
+            # the orchestrator and AgentHandler both hold, then SIGTERM.
+            from src.bot.orchestration.commands.system import request_restart
+
+            _restart_locks = app["agent_handler"].turn_locks
+
+            async def _request_restart(reason: str, ctx: Any) -> str:
+                return await request_restart(
+                    _restart_locks, reason=reason, user_id=ctx.user_id
+                )
+
+            agent_services.request_restart = _request_restart
             if config.hireli_mcp_url and config.hireli_service_key:
                 from src.claude.hireli_tools import HireliClient
 
@@ -1077,6 +1098,7 @@ async def run_application(app: Dict[str, Any]) -> None:
                     profile_registry=bot.deps.get("profile_registry"),
                     confirmation_manager=bot.deps.get("confirmation_manager"),
                     model_calls=ModelCallRepository(storage.db_manager),
+                    tool_calls=storage.tool_calls,
                 )
             )
             tasks.append(api_task)

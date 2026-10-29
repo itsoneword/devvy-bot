@@ -7,9 +7,18 @@ chat turns, asks sent to the owner over the bot, and a `model_calls` row.
 
 Usage:
   agentjob --profile devops --prompt-file prompt.txt [--cwd DIR] [--model sonnet]
-           [--name NAME] [--purpose background_job|monitor]
+           [--route pump_review] [--name NAME] [--purpose background_job|monitor]
+           [--session-file PATH]
+           [--ask-context '{"task_id": ..., "task_title": ..., "stage": ...}']
+  agentjob --print-route [--route NAME] [--model M]   # resolved route as JSON
 
-The answer goes to stdout; the exit code is 0 on success. Needs the bot's
+The job's harness, provider and model come from the `jobs:` rows of
+config/models.yaml (dv-d63d; read here, so an edit applies to the next job).
+`--route` names the row (default: background_job, or monitor for
+--purpose monitor); `--model` beats it only on the Claude subscription.
+
+The answer goes to stdout; the exit code is 0 on success, 3 when work the job
+started was still running at its end (dv-b6dd). Needs the bot's
 poetry environment; re-executes itself in it when started with another python.
 """
 
@@ -62,18 +71,102 @@ import structlog  # noqa: E402
 # stderr, including the loader's and the registry's.
 structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
 
-from src.model_router.job import JobSpec, bot_link_from_env, run_job  # noqa: E402
+import json  # noqa: E402
+
+from src.model_router.job import (  # noqa: E402
+    JobSpec,
+    bot_link_from_env,
+    parse_ask_context,
+    pump_worktree_root,
+    run_job,
+)
+from src.model_router.routes import process_call_routes  # noqa: E402
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--profile", required=True, help="profile slug (policy flags)")
-    ap.add_argument("--prompt-file", required=True, type=Path)
+    ap.add_argument("--profile", help="profile slug (policy flags)")
+    ap.add_argument("--prompt-file", type=Path)
     ap.add_argument("--cwd", type=Path, default=None, help="default: the profile's")
-    ap.add_argument("--model", default="sonnet")
+    ap.add_argument(
+        "--model",
+        default=None,
+        help="explicit Claude model; default: the job route's (models.yaml jobs:)",
+    )
+    ap.add_argument(
+        "--route",
+        default=None,
+        help="job route row in models.yaml jobs: (default: background_job, "
+        "or monitor for --purpose monitor)",
+    )
+    ap.add_argument(
+        "--print-route",
+        action="store_true",
+        help="print the resolved route as JSON and exit",
+    )
     ap.add_argument("--name", default="job")
     ap.add_argument("--purpose", default="background_job", choices=["background_job", "monitor"])
+    ap.add_argument(
+        "--setting-sources",
+        default="user,project",
+        help="comma list of CLI setting sources; taskpump stages pass 'project'",
+    )
+    ap.add_argument(
+        "--ask-context",
+        default=None,
+        help="JSON {task_id, task_title, stage} for the ask explainer (dv-781f)",
+    )
+    ap.add_argument(
+        "--session-file",
+        type=Path,
+        default=None,
+        help="write the turn's session id here (LLM Analytics job link)",
+    )
+    ap.add_argument(
+        "--ignore-quota",
+        action="store_true",
+        help="start even while a usage limit is recorded (bgjob run --force)",
+    )
     args = ap.parse_args()
+
+    try:
+        route = process_call_routes().resolve_job(
+            args.route or args.purpose, model=args.model
+        )
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    if args.print_route:
+        print(
+            json.dumps(
+                {
+                    "harness": route.harness,
+                    "provider": route.provider,
+                    "model": route.model,
+                }
+            )
+        )
+        return 0
+    if not args.profile or not args.prompt_file:
+        ap.error("--profile and --prompt-file are required")
+    print(
+        f"agentjob: route={args.route or args.purpose} "
+        f"{route.harness}/{route.provider}/{route.model}",
+        file=sys.stderr,
+    )
+
+    # dv-7ad9: a usage limit recorded by an earlier job and not reset yet.
+    # Starting the turn would only hit it again: end the way a limit hit
+    # ends (exit QUOTA_EXIT plus the quota line), without a model call.
+    from src.model_router import quota
+
+    # Only a Claude-subscription route is stopped by Claude's limit; a job
+    # moved to Codex/OpenRouter (dv-d63d) goes ahead.
+    on_claude = route.harness == "claude"
+    limit = None if args.ignore_quota or not on_claude else quota.active()
+    if limit is not None:
+        print(f"agentjob failed: {limit.message} (recorded, not retried)", file=sys.stderr)
+        print(quota.quota_line(limit), file=sys.stderr)
+        return quota.QUOTA_EXIT
 
     from src.config.loader import load_config
     from src.profiles import load_profile_registry
@@ -93,17 +186,33 @@ def main() -> int:
     cwd = (args.cwd or profile.working_dir).expanduser().resolve()
     if not cwd.is_dir():
         sys.exit(f"error: working dir does not exist: {cwd}")
+    # dv-58db: a pump worktree is disposable; deleting inside it needs no ask.
+    free_root = pump_worktree_root(cwd)
+    print(f"agentjob: free_root={free_root}", file=sys.stderr)
+
+    sources = tuple(s.strip() for s in args.setting_sources.split(",") if s.strip())
+    unknown = [s for s in sources if s not in ("user", "project", "local")]
+    if unknown:
+        sys.exit(f"error: unknown setting source(s): {', '.join(unknown)}")
 
     spec = JobSpec(
         purpose=args.purpose,
         name=args.name,
         prompt=args.prompt_file.read_text(encoding="utf-8"),
-        model=args.model,
+        model=route.model or "sonnet",
+        route=route,
         working_directory=cwd,
         full_access=not sandbox,
         unrestricted=bool(profile.unrestricted),
         profile=profile.slug,
         cli_path=config.claude_cli_path or None,
+        free_root=free_root,
+        setting_sources=sources,  # type: ignore[arg-type]
+        ask_context=parse_ask_context(args.ask_context),
+        session_file=args.session_file,
+        # A confined Codex job writes these too (dv-d63d); --cwd jobs (pump
+        # worktrees) keep their explicit write set, as in the bgjob box.
+        extra_dirs=() if args.cwd else tuple(profile.extra_dirs or ()),
     )
     return asyncio.run(run_job(spec, bot_link_from_env(REPO)))
 

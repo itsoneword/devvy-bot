@@ -20,6 +20,9 @@ ALLOWED_PREFIXES = (
     "src/items/repository.py",
     "src/channel_intel/",
     "src/llm_analytics/",
+    # Standalone writer of the separate Postgres observability DB (psycopg,
+    # obs_writer role); not the bot's SQLite, same class as llm_analytics.
+    "src/observability/host_metrics.py",
 )
 
 _PATTERN = re.compile(r"\bget_connection\(|\.execute\(|\.executescript\(")

@@ -43,6 +43,8 @@ from typing import Sequence
 
 import structlog
 
+from .attribution import AgentDirs, agent_for_path
+
 logger = structlog.get_logger(__name__)
 
 # Complaint patterns over USER messages. THE single place to extend/tune;
@@ -94,7 +96,7 @@ _PROGRAM_NUMBER_RES = (_SET_REP_RE, _WEIGHT_RE, _PERCENT_1RM_RE, _RPE_RE)
 CHEAP_CHECK_MAX = 3
 
 # Search-class tools: each call pulls external content into the turn. A
-# foreground subagent is one row in tool_calls but weighs 2 against the live
+# foreground subagent is one main-agent row in tool_calls but weighs 2 against the live
 # budget: one spawn routinely fans out into many nested Web* calls (turn
 # 1817: Agent x1 -> WebSearch x17 + WebFetch x2).
 SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
@@ -186,16 +188,14 @@ def _date(ts: object) -> str | None:
     return None
 
 
-def compute_quality_daily(src: sqlite3.Connection) -> list[tuple]:
+def compute_quality_daily(
+    src: sqlite3.Connection, agents: AgentDirs | None = None
+) -> list[tuple]:
     """Per-(date, profile, user) counters from an open bot.db connection.
 
     Returns rows shaped for quality_daily. Missing source tables (older
     bot.db) are tolerated: their counters simply stay zero.
     """
-    # Imported here: indexer imports this module, so a top-level import of
-    # indexer would be circular.
-    from .indexer import _profile_from_cwd
-
     tables = {
         row[0]
         for row in src.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -208,7 +208,7 @@ def compute_quality_daily(src: sqlite3.Connection) -> list[tuple]:
             "SELECT session_id, user_id, project_path FROM sessions"
         ):
             scope[row["session_id"]] = (
-                _profile_from_cwd(row["project_path"]),
+                agent_for_path(row["project_path"], agents),
                 row["user_id"],
             )
 
@@ -217,8 +217,9 @@ def compute_quality_daily(src: sqlite3.Connection) -> list[tuple]:
     tools_by_message: dict[int, list[str]] = defaultdict(list)
     if "tool_calls" in tables:
         for row in src.execute(
-            "SELECT session_id, message_id, tool_name, started_at AS timestamp "
-            "FROM tool_calls WHERE parent_tool_use_id IS NULL"
+            "SELECT session_id, message_id, tool AS tool_name,"
+            " started_at AS timestamp FROM tool_calls"
+            " WHERE parent_tool_use_id IS NULL"
         ):
             if row["message_id"] is not None:
                 tools_by_message[int(row["message_id"])].append(row["tool_name"])
@@ -288,7 +289,9 @@ def compute_quality_daily(src: sqlite3.Connection) -> list[tuple]:
     ]
 
 
-def mirror_quality(conn: sqlite3.Connection, bot_db_path: Path) -> bool:
+def mirror_quality(
+    conn: sqlite3.Connection, bot_db_path: Path, agents: AgentDirs | None = None
+) -> bool:
     """Full refresh of quality_daily from bot.db. False if bot.db is absent."""
     if not bot_db_path.exists():
         logger.warning("bot_db_missing", path=str(bot_db_path))
@@ -296,7 +299,7 @@ def mirror_quality(conn: sqlite3.Connection, bot_db_path: Path) -> bool:
     src = sqlite3.connect(f"file:{bot_db_path}?mode=ro", uri=True)
     src.row_factory = sqlite3.Row
     try:
-        rows = compute_quality_daily(src)
+        rows = compute_quality_daily(src, agents)
     finally:
         src.close()
     with conn:

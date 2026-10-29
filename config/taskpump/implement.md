@@ -32,10 +32,17 @@ has the file:line detail this summary lacks. It is a plan, not proof: where
 the code disagrees with it, the code wins — say so in RESULT.
 
 {{PHASE}}
-{{PROTECTED}}{{RETURNED}}**The human's answers are binding.** They appear in the task file as a
+{{PROTECTED}}{{RETURNED}}{{INTERRUPTED}}**The human's answers are binding.** They appear in the task file as a
 `### @user` comment near the end. Where an answer contradicts your earlier
 plan, the answer wins. Where a question went unanswered, apply the `(default:
 …)` you proposed and note that you did.
+
+**Decided items (question triage).** If the architect's comment ends with
+`Not asked (triage decided): <numbers>`, those questions were not asked: the
+owner's card showed each as "decided: <choice>", taken from the `TRIAGE`
+lines above it. Treat a decided item as an answer he approved, unless his
+reply names its number; then his words win. Any other `DECIDE` line (shadow
+mode, or an always-ask override) is only a note: he was asked that question.
 
 ## What you must do
 
@@ -43,7 +50,10 @@ plan, the answer wins. Where a question went unanswered, apply the `(default:
    comment density — a diff that reads as foreign is a diff that gets reverted.
 2. Add or update tests covering the behaviour you changed. A fix with no test
    asserting it is not finished. If test scenarios are listed above, each one
-   is a test you must write and pass.
+   is a test you must write and pass. If you add or change a bot screen
+   (`src/bot/`, this repo), add or update its entry in
+   `src/bot/screens/registry.py`; `scripts/screens check` must pass — the
+   review renders those screens and returns the step on any violation.
 3. Run the tests. {{TEST_RUN}}
    **Before you change anything**, run the tests of the subsystem you will
    touch and note the counts: that is your baseline (failures already there

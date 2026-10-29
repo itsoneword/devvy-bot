@@ -72,8 +72,7 @@ def test_answer_scores_primary_key_is_idempotency_key() -> None:
 def test_init_db_migrates_preexisting_quality_daily_missing_new_columns() -> None:
     conn = sqlite3.connect(":memory:")
     # Simulate a DB created before dv-300d: the old 8-column quality_daily.
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE quality_daily (
             date TEXT NOT NULL, profile TEXT, user_id INTEGER,
             pinned_facts INTEGER NOT NULL DEFAULT 0,
@@ -82,8 +81,7 @@ def test_init_db_migrates_preexisting_quality_daily_missing_new_columns() -> Non
             complaint_hits INTEGER NOT NULL DEFAULT 0,
             user_messages INTEGER NOT NULL DEFAULT 0
         );
-        """
-    )
+        """)
     conn.execute("INSERT INTO quality_daily VALUES ('2026-08-10','chef',7,0,1,1,0,2)")
     init_db(conn)
     assert {"recipe_turns", "recipe_turns_unsearched"} <= _cols(conn, "quality_daily")

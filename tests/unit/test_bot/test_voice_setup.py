@@ -390,7 +390,7 @@ async def test_bad_cloud_key_rejected_previous_provider_keeps_working(
 async def test_text_only_turns_voice_off_and_voice_message_points_to_voice(
     env, fake_whisper
 ):
-    """"Только текст" -> voice off; voice message gets "/voice to enable"."""
+    """ "Только текст" -> voice off; voice message gets "/voice to enable"."""
     bot = Bot(env, voice_provider="whisper")
     assert bot.voice_handler() is not None
 
@@ -426,7 +426,9 @@ async def test_voice_choice_survives_restart(env, fake_whisper):
     reloaded = load_config(config_file=env.env_file)
     assert reloaded.voice_provider == "whisper"
     assert reloaded.enable_voice_messages is True
-    registry = FeatureRegistry(config=reloaded, storage=MagicMock(), security=MagicMock())
+    registry = FeatureRegistry(
+        config=reloaded, storage=MagicMock(), security=MagicMock()
+    )
     assert registry.get_voice_handler() is not None
 
 
@@ -485,7 +487,9 @@ async def test_cloud_key_from_keystore_survives_restart(
     os.environ.pop("VOICE_PROVIDER", None)
     reloaded = load_config(config_file=env.env_file)
     assert reloaded.voice_provider == "elevenlabs"
-    registry = FeatureRegistry(config=reloaded, storage=MagicMock(), security=MagicMock())
+    registry = FeatureRegistry(
+        config=reloaded, storage=MagicMock(), security=MagicMock()
+    )
     handler = registry.get_voice_handler()
     assert handler is not None, "keystore-only key not resolved at boot"
 

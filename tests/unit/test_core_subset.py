@@ -101,6 +101,12 @@ def test_makefile_test_core_target_selects_core_marker() -> None:
             "test_no_shipped_file_carries_personal_data",
             marks=PRIVATE_ONLY,
         ),
+        pytest.param(
+            "withheld refs",
+            "tests/unit/test_scripts/test_export_public.py::"
+            "test_no_exported_test_reads_a_withheld_path",
+            marks=PRIVATE_ONLY,
+        ),
     ],
 )
 def test_core_marker_covers_required_area(
@@ -113,6 +119,7 @@ def test_core_marker_covers_required_area(
 # --- scenario 2: make test-core finishes in about 60 s or less
 
 
+@pytest.mark.timing
 def test_core_subset_passes_within_budget() -> None:
     if os.environ.get(_GUARD):
         pytest.skip("inside a core-subset child run")
@@ -149,9 +156,9 @@ def test_claude_md_restart_checklist_lists_test_core_next_to_parity_gate() -> No
 
 def test_core_marker_is_registered() -> None:
     proc = _pytest("--markers")
-    assert re.search(r"^@pytest\.mark\.core\b", proc.stdout, re.MULTILINE), (
-        "`core` marker not registered in [tool.pytest.ini_options] markers"
-    )
+    assert re.search(
+        r"^@pytest\.mark\.core\b", proc.stdout, re.MULTILINE
+    ), "`core` marker not registered in [tool.pytest.ini_options] markers"
 
 
 def test_core_subset_is_a_strict_subset(core_ids: list[str]) -> None:

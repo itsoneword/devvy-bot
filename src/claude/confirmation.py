@@ -22,10 +22,16 @@ from __future__ import annotations
 
 import asyncio
 import html
+import time
 import uuid
-from typing import Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import structlog
+
+if TYPE_CHECKING:
+    from ..security.ask_explain import AskContext
+
+from .turn_activity import note_owner_wait
 
 logger = structlog.get_logger()
 
@@ -42,7 +48,9 @@ class ConfirmationManager:
         chat_ids: Optional[List[int]],
         timeout_seconds: float = 600.0,
         edit_prompt: Optional[Callable[[int, int, str], Awaitable[None]]] = None,
-        explain: Optional[Callable[[str, str], Awaitable[Optional[str]]]] = None,
+        explain: Optional[
+            Callable[[str, str, Optional["AskContext"]], Awaitable[Optional[str]]]
+        ] = None,
         update_prompt: Optional[Callable[[int, int, str, str], Awaitable[None]]] = None,
     ) -> None:
         # send_prompt(chat_id, text, token) -> sends a message with two inline
@@ -53,9 +61,10 @@ class ConfirmationManager:
         # it's resolved by timeout, so stale Approve/Deny buttons don't sit
         # there looking actionable after the decision has already been made.
         self._edit_prompt = edit_prompt
-        # explain(reason, preview) -> an HTML block for under the code, or
-        # None (dv-af70). It sees only the reason and the command, never who
-        # asked. update_prompt(chat_id, message_id, text, token) edits the
+        # explain(reason, preview, context) -> an HTML block for under the
+        # code, or None (dv-af70). It sees the reason, the command and the
+        # ask's task context (profile, job, task id + title, stage; dv-781f),
+        # never the agent's reasoning. update_prompt(chat_id, message_id, text, token) edits the
         # card in place and rebuilds the Approve/Deny buttons for the token
         # (an edit without reply_markup would drop them).
         self._explain = explain
@@ -74,12 +83,14 @@ class ConfirmationManager:
         *,
         timeout_seconds: Optional[float] = None,
         source: Optional[str] = None,
+        context: Optional["AskContext"] = None,
     ) -> bool:
         """Ask the owner to approve a destructive op. Returns True if approved.
 
         ``timeout_seconds`` overrides the manager's default: an unattended
         background job waits an hour (owner, dv-ef90), a chat turn two
         minutes. ``source`` names who is asking (a job's name) in the prompt.
+        ``context`` is what the explainer may know about the ask (dv-781f).
         """
         timeout = self._timeout if timeout_seconds is None else timeout_seconds
         if not self._chat_ids:
@@ -118,15 +129,33 @@ class ConfirmationManager:
             self._pending_texts[token] = text
             if self._explain and self._update_prompt:
                 explaining = asyncio.create_task(
-                    self._add_explanation(token, reason, preview, head, tail)
+                    self._add_explanation(token, reason, preview, context, head, tail)
                 )
 
+        # The owner's think time, measured from the card going out. It is
+        # charged to the calling hook so the turn ledger does not report it
+        # as a slow hook (dv-d760).
+        asked_at = time.monotonic()
+        log_fields = {"reason": reason, "source": source, "preview": preview[:120]}
         try:
             approved = await asyncio.wait_for(fut, timeout=timeout)
-            logger.info("Confirmation resolved", reason=reason, approved=approved)
+            waited = time.monotonic() - asked_at
+            note_owner_wait(waited)
+            logger.info(
+                "Confirmation resolved",
+                approved=approved,
+                waited_s=round(waited, 2),
+                **log_fields,
+            )
             return approved
         except asyncio.TimeoutError:
-            logger.info("Confirmation timed out -> denied", reason=reason)
+            waited = time.monotonic() - asked_at
+            note_owner_wait(waited)
+            logger.info(
+                "Confirmation timed out -> denied",
+                waited_s=round(waited, 2),
+                **log_fields,
+            )
             await self._mark_timed_out(token, self._pending_texts.get(token, text))
             return False
         finally:
@@ -137,7 +166,13 @@ class ConfirmationManager:
             self._pending_texts.pop(token, None)
 
     async def _add_explanation(
-        self, token: str, reason: str, preview: str, head: str, tail: str
+        self,
+        token: str,
+        reason: str,
+        preview: str,
+        context: Optional["AskContext"],
+        head: str,
+        tail: str,
     ) -> None:
         """Edit the explanation in under the code once it arrives (dv-af70).
 
@@ -146,7 +181,7 @@ class ConfirmationManager:
         """
         assert self._explain is not None and self._update_prompt is not None
         try:
-            block = await self._explain(reason, preview)
+            block = await self._explain(reason, preview, context)
         except Exception as exc:
             logger.info("Ask explanation failed", reason=reason, error=str(exc))
             return

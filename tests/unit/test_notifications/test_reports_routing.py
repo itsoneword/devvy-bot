@@ -116,9 +116,7 @@ async def test_topic_created_once_and_persisted(bot: AsyncMock) -> None:
     assert bot.create_forum_topic.await_count == 1
 
 
-@pytest.mark.parametrize(
-    "source", ["reminder", "item", "family", "agent", "unknown"]
-)
+@pytest.mark.parametrize("source", ["reminder", "item", "family", "agent", "unknown"])
 async def test_answer_needed_and_unmapped_stay_in_dm(
     bot: AsyncMock, source: str
 ) -> None:
@@ -191,7 +189,6 @@ async def test_pinned_status_posts_inside_topic(bot: AsyncMock) -> None:
     bot.pin_chat_message.assert_awaited_once()
 
 
-
 async def test_first_pump_pin_unpins_old_topic_pins_then_edits_in_place(
     bot: AsyncMock,
 ) -> None:
@@ -246,7 +243,9 @@ async def test_transient_pin_edit_error_does_not_post_a_second_pin(
     await deliver(svc, "taskpump:status", pin_as="pump")
     assert bot.send_message.await_count == 1
     assert svc._pinned_messages == {(REPORTS, "pump"): 8}
-    unpinned = [c.kwargs.get("message_id") for c in bot.unpin_chat_message.call_args_list]
+    unpinned = [
+        c.kwargs.get("message_id") for c in bot.unpin_chat_message.call_args_list
+    ]
     assert 7 in unpinned
 
 

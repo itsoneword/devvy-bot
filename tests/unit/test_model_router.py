@@ -188,3 +188,61 @@ def test_lean_options_strip_the_harness_and_set_account_separation():
     assert options.env == CLAUDE_ACCOUNT_ENV
     assert options.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
     assert options.model == "haiku" and options.system_prompt == "s"
+
+
+# --- dv-9133: an image call on a harness that cannot take images -------------
+
+
+def test_call_request_carries_images_and_defaults_to_empty():
+    assert _request().images == ()
+    assert _request(images=("a.png", "b.png")).images == ("a.png", "b.png")
+
+
+async def test_claude_plain_call_with_images_fails_loudly_and_is_recorded(
+    db, monkeypatch, tmp_path
+):
+    """Silently dropping the images would let a critic judge renders it never
+    saw: the Claude adapter refuses, before it starts the CLI."""
+    from src.model_router import claude_plain
+
+    def no_client(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the CLI must not start for an image call")
+
+    monkeypatch.setattr(claude_plain, "ClaudeSDKClient", no_client)
+    image = tmp_path / "shot.png"
+    image.write_bytes(b"\x89PNG")
+    router = _router(db, plain_callers={"claude": claude_plain.ClaudePlainCaller()})
+
+    with pytest.raises(ModelCallError, match="(?i)image"):
+        await router.complete(_request(images=(str(image),)))
+
+    (row,) = await _rows(db)
+    assert row["kind"] == "plain" and row["harness"] == "claude"
+    assert row["outcome"] == "error" and "image" in row["error"].lower()
+
+
+async def test_openrouter_plain_call_with_images_fails_loudly_and_is_recorded(
+    db, monkeypatch, tmp_path
+):
+    from src.model_router import openrouter_plain
+
+    class _NoHttp:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("no HTTP request for an image call")
+
+    monkeypatch.setattr(openrouter_plain, "openrouter_key", lambda: "sk-test")
+    monkeypatch.setattr(openrouter_plain.httpx, "AsyncClient", _NoHttp)
+    image = tmp_path / "shot.png"
+    image.write_bytes(b"\x89PNG")
+    router = _router(
+        db, plain_callers={"openrouter": openrouter_plain.OpenRouterPlainCaller()}
+    )
+
+    with pytest.raises(ModelCallError, match="(?i)image"):
+        await router.complete(
+            _request(harness="openrouter", model="z-ai/glm-5.3", images=(str(image),))
+        )
+
+    (row,) = await _rows(db)
+    assert row["harness"] == "openrouter"
+    assert row["outcome"] == "error" and "image" in row["error"].lower()

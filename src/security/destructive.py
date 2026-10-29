@@ -39,6 +39,7 @@ instructions, not a determined attacker.
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shlex
@@ -47,6 +48,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..storage.board_policy import privileged_merge_reason
+from .denylist import STREAM_PSEUDO_FILES
 
 # Dirs under ~/tools that hold the exchange scripts (fetchcrypto, fetchmexc),
 # including their lib/ subdirs -- every JS file under either tree is a money
@@ -147,7 +149,7 @@ _REDIRECT_RE = re.compile(r">>?\s*(?P<path>/[^\s;&|()`'\"]+)")
 
 # Redirecting a stream *into* these is never destructive: there's no real data
 # there to damage (unlike e.g. /dev/sda, an actual device backing store).
-_SAFE_REDIRECT_TARGETS = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin"}
+_SAFE_REDIRECT_TARGETS = STREAM_PSEUDO_FILES
 
 _BASH_TOOLS = {"Bash", "bash", "shell"}
 _FILE_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "create_file", "edit_file"}
@@ -231,8 +233,12 @@ def _segments(command: str) -> List[str]:
     return [seg.strip() for seg in out if seg.strip()]
 
 
-def _argv(segment: str) -> List[str]:
-    """Words of one simple command, minus wrappers and env assignments."""
+def _argv(segment: str, stripped: Optional[List[str]] = None) -> List[str]:
+    """Words of one simple command, minus wrappers and env assignments.
+
+    Each wrapper removed (``sudo``, ``xargs``, ...) is appended to *stripped*
+    when given.
+    """
     try:
         words = shlex.split(segment)
     except ValueError:
@@ -244,11 +250,15 @@ def _argv(segment: str) -> List[str]:
         elif _ENV_ASSIGNMENT.match(head):
             words = words[1:]
         elif os.path.basename(head) in _WRAPPERS:
+            if stripped is not None:
+                stripped.append(os.path.basename(head))
             words = words[1:]
             # the wrapper's own flags (`sudo -n`, `nice -n 5`)
             while words and words[0].startswith("-"):
                 words = words[1:]
         elif os.path.basename(head) in ("timeout", "xargs"):
+            if stripped is not None:
+                stripped.append(os.path.basename(head))
             words = words[1:]
             while words and (words[0].startswith("-") or words[0][:1].isdigit()):
                 words = words[1:]
@@ -257,11 +267,16 @@ def _argv(segment: str) -> List[str]:
     return words
 
 
-def _commands(command: str, depth: int = 0) -> List[List[str]]:
-    """Every simple command in *command*, including inside ``sh -c '...'``."""
+def _commands(
+    command: str, depth: int = 0, stripped: Optional[List[str]] = None
+) -> List[List[str]]:
+    """Every simple command in *command*, including inside ``sh -c '...'``.
+
+    *stripped* collects the wrappers ``_argv`` removed on the way.
+    """
     found: List[List[str]] = []
     for segment in _segments(command):
-        argv = _argv(segment)
+        argv = _argv(segment, stripped)
         if not argv:
             continue
         found.append(argv)
@@ -269,7 +284,7 @@ def _commands(command: str, depth: int = 0) -> List[List[str]]:
         if name in _SHELLS and depth < _MAX_NESTING:
             for idx, word in enumerate(argv[1:], start=1):
                 if word.startswith("-") and "c" in word and idx + 1 < len(argv):
-                    found.extend(_commands(argv[idx + 1], depth + 1))
+                    found.extend(_commands(argv[idx + 1], depth + 1, stripped))
                     break
     return found
 
@@ -560,14 +575,100 @@ def _is_temp_path(target: str, cwd: Path) -> bool:
     return any(path.startswith(root + "/") for root in _temp_roots())
 
 
-def _deletion_reason(commands: List[List[str]], cwd: Path) -> Optional[str]:
-    """Deleting anything outside the temp dirs needs the owner (dv-1601)."""
+# -- a pump job's own worktree (dv-58db) -------------------------------------
+#
+# An unattended pump job runs in a disposable git worktree; its committed work
+# is in git. Deleting inside it needs no owner, so the job turn carries the
+# worktree as ``free_root`` (``src/model_router/job.py::pump_worktree_root``).
+# Chat turns, Codex and non-pump jobs never set it. Fail closed: a target is
+# free only when both its lexical and its symlink-resolved path are strictly
+# inside the root, outside ``.git``, and spelled without variables, ``~``,
+# braces or substitutions; a glob must start below the root and every match
+# must pass. A command with a wrapper (``sudo``, ``xargs``, ...) gets no free
+# root at all, and neither does one that runs anything but a deletion or a
+# command below that cannot create, move or link a path: realpath runs before
+# the line does, so ``ln -s /etc x && rm -rf x/y`` (or ``cd``, ``mv``, an
+# interpreter) would slip past it.
+
+_FREE_ROOT_COMPANIONS = {
+    "echo",
+    "printf",
+    "true",
+    "false",
+    ":",
+    "test",
+    "[",
+    "ls",
+    "pwd",
+    "cat",
+    "wc",
+    "head",
+    "tail",
+    "grep",
+    "stat",
+    "touch",
+    "mkdir",
+}
+_GLOB_CHARS = ("*", "?", "[")
+
+
+def _strictly_inside(path: str, root: str) -> bool:
+    return path.startswith(root + "/")
+
+
+def _free_target(target: str, cwd: Path, root: Path) -> bool:
+    """True when deleting *target* cannot touch anything but the job's tree."""
+    if not target or any(ch in target for ch in "$`{~"):
+        return False
+    path = target if os.path.isabs(target) else os.path.join(str(cwd), target)
+    path = os.path.normpath(path)
+    lexical_root = os.path.normpath(str(root))
+    real_root = os.path.realpath(str(root))
+    if not _strictly_inside(path, lexical_root):
+        return False
+    if os.path.relpath(path, lexical_root).split("/")[0] == ".git":
+        return False
+    real = os.path.realpath(path)
+    if not _strictly_inside(real, real_root):
+        return False
+    return os.path.relpath(real, real_root).split("/")[0] != ".git"
+
+
+def _is_free_path(target: str, cwd: Path, free_root: Optional[Path] = None) -> bool:
+    """A temp path (always), or a path inside *free_root* (a pump job's tree)."""
+    if _is_temp_path(target, cwd):
+        return True
+    if free_root is None:
+        return False
+    if not any(ch in target for ch in _GLOB_CHARS):
+        return _free_target(target, cwd, free_root)
+    # The glob's literal directory must already be below the root, so `*`
+    # or `./*` at the root (the whole tree) keeps asking.
+    cut = min(target.index(ch) for ch in _GLOB_CHARS if ch in target)
+    prefix = target[:cut].rpartition("/")[0]
+    if not prefix or not _free_target(prefix, cwd, free_root):
+        return False
+    matches = glob.glob(target, root_dir=str(cwd))
+    return all(_free_target(m, cwd, free_root) for m in matches)
+
+
+def _deletion_reason(
+    commands: List[List[str]], cwd: Path, free_root: Optional[Path] = None
+) -> Optional[str]:
+    """Deleting anything outside the temp dirs needs the owner (dv-1601).
+
+    With *free_root* (a pump job), deleting inside it needs no owner either
+    (dv-58db). The caller drops *free_root* for commands it cannot pin down.
+    """
+    allowed = _DELETE_COMMANDS | _FREE_ROOT_COMPANIONS
+    if any(os.path.basename(argv[0]) not in allowed for argv in commands):
+        free_root = None
     for argv in commands:
         name = os.path.basename(argv[0])
         if name in _DELETE_COMMANDS:
             flags = [w for w in argv[1:] if w.startswith("-") and w != "--"]
             targets = [w for w in argv[1:] if not w.startswith("-")]
-            if targets and all(_is_temp_path(t, cwd) for t in targets):
+            if targets and all(_is_free_path(t, cwd, free_root) for t in targets):
                 continue
             forced = any(set(f.lstrip("-")) & {"r", "R", "f"} for f in flags)
             if name == "rm" and forced:
@@ -663,8 +764,13 @@ def classify(
     tool_name: str,
     tool_input: Dict[str, Any],
     working_directory: Path,
+    free_root: Optional[Path] = None,
 ) -> Optional[str]:
-    """Return a reason string if the op needs confirmation, else None."""
+    """Return a reason string if the op needs confirmation, else None.
+
+    *free_root*: a pump job's own worktree, where deleting needs no owner
+    (dv-58db). ``None`` everywhere else.
+    """
     if tool_name in _BASH_TOOLS:
         command = tool_input.get("command", "") or ""
         rule_reason = _command_rule_reason(command)
@@ -682,10 +788,11 @@ def classify(
         merge_reason = privileged_merge_reason(command, working_directory)
         if merge_reason:
             return merge_reason
-        commands = _commands(command)
-        parsed_reason = _deletion_reason(commands, working_directory) or _egress_reason(
-            commands
-        )
+        stripped: List[str] = []
+        commands = _commands(command, stripped=stripped)
+        parsed_reason = _deletion_reason(
+            commands, working_directory, None if stripped else free_root
+        ) or _egress_reason(commands)
         if parsed_reason:
             return parsed_reason
         if _EMBEDDED_RM.search(command) and not any(

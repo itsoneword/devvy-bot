@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
-"""Apply owner-approved actions from a consolidation report (dv-4c6f).
+"""Apply owner-ticked actions from a consolidation report (dv-4c6f, dv-cf07).
 
-The recurring pass (src/consolidation/service.py) is report-only; this script
-is the ONLY writer. It executes exactly the ``- [x]``-annotated lines of a
-``report-*.md`` from ``DataLayout.consolidation_dir``
+The stale-fact sweep (src/consolidation/service.py) closes superseded facts
+itself and lists each closure as an ``UNDO`` line; this script executes
+exactly the ``- [x]``-annotated lines of a ``report-*.md`` from
+``DataLayout.consolidation_dir``
 (``<root>/workspaces/devops/reports/consolidation/``, or ``data/consolidation/``
 in the legacy layout). A bare ``--report`` file name is looked up there:
 
+    - [x] UNDO scope=<scope> id=<id>
     - [x] MERGE scope=<scope> survivor=<id> close=<id>[,<id>...]
     - [x] EXPIRE scope=<scope> id=<id>
 
+MERGE and EXPIRE are no longer generated (dv-cf07) but still accepted for
+hand-written reports.
+
 Semantics:
+  - UNDO: reopen a row the sweep (or a MERGE) closed: status='active',
+    invalid_at / superseded_by / invalidated_by cleared. Only rows with
+    invalidated_by 'sweep' or 'consolidation' -- an owner's memory_forget
+    stays forgotten (same rule as MemoryRepository.reopen_fact).
   - MERGE: the survivor row (one of the originals, verbatim — never
     model-composed) stays untouched; every ``close`` row is closed
     metadata-only: status='superseded', invalid_at=now,
@@ -39,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.utils.paths import data_layout  # noqa: E402
 
 _ACTION_RE = re.compile(
-    r"^\s*-\s*\[x\]\s+(MERGE|EXPIRE)\s+(.+?)\s*$", re.IGNORECASE | re.MULTILINE
+    r"^\s*-\s*\[x\]\s+(UNDO|MERGE|EXPIRE)\s+(.+?)\s*$", re.IGNORECASE | re.MULTILINE
 )
 
 
@@ -61,7 +70,22 @@ def apply_report(conn: sqlite3.Connection, report_path: Path) -> None:
         for verb, rest in actions:
             kv = _parse_kv(rest)
             scope = kv["scope"]
-            if verb.upper() == "MERGE":
+            if verb.upper() == "UNDO":
+                fid = int(kv["id"])
+                changed = cur.execute(
+                    "UPDATE memory_facts SET status='active', invalid_at=NULL, "
+                    "superseded_by=NULL, invalidated_by=NULL, updated_at=? "
+                    "WHERE id=? AND agent_id=? AND invalid_at IS NOT NULL "
+                    "AND invalidated_by IN ('sweep', 'consolidation')",
+                    (now, fid, scope),
+                ).rowcount
+                if not changed:
+                    raise RuntimeError(
+                        f"id {fid} in scope {scope} is not a sweep/consolidation "
+                        "closure"
+                    )
+                print(f"  UNDO {scope}: {fid} reopened")
+            elif verb.upper() == "MERGE":
                 survivor = int(kv["survivor"])
                 closing = [int(i) for i in kv["close"].split(",") if i]
                 row = cur.execute(

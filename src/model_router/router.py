@@ -3,7 +3,8 @@
 Three call kinds. :meth:`ModelRouter.run_turn` is an agent turn (tools,
 session, streaming) and runs on a registered :class:`AgentBackend`.
 :meth:`ModelRouter.complete` is a plain call (prompt in, text out, no tools)
-and runs on a plain-call adapter. :meth:`ModelRouter.decide` is a typed
+and runs on a plain-call adapter; its harness and model come from the
+purpose's call route (``routes.CallRoutes``, dv-781f), not from the caller. :meth:`ModelRouter.decide` is a typed
 decision (questions about a state in, typed answers out) and runs on Jev,
 falling back to a plain LLM call (dv-7e11). The router finds the harness, times the call and writes
 one ``model_calls`` row for it, whatever the outcome.
@@ -15,24 +16,28 @@ a default router that makes the same calls and records nothing.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional, Union
 
 import structlog
 
-from . import llm_decide
+from . import json_contract, llm_decide
 from .claude_plain import ClaudePlainCaller
 from .codex_plain import CodexPlainCaller
 from .harness import HarnessVersions
 from .openrouter_plain import OpenRouterPlainCaller
+from .routes import CallRoute, CallRoutes
 from .trace import TraceCollector, activate
 from .turn_cost import Settlement, when_settled
 from .types import (
     CLAUDE_HARNESS,
     CODEX_HARNESS,
     OPENROUTER_HARNESS,
+    PLAIN_PURPOSES,
     PURPOSES,
+    TURN_PURPOSES,
     TYPESAFE_HARNESS,
     CallRequest,
     CallResult,
@@ -73,6 +78,7 @@ class ModelRouter:
         profile_resolver: Optional[ProfileResolver] = None,
         decider: Optional[Decider] = None,
         tool_calls: Optional["ToolCallRepository"] = None,
+        call_routes: Optional[CallRoutes] = None,
     ) -> None:
         self.backends: Dict[str, "AgentBackend"] = backends if backends else {}
         self._plain: Dict[str, PlainCaller] = (
@@ -89,6 +95,8 @@ class ModelRouter:
         self._profile_resolver = profile_resolver
         self._decider: Decider = decider or TypesafeDecider()
         self._tool_calls = tool_calls
+        # None = the built-in rows; the bot passes models.yaml's (main.py).
+        self._routes = call_routes if call_routes is not None else CallRoutes()
 
     async def run_turn(
         self,
@@ -99,7 +107,7 @@ class ModelRouter:
         **turn: Any,
     ) -> "ClaudeResponse":
         """Run one agent turn; ``turn`` is ``AgentBackend.run_command``'s kwargs."""
-        _check_purpose(purpose)
+        _check_purpose(purpose, TURN_PURPOSES, "agent-turn")
         adapter = self.backends[backend] if isinstance(backend, str) else backend
         harness = str(adapter.backend_id)
         # Asked only when there is a row to write it into.
@@ -114,7 +122,7 @@ class ModelRouter:
             with activate(trace):
                 response = await adapter.run_command(**turn)
         except BaseException as exc:
-            trace.close("turn failed")
+            trace.close(completed=False)
             row_id = await self._record(
                 purpose=purpose,
                 kind="turn",
@@ -130,12 +138,9 @@ class ModelRouter:
             )
             await self._link_trace(trace, row_id, turn.get("session_id"))
             raise
-        trace.close()
+        trace.close(completed=not response.is_error)
         if trace.rows():
-            try:
-                response.trace_id = trace.trace_id
-            except AttributeError:
-                pass
+            _set(response, "trace_id", trace.trace_id)
         row_id = await self._record(
             purpose=purpose,
             kind="turn",
@@ -156,6 +161,7 @@ class ModelRouter:
             cost_usd=response.cost,
             cost_source=getattr(response, "cost_source", None),
         )
+        _set(response, "model_call_id", row_id)
         await self._link_trace(trace, row_id, response.session_id)
         recorder = self._recorder
         if row_id is not None and recorder is not None:
@@ -187,11 +193,94 @@ class ModelRouter:
             logger.warning("trace not linked", error=str(exc))
 
     async def complete(self, request: CallRequest) -> CallResult:
-        """Run one plain call and return its result."""
-        _check_purpose(request.purpose)
-        caller = self._plain.get(request.harness)
+        """Run one plain call on its purpose's route and return its result.
+
+        A schema call gets the same contract on every route
+        (``json_contract``): the text is canonical JSON for the caller's
+        schema, an invalid answer is retried once on the same route.
+        A route with a fallback runs it once when the first route fails with
+        :class:`ModelCallError` (a timeout or twice-invalid JSON included).
+        So at most 4 adapter calls, each with its own row. Any other
+        exception is a bug, never retried elsewhere.
+        """
+        _check_purpose(request.purpose, PLAIN_PURPOSES, "plain-call")
+        route = self._routes.resolve(
+            request.purpose,
+            harness=request.harness,
+            model=request.model,
+            backend=request.backend,
+        )
+        deadline = (
+            None
+            if request.deadline_seconds is None
+            else time.monotonic() + request.deadline_seconds
+        )
+        try:
+            return await self._complete_route(request, route, deadline)
+        except ModelCallError as exc:
+            if route.fallback is None or not _time_for_another(deadline):
+                raise
+            logger.warning(
+                "plain call failed; trying the fallback route",
+                purpose=request.purpose,
+                harness=route.harness,
+                fallback=route.fallback.harness,
+                error=_error_text(exc),
+            )
+            return await self._complete_route(request, route.fallback, deadline)
+
+    async def _complete_route(
+        self, request: CallRequest, route: CallRoute, deadline: Optional[float]
+    ) -> CallResult:
+        """The call on one route: one adapter call, or two for a schema call
+        whose first answer was not valid JSON."""
+        schema = request.json_schema
+        if schema is None:
+            return await self._complete_on(_bounded(request, deadline), route)
+        native = route.json == json_contract.JSON_NATIVE
+        sent = dataclasses.replace(
+            request,
+            json_schema=(
+                json_contract.native_schema(schema, route.harness) if native else None
+            ),
+        )
+
+        def _check(result: CallResult) -> CallResult:
+            result.text = json_contract.canonical(result.text, schema, validate=native)
+            return result
+
+        try:
+            return await self._complete_on(_bounded(sent, deadline), route, _check)
+        except json_contract.InvalidJSON as exc:
+            if not _time_for_another(deadline):
+                raise
+            retry = dataclasses.replace(
+                sent,
+                prompt=json_contract.retry_prompt(
+                    request.prompt, str(exc), None if native else schema
+                ),
+            )
+            return await self._complete_on(_bounded(retry, deadline), route, _check)
+
+    async def _complete_on(
+        self,
+        request: CallRequest,
+        route: CallRoute,
+        check: Optional[Callable[[CallResult], CallResult]] = None,
+    ) -> CallResult:
+        """One adapter call on ``route``, recorded whatever the outcome.
+
+        ``check`` turns the answer into the caller's contract; when it raises
+        (invalid JSON) the row is an error that keeps the spent tokens."""
+        caller = self._plain.get(route.harness)
         if caller is None:
-            raise ModelCallError(f"no plain-call adapter for {request.harness}")
+            raise ModelCallError(f"no plain-call adapter for {route.harness}")
+        if route.model is None and route.harness != OPENROUTER_HARNESS:
+            raise ValueError(
+                f"{request.purpose}: no model for {route.harness} "
+                "(set it in models.yaml)"
+            )
+        request = dataclasses.replace(request, harness=route.harness, model=route.model)
         started = time.monotonic()
         try:
             result = await caller(request)
@@ -199,37 +288,48 @@ class ModelRouter:
             await self._record(
                 purpose=request.purpose,
                 kind="plain",
-                harness=request.harness,
-                model=request.model,
+                harness=route.harness,
+                model=route.model,
                 attended=False,
                 started=started,
                 outcome="timeout" if isinstance(exc, ModelCallTimeout) else "error",
                 error=_error_text(exc),
             )
             raise
-        await self._record(
-            purpose=request.purpose,
-            kind="plain",
-            harness=request.harness,
-            harness_version=result.harness_version,
-            model=result.model or request.model,
-            attended=False,
-            session_id=result.session_id,
-            started=started,
-            outcome="ok",
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
-            cache_read_tokens=result.cache_read_tokens,
-            cache_creation_tokens=result.cache_creation_tokens,
-            cost_usd=result.cost_usd,
-        )
+        outcome, error = "ok", None
+        try:
+            if check is not None:
+                result = check(result)
+        except BaseException as exc:
+            outcome = "error"
+            invalid = isinstance(exc, json_contract.InvalidJSON)
+            error = str(exc)[:500] if invalid else _error_text(exc)
+            raise
+        finally:
+            await self._record(
+                purpose=request.purpose,
+                kind="plain",
+                harness=route.harness,
+                harness_version=result.harness_version,
+                model=result.model or route.model,
+                attended=False,
+                session_id=result.session_id,
+                started=started,
+                outcome=outcome,
+                error=error,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                cache_read_tokens=result.cache_read_tokens,
+                cache_creation_tokens=result.cache_creation_tokens,
+                cost_usd=result.cost_usd,
+            )
         return result
 
     async def decide(self, request: DecideRequest) -> DecideResult:
         """Answer typed questions about a state: Jev when its key is set,
         else (or on any Jev failure) the LLM fallback through
         :meth:`complete`. Jev is optional; the bot never requires it."""
-        _check_purpose(request.purpose)
+        _check_purpose(request.purpose, PLAIN_PURPOSES, "decide")
         if not request.questions:
             raise ValueError("decide needs at least one question")
         if not typesafe_key():
@@ -272,15 +372,20 @@ class ModelRouter:
                 return result
         if request.fallback_model is None:
             raise ModelCallError(f"decide: jev unavailable, no fallback ({reason})")
+        call_request = llm_decide.call_request(request)
+        route = self._routes.resolve(
+            request.purpose, harness=call_request.harness, model=call_request.model
+        )
         logger.info(
             "decide falling back to llm",
             purpose=request.purpose,
-            model=request.fallback_model,
+            harness=route.harness,
+            model=route.model,
             reason=reason,
         )
         # complete() records this leg as an ordinary plain call.
-        call = await self.complete(llm_decide.call_request(request))
-        return llm_decide.result_from(request, call, reason)
+        call = await self.complete(call_request)
+        return llm_decide.result_from(request, call, reason, route)
 
     async def _record(
         self,
@@ -349,9 +454,29 @@ class ModelRouter:
             return None
 
 
-def _check_purpose(purpose: str) -> None:
+def _check_purpose(purpose: str, allowed: frozenset, kind: str) -> None:
     if purpose not in PURPOSES:
         raise ValueError(f"unknown model call purpose: {purpose!r}")
+    if purpose not in allowed:
+        raise ValueError(f"{purpose!r} is not a {kind} purpose")
+
+
+# No JSON retry or fallback starts with less than this left of a deadline.
+_MIN_ATTEMPT_SECONDS = 5.0
+
+
+def _time_for_another(deadline: Optional[float]) -> bool:
+    return deadline is None or deadline - time.monotonic() >= _MIN_ATTEMPT_SECONDS
+
+
+def _bounded(request: CallRequest, deadline: Optional[float]) -> CallRequest:
+    """``request`` with its timeout cut to what is left of ``deadline``."""
+    if deadline is None:
+        return request
+    left = max(deadline - time.monotonic(), 0.0)
+    if left >= request.timeout_seconds:
+        return request
+    return dataclasses.replace(request, timeout_seconds=left)
 
 
 def _default_model(adapter: "AgentBackend") -> Optional[str]:
@@ -375,10 +500,17 @@ def set_router(router: Optional[ModelRouter]) -> None:
 
 
 def get_router() -> ModelRouter:
-    """The process's router; a recorder-less default outside the bot."""
+    """The process's router; a recorder-less default outside the bot.
+
+    The default reads ``models.yaml`` too (``MODEL_ROUTES_PATH``, else the
+    repo's ``config/models.yaml``), so scripts follow the same routes; a bad
+    file logs and falls back to the built-in rows.
+    """
     global _router
     if _router is None:
-        _router = ModelRouter()
+        from .routes import process_call_routes
+
+        _router = ModelRouter(call_routes=process_call_routes())
     return _router
 
 
@@ -386,18 +518,30 @@ async def complete_text(
     prompt: str,
     *,
     purpose: str,
-    model: str,
     system_prompt: str,
+    model: Optional[str] = None,
+    harness: Optional[str] = None,
     timeout: float = 120.0,
 ) -> str:
-    """Plain Claude call through the process's router; returns the text."""
+    """Plain call through the process's router on ``purpose``'s route
+    (``model`` / ``harness`` override it); returns the text."""
     result = await get_router().complete(
         CallRequest(
             purpose=purpose,
             prompt=prompt,
             model=model,
+            harness=harness,
             system_prompt=system_prompt,
             timeout_seconds=timeout,
         )
     )
     return result.text
+
+
+def _set(response: Any, name: str, value: Any) -> None:
+    """Tag a backend's response; a response type without the field (a test
+    double) is left as it is."""
+    try:
+        setattr(response, name, value)
+    except AttributeError:
+        pass

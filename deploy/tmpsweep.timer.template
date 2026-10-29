@@ -1,0 +1,18 @@
+-- rendered by scripts/render_deploy.py; do not install this file directly --
+# Not enabled by the installer. Enable by hand: systemctl --user enable --now tmpsweep.timer
+[Unit]
+Description=Check /tmp every 15 minutes; sweep when over 70% or once a day
+
+[Timer]
+# The 15-min tick is cheap: tmpsweep exits at once unless /tmp is over 70%
+# or the last sweep is >=23h old (state in ~/.local/state/devvy/).
+OnBootSec=10min
+# Same reason as taskpump.timer: OnBootSec alone never arms when the user
+# manager starts after boot.
+OnStartupSec=10min
+OnUnitActiveSec=15min
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

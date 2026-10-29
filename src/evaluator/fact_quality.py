@@ -216,7 +216,7 @@ class FactQualityCheck:
         self,
         db: "DatabaseManager",
         notify_callback: Optional[Callable[[str], Awaitable[None]]] = None,
-        model: str = "haiku",
+        model: Optional[str] = None,
         window_hours: int = WINDOW_HOURS,
     ) -> None:
         self._db = db
@@ -381,7 +381,7 @@ def register_daily_check(
     enabled: bool,
     cron_expression: str,
     notify_callback: Optional[Callable[[str], Awaitable[None]]] = None,
-    model: str = "haiku",
+    model: Optional[str] = None,
 ) -> Optional[FactQualityCheck]:
     """Register the daily check as a native scheduler job when enabled.
 

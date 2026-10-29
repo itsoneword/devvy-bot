@@ -1,6 +1,8 @@
 """Pytest configuration and fixtures."""
 
 import os
+import shutil
+import tempfile
 
 import pytest
 
@@ -26,11 +28,18 @@ CORE_TESTS = (
     # one rule set / one call path
     "tests/unit/test_security/test_policy_parity.py::",
     "tests/unit/test_no_stray_model_calls.py::",
+    # dv-4cd8: every registered bot screen fits a phone
+    "tests/unit/test_screens_gate.py::",
     # export drift: caught at restart, not at release
     "tests/unit/test_scripts/test_export_public.py::"
     "test_every_tracked_file_is_classified",
     "tests/unit/test_scripts/test_export_public.py::"
     "test_no_shipped_file_carries_personal_data",
+    # dv-5432: no exported test reads a path the export withholds
+    "tests/unit/test_scripts/test_export_public.py::"
+    "test_no_exported_test_reads_a_withheld_path",
+    "tests/unit/test_scripts/test_export_public.py::"
+    "test_withheld_ref_scan_flags_a_root_chain_into_docs_research",
 )
 
 
@@ -52,10 +61,33 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+_SESSION_TMP: str | None = None
+
+
 def pytest_configure(config: pytest.Config) -> None:
     if config.getoption("--update-golden"):
         os.environ["DEVVY_UPDATE_GOLDEN"] = "1"
     _scrub_live_config()
+    _private_tempdir()
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    if _SESSION_TMP:
+        shutil.rmtree(_SESSION_TMP, ignore_errors=True)
+
+
+def _private_tempdir() -> None:
+    """Every temp file of the run goes into one dir, removed at the end.
+
+    /tmp on this host is tmpfs (RAM). Tests that call ``tempfile.mktemp(".db")``
+    left ~4000 SQLite files (1.9 GB) there in one day, until Claude in chat
+    failed with EDQUOT (25.10.26). Pointing ``tempfile.tempdir`` at a per-run
+    dir covers mktemp/mkstemp/TemporaryDirectory and pytest's own basetemp
+    without touching each test.
+    """
+    global _SESSION_TMP
+    _SESSION_TMP = tempfile.mkdtemp(prefix="devvy-pytest-")
+    tempfile.tempdir = _SESSION_TMP
 
 
 def _scrub_live_config() -> None:

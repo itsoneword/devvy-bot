@@ -30,6 +30,16 @@ class PinnedMessageRepository:
             rows = await cur.fetchall()
         return {(int(r[0]), str(r[1])): int(r[2]) for r in rows}
 
+    async def load_dates(self) -> Dict[PinKey, str]:
+        """UTC creation date (YYYY-MM-DD) of each pin message (dv-6646):
+        ``updated_at`` only moves when ``set`` swaps in a new message id."""
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(
+                "SELECT chat_id, pin_as, updated_at FROM pinned_messages"
+            )
+            rows = await cur.fetchall()
+        return {(int(r[0]), str(r[1])): str(r[2])[:10] for r in rows if r[2]}
+
     async def set(self, chat_id: int, pin_as: str, message_id: int) -> None:
         async with self._db.get_connection() as conn:
             await conn.execute(

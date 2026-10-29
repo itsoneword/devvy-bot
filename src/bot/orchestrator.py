@@ -23,6 +23,7 @@ from telegram.ext import (
 )
 
 from ..profiles.registry import ensure_workspace_for
+from .orchestration.admin_menu import MENU_PREFIX, AdminMenuMixin
 from .orchestration.callbacks import CallbacksMixin
 from .orchestration.commands.admin import AdminCommandsMixin
 from .orchestration.commands.info import InfoCommandsMixin
@@ -56,6 +57,8 @@ OWNER_ONLY_COMMANDS = frozenset(
         "voice",
         "setup",
         "trace",
+        "menu",
+        "tasks",
     }
 )
 
@@ -65,9 +68,10 @@ class CommandSpec:
     """One bot command, described once for all three consumers.
 
     Registration, the Telegram menu and ``/help`` all read this table — see
-    CLAUDE.md "Adding a New Bot Command". The point of a single table is that
-    most commands are deliberately *not* in the menu (dv-a1c8): a command that
-    fell out of ``/help`` would become invisible rather than merely unlisted.
+    docs/architecture.md "Adding a New Bot Command". The point of a single
+    table is that most commands are deliberately *not* in the menu (dv-a1c8): a
+    command that fell out of ``/help`` would become invisible rather than
+    merely unlisted.
     """
 
     name: str
@@ -88,6 +92,7 @@ _EVERYONE = frozenset({"owner", "guest"})
 # core + safety first, then the owner's four at the bottom.
 COMMAND_TABLE: tuple[CommandSpec, ...] = (
     CommandSpec("start", "Start the bot", "core", _EVERYONE),
+    CommandSpec("menu", "Меню: лимиты, расход, Pump, настройки", "core", _OWNER),
     CommandSpec("new", "Start a fresh session", "core", _EVERYONE),
     CommandSpec(
         "agents", "Pick active agent (keyboard)", "core", _EVERYONE, requires="profiles"
@@ -103,10 +108,13 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
     CommandSpec("help", "List every command you can run", "core", _EVERYONE),
     CommandSpec("status", "Show session status", "session", _OWNER),
     CommandSpec("usage", "Show cost spent and budget caps", "session", _EVERYONE),
-    CommandSpec("limits", "Show OpenAI/Codex account limits", "session", _OWNER),
+    CommandSpec(
+        "limits", "Claude/Codex limits, Pump pause, chat backend", "session", _OWNER
+    ),
     CommandSpec("model", "Choose model backend / log in", "session", _OWNER),
-    CommandSpec("tasks", "Show the shared task board", "session", _OWNER),
     # --- Unlisted from here down: registered and working, surfaced by /help.
+    # /tasks: the /menu Pump screen replaces it (owner 26.10.26, dv-6104).
+    CommandSpec("tasks", "Show the shared task board", "session"),
     CommandSpec("family", "Manage your family members", "people", frozenset({"guest"})),
     CommandSpec("verbose", "Set output verbosity (0/1/2)", "session"),
     CommandSpec("memory", "Show loaded memory and context size", "session"),
@@ -120,11 +128,6 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
     ),
     CommandSpec("servercheck", "Run server health check now", "diagnostics"),
     CommandSpec(
-        "trace",
-        "Show what a turn did: tool-call tree (/trace [id|last])",
-        "diagnostics",
-    ),
-    CommandSpec(
         "diag",
         "Show profile lifecycle diagnostics",
         "diagnostics",
@@ -136,6 +139,7 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
         "diagnostics",
         requires="profiles",
     ),
+    CommandSpec("trace", "Show a turn's tool-call tree: /trace [id]", "diagnostics"),
     CommandSpec("setkey", "Store a tool API key (message auto-deleted)", "safety"),
     CommandSpec("keys", "List stored tool key names", "safety"),
     CommandSpec("delkey", "Delete a stored tool key", "safety"),
@@ -153,7 +157,12 @@ _HELP_SECTIONS: tuple[tuple[str, str], ...] = (
 
 
 class MessageOrchestrator(
-    AdminCommandsMixin, InfoCommandsMixin, StreamingMixin, CallbacksMixin, TurnsMixin
+    AdminMenuMixin,
+    AdminCommandsMixin,
+    InfoCommandsMixin,
+    StreamingMixin,
+    CallbacksMixin,
+    TurnsMixin,
 ):
     """Routes messages based on mode. Single entry point for all Telegram updates."""
 
@@ -182,6 +191,7 @@ class MessageOrchestrator(
 
         return {
             "start": self.agentic_start,
+            "menu": self.agentic_menu,
             "new": self.agentic_new,
             "agents": self.agentic_agents,
             "stop": self.agentic_stop,
@@ -204,6 +214,7 @@ class MessageOrchestrator(
             "servercheck": server_monitor.servercheck_command,
             "diag": self.agentic_diag,
             "identity": self.agentic_identity,
+            "trace": trace.trace_command,
             "adduser": self.agentic_adduser,
             "rmuser": self.agentic_rmuser,
             "setkey": keys.setkey_command,
@@ -211,7 +222,6 @@ class MessageOrchestrator(
             "delkey": keys.delkey_command,
             "voice": voice.voice_command,
             "setup": setup.setup_command,
-            "trace": trace.trace_command,
         }
 
     def _available_commands(self) -> List[CommandSpec]:
@@ -296,7 +306,15 @@ class MessageOrchestrator(
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
-                pattern=r"^(cd:|model:|agent:|agents:|auth:|rem:|vset:|onb:|qi:)",
+                pattern=r"^(cd:|model:|agent:|agents:|auth:|rem:|vset:|onb:|qi:|lim:|limits:)",
+            )
+        )
+
+        # /menu hub buttons (dv-6104): owner-gated in _menu_callback itself.
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._menu_callback),
+                pattern=f"^{MENU_PREFIX}",
             )
         )
 

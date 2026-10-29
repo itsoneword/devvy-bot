@@ -191,6 +191,52 @@ class TestOutputTailIsCharacterSafe:
         assert out.decode("utf-8") == content
 
 
+def _ping_header(run_sh: Path, rc: int) -> str:
+    """Execute run.sh's own ping-header block (from `d=$((` up to `hdr=`) as
+    emitted, with the given exit code, and return the built $msg."""
+    import subprocess
+
+    lines = run_sh.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("d=$(("))
+    end = next(i for i in range(start, len(lines)) if lines[i].startswith("hdr="))
+    block = "\n".join(lines[start:end])
+    script = f"rc={rc}\nt0=$(date +%s)\nstarted_h=now\n{block}\nprintf '%s' \"$msg\"\n"
+    # Popen, not run: the fixture monkeypatches subprocess.run (same module).
+    proc = subprocess.Popen(
+        ["bash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    out, err = proc.communicate(timeout=30)
+    assert proc.returncode == 0, err
+    return out.decode("utf-8")
+
+
+class TestIncompletePing:
+    """dv-b6dd: agentjob exits 3 when the job's own background work was still
+    running at its end; the ping must say so instead of ✅ finished."""
+
+    def test_clean_exit_still_pings_finished(self, bgjob, tmp_path, monkeypatch):
+        """Scenario 1 (guard): rc 0 -> ✅ finished, as today."""
+        msg = _ping_header(_write_run_sh(bgjob, tmp_path, monkeypatch), 0)
+        first = msg.splitlines()[0]
+        assert first.startswith("✅") and "finished" in first
+        assert "INCOMPLETE" not in msg
+
+    def test_exit_3_pings_incomplete_not_ok(self, bgjob, tmp_path, monkeypatch):
+        """Scenario 3: rc 3 -> ⚠️ INCOMPLETE, never ✅ / finished."""
+        msg = _ping_header(_write_run_sh(bgjob, tmp_path, monkeypatch), 3)
+        first = msg.splitlines()[0]
+        assert first.startswith("⚠️") and "INCOMPLETE" in first
+        assert "✅" not in msg and "❌" not in first
+
+    def test_other_failures_stay_failed(self, bgjob, tmp_path, monkeypatch):
+        """Other non-zero exits keep the ❌ FAILED ping."""
+        run_sh = _write_run_sh(bgjob, tmp_path, monkeypatch)
+        for rc in (1, 2, 137):
+            first = _ping_header(run_sh, rc).splitlines()[0]
+            assert first.startswith("❌") and "FAILED" in first, rc
+            assert "INCOMPLETE" not in first
+
+
 class TestProfileResolution:
     """Jobs resolve profiles through the bot's registry loader: a private YAML
     parser left ${DEVVY_WORKSPACES} unexpanded, so every job for a
@@ -693,3 +739,500 @@ class TestCmdJobsKeepTheBus:
         caps = [a for a in argv if "MemoryMax=" in a]
         assert caps == ["--property=MemoryMax=1G"], argv
         assert kw.get("env", {}).get("XDG_RUNTIME_DIR"), kw
+
+
+# --------------------------------------------------------------------------
+# dv-5432 phase 2: command jobs queue for a job slot; prompt jobs are refused.
+# `bgjob run --queue`: with the cap full the unit still starts, writes QUEUED
+# in its job dir, and run.sh runs `bgjob wait-slot <id>` before the command.
+# live_jobs() does not count a QUEUED job. wait-slot polls (time.sleep) until
+# live non-queued jobs other than itself < cap, then removes QUEUED; gives up
+# after 2 h with rc 75. Design: docs/research/dv-5432/analysis.md decision 6.
+# --------------------------------------------------------------------------
+
+
+class _StillWaiting(BaseException):
+    """Raised by the fake sleep to stop a waiter the test expects to block."""
+
+
+class _QueueBox:
+    """A jobs root with fake units: `active` is the set of running unit names.
+
+    systemd-run marks its unit active, as the real one would; every other
+    subprocess call (agentctl notify, pin) is recorded and succeeds.
+    """
+
+    def __init__(self, bgjob, tmp_path, monkeypatch, cap):
+        self.bgjob = bgjob
+        self.root = tmp_path / "jobs"
+        self.root.mkdir()
+        self.active: set = set()
+        self.calls: list = []
+        self.sleeps = 0
+        self.on_sleep = None
+        self.clock = 1_000_000.0
+        monkeypatch.setattr(bgjob, "JOBS_ROOT", self.root)
+        monkeypatch.setattr(bgjob, "MAX_CONCURRENT", cap)
+        monkeypatch.setattr(bgjob, "load_profiles", lambda: {"general": str(tmp_path)})
+        monkeypatch.setattr(bgjob, "unit_active", lambda unit: unit in self.active)
+        monkeypatch.setattr(bgjob, "job_progress", lambda unit: "")
+        monkeypatch.setattr(bgjob.shutil, "which", lambda name: "/bin/sh")
+
+        box = self
+
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        def fake_run(cmd, **kw):
+            box.calls.append(list(cmd))
+            if cmd and cmd[0] == "systemd-run":
+                unit = next(a for a in cmd if a.startswith("--unit="))
+                box.active.add(unit.split("=", 1)[1])
+            return R()
+
+        monkeypatch.setattr(bgjob.subprocess, "run", fake_run)
+        monkeypatch.setattr(bgjob.subprocess, "Popen", lambda *a, **k: None)
+
+        import time as real_time
+
+        class FakeTime:
+            """Fake clock: sleep advances it and lets the test free a slot."""
+
+            def __getattr__(self, name):
+                return getattr(real_time, name)
+
+            def time(self):
+                return box.clock
+
+            def monotonic(self):
+                return box.clock
+
+            def sleep(self, secs):
+                box.sleeps += 1
+                box.clock += max(float(secs), 1.0)
+                if box.sleeps > 2000:
+                    raise AssertionError("wait-slot never returned")
+                if box.on_sleep:
+                    box.on_sleep(box.sleeps)
+
+        monkeypatch.setattr(bgjob, "time", FakeTime())
+
+    def running_job(self, name, queued=False):
+        jid = f"20261025-1200{len(self.active):02d}-{name}"
+        d = self.root / jid
+        d.mkdir()
+        unit = f"bgjob-{jid}"
+        (d / "meta.json").write_text(
+            json.dumps({"id": jid, "name": name, "profile": "general", "unit": unit})
+        )
+        if queued:
+            (d / "QUEUED").write_text("")
+        self.active.add(unit)
+        return jid
+
+    def stop(self, jid):
+        self.active.discard(f"bgjob-{jid}")
+
+    def main(self, *argv):
+        """bgjob's real CLI entry point; returns the exit code."""
+        import sys as sys_mod
+
+        old = sys_mod.argv
+        sys_mod.argv = ["bgjob", *argv]
+        try:
+            rc = self.bgjob.main()
+        except SystemExit as e:
+            rc = e.code
+        finally:
+            sys_mod.argv = old
+        return rc
+
+    def systemd_runs(self):
+        return [c for c in self.calls if c and c[0] == "systemd-run"]
+
+    def new_job_dirs(self, before):
+        return sorted(p for p in self.root.iterdir() if p.name not in before)
+
+
+class TestCommandJobsQueueForASlot:
+    def test_command_job_with_cap_full_is_queued_and_starts_when_slot_frees(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """Scenario: job_start(command) with the job cap full is queued (not
+        refused) and starts once a slot frees."""
+        box = _QueueBox(bgjob, tmp_path, monkeypatch, cap=1)
+        other = box.running_job("research")
+        before = {p.name for p in box.root.iterdir()}
+
+        rc = box.main(
+            "run", "--profile", "general", "--name", "rel", "--queue",
+            "--cmd", "echo release",
+        )  # fmt: skip
+
+        assert rc == 0
+        (d,) = box.new_job_dirs(before)
+        jid = d.name
+        assert len(box.systemd_runs()) == 1, "queued job's unit must still start"
+        assert (d / "QUEUED").exists()
+        # A queued job does not take the slot it is waiting for.
+        assert bgjob.live_jobs() == [other]
+        # run.sh waits for the slot before it runs the command.
+        run_sh = (d / "run.sh").read_text()
+        wait_at = run_sh.find(f"wait-slot {jid}")
+        assert wait_at != -1, run_sh
+        assert wait_at < run_sh.find("cmd.txt"), run_sh
+        # The start ping says it is queued, and why.
+        pings = " ".join(" ".join(c) for c in box.calls if "notify" in c)
+        assert "queued" in pings and "cap 1" in pings, pings
+
+        # The other job finishes while the queued one polls.
+        box.on_sleep = lambda n: box.stop(other)
+        assert box.main("wait-slot", jid) == 0
+        assert box.sleeps >= 1
+        assert not (d / "QUEUED").exists()
+        assert bgjob.live_jobs() == [jid]
+
+    def test_wait_slot_returns_at_once_when_a_slot_is_free(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """added: a queued job whose slot is already free does not sit out a
+        poll interval (its own active unit does not count against it)."""
+        box = _QueueBox(bgjob, tmp_path, monkeypatch, cap=1)
+        jid = box.running_job("rel", queued=True)
+
+        assert box.main("wait-slot", jid) == 0
+        assert box.sleeps == 0
+        assert not (box.root / jid / "QUEUED").exists()
+
+    def test_second_waiter_does_not_take_a_slot_the_first_one_took(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """added: two queued jobs and one free slot: only one passes."""
+        box = _QueueBox(bgjob, tmp_path, monkeypatch, cap=2)
+        box.running_job("research")
+        first = box.running_job("rel-a", queued=True)
+        second = box.running_job("rel-b", queued=True)
+
+        assert box.main("wait-slot", first) == 0
+
+        def give_up(n):
+            if n >= 3:
+                raise _StillWaiting
+
+        box.on_sleep = give_up
+        with pytest.raises(_StillWaiting):
+            box.main("wait-slot", second)
+        assert (box.root / second / "QUEUED").exists()
+
+    def test_wait_slot_gives_up_after_two_hours_with_rc_75(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """added: the cap never frees: rc 75 after 2 h, not an endless wait."""
+        box = _QueueBox(bgjob, tmp_path, monkeypatch, cap=1)
+        box.running_job("research")
+        jid = box.running_job("rel", queued=True)
+        start = box.clock
+
+        assert box.main("wait-slot", jid) == 75
+        waited = box.clock - start
+        assert 2 * 3600 <= waited <= 2 * 3600 + 120, waited
+
+
+class TestPromptJobsStillRefusedAtCap:
+    def test_prompt_job_with_cap_full_is_refused_and_starts_nothing(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """Scenario: prompt jobs with the cap full are still refused, as today
+        (and a command job without --queue is too: the shell default holds)."""
+        box = _QueueBox(bgjob, tmp_path, monkeypatch, cap=1)
+        box.running_job("research")
+        before = {p.name for p in box.root.iterdir()}
+
+        for argv in (
+            ("run", "--profile", "general", "--name", "p", "do it"),
+            ("run", "--profile", "general", "--name", "c", "--cmd", "echo hi"),
+        ):
+            rc = box.main(*argv)
+            assert rc not in (0, None), argv
+            assert "already running" in str(rc) and "cap 1" in str(rc), rc
+        assert box.systemd_runs() == []
+        assert box.new_job_dirs(before) == []
+
+
+# --------------------------------------------------------------------------
+# dv-d63d phase 2: jobs resolve their model from the route table.
+#
+# Contract (docs/research/dv-d63d/analysis.md, Phase 2):
+# * `bgjob run --route NAME` hands the job route name to agentjob, which
+#   resolves harness/provider/model from models.yaml `jobs:`;
+# * `--model` has no default any more: without it run.sh passes no
+#   `--model`, so the table row decides (an always-sent `sonnet` would beat
+#   every row, and on a non-Claude route it would be a Claude tier);
+# * the legacy PUMP_*_MODEL env (taskpump's environment) must still reach
+#   agentjob, which runs in a transient unit that does not inherit our env.
+# --------------------------------------------------------------------------
+
+
+def _main_run(bgjob, tmp_path, monkeypatch, *argv):
+    """`bgjob run <argv>` through the real parser and cmd_run; nothing is
+    launched. Returns (agentjob line of run.sh, systemd-run argv, run.sh)."""
+    jobs, ws = tmp_path / "jobs", tmp_path / "ws"
+    jobs.mkdir()
+    ws.mkdir()
+    real_bwrap = _shutil.which("bwrap") or "/usr/bin/bwrap"
+    monkeypatch.setattr(bgjob, "JOBS_ROOT", jobs)
+    monkeypatch.setattr(bgjob, "load_profiles", lambda: {"general": str(ws)})
+    monkeypatch.setattr(bgjob, "load_extra_dirs", lambda slug: [])
+    monkeypatch.setattr(bgjob, "live_jobs", lambda: [])
+    monkeypatch.setattr(bgjob, "_venv_python", lambda: _sys.executable)
+    monkeypatch.setattr(
+        bgjob.shutil, "which", lambda n: real_bwrap if n == "bwrap" else "/bin/sh"
+    )
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        # Should bgjob ask agentjob for the resolved route, answer as the
+        # route table would for a Claude row.
+        out = (
+            '{"harness": "claude", "provider": "anthropic_sub", "model": "sonnet"}'
+            if "--print-route" in cmd
+            else ""
+        )
+        return _subprocess.CompletedProcess(cmd, 0, out, "")
+
+    monkeypatch.setattr(bgjob.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        _sys,
+        "argv",
+        ["bgjob", "run", "do it", "--profile", "general", "--quiet", *argv],
+    )
+    assert bgjob.main() == 0
+    run_sh = next(jobs.glob("*/run.sh"))
+    line = next(
+        ln
+        for ln in run_sh.read_text().splitlines()
+        if "agentjob" in ln and "--prompt-file" in ln
+    )
+    units = [c for c in calls if c and c[0] == "systemd-run"]
+    assert units, calls
+    return line, units[-1], run_sh
+
+
+class TestJobRoutes:
+    def test_route_reaches_agentjob_and_no_model_is_forced(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """taskpump's `--route pump_review` gets to agentjob; with no
+        --model the table row picks the model."""
+        line, _unit, _ = _main_run(
+            bgjob, tmp_path, monkeypatch, "--route", "pump_review"
+        )
+        assert "--route pump_review" in line
+        assert "--model" not in line
+
+    def test_plain_bgjob_without_model_sends_no_model(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """No models.yaml + no --model: agentjob's background_job row
+        (sonnet, as today) decides, not a hardcoded default here."""
+        line, _unit, _ = _main_run(bgjob, tmp_path, monkeypatch)
+        assert "--model" not in line
+        assert "--route" not in line or "--route background_job" in line
+
+    def test_legacy_pump_model_env_reaches_the_job_unit(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """PUMP_REVIEW_MODEL set for taskpump must reach agentjob inside the
+        transient unit (it does not inherit taskpump's environment)."""
+        monkeypatch.setenv("PUMP_REVIEW_MODEL", "fable")
+        line, unit, run_sh = _main_run(
+            bgjob, tmp_path, monkeypatch, "--route", "pump_review"
+        )
+        assert "--model" not in line  # an explicit model would beat models.yaml
+        assert "PUMP_REVIEW_MODEL=fable" in " ".join(unit) + run_sh.read_text()
+
+
+# --------------------------------------------------------------------------
+# dv-2514: an agent job's optional pre-agent command step (taskpump runs the
+# board's acceptance command with it). `bgjob run <prompt> --pre-cmd <shell>
+# --pre-log <file> --pre-timeout <s>`: run.sh runs the command inside the
+# job's box, output to the log, BEFORE agentjob; `pre_exit_code` in the job
+# dir. Past the timeout it is killed, `pre_timed_out` is written, agentjob
+# never runs and `exit_code` is 124. `--cmd` + `--pre-cmd` is refused.
+# --------------------------------------------------------------------------
+
+
+def _pre_job(bgjob, tmp_path, monkeypatch, pre_cmd, pre_timeout):
+    """cmd_run for an agent job with a pre-step, then run its run.sh for
+    real with three seams: the box is a wrapper that sets BOXED=1, the
+    cgroup carve-out is a no-op, and "python" is a fake that logs whether it
+    ran agentjob. Returns (job dir, order log lines, pre-log path, rc)."""
+    jobs, ws = tmp_path / "jobs", tmp_path / "ws"
+    jobs.mkdir()
+    ws.mkdir()
+    order = tmp_path / "order.log"
+    pre_log = ws / ".pump" / "acceptance" / "run.log"
+    pre_log.parent.mkdir(parents=True)
+    box = tmp_path / "box.sh"
+    box.write_text('#!/bin/bash\nexport BOXED=1\nexec "$@"\n')
+    box.chmod(0o755)
+    fakepy = tmp_path / "fakepy"
+    fakepy.write_text(
+        "#!/bin/bash\n"
+        'case "$*" in *agentjob*)\n'
+        f"  echo agent >> {_shlex.quote(str(order))}\n"
+        f"  [ -s {_shlex.quote(str(pre_log))} ] && "
+        f"echo agent-saw-log >> {_shlex.quote(str(order))}\n"
+        ";; esac\nexit 0\n"
+    )
+    fakepy.chmod(0o755)
+    monkeypatch.setattr(bgjob, "JOBS_ROOT", jobs)
+    monkeypatch.setattr(bgjob, "load_profiles", lambda: {"general": str(ws)})
+    monkeypatch.setattr(bgjob, "load_extra_dirs", lambda slug: [])
+    monkeypatch.setattr(bgjob, "live_jobs", lambda: [])
+    monkeypatch.setattr(bgjob, "_venv_python", lambda: str(fakepy))
+    monkeypatch.setattr(bgjob, "job_box_prefix", lambda b, w: _shlex.quote(str(box)))
+    monkeypatch.setattr(bgjob, "cgroup_carveout", lambda *a, **k: "box_cg=''\n")
+    monkeypatch.setattr(bgjob.shutil, "which", lambda n: "/bin/sh")
+
+    class R:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    monkeypatch.setattr(bgjob.subprocess, "run", lambda cmd, **kw: R())
+    args = type(
+        "A",
+        (),
+        {
+            "prompt": "judge it",
+            "profile": "general",
+            "name": "pump-x-acceptance",
+            "allow_dir": None,
+            "model": "sonnet",
+            "quiet": True,
+            "cwd": str(ws),
+            "pre_cmd": pre_cmd,
+            "pre_log": str(pre_log),
+            "pre_timeout": pre_timeout,
+        },
+    )()
+    assert bgjob.cmd_run(args) == 0
+    run_sh = next(jobs.glob("*/run.sh"))
+    # Popen, not run: subprocess.run is patched module-wide above.
+    proc = _subprocess.Popen(
+        ["bash", str(run_sh)], stdout=_subprocess.PIPE, stderr=_subprocess.PIPE
+    )
+    proc.communicate(timeout=200)
+    lines = order.read_text().splitlines() if order.exists() else []
+    return run_sh.parent, lines, pre_log, proc.returncode
+
+
+class TestPreAgentStep:
+    def test_cli_takes_the_pre_step_flags(self, bgjob, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(bgjob, "cmd_run", lambda a: seen.setdefault("a", a) and 0)
+        monkeypatch.setattr(
+            bgjob.sys,
+            "argv",
+            [
+                "bgjob",
+                "run",
+                "judge it",
+                "--pre-cmd",
+                "scripts/acceptance --users 50",
+                "--pre-log",
+                "/w/.pump/acceptance/run.log",
+                "--pre-timeout",
+                "3600",
+            ],
+        )
+        bgjob.main()
+        a = seen["a"]
+        assert a.pre_cmd == "scripts/acceptance --users 50"
+        assert a.pre_log == "/w/.pump/acceptance/run.log"
+        assert int(a.pre_timeout) == 3600
+
+    def test_pre_step_runs_in_the_box_to_completion_before_the_agent(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        order = tmp_path / "order.log"
+        cmd = (
+            "sleep 2; echo 'scenario 1 ok'; echo '{\"ok\": true}' > verdict.json; "
+            f'echo "pre boxed=$BOXED" >> {_shlex.quote(str(order))}'
+        )
+        d, lines, pre_log, _ = _pre_job(bgjob, tmp_path, monkeypatch, cmd, 3600)
+        # The step ran inside the job box, finished, then the agent started
+        # and could already read the step's output.
+        assert lines == ["pre boxed=1", "agent", "agent-saw-log"], lines
+        assert "scenario 1 ok" in pre_log.read_text()
+        assert (tmp_path / "ws" / "verdict.json").exists()  # cwd = worktree
+        assert (d / "pre_exit_code").read_text().strip() == "0"
+        assert not (d / "pre_timed_out").exists()
+        assert (d / "exit_code").read_text().strip() == "0"
+        assert (d / "pre_cmd.txt").read_text() == cmd
+
+    def test_pre_step_past_its_timeout_is_killed_and_the_agent_never_runs(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        order = tmp_path / "order.log"
+        cmd = f"echo started; sleep 60; echo late >> {_shlex.quote(str(order))}"
+        d, lines, pre_log, _ = _pre_job(bgjob, tmp_path, monkeypatch, cmd, 1)
+        assert lines == [], lines  # no agent, the command never got past sleep
+        assert (d / "pre_timed_out").exists()
+        assert (d / "exit_code").read_text().strip() == "124"
+        assert "started" in pre_log.read_text()
+
+    def test_pre_step_failing_on_its_own_still_hands_over_to_the_agent(
+        self, bgjob, tmp_path, monkeypatch
+    ):
+        """added: a non-zero exit (failing scenarios) is the agent's to judge;
+        an exit 124 from the command itself, well inside the timeout, is not
+        a hang."""
+        for rc in (3, 124):
+            sub = tmp_path / f"rc{rc}"
+            sub.mkdir()
+            d, lines, pre_log, _ = _pre_job(
+                bgjob, sub, monkeypatch, f"echo 'scenario 2 FAIL'; exit {rc}", 3600
+            )
+            assert lines == ["agent", "agent-saw-log"], (rc, lines)
+            assert (d / "pre_exit_code").read_text().strip() == str(rc)
+            assert not (d / "pre_timed_out").exists(), rc
+            assert (d / "exit_code").read_text().strip() == "0"
+
+    def test_cmd_job_with_a_pre_step_is_refused(self, bgjob, tmp_path, monkeypatch):
+        monkeypatch.setattr(bgjob, "JOBS_ROOT", tmp_path)
+        monkeypatch.setattr(bgjob, "load_profiles", lambda: {"general": str(tmp_path)})
+        monkeypatch.setattr(bgjob, "live_jobs", lambda: [])
+        started = []
+
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        monkeypatch.setattr(
+            bgjob.subprocess, "run", lambda cmd, **kw: started.append(cmd) or R()
+        )
+        args = type(
+            "A",
+            (),
+            {
+                "prompt": None,
+                "cmd": "pytest -q",
+                "profile": "general",
+                "name": "t",
+                "allow_dir": None,
+                "model": "sonnet",
+                "pre_cmd": "echo hi",
+                "pre_log": str(tmp_path / "x.log"),
+                "pre_timeout": 60,
+            },
+        )()
+        with pytest.raises(SystemExit):
+            bgjob.cmd_run(args)
+        assert not list(tmp_path.glob("*/run.sh"))
+        assert not any(c and c[0] == "systemd-run" for c in started)

@@ -656,24 +656,23 @@
     ],
     "dump.tool_calls": [
       {
-        "detached": 0,
-        "duration_ms": null,
+        "duration_ms": 5,
         "error": null,
         "id": "<id>",
-        "input_short": "{\"command\": \"ls\"}",
+        "input": "{\"command\": \"ls\"}",
         "message_id": "<id>",
         "model_call_id": null,
-        "ok": 1,
         "parent_tool_use_id": null,
-        "result_bytes": null,
-        "result_preview": null,
+        "result_bytes": 3,
+        "result_preview": "a.b",
         "seq": 1,
         "session_id": "sess-1",
         "started_at": "2026-01-01T00:00:00+00:00",
+        "status": "ok",
         "subagent_type": null,
-        "tool_name": "Bash",
-        "tool_use_id": "u1",
-        "trace_id": "golden-trace"
+        "tool": "Bash",
+        "tool_use_id": "tu-1",
+        "trace_id": "trace-golden"
       }
     ],
     "dump.user_holds": [
@@ -845,24 +844,23 @@
       },
       "tool_calls": [
         {
-          "detached": 0,
-          "duration_ms": null,
+          "duration_ms": 5,
           "error": null,
           "id": "<id>",
-          "input_short": "{\"command\": \"ls\"}",
+          "input": "{\"command\": \"ls\"}",
           "message_id": "<id>",
           "model_call_id": null,
-          "ok": 1,
           "parent_tool_use_id": null,
-          "result_bytes": null,
-          "result_preview": null,
+          "result_bytes": 3,
+          "result_preview": "a.b",
           "seq": 1,
           "session_id": "sess-1",
           "started_at": "2026-01-01T00:00:00+00:00",
+          "status": "ok",
           "subagent_type": null,
-          "tool_name": "Bash",
-          "tool_use_id": "u1",
-          "trace_id": "golden-trace"
+          "tool": "Bash",
+          "tool_use_id": "tu-1",
+          "trace_id": "trace-golden"
         }
       ]
     },
@@ -1450,6 +1448,23 @@
       "profiles": [
         "proj"
       ],
+      "sources": [
+        {
+          "archived": 0,
+          "group": "agent",
+          "key": "proj"
+        },
+        {
+          "archived": 0,
+          "group": "cli",
+          "key": "proj"
+        },
+        {
+          "archived": 0,
+          "group": "other",
+          "key": "proj"
+        }
+      ],
       "users": [
         111,
         "local"
@@ -1504,6 +1519,47 @@
           "input_tokens": 24,
           "output_tokens": 80,
           "profile": "proj"
+        }
+      ],
+      "by_source": [
+        {
+          "api_calls": 5,
+          "archived": 0,
+          "cache_creation_tokens": 300,
+          "cache_read_tokens": 250,
+          "detail": null,
+          "est_cost_usd": 0.00445,
+          "group": "agent",
+          "input_tokens": 15,
+          "key": "proj",
+          "output_tokens": 50,
+          "sessions": 2
+        },
+        {
+          "api_calls": 2,
+          "archived": 0,
+          "cache_creation_tokens": 120,
+          "cache_read_tokens": 100,
+          "detail": null,
+          "est_cost_usd": 0.00178,
+          "group": "other",
+          "input_tokens": 6,
+          "key": "proj",
+          "output_tokens": 20,
+          "sessions": 2
+        },
+        {
+          "api_calls": 1,
+          "archived": 0,
+          "cache_creation_tokens": 60,
+          "cache_read_tokens": 50,
+          "detail": null,
+          "est_cost_usd": 0.00089,
+          "group": "cli",
+          "input_tokens": 3,
+          "key": "proj",
+          "output_tokens": 10,
+          "sessions": 1
         }
       ],
       "daily": [
@@ -1755,6 +1811,10 @@
       "missing_transcript": false,
       "session": {
         "api_call_count": 4,
+        "attr_archived": 0,
+        "attr_detail": null,
+        "attr_group": "agent",
+        "attr_key": "proj",
         "bot_formula_tokens": 52,
         "cache_creation_tokens": 240,
         "cache_read_tokens": 200,
@@ -1853,6 +1913,10 @@
       "missing_transcript": false,
       "session": {
         "api_call_count": 1,
+        "attr_archived": 0,
+        "attr_detail": null,
+        "attr_group": "agent",
+        "attr_key": "proj",
         "bot_formula_tokens": 13,
         "cache_creation_tokens": 60,
         "cache_read_tokens": 50,
@@ -2047,6 +2111,10 @@
       "sessions": [
         {
           "api_call_count": 1,
+          "attr_archived": 0,
+          "attr_detail": null,
+          "attr_group": "other",
+          "attr_key": "proj",
           "bot_formula_tokens": 13,
           "cache_creation_tokens": 60,
           "cache_read_tokens": 50,
@@ -2071,6 +2139,10 @@
         },
         {
           "api_call_count": 1,
+          "attr_archived": 0,
+          "attr_detail": null,
+          "attr_group": "cli",
+          "attr_key": "proj",
           "bot_formula_tokens": 13,
           "cache_creation_tokens": 60,
           "cache_read_tokens": 50,
@@ -2095,6 +2167,10 @@
         },
         {
           "api_call_count": 1,
+          "attr_archived": 0,
+          "attr_detail": null,
+          "attr_group": "other",
+          "attr_key": "proj",
           "bot_formula_tokens": 13,
           "cache_creation_tokens": 60,
           "cache_read_tokens": 50,
@@ -2119,6 +2195,10 @@
         },
         {
           "api_call_count": 1,
+          "attr_archived": 0,
+          "attr_detail": null,
+          "attr_group": "agent",
+          "attr_key": "proj",
           "bot_formula_tokens": 13,
           "cache_creation_tokens": 60,
           "cache_read_tokens": 50,
@@ -2143,6 +2223,10 @@
         },
         {
           "api_call_count": 4,
+          "attr_archived": 0,
+          "attr_detail": null,
+          "attr_group": "agent",
+          "attr_key": "proj",
           "bot_formula_tokens": 52,
           "cache_creation_tokens": 240,
           "cache_read_tokens": 200,
@@ -2179,10 +2263,12 @@
         "cost_usd": 0.01,
         "duration_ms": 250,
         "error": null,
+        "exported_at": null,
         "harness": "claude",
         "harness_version": "1.2.3",
         "id": "<id>",
         "input_tokens": 120,
+        "job_name": null,
         "kind": "turn",
         "model": "claude-sonnet-5",
         "outcome": "ok",
@@ -2202,10 +2288,12 @@
         "cost_usd": null,
         "duration_ms": 5,
         "error": "boom",
+        "exported_at": null,
         "harness": "openai_codex",
         "harness_version": null,
         "id": "<id>",
         "input_tokens": 0,
+        "job_name": null,
         "kind": "plain",
         "model": null,
         "outcome": "error",

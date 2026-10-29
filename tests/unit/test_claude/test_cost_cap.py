@@ -163,8 +163,7 @@ def _config(tmp_path: Path, cap: float = 5.0) -> Settings:
 
 def _or_manager(tmp_path: Path, cap: float = 0.2) -> ClaudeSDKManager:
     p = tmp_path / "profiles.yaml"
-    p.write_text(
-        f"""
+    p.write_text(f"""
 profiles:
   - slug: devops
     name: DevOps
@@ -181,8 +180,7 @@ profiles:
     provider: openrouter
     model: {GLM}
     max_cost_per_request: {cap}
-"""
-    )
+""")
     (tmp_path / "ws" / "scratch").mkdir(parents=True)
     return ClaudeSDKManager(
         _config(tmp_path), profile_registry=load_profile_registry(p)

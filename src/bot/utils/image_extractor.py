@@ -10,7 +10,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import structlog
 
@@ -178,3 +178,69 @@ def should_send_as_photo(path: Path) -> bool:
         return path.stat().st_size <= PHOTO_SIZE_LIMIT
     except OSError:
         return False
+
+
+# MCP tools whose calls carry a file for the user (bare names; the SDK
+# namespaces them as "mcp__<server>__<tool>").
+SEND_FILE_TOOLS = ("send_image_to_user", "send_file_to_user")
+
+
+def is_send_file_call(tool_call: Dict[str, Any]) -> bool:
+    """True if *tool_call* is a ``send_image_to_user`` / ``send_file_to_user``."""
+    return str(tool_call.get("name", "")).rsplit("__", 1)[-1] in SEND_FILE_TOOLS
+
+
+def attachment_from_tool_call(
+    tool_call: Dict[str, Any],
+    approved_directory: Union[Path, Sequence[Path]],
+) -> Optional[ImageAttachment]:
+    """Validated attachment for one send_image/send_file tool call, else None.
+
+    The one place a tool call becomes a deliverable file: the chat stream
+    intercept and the scheduled/webhook turn (dv-ff39) both go through it.
+    """
+    if not is_send_file_call(tool_call):
+        return None
+    bare = str(tool_call.get("name", "")).rsplit("__", 1)[-1]
+    tc_input = tool_call.get("input") or {}
+    if not isinstance(tc_input, dict):
+        return None
+    return validate_image_path(
+        str(tc_input.get("file_path", "")),
+        approved_directory,
+        str(tc_input.get("caption", "") or ""),
+        any_file=bare == "send_file_to_user",
+    )
+
+
+def attachments_from_tools_used(
+    tools_used: Any,
+    approved_directory: Union[Path, Sequence[Path]],
+) -> List[ImageAttachment]:
+    """Files a finished turn sent with send_image/send_file (dv-ff39).
+
+    Reads ``response.tools_used`` after a turn that had no stream intercept
+    (scheduled, webhook). Errored calls (the tool refused) are skipped,
+    duplicates dropped, at most :data:`MAX_IMAGES_PER_RESPONSE` kept.
+    """
+    out: List[ImageAttachment] = []
+    seen: set[Path] = set()
+    for tc in tools_used if isinstance(tools_used, list) else []:
+        if not isinstance(tc, dict) or not is_send_file_call(tc) or tc.get("error"):
+            continue
+        img = attachment_from_tool_call(tc, approved_directory)
+        if img is None:
+            logger.warning(
+                "send_image_to_user path failed validation "
+                "(image will not reach the user despite the tool call "
+                "returning success)",
+                file_path=str(tc.get("input"))[:300],
+            )
+            continue
+        if img.path in seen:
+            continue
+        seen.add(img.path)
+        out.append(img)
+        if len(out) >= MAX_IMAGES_PER_RESPONSE:
+            break
+    return out

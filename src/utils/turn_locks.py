@@ -184,6 +184,18 @@ class TurnLocks:
                 return w
         return None
 
+    def busy(self) -> List[str]:
+        """Holder labels of every lock held right now (a turn in flight).
+
+        A lock taken without ``hold()`` has no label; it is named by its key.
+        The deferred restart (dv-da50) waits until this is empty.
+        """
+        return [
+            lock.holder or f"user {key[0]} / {key[1] or 'default'}"
+            for key, lock in self._locks.items()
+            if lock.locked()
+        ]
+
     def pending(self) -> List[Waiter]:
         """Every message still blocked on a lock (for the shutdown report)."""
         return [w for lock in self._locks.values() for w in lock.waiters]

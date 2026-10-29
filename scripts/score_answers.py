@@ -52,7 +52,8 @@ def _load_repo_env() -> None:
     path = Path(__file__).resolve().parent.parent / ".env"
     if not path.exists():
         return
-    wanted = ("OPENROUTER_API_KEY", "SCORER_MODEL")
+    # PROFILES_CONFIG_PATH: answer scores carry the registry's agent slug.
+    wanted = ("OPENROUTER_API_KEY", "SCORER_MODEL", "PROFILES_CONFIG_PATH")
     try:
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
@@ -74,7 +75,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import structlog  # noqa: E402
 
 from src.llm_analytics import db as index_db  # noqa: E402
-from src.llm_analytics.indexer import _profile_from_cwd  # noqa: E402
+from src.llm_analytics.attribution import agent_for_path  # noqa: E402
 from src.llm_analytics.judges import JudgeProvider, build_judge  # noqa: E402
 from src.llm_analytics.quality import looks_like_recipe  # noqa: E402
 from src.llm_analytics.rubric import (  # noqa: E402
@@ -115,7 +116,7 @@ def _load_session_scope(
     scope: dict[str, tuple[Optional[str], Optional[int]]] = {}
     for row in conn.execute("SELECT session_id, user_id, project_path FROM sessions"):
         scope[row["session_id"]] = (
-            _profile_from_cwd(row["project_path"]),
+            agent_for_path(row["project_path"]),
             row["user_id"],
         )
     return scope
@@ -179,10 +180,9 @@ def _fetch_context_turns(
 
 def _fetch_tool_calls(conn: sqlite3.Connection, message_id: int) -> list[str]:
     rows = conn.execute(
-        "SELECT DISTINCT tool_name FROM tool_calls WHERE message_id = ?",
-        (message_id,),
+        "SELECT DISTINCT tool FROM tool_calls WHERE message_id = ?", (message_id,)
     ).fetchall()
-    return [row["tool_name"] for row in rows]
+    return [row["tool"] for row in rows]
 
 
 def _already_scored(

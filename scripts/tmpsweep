@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Sweep our own stale entries out of /tmp (dv-1a02).
+
+/tmp on this host is tmpfs with a user quota: it is RAM, and when it fills
+the CLI fails with EDQUOT (its scratch is /tmp/claude-<uid>). This removes
+every top-level entry we own in which nothing changed for --max-idle-h hours.
+
+Never removed: sockets, ``*.lock``, ``codex-*``, an entry that contains a
+socket, a lock or another filesystem, and an entry a live process of ours
+has as cwd or open fd. Containers keep the dir and sweep its children:
+``pytest-of-<user>``, ``claude_bot_files`` (the bot creates it once at
+start) and ``claude-<uid>/<slug>/`` (CLI session dirs).
+
+Run by tmpsweep.timer every 15 min; it only sweeps when /tmp is over 70% or
+the last sweep is >=23h old. ``--notify`` sends one devops line when >500 MB
+was freed or /tmp is still over 70% (that alert at most once per 6h).
+
+Usage:
+  tmpsweep [--root /tmp] [--max-idle-h 12] [--dry-run] [--notify] [--force]
+"""
+
+import argparse
+import fnmatch
+import json
+import os
+import pwd
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+AGENTCTL = REPO / "scripts" / "agentctl"
+
+OVER_PCT = 70.0
+SWEEP_EVERY_S = 23 * 3600
+OVER_ALERT_EVERY_S = 6 * 3600
+NOTIFY_FREED_BYTES = 500 * 2**20
+KEEP_GLOBS = ("*.lock", "codex-*")
+
+
+@dataclass
+class Result:
+    freed_bytes: int = 0
+    removed: list[str] = field(default_factory=list)
+    # report bucket (top-level name, or "tmp*.db") -> bytes
+    buckets: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class _Scan:
+    newest: float = 0.0
+    size: int = 0
+    keep: bool = False
+
+
+def _scan(path: str, dev: int) -> _Scan:
+    """Newest mtime and size of path and everything under it. No symlink is
+    followed; a socket, a lock or another filesystem inside marks it keep."""
+    out = _Scan()
+
+    def visit(p: str) -> bool:
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            return False
+        out.newest = max(out.newest, st.st_mtime)
+        out.size += st.st_blocks * 512
+        name = os.path.basename(p)
+        if (
+            stat.S_ISSOCK(st.st_mode)
+            or st.st_dev != dev
+            or any(fnmatch.fnmatch(name, g) for g in KEEP_GLOBS)
+        ):
+            out.keep = True
+        return stat.S_ISDIR(st.st_mode) and st.st_dev == dev
+
+    if not visit(path):
+        return out
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+        for n in filenames:
+            visit(os.path.join(dirpath, n))
+        # Prune subdirs on another filesystem; visit() already marked keep.
+        dirnames[:] = [n for n in dirnames if visit(os.path.join(dirpath, n))]
+        if out.keep:
+            break
+    return out
+
+
+def _held_paths(root: str, uid: int, proc_root: str) -> list[str]:
+    """Paths under root that a live process of uid has as cwd or open fd."""
+    held: list[str] = []
+    prefix = root.rstrip("/") + "/"
+    try:
+        pids = [p for p in os.listdir(proc_root) if p.isdigit()]
+    except OSError:
+        return held
+    for pid in pids:
+        base = os.path.join(proc_root, pid)
+        try:
+            if os.stat(base).st_uid != uid:
+                continue
+            links = [os.path.join(base, "cwd")]
+            fd_dir = os.path.join(base, "fd")
+            links += [os.path.join(fd_dir, f) for f in os.listdir(fd_dir)]
+        except OSError:
+            continue
+        for link in links:
+            try:
+                target = os.readlink(link)
+            except OSError:
+                continue
+            if target.startswith(prefix):
+                held.append(target)
+    return held
+
+
+def _bucket(top: str) -> str:
+    return "tmp*.db" if fnmatch.fnmatch(top, "tmp*.db*") else top
+
+
+def _remove(path: str, is_dir: bool) -> bool:
+    try:
+        if is_dir:
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        print(f"tmpsweep: cannot remove {path}: {exc}", file=sys.stderr)
+        return False
+
+
+def sweep(
+    root: str | os.PathLike = "/tmp",
+    *,
+    now: float | None = None,
+    max_idle_h: float = 12,
+    uid: int | None = None,
+    proc_root: str = "/proc",
+    dry_run: bool = False,
+) -> Result:
+    """Remove uid's entries under root idle for more than max_idle_h hours."""
+    now = time.time() if now is None else now
+    uid = os.getuid() if uid is None else uid
+    cutoff = now - max_idle_h * 3600
+    root_s = os.path.realpath(root)
+    dev = os.lstat(root_s).st_dev
+    held = _held_paths(root_s, uid, proc_root)
+    try:
+        user = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        user = str(uid)
+    # name -> how many levels down the sweep applies (the dir itself is kept)
+    containers = {
+        f"pytest-of-{user}": 1,
+        "claude_bot_files": 1,
+        f"claude-{uid}": 2,
+    }
+    result = Result()
+
+    def is_held(path: str) -> bool:
+        return any(h == path or h.startswith(path + "/") for h in held)
+
+    def consider(path: str, top: str, depth: int, container: bool) -> None:
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return
+        if st.st_uid != uid or st.st_dev != dev:
+            return
+        is_dir = stat.S_ISDIR(st.st_mode)
+        name = os.path.basename(path)
+        if stat.S_ISSOCK(st.st_mode) or any(
+            fnmatch.fnmatch(name, g) for g in KEEP_GLOBS
+        ):
+            return
+        scan = None if container else _scan(path, dev)
+        stale = scan is not None and not (
+            scan.keep or scan.newest > cutoff or is_held(path)
+        )
+        if depth > 0 and is_dir and not stale:
+            # A container, or a live level inside one (claude-<uid>/<slug>):
+            # keep it, judge its children one by one.
+            for child in _listdir(path):
+                consider(os.path.join(path, child), top, depth - 1, False)
+            return
+        if scan is None or not stale:
+            return
+        if dry_run or _remove(path, is_dir):
+            result.freed_bytes += scan.size
+            result.removed.append(path)
+            b = _bucket(top)
+            result.buckets[b] = result.buckets.get(b, 0) + scan.size
+
+    for name in _listdir(root_s):
+        consider(
+            os.path.join(root_s, name),
+            name,
+            containers.get(name, 0),
+            name in containers,
+        )
+    return result
+
+
+def _listdir(path: str) -> list[str]:
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
+def usage_percent(root: str | os.PathLike = "/tmp") -> float:
+    st = os.statvfs(root)
+    if not st.f_blocks:
+        return 0.0
+    return 100.0 * (st.f_blocks - st.f_bfree) / st.f_blocks
+
+
+def send_notify(text: str) -> None:
+    """The one devops line. A failure (bot down) is logged, never raised."""
+    try:
+        r = subprocess.run(
+            [
+                str(AGENTCTL),
+                "notify",
+                "--profile",
+                "devops",
+                "--deliver",
+                "--source",
+                "tmpsweep",
+                text,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if r.returncode != 0:
+            print(f"tmpsweep: notify failed: {r.stderr.strip()}", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"tmpsweep: notify failed: {exc}", file=sys.stderr)
+
+
+def _human(n: float) -> str:
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024 or unit == "G":
+            return f"{n:.0f}{unit}" if unit != "G" else f"{n:.1f}G"
+        n /= 1024
+    return f"{n:.1f}G"
+
+
+def _state_path() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "devvy" / "tmpsweep.json"
+
+
+def _load_state(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state), encoding="utf-8")
+    tmp.replace(path)
+
+
+def report_line(root: str, res, pct: float) -> str:
+    buckets = getattr(res, "buckets", {}) or {}
+    top = sorted(buckets.items(), key=lambda kv: -kv[1])[:5]
+    parts = ", ".join(f"{k} {_human(v)}" for k, v in top)
+    detail = f"{len(res.removed)} entries" + (f"; {parts}" if parts else "")
+    return f"🧹 {root}: freed {_human(res.freed_bytes)} ({detail}), now {pct:.0f}%"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="tmpsweep", description=__doc__.split("\n")[0])
+    ap.add_argument("--root", default="/tmp")
+    ap.add_argument("--max-idle-h", type=float, default=12)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--notify", action="store_true")
+    ap.add_argument("--force", action="store_true", help="sweep regardless of gate")
+    args = ap.parse_args(argv)
+
+    now = time.time()
+    state_file = _state_path()
+    state = _load_state(state_file)
+    before = usage_percent(args.root)
+    due = now - float(state.get("last_sweep", 0)) >= SWEEP_EVERY_S
+    if not (args.force or args.dry_run or before > OVER_PCT or due):
+        return 0
+
+    res = sweep(args.root, now=now, max_idle_h=args.max_idle_h, dry_run=args.dry_run)
+    after = usage_percent(args.root)
+    line = report_line(args.root, res, after)
+    print(("[dry-run] " if args.dry_run else "") + line)
+    for p in res.removed[:20]:
+        print(f"  {p}")
+    if args.dry_run:
+        return 0
+
+    state["last_sweep"] = now
+    still_over = after > OVER_PCT
+    over_alert = still_over and (
+        now - float(state.get("last_over_alert", 0)) >= OVER_ALERT_EVERY_S
+    )
+    if args.notify and (res.freed_bytes > NOTIFY_FREED_BYTES or over_alert):
+        msg = line + (" — still over 70%" if still_over else "")
+        send_notify(msg)
+        if still_over:
+            state["last_over_alert"] = now
+    _save_state(state_file, state)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -56,7 +56,7 @@ async def message_repo(db_manager):
 
 @pytest.fixture
 async def tool_repo(db_manager):
-    """Create tool call (harness trace) repository."""
+    """Create the tool_calls repository (dv-2260; replaced tool_usage)."""
     return ToolCallRepository(db_manager)
 
 
@@ -631,60 +631,52 @@ class TestProjectThreadRepository:
         assert mapping.is_active is False
 
 
-def _row(use_id, name="Read", parent=None, **kw):
-    base = {
+def _row(use_id, tool, status="ok", seq=1, parent=None):
+    return {
         "tool_use_id": use_id,
         "parent_tool_use_id": parent,
-        "seq": 1,
-        "tool_name": name,
-        "input_short": "{}",
-        "ok": 1,
+        "seq": seq,
+        "tool": tool,
+        "input": '{"file_path": "/test/file.py"}',
+        "status": status,
         "started_at": datetime.now(UTC),
-        "detached": 0,
     }
-    base.update(kw)
-    return base
 
 
 class TestToolCallRepository:
-    """The harness trace store (dv-2260)."""
+    """Test the tool_calls repository."""
 
-    async def test_upsert_updates_in_place_and_keeps_links(self, tool_repo):
-        await tool_repo.upsert("t1", [_row("a", ok=None)])
-        await tool_repo.link_model_call("t1", 7, "s1")
-        # the result arrives later: same key, new state, links untouched
-        await tool_repo.upsert("t1", [_row("a", ok=0, error="boom", duration_ms=5)])
-        rows = await tool_repo.for_model_call(7)
+    async def test_upsert_link_and_read_back(self, tool_repo, db_manager):
+        async with db_manager.get_connection() as conn:
+            cur = await conn.execute(
+                "INSERT INTO model_calls (purpose, kind, harness, provider, outcome)"
+                " VALUES ('chat', 'turn', 'claude', 'anthropic', 'ok')"
+            )
+            call_id = cur.lastrowid
+            await conn.commit()
+        await tool_repo.upsert("t1", [_row("u1", "Read", status="unfinished")])
+        # Same (trace_id, tool_use_id): the result updates the row in place.
+        await tool_repo.upsert("t1", [_row("u1", "Read", status="ok")])
+        await tool_repo.link_model_call("t1", call_id, "tool-session")
+
+        rows = await tool_repo.for_session("tool-session")
         assert len(rows) == 1
-        assert rows[0]["ok"] == 0 and rows[0]["error"] == "boom"
-        assert rows[0]["session_id"] == "s1"
+        assert (rows[0]["tool"], rows[0]["status"]) == ("Read", "ok")
+        assert rows[0]["model_call_id"] == call_id
+        assert await tool_repo.for_model_call(call_id) == rows
 
-    async def test_link_message_and_lookup(self, tool_repo):
-        await tool_repo.upsert("t2", [_row("a"), _row("b", parent="a", seq=2)])
-        await tool_repo.link_message("t2", 42, "s2")
-        rows = await tool_repo.for_message(42)
-        assert [r["tool_use_id"] for r in rows] == ["a", "b"]
-        assert rows[1]["parent_tool_use_id"] == "a"
-        assert await tool_repo.for_session("s2") == rows
-
-    async def test_tool_stats(self, tool_repo):
+    async def test_get_tool_stats(self, tool_repo):
+        tools = ["Read", "Write", "Read", "Edit", "Read"]
         await tool_repo.upsert(
-            "t3",
-            [_row("a"), _row("b", name="Write"), _row("c", ok=0, error="x")],
+            "t2",
+            [_row(f"u{i}", t, seq=i) for i, t in enumerate(tools)]
+            + [_row("bad", "Read", status="error", seq=9, parent="u0")],
         )
         stats = await tool_repo.get_tool_stats()
-        read = next(s for s in stats if s["tool_name"] == "Read")
-        assert read["usage_count"] == 2
-        assert read["success_count"] == 1 and read["error_count"] == 1
-
-    async def test_prune_drops_only_old_rows(self, tool_repo):
-        from datetime import timedelta
-
-        old = datetime.now(UTC) - timedelta(days=120)
-        await tool_repo.upsert("t4", [_row("old", started_at=old), _row("new")])
-        assert await tool_repo.prune(90) == 1
-        await tool_repo.link_message("t4", 1, "s")
-        assert [r["tool_use_id"] for r in await tool_repo.for_message(1)] == ["new"]
+        read_stats = next(s for s in stats if s["tool_name"] == "Read")
+        assert read_stats["usage_count"] == 4
+        assert read_stats["success_count"] == 3
+        assert read_stats["error_count"] == 1
 
 
 class TestAuditLogRepository:

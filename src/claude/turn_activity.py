@@ -70,20 +70,28 @@ class TurnActivity:
         self.note(f"{kind}:in", detail)
         return token
 
-    def end(self, token: int, outcome: str = "ok") -> float:
+    def end(self, token: int, outcome: str = "ok", owner_wait: float = 0.0) -> float:
+        """Close a control call. ``owner_wait`` is the part of it spent waiting
+        for the owner's Approve/Deny tap (dv-d760): it is reported, but only
+        the self-time (total minus that wait) makes a "Slow control call"."""
         entry = self.open.pop(token, None)
         if entry is None:
             return 0.0
         kind, detail, t0 = entry
         took = time.monotonic() - t0
-        self.note(f"{kind}:out", f"{detail} {outcome} {took:.1f}s".strip())
-        if took >= SLOW_CALL_LOG_SECONDS:
+        self_time = max(0.0, took - owner_wait)
+        out = f"{detail} {outcome} {took:.1f}s"
+        if owner_wait > 0:
+            out += f" (owner {owner_wait:.1f}s)"
+        self.note(f"{kind}:out", out.strip())
+        if self_time >= SLOW_CALL_LOG_SECONDS:
             logger.warning(
                 "Slow control call",
                 kind=kind,
                 detail=detail,
                 outcome=outcome,
                 seconds=round(took, 1),
+                owner_wait_s=round(owner_wait, 1),
                 label=self.label,
             )
         return took
@@ -168,13 +176,18 @@ class TurnActivity:
                 pass
             token = self.begin(kind, detail)
             outcome = "ok"
+            # Per call, not per turn: parallel tool calls each run in their
+            # own task/context, so one call's ask is never charged to another.
+            wait = [0.0]
+            wait_token = _owner_wait.set(wait)
             try:
                 return await fn(*args, **kwargs)
             except BaseException as exc:
                 outcome = type(exc).__name__
                 raise
             finally:
-                self.end(token, outcome)
+                _owner_wait.reset(wait_token)
+                self.end(token, outcome, owner_wait=wait[0])
 
         return wrapper
 
@@ -188,6 +201,23 @@ def set_current(activity: Optional[TurnActivity]) -> None:
 
 def current_activity() -> Optional[TurnActivity]:
     return _current.get()
+
+
+# Owner-wait accumulator of the wrapped control call running in this context
+# (set by TurnActivity.wrap). None outside a wrapped call, e.g. a job's ask.
+_owner_wait: ContextVar[Optional[List[float]]] = ContextVar(
+    "turn_activity_owner_wait", default=None
+)
+
+
+def note_owner_wait(seconds: float) -> None:
+    """Charge ``seconds`` of waiting for the owner to the current control call.
+
+    Called by ConfirmationManager.request; a no-op outside a wrapped call.
+    """
+    holder = _owner_wait.get()
+    if holder is not None:
+        holder[0] += seconds
 
 
 # -- CLI process probe ------------------------------------------------------

@@ -425,3 +425,33 @@ async def test_transition_survives_a_restart(repo):
     state = await after_restart.get_or_create(7, "/p")
     assert state.force_new_session is False
     assert state.pending_seed_window is None
+
+
+async def test_seed_notes_cap_pointers_at_15_with_raised_snapshot_caps(repo):
+    """dv-cf07: the bundle now carries up to 60 pointers; the roll seed stays
+    compact -- at most 15 pointer lines (and 15 fact lines), not a second
+    copy of the bundle's pointer list."""
+    from src.bot.orchestration.windowing import _session_notes_for_seed
+    from src.storage.memory_repository import MemoryRepository
+
+    memory_repo = MemoryRepository(repo._db)
+    for i in range(30):
+        await memory_repo.add_fact("devops", "general", f"seed general fact {i}")
+    for i in range(71):
+        await memory_repo.add_fact(
+            "devops",
+            "general",
+            f"body {i}",
+            label=f"seed conclusion {i:02d}",
+            kind="conversation_result",
+        )
+
+    notes = await _session_notes_for_seed(memory_repo, "devops")
+    head, sep, pointer_block = notes.partition("Your own earlier conclusions")
+    assert sep, notes
+    pointer_lines = [ln for ln in pointer_block.splitlines() if ln.startswith("- ")]
+    fact_lines = [ln for ln in head.splitlines() if ln.startswith("- ")]
+    assert 0 < len(pointer_lines) <= 15
+    assert 0 < len(fact_lines) <= 15
+    # The newest conclusion is the one that survives the cut.
+    assert "seed conclusion 70" in pointer_block

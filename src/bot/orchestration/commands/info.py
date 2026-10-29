@@ -1,8 +1,10 @@
 """Info/status command handlers moved verbatim from src/bot/orchestrator.py."""
 
 import asyncio
+import json
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -18,6 +20,14 @@ from ..formatting import format_diag, format_sessions_summary, format_usage_tabl
 from ..windowing import apply_window_tokens, reset_window, window_conversation_text
 
 logger = structlog.get_logger()
+
+
+CODEX_MENU_MODELS = 3
+
+
+def _mark(label: str, current: bool) -> str:
+    """Prefix the current pick with a check mark."""
+    return f"✓ {label}" if current else label
 
 
 class InfoCommandsMixin(OrchestratorBase):
@@ -93,6 +103,7 @@ class InfoCommandsMixin(OrchestratorBase):
                 ),
                 agent_id=self._agent_id_for(context, current_dir, user_id),
                 family_id=self._family_id_for(context, user_id, current_dir),
+                consolidation=context.bot_data.get("consolidation_service"),
             )
         context.user_data.pop("pending_seed_window", None)
 
@@ -163,9 +174,17 @@ class InfoCommandsMixin(OrchestratorBase):
         Until now the caps surfaced exactly once — as a hard refusal when the
         rolling-24h budget ran out. This makes them visible beforehand.
         """
-        from datetime import UTC, datetime
-
         user_id = update.effective_user.id
+        text = await self._usage_text(user_id, context)
+        storage = context.bot_data.get("storage")
+        if storage:
+            await storage.log_bot_event(user_id, "command_usage", {})
+        await update.message.reply_text(text)
+
+    async def _usage_text(
+        self, user_id: int, context: ContextTypes.DEFAULT_TYPE
+    ) -> str:
+        """The /usage text; /menu → Использование shows the same (dv-6104)."""
         role = self._resolve_role(user_id, context)
         lines = [f"💸 Usage ({role})"]
 
@@ -250,33 +269,17 @@ class InfoCommandsMixin(OrchestratorBase):
             lines.append("Per-request cap: none")
         else:
             lines.append(f"Per-request cap: ${per_request:.2f}")
-
-        if storage:
-            await storage.log_bot_event(user_id, "command_usage", {})
-        await update.message.reply_text("\n".join(lines))
+        return "\n".join(lines)
 
     async def agentic_limits(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Show provider-side Codex limits without invoking an LLM."""
-        backends = context.bot_data.get("backends") or {}
-        backend = backends.get("openai_codex") or context.bot_data.get(
-            "codex_integration"
-        )
-        reader = getattr(backend, "read_account_limits", None)
-        if reader is None:
-            await update.message.reply_text("Codex backend не подключён.")
-            return
-        try:
-            snapshot = await reader()
-        except CodexUsageError as exc:
-            await update.message.reply_text(f"Не удалось получить лимиты Codex: {exc}")
-            return
-        except Exception:
-            logger.warning("limits: Codex account query failed", exc_info=True)
-            await update.message.reply_text("Не удалось получить лимиты Codex.")
-            return
-        await update.message.reply_text(format_codex_limits(snapshot))
+        """Расход (dv-f6af): Claude's last seen usage (dv-55ad) and recorded
+        limit, paid spend today / 7 days, Codex limits if Codex was used this
+        week. No buttons, no LLM anywhere: it must work exactly when Claude's
+        subscription is out."""
+        text, markup = await limits_panel(context)
+        await update.message.reply_text(text, reply_markup=markup)
 
     def _stop_notice(self, error_type: Optional[str]) -> Optional[str]:
         """User-facing note for a run that stopped before producing a result.
@@ -306,6 +309,11 @@ class InfoCommandsMixin(OrchestratorBase):
             )
         if error_type == "interrupted":
             return "🛑 Stopped by /stop — the text above is partial."
+        if error_type == "quota":
+            return (
+                "⏸ Claude's usage limit is out. /limits shows the reset time "
+                "and switches this chat to Codex."
+            )
         return None
 
     async def agentic_verbose(
@@ -343,7 +351,9 @@ class InfoCommandsMixin(OrchestratorBase):
             parse_mode="HTML",
         )
 
-    async def _codex_model_rows(self) -> List[List[InlineKeyboardButton]]:
+    async def _codex_model_rows(
+        self, current: str = ""
+    ) -> List[List[InlineKeyboardButton]]:
         """Keyboard rows for the Codex backend, built from the live catalog.
 
         `codex debug models` is the source of truth (dv-0c01): the entitled
@@ -360,12 +370,23 @@ class InfoCommandsMixin(OrchestratorBase):
         # so refresh rather than leaving a recently upgraded account on the
         # hour-long catalog cache.
         models = await CODEX_CATALOG.get(force=True)
+        # Three, like the Claude row (owner, 27.10.26): the catalog is sorted
+        # by the vendor's priority, so the top three are the current
+        # generation. A current pick outside them stays visible.
+        shown = models[:CODEX_MENU_MODELS]
+        shown += [
+            m for m in models[CODEX_MENU_MODELS:] if current == f"openai-codex/{m.slug}"
+        ]
+        models = shown
         rows: List[List[InlineKeyboardButton]] = []
         for i in range(0, len(models), 2):
             rows.append(
                 [
                     InlineKeyboardButton(
-                        f"Codex {m.display_name}",
+                        _mark(
+                            m.display_name.replace("-", " "),
+                            current == f"openai-codex/{m.slug}",
+                        ),
                         callback_data=f"model:codex:{m.slug}",
                     )
                     for m in models[i : i + 2]
@@ -381,44 +402,62 @@ class InfoCommandsMixin(OrchestratorBase):
         user = getattr(update, "effective_user", None)
         user_id = user.id if user else None
         model = self._selected_model(context, user_id)
-        codex_status = (
-            "authenticated"
-            if (Path.home() / ".codex" / "auth.json").exists()
-            else "not authenticated"
-        )
+        codex_logged_in = (Path.home() / ".codex" / "auth.json").exists()
+        on_claude = backend == "claude"
+        # Short labels so a phone shows them whole (3 per row truncated
+        # "Claude Fable" to "Clau...able"); the ✓ marks the current pick.
         rows = [
             [
                 InlineKeyboardButton(
-                    "Claude Sonnet", callback_data="model:claude:sonnet"
-                ),
-                InlineKeyboardButton("Claude Opus", callback_data="model:claude:opus"),
+                    _mark(label, on_claude and model == tier),
+                    callback_data=f"model:claude:{tier}",
+                )
+                for tier, label in (
+                    ("sonnet", "Sonnet"),
+                    ("opus", "Opus"),
+                    ("fable", "Fable"),
+                )
             ]
         ]
-        rows += await self._codex_model_rows()
+        rows += await self._codex_model_rows(model)
         # The active profile's own model list (dv-d2f6), e.g. an OpenRouter
         # agent: only these slugs are pickable while it is active.
         profile = self._active_profile(context, user_id)
         if profile is not None and profile.allowed_models:
             rows += [
-                [InlineKeyboardButton(m, callback_data=f"model:or:{m}")]
+                [
+                    InlineKeyboardButton(
+                        _mark(m, model == m), callback_data=f"model:or:{m}"
+                    )
+                ]
                 for m in profile.allowed_models
             ]
+        # Only the action that applies now.
         rows.append(
             [
-                InlineKeyboardButton(
-                    "Login OpenAI Codex", callback_data="model:codex_login"
-                ),
-                InlineKeyboardButton(
-                    "Logout Codex", callback_data="model:codex_logout"
-                ),
+                (
+                    InlineKeyboardButton(
+                        "Log out of Codex", callback_data="model:codex_logout"
+                    )
+                    if codex_logged_in
+                    else InlineKeyboardButton(
+                        "Log in to Codex", callback_data="model:codex_login"
+                    )
+                )
             ]
         )
         keyboard = InlineKeyboardMarkup(rows)
+        current = (
+            f"Claude {model.capitalize()}"
+            if on_claude
+            else model.removeprefix("openai-codex/")
+        )
         await update.message.reply_text(
-            "<b>Model backend</b>\n\n"
-            f"Current: <code>{escape_html(backend)}</code> "
-            f"/ <code>{escape_html(model)}</code>\n"
-            f"OpenAI Codex: {escape_html(codex_status)}",
+            "<b>Model</b>\n\n"
+            f"Now: <b>{escape_html(current)}</b>\n"
+            "Row 1: Claude. Below: Codex (GPT)"
+            + ("" if codex_logged_in else ", needs login")
+            + ".",
             parse_mode="HTML",
             reply_markup=keyboard,
         )
@@ -606,6 +645,14 @@ class InfoCommandsMixin(OrchestratorBase):
             await self._stop_everything(update, context)
             return
 
+        text = await self._stop_this_chat(update, context)
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def _stop_this_chat(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> str:
+        """Scoped /stop; the /menu Pump screen's Stop button runs the same
+        (dv-6104 — a button beside the command, not a copy). Returns HTML."""
         from ....profiles.registry import DEFAULT_AGENT_ID
 
         storage = context.bot_data.get("storage")
@@ -626,7 +673,7 @@ class InfoCommandsMixin(OrchestratorBase):
                 f"Nothing is running on <b>{escape_html(slug)}</b>. "
                 "<code>/stop all</code> halts every agent and pauses the scheduler."
             )
-        await update.message.reply_text(text, parse_mode="HTML")
+        return text
 
     async def _stop_everything(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -948,3 +995,203 @@ class InfoCommandsMixin(OrchestratorBase):
             parse_mode="HTML",
             reply_markup=reply_markup,
         )
+
+
+# --- /limits outage panel (dv-7ad9) -------------------------------------------
+
+
+async def limits_panel(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    """The /limits text; /menu → Расход shows the same (dv-f6af). Spend and
+    limits only: no buttons (freeze lives on the Pump screen, the chat switch
+    in /model, the jobs switch in Модели). Kept as a pair so callers add
+    their own « Назад."""
+    return await spend_text(context), None
+
+
+_CODEX_HARNESS = "openai_codex"
+_CODEX_RECENT_DAYS = 7
+
+
+async def spend_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Расход: the Claude subscription first (dv-55ad renderer), then real
+    money per paying provider today / 7 days, then the Codex limits only if
+    Codex was used in the last 7 days. No model call."""
+    storage = context.bot_data.get("storage")
+    db = getattr(storage, "db_manager", None)
+    blocks = [_claude_limit_text(), await _paid_spend_text(db)]
+    if db is not None and await _codex_recently_used(db):
+        blocks.append(await _codex_limits_text(context))
+    return "\n\n".join(b for b in blocks if b)
+
+
+async def _paid_spend_text(db: Any) -> str:
+    if db is None:
+        return ""
+    from ....storage.model_calls import paid_spend
+
+    try:
+        rows = await paid_spend(db)
+    except Exception:
+        logger.warning("spend: model_calls read failed", exc_info=True)
+        return "Платные вызовы: не удалось прочитать."
+    if not rows:
+        return "Платных вызовов за 7 дней нет."
+    lines = ["Платные вызовы (сегодня / 7 дней):"]
+    lines += [f"• {name}: ${day:.2f} / ${week:.2f}" for name, day, week in rows]
+    return "\n".join(lines)
+
+
+async def _codex_recently_used(db: Any) -> bool:
+    from ....storage.model_calls import harness_used_since
+
+    try:
+        return await harness_used_since(db, _CODEX_HARNESS, _CODEX_RECENT_DAYS)
+    except Exception:
+        logger.warning("spend: model_calls read failed", exc_info=True)
+        return False
+
+
+def _claude_limit_text() -> str:
+    """Claude's usage and limit from the shared record (dv-55ad renderer)."""
+    from ....model_router import quota
+
+    return quota.claude_limits_text()
+
+
+def _pump_frozen() -> Optional[Dict[str, Any]]:
+    """The Pump's `frozen` block from its state file, None when running."""
+    from ....utils.paths import data_layout
+
+    try:
+        state = json.loads(data_layout().taskpump_state.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    frozen = state.get("frozen") if isinstance(state, dict) else None
+    return frozen if isinstance(frozen, dict) else None
+
+
+async def _codex_limits_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """The provider-side Codex limits, or why they are not there."""
+    backends = context.bot_data.get("backends") or {}
+    backend = backends.get("openai_codex") or context.bot_data.get("codex_integration")
+    reader = getattr(backend, "read_account_limits", None)
+    if reader is None:
+        return "Codex backend не подключён."
+    try:
+        snapshot = await reader()
+    except CodexUsageError as exc:
+        return f"Не удалось получить лимиты Codex: {exc}"
+    except Exception:
+        logger.warning("limits: Codex account query failed", exc_info=True)
+        return "Не удалось получить лимиты Codex."
+    return format_codex_limits(snapshot)
+
+
+# --- the owner's job switch (dv-d63d; moved into Модели, dv-f6af) ---------
+
+LIMITS_JOBS_PREFIX = "limits:jobs:"  # stale /limits buttons still land here
+JOBS_SWITCH_PREFIX = "menu:jobs:"
+_JOB_SWITCH_LABELS = {
+    "claude": "Claude",
+    "openai_codex": "Codex",
+    "openrouter": "OpenRouter",
+}
+_TABLE_LABEL = "по таблице"
+
+
+def jobs_switch_name() -> str:
+    """Where background jobs run now, in words (the switch, or the table)."""
+    from ....model_router.quota import job_route_info
+
+    info = job_route_info()
+    if info is None:
+        return _TABLE_LABEL
+    return _JOB_SWITCH_LABELS.get(str(info["harness"]), str(info["harness"]))
+
+
+def jobs_switch_screen(note: str = "") -> Tuple[str, InlineKeyboardMarkup]:
+    """The jobs switch explained in words, one button per target, the current
+    one ✓. Targets are ``menu:jobs:<harness|table>``."""
+    from ....model_router.quota import job_route_info
+
+    info = job_route_info()
+    current = "table" if info is None else str(info["harness"])
+    lines = [note, ""] if note else []
+    lines += [
+        "Фоновые задачи — это стадии Pump и фоновые job: анализ, сборка, "
+        "ревью. Чат это не меняет (его модель — /model).",
+        "",
+        "Выберите, на чём они работают с ближайшего запуска. «По таблице» — "
+        "у каждой стадии своя модель, как в «🧠 Модели» (« Назад).",
+    ]
+    options = [*_JOB_SWITCH_LABELS.items(), ("table", _TABLE_LABEL.capitalize())]
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{'✓ ' if key == current else ''}{label}",
+                callback_data=f"{JOBS_SWITCH_PREFIX}{key}",
+            )
+        ]
+        for key, label in options
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _job_switch_refusal(harness: str) -> Optional[str]:
+    """Why the jobs cannot move to ``harness`` now, or None when they can."""
+    from dataclasses import replace
+
+    from ....agent_backends.codex_cli import codex_home
+    from ....model_router.routes import openrouter_key, process_call_routes
+    from ....model_router.types import JOB_ROUTE_NAMES
+
+    if harness == "openai_codex" and not (codex_home() / "auth.json").exists():
+        return "Codex is not logged in: /model → Login OpenAI Codex."
+    if harness == "openrouter" and not openrouter_key():
+        return "No OpenRouter key: /setkey openrouter."
+    routes = replace(process_call_routes(), job_switch=harness)
+    missing = [n for n in sorted(JOB_ROUTE_NAMES) if not routes.resolve_job(n).model]
+    if missing:
+        return (
+            f"No {harness} model for {', '.join(missing)}: set "
+            f"jobs.default.models.{harness} in config/models.yaml."
+        )
+    return None
+
+
+def switch_jobs(target: str, by: str) -> str:
+    """Move every job to ``target`` (a harness) or back to the table
+    (``table`` / ``reset``); the one writer of the ``job_route`` key. Returns
+    the note to show. Never called on a quota error: only a tap switches
+    (owner, 2026-10-26)."""
+    from ....model_router.quota import set_job_route
+
+    if target in ("table", "reset"):
+        set_job_route(None, by)
+        return "✅ Фоновые задачи снова по таблице."
+    if target not in _JOB_SWITCH_LABELS:
+        return "⚠️ Неизвестная кнопка."
+    refusal = _job_switch_refusal(target)
+    if refusal is not None:
+        return f"⚠️ Не переключено. {refusal}"
+    set_job_route(target, by)
+    return (
+        f"✅ Все фоновые задачи → {_JOB_SWITCH_LABELS[target]} " "с ближайшего запуска."
+    )
+
+
+async def handle_limits_callback(
+    query: Any, context: ContextTypes.DEFAULT_TYPE, data: str
+) -> None:
+    """``limits:jobs:<harness|reset>`` from an old /limits message
+    (owner-gated by the dispatcher): the same switch as Модели."""
+    if not data.startswith(LIMITS_JOBS_PREFIX):
+        await query.edit_message_text("Unknown /limits button.")
+        return
+    note = switch_jobs(
+        data[len(LIMITS_JOBS_PREFIX) :], str(getattr(query.from_user, "id", "owner"))
+    )
+    text, markup = jobs_switch_screen(note)
+    await query.edit_message_text(text, reply_markup=markup)

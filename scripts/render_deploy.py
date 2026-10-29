@@ -190,6 +190,13 @@ def main() -> int:
     )
     print(f"  sudo chmod 440 /etc/sudoers.d/{args.service_name}")
     print("  sudo systemctl daemon-reload")
+    print("User timers (opt-in, docs/systemd-operations.md):")
+    print(
+        f"  cp {out_dir}/tmpsweep.service {out_dir}/tmpsweep.timer ~/.config/systemd/user/"
+    )
+    print(
+        "  systemctl --user daemon-reload && systemctl --user enable --now tmpsweep.timer"
+    )
     return 0
 
 

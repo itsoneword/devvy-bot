@@ -223,6 +223,13 @@ sessions = Table(
     Column("first_call_context", INTEGER),
     Column("bot_formula_tokens", INTEGER),
     Column("seeded_start", INTEGER, nullable=False, server_default=text("0")),
+    # Session attribution (dv-d2a3, src/llm_analytics/attribution.py). The
+    # raw cwd label stays in `profile`.
+    Column("attr_group", TEXT),
+    Column("attr_key", TEXT),
+    Column("attr_detail", TEXT),
+    Column("attr_archived", INTEGER, nullable=False, server_default=text("0")),
+    Index("idx_sessions_attr", "attr_group", "attr_key"),
 )
 
 subagent_runs = Table(

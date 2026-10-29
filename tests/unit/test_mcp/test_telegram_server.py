@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from src.mcp.telegram_server import send_file_to_user, send_image_to_user
 from src.bot.utils.image_extractor import validate_image_path
+from src.mcp.telegram_server import send_file_to_user, send_image_to_user
 
 
 @pytest.fixture

@@ -97,19 +97,23 @@ async def _facade_section(tmp_path: Path) -> Dict[str, Any]:
             is_error = False
             num_turns = 1
             tools_used = [{"name": "Bash", "input": {"command": "ls"}}]
-            trace_id = "golden-trace"
+            trace_id = "trace-golden"
 
+        # The harness trace writes the turn's tool rows while it runs
+        # (dv-2260); saving the message links them to it.
         await storage.tool_calls.upsert(
-            "golden-trace",
+            "trace-golden",
             [
                 {
-                    "tool_use_id": "u1",
+                    "tool_use_id": "tu-1",
                     "seq": 1,
-                    "tool_name": "Bash",
-                    "input_short": '{"command": "ls"}',
-                    "ok": 1,
+                    "tool": "Bash",
+                    "input": '{"command": "ls"}',
+                    "status": "ok",
                     "started_at": "2026-01-01T00:00:00+00:00",
-                    "detached": 0,
+                    "duration_ms": 5,
+                    "result_bytes": 3,
+                    "result_preview": "a.b",
                 }
             ],
         )

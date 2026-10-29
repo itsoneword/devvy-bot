@@ -16,6 +16,7 @@ from src import agent_bridge
 from src.agent_bridge.server import (
     NOT_EXPORTED,
     AgentBridgeMcp,
+    _to_result,
     bearer_token,
     build_app,
     exported_tool_names,
@@ -80,6 +81,8 @@ JOB_TOOLS = frozenset(
         "pump_status",
         "pump_pending",
         "pump_answer",
+        # dv-b17e: freeze / thaw / urgent, global across boards.
+        "pump_control",
     }
 )
 
@@ -234,9 +237,12 @@ class TestToolFiltering:
             if n.startswith(("hireli_", "exchange_")) or n == "onchain_activity"
         }
         # task_done is devops-only (dv-535b): other agents create + comment.
+        # restart_bot needs AgentServices.request_restart wired (dv-da50).
         assert (
             self._names(bridge, _ctx())
-            == set(exported_tool_names()) - {"export_my_data", "task_done"} - opt_in
+            == set(exported_tool_names())
+            - {"export_my_data", "task_done", "restart_bot"}
+            - opt_in
         )
 
     def test_no_memory_scope_means_no_memory_tools(self, bridge) -> None:
@@ -355,3 +361,55 @@ class TestExposure:
         """Waves were a roll-out switch; nothing may grow a new one quietly."""
         assert not [n for n in dir(agent_bridge) if n.startswith("WAVE_")]
         assert not hasattr(agent_bridge, "EXPORTED_TOOLS")
+
+
+class TestImageResults:
+    """dv-275f: a handler's image block reaches Codex as MCP ImageContent.
+
+    Before, ``_to_result`` kept only text items, so ``view_image`` gave Codex
+    an empty result while Claude saw the picture.
+    """
+
+    PAYLOAD = {
+        "content": [
+            {"type": "image", "data": "aGVsbG8=", "mimeType": "image/jpeg"},
+            {"type": "text", "text": '{"sent": [725, 1568]}'},
+        ]
+    }
+
+    def test_an_image_item_becomes_image_content(self) -> None:
+        result = _to_result(self.PAYLOAD)
+        assert not result.isError
+        kinds = [block.type for block in result.content]
+        assert kinds == ["image", "text"]
+        image = result.content[0]
+        assert image.data == "aGVsbG8="  # type: ignore[union-attr]
+        assert image.mimeType == "image/jpeg"  # type: ignore[union-attr]
+        assert result.content[1].text == '{"sent": [725, 1568]}'  # type: ignore[union-attr]
+
+    def test_text_only_results_are_unchanged(self) -> None:
+        result = _to_result({"content": [{"type": "text", "text": "ok"}]})
+        assert [b.type for b in result.content] == ["text"]
+        assert not result.isError
+
+    @pytest.mark.parametrize("flag", ["isError", "is_error"])
+    def test_error_flag_survives_next_to_an_image(self, flag: str) -> None:
+        result = _to_result({**self.PAYLOAD, flag: True})
+        assert result.isError
+
+    def test_view_image_is_exported_to_codex(self) -> None:
+        assert "view_image" in {spec.name for spec in ALL_TOOL_SPECS}
+        assert "view_image" in exported_tool_names()
+        assert "view_image" not in NOT_EXPORTED
+
+    def test_view_image_is_listed_for_every_profile(
+        self, services: AgentServices
+    ) -> None:
+        """Stateless and root-scoped: no scope or role gates it (owner 2.1)."""
+        bridge = AgentBridgeMcp(services, TokenRegistry())
+        for ctx in (
+            _ctx(),
+            _ctx(role="guest"),
+            _ctx(profile_slug="devops", user_id=None, memory_agent_id=None),
+        ):
+            assert "view_image" in {s.name for s in bridge.specs_for(ctx)}

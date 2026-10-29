@@ -412,3 +412,24 @@ async def test_new_facts_since_bound_and_scope(repo):
 
     after = dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(sep=" ")
     assert await repo.new_facts_since(after) == []
+
+
+async def test_facts_snapshot_honours_passed_caps(repo):
+    """dv-cf07: facts_snapshot takes the caps as kwargs (settings-driven);
+    pinned and core stay uncapped whatever is passed."""
+    await repo.add_fact("coach", "pinned", "allergic to nuts")
+    await repo.add_fact("coach", "core", "Age 34")
+    for i in range(70):
+        await repo.add_fact("coach", "general", f"general fact {i}")
+        await repo.add_fact(
+            "coach", "general", f"result {i}", kind="conversation_result"
+        )
+
+    snap = await repo.facts_snapshot("coach", general_cap=60, pointer_cap=60)
+    assert len(snap.pinned) == 1
+    assert len(snap.general) == 1 + 60  # core + capped general
+    assert len(snap.pointers) == 60
+
+    small = await repo.facts_snapshot("coach", general_cap=3, pointer_cap=0)
+    assert len(small.general) == 1 + 3
+    assert small.pointers == []

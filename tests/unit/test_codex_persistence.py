@@ -97,6 +97,7 @@ async def test_codex_turn_writes_session_message_and_cost_rows(
     workdir.mkdir()
     integ = _integration(settings, storage, tmp_path)
 
+    # Under a harness trace, as the router runs it (dv-2260).
     response = await traced(
         storage,
         lambda: integ.run_command(
@@ -135,7 +136,7 @@ async def test_codex_turn_writes_session_message_and_cost_rows(
         assert row[1] == 17
 
         cur = await conn.execute(
-            "SELECT tool_name FROM tool_calls WHERE message_id = ?", (message_id,)
+            "SELECT tool FROM tool_calls WHERE message_id = ?", (message_id,)
         )
         assert [r[0] for r in await cur.fetchall()] == ["Bash"]
 
@@ -305,7 +306,7 @@ async def test_failed_mcp_call_is_stored_as_failure(storage, settings, tmp_path)
     )
     async with storage.db_manager.get_connection() as conn:
         cur = await conn.execute(
-            "SELECT tool_name, ok, error FROM tool_calls "
+            "SELECT tool, status, error FROM tool_calls "
             "WHERE message_id = ? ORDER BY id",
             (message_id,),
         )
@@ -313,8 +314,8 @@ async def test_failed_mcp_call_is_stored_as_failure(storage, settings, tmp_path)
     assert rows == [
         (
             "week_summary",
-            0,
+            "error",
             "MCP tool call requires approval, but approval policy is never",
         ),
-        ("Bash", 1, None),
+        ("Bash", "ok", None),
     ]

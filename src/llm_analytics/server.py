@@ -193,9 +193,14 @@ def build_app(config: AnalyticsConfig) -> FastAPI:
         to: str | None = None,
         user_id: str | None = None,
         profile: str | None = None,
+        source: str | None = None,
     ) -> dict[str, Any]:
         return await _store(request).overview(
-            from_=from_, to=to, user_id=_parse_user(user_id), profile=profile
+            from_=from_,
+            to=to,
+            user_id=_parse_user(user_id),
+            profile=profile,
+            source=source,
         )
 
     @app.get("/api/quality")
@@ -217,6 +222,7 @@ def build_app(config: AnalyticsConfig) -> FastAPI:
         to: str | None = None,
         user_id: str | None = None,
         profile: str | None = None,
+        source: str | None = None,
         entrypoint: str | None = None,
         sort: str = "last_ts",
         order: str = "desc",
@@ -229,6 +235,7 @@ def build_app(config: AnalyticsConfig) -> FastAPI:
                 to=to,
                 user_id=_parse_user(user_id),
                 profile=profile,
+                source=source,
                 entrypoint=entrypoint,
                 sort=sort,
                 order=order,

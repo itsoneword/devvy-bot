@@ -39,6 +39,7 @@ class NotifyRequest(BaseModel):
     # When set, edit/keep-pinned the single status post under this key instead
     # of appending a new message. Empty text retires the pin.
     pin_as: Optional[str] = None
+    repin: bool = False  # daily re-send + re-pin of the pin_as post (dv-6646)
     # True: text is model markdown, converted to Telegram HTML on delivery.
     markdown: bool = False
     # Who is speaking (dv-e215): "server-monitor:<host>", "taskpump:status",
@@ -76,6 +77,10 @@ class PolicyAskRequest(BaseModel):
     reason: str
     preview: str = ""
     source: str = "background job"
+    # dv-781f: profile, job, task_id, task_title, stage for the explainer.
+    # Untrusted (the job's agent runs beside it): unknown keys are dropped,
+    # values capped (AskContext.from_mapping).
+    context: Optional[Dict[str, Any]] = None
 
 
 class ModelCallRequest(BaseModel):
@@ -85,6 +90,10 @@ class ModelCallRequest(BaseModel):
     kind: str
     harness: str
     harness_version: Optional[str] = None
+    # Who served the call when the harness alone does not say (dv-d63d): a
+    # job on the Claude CLI pointed at OpenRouter sends ``openrouter``.
+    # None = derived from the harness.
+    provider: Optional[str] = None
     model: Optional[str] = None
     attended: bool = False
     profile: Optional[str] = None
@@ -98,15 +107,12 @@ class ModelCallRequest(BaseModel):
     duration_ms: int = 0
     outcome: str
     error: Optional[str] = None
-    # The harness trace this call made (dv-2260), rows already sent.
+    # The job's harness trace (dv-2260): its tool_calls rows, written with
+    # this call's id. ``trace_id`` is the job's collector id.
     trace_id: Optional[str] = None
-
-
-class ToolCallsRequest(BaseModel):
-    """Tool-call rows of a job's trace (dv-2260), sent as they happen."""
-
-    trace_id: str
-    rows: List[Dict[str, Any]]
+    # The job's name (dv-87d8): names its Phoenix trace, e.g. a pump stage.
+    job_name: Optional[str] = None
+    tools: Optional[List[Dict[str, Any]]] = None
 
 
 class ScheduleRequest(BaseModel):
@@ -141,12 +147,15 @@ def create_api_app(
     profile_registry: Optional["ProfileRegistry"] = None,
     confirmation_manager: Optional[Any] = None,
     model_calls: Optional[Any] = None,
+    tool_calls: Optional[Any] = None,
 ) -> FastAPI:
     """Create the FastAPI application.
 
     ``confirmation_manager`` serves background jobs' ask rules
     (``/internal/policy/ask``); ``model_calls`` is the ``ModelCallRepository``
     their call records go into (``/internal/model_calls``). Both dv-ef90.
+    ``tool_calls`` is the ``ToolCallRepository`` for the tool rows a job
+    sends with its call record (dv-2260).
     """
 
     app = FastAPI(
@@ -328,6 +337,7 @@ def create_api_app(
             text=body.text,
             parse_mode="markdown" if body.markdown else None,
             pin_as=body.pin_as,
+            repin=body.repin,
             source=body.source or "internal",
             ledger_ref=body.ref,
             ledger_profile_slug=body.profile,
@@ -373,12 +383,14 @@ def create_api_app(
             logger.warning("policy ask with no confirmation manager -> denied")
             return {"approved": False}
         from src.model_router.job import ASK_TIMEOUT_SECONDS
+        from src.security.ask_explain import AskContext
 
         approved = await confirmation_manager.request(
             body.reason,
             body.preview,
             timeout_seconds=ASK_TIMEOUT_SECONDS,
             source=body.source,
+            context=AskContext.from_mapping(body.context),
         )
         return {"approved": bool(approved)}
 
@@ -402,7 +414,8 @@ def create_api_app(
                 kind=body.kind,
                 harness=body.harness,
                 harness_version=body.harness_version,
-                provider={"claude": "anthropic", "openai_codex": "openai"}.get(
+                provider=body.provider
+                or {"claude": "anthropic", "openai_codex": "openai"}.get(
                     body.harness, body.harness
                 ),
                 model=body.model,
@@ -418,28 +431,18 @@ def create_api_app(
                 duration_ms=body.duration_ms,
                 outcome=body.outcome,
                 error=body.error,
+                job_name=body.job_name,
             )
         )
-        if body.trace_id and row_id is not None and db_manager is not None:
-            from src.storage.tool_calls import ToolCallRepository
-
-            await ToolCallRepository(db_manager).link_model_call(
-                body.trace_id, row_id, body.session_id
-            )
-        return {"status": "recorded"}
-
-    @app.post("/internal/tool_calls")
-    async def internal_tool_calls(
-        body: ToolCallsRequest,
-        authorization: Optional[str] = Header(None),
-    ) -> Dict[str, str]:
-        """Store tool-call rows of a job's trace (dv-2260)."""
-        _require_internal_auth(authorization)
-        if db_manager is None:
-            raise HTTPException(status_code=503, detail="database not available")
-        from src.storage.tool_calls import ToolCallRepository
-
-        await ToolCallRepository(db_manager).upsert(body.trace_id, body.rows[:200])
+        if body.tools and tool_calls is not None and row_id is not None:
+            # The call row is in; a trace that fails to write is logged, the
+            # job's record still counts.
+            trace_id = body.trace_id or uuid.uuid4().hex
+            try:
+                await tool_calls.upsert(trace_id, body.tools)
+                await tool_calls.link_model_call(trace_id, row_id, body.session_id)
+            except Exception as exc:
+                logger.warning("job trace not recorded", error=str(exc))
         return {"status": "recorded"}
 
     @app.post("/internal/schedule")
@@ -607,9 +610,12 @@ async def run_api_server(
     profile_registry: Optional["ProfileRegistry"] = None,
     confirmation_manager: Optional[Any] = None,
     model_calls: Optional[Any] = None,
+    tool_calls: Optional[Any] = None,
 ) -> None:
     """Run the FastAPI server using uvicorn."""
     import uvicorn
+
+    from src.utils.embedded_uvicorn import EmbeddedServer
 
     app = create_api_app(
         event_bus,
@@ -619,6 +625,7 @@ async def run_api_server(
         profile_registry,
         confirmation_manager=confirmation_manager,
         model_calls=model_calls,
+        tool_calls=tool_calls,
     )
 
     config = uvicorn.Config(
@@ -627,5 +634,5 @@ async def run_api_server(
         port=settings.api_server_port,
         log_level="info" if not settings.debug else "debug",
     )
-    server = uvicorn.Server(config)
+    server = EmbeddedServer(config)
     await server.serve()

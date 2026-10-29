@@ -6,10 +6,10 @@ probabilities, so ``confidence`` and ``probabilities`` stay None."""
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .types import (
-    CLAUDE_HARNESS,
+    ROUTE,
     Answer,
     CallRequest,
     CallResult,
@@ -20,6 +20,9 @@ from .types import (
     Score,
 )
 
+if TYPE_CHECKING:
+    from .routes import CallRoute
+
 SYSTEM_PROMPT = (
     "You answer typed decision questions about a given state. Read each "
     "question literally, judge only from the state, and reply with JSON that "
@@ -28,14 +31,18 @@ SYSTEM_PROMPT = (
 
 
 def call_request(request: DecideRequest) -> CallRequest:
+    """The LLM leg as a plain call on the purpose's route (:data:`ROUTE`), or
+    on an explicit ``fallback_model`` there."""
     if request.fallback_model is None:
         raise ModelCallError("decide: no fallback model")
+    model: Optional[str] = (
+        None if request.fallback_model == ROUTE else request.fallback_model
+    )
     return CallRequest(
         purpose=request.purpose,
         prompt=prompt(request),
-        model=request.fallback_model,
+        model=model,
         system_prompt=SYSTEM_PROMPT,
-        harness=CLAUDE_HARNESS,
         json_schema=json_schema(request),
         timeout_seconds=request.fallback_timeout_seconds,
     )
@@ -93,7 +100,10 @@ def json_schema(request: DecideRequest) -> Dict[str, Any]:
 
 
 def result_from(
-    request: DecideRequest, result: CallResult, fallback_reason: str
+    request: DecideRequest,
+    result: CallResult,
+    fallback_reason: str,
+    route: "CallRoute",
 ) -> DecideResult:
     try:
         data = json.loads(result.text)
@@ -116,8 +126,8 @@ def result_from(
         ) from exc
     return DecideResult(
         answers=answers,
-        harness=CLAUDE_HARNESS,
-        model=result.model or request.fallback_model,
+        harness=route.harness,
+        model=result.model or route.model,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         cost_usd=result.cost_usd,

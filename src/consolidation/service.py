@@ -1,32 +1,51 @@
-"""Memory consolidation pass: report duplicate clusters + expiry candidates.
+"""Stale-fact sweep: close facts a newer fact on the same subject replaced.
 
-The per-message evaluator stays conservative (when unsure, keep both facts);
-this offline pass is the pressure valve that later merges duplicates and
-expires long-invalid rows (dv-4c6f, Letta sleep-time pattern).
+The per-message evaluator stays conservative (when unsure, keep both facts),
+and the in-session ``remember`` tool has no reconciler at all, so status
+updates pile up next to the facts they replaced ("concurrency 3" next to
+"raised to 5"). This pass is the pressure valve (dv-4c6f, Letta sleep-time
+pattern; reshaped by dv-cf07):
 
-**Zero writes to memory_facts.** The pass emits a markdown report under
-``DataLayout.consolidation_dir`` (``<root>/workspaces/devops/reports/
-consolidation/``; legacy layout ``data/consolidation/``) and notifies the owner; merges/expiries are executed
-only by ``scripts/consolidation_apply.py`` from an owner-annotated report —
-a wrong merge is unrecoverable and invisible, so nothing is automatic.
+- **when:** after every window rotation (``after_rotation``: the outgoing
+  window's final extraction, then the sweep; the new window's bundle waits
+  for it, bounded), on the bundle budget valve (``request_run``) and weekly
+  over every scope (``run``).
+- **how:** one ``complete_text(purpose="consolidation")`` call per scope
+  proposes ``[{old_id, newer_id, reason}]``; every pair is validated in code
+  before anything is closed (general tier only, never a ``conflict_group``
+  row, both ids active in the scope, newer really newer, a per-run fuse).
+- **writes:** soft and reversible. ``MemoryRepository.close_superseded``
+  sets ``superseded_by`` + ``invalidated_by='sweep'``, content untouched;
+  one ``memory_sweep_closed`` log line per row and a ``- [ ] UNDO`` line in
+  the day's report under ``DataLayout.consolidation_dir``. Ticking it and
+  running ``scripts/consolidation_apply.py`` reopens the row.
 
-Semantic comparison via one haiku CLI call per scope is sanctioned here
-(off the write path — see dv-3c8f): cross-language restatements
-("любит острое" / "likes spicy food") are invisible to the lexical pass.
+The old similarity merges (lexical + semantic clusters) and the EXPIRE list
+are retired: similarity is not supersession (banana vs peach, two different
+mozzarellas), and EXPIRE only re-labelled rows that were already out of
+context (dv-cf07, owner 27.10.26).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from difflib import SequenceMatcher
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 
 import structlog
 
-from src.evaluator.writer import normalize_fact
 from src.model_router import complete_text
 
 if TYPE_CHECKING:
@@ -36,47 +55,118 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-# Looser than the write path's 0.92 duplicate gate: these are *candidates*
-# for owner review, not automatic rejections, so recall beats precision.
-CANDIDATE_RATIO = 0.80
-
-# Rows invalid for this long are proposed for expiry (owner default D15;
-# age-only — per-fact recall hits are not measurable today).
-EXPIRY_DAYS = 60
-
-# At most one triggered run per scope per this window (plan decision:
-# request_run debounce).
+# At most one triggered (valve) run per scope per this window (plan
+# decision: request_run debounce).
 DEBOUNCE_HOURS = 24
 
-SEMANTIC_SYSTEM_PROMPT = (
-    "You group near-duplicate memory facts. Reply with JSON only, exactly in "
-    "the format requested."
+# Fuse (dv-cf07 decision 5, owner 2.1): at most max(FUSE_FLOOR, FUSE_SHARE of
+# the scope's active general rows) closures per sweep. The rest waits for
+# the next sweep; a model gone wrong cannot empty a scope in one run.
+FUSE_FLOOR = 5
+FUSE_SHARE = 0.25
+
+# Per-fact text shown to the model; pointers carry whole result notes.
+SWEEP_FACT_CHARS = 300
+
+# One call reads ~100+ facts; the router's 120 s default timed out on the
+# devops replay under load (27.10.26). Off the turn path: a new window waits
+# at most MEMORY_SWEEP_WAIT_SECONDS for it anyway.
+SWEEP_TIMEOUT_SECONDS = 300.0
+
+SWEEP_SYSTEM_PROMPT = (
+    "You find stale memory facts. Reply with JSON only, exactly in the "
+    "format requested."
 )
 
-SEMANTIC_PROMPT = """\
-Below are memory facts for one agent, as `id | content` lines. Identify groups
-of facts that say the SAME thing (cross-language restatements count: a Russian
-and an English sentence with the same meaning are duplicates). Scope
-difference is NOT duplication ("no nuts in desserts" vs "allergic to nuts"
-are different facts). When unsure, do NOT group.
+SWEEP_PROMPT = """\
+Below are the active memory facts of one agent, one per line:
+`id | kind | tier | recorded | content`.
 
-Return ONLY a JSON array of arrays of ids, e.g. [[3,17],[5,9,12]].
-Return [] if nothing is duplicated.
+List the facts that a NEWER fact on the SAME subject makes stale:
+- a status or value changed ("concurrency is 3" -> "raised to 5");
+- a version moved on ("repo is at 1.3" -> "repo is at 1.5");
+- a plan, a pending step or a follow-up is now done ("release goes out after
+  X is merged" -> "released 1.5");
+- a problem a finding describes is fixed, and the newer fact says so.
+The newer fact must say so itself; never pair two facts only because they
+look alike. One newer fact can make several older ones stale: list each
+pair. Different items are not stale ("likes banana" vs "likes peach"),
+and scope difference is not staleness ("no nuts in desserts" vs "allergic to
+nuts"). Keep a fact that still teaches something after the change: an owner
+rule, a lesson, a root cause, the reason behind a decision. When unsure,
+leave both.
+
+Return ONLY a JSON array, e.g.
+[{{"old_id": 12, "newer_id": 40, "reason": "version 1.3 -> 1.5"}}].
+Return [] if nothing is stale.
 
 ## Facts
 {facts}
 """
 
 
+@dataclass
+class SweepResult:
+    """What one sweep of one scope did."""
+
+    scope: str
+    closed: List[Tuple[int, int]] = field(default_factory=list)
+    # Per closure, for the report: (old fact, newer fact, model's reason).
+    details: List[Tuple["MemoryFact", "MemoryFact", str]] = field(default_factory=list)
+    proposed: int = 0
+    rejected: int = 0
+    over_fuse: int = 0
+    failed: bool = False
+
+
+def _as_utc(value: Any) -> datetime:
+    """recorded_at as an aware datetime (rows carry str or datetime)."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return datetime.min.replace(tzinfo=UTC)
+    if not isinstance(value, datetime):
+        return datetime.min.replace(tzinfo=UTC)
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def _order_key(fact: "MemoryFact") -> Tuple[datetime, int]:
+    return (_as_utc(fact.recorded_at), fact.id)
+
+
+def _parse_proposals(raw: str) -> List[Tuple[int, int, str]]:
+    """Model reply -> [(old_id, newer_id, reason)]; raises on a reply that is
+    not a JSON array (the caller closes nothing then). Malformed entries are
+    dropped one by one."""
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    data = json.loads(cleaned)
+    if not isinstance(data, list):
+        raise ValueError("sweep reply is not a JSON array")
+    out: List[Tuple[int, int, str]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        old, new = item.get("old_id"), item.get("newer_id")
+        if not isinstance(old, int) or not isinstance(new, int):
+            continue
+        if isinstance(old, bool) or isinstance(new, bool):
+            continue
+        out.append((old, new, str(item.get("reason") or "")[:200]))
+    return out
+
+
 class ConsolidationService:
-    """Builds consolidation reports; never writes to memory_facts."""
+    """Stale-fact sweep per scope: after rotations, on the valve, weekly."""
 
     def __init__(
         self,
         memory_repo: "MemoryRepository",
         db: "DatabaseManager",
         notify_callback: Optional[Callable[[str], Awaitable[None]]] = None,
-        model: str = "haiku",
+        model: Optional[str] = None,
         report_dir: Path = Path("data/consolidation"),
         board: Optional["DevizBoard"] = None,
     ) -> None:
@@ -87,8 +177,57 @@ class ConsolidationService:
         self._model = model
         self._report_dir = report_dir
         # scope -> last triggered-run time (in-memory: a restart resetting
-        # the debounce at worst produces one extra report).
+        # the debounce at worst produces one extra sweep).
         self._last_run: Dict[str, datetime] = {}
+        # One sweep per scope at a time (rotation, valve and weekly overlap).
+        self._locks: Dict[str, asyncio.Lock] = {}
+        # scope -> the latest rotation's eval+sweep task (wait_rotation).
+        self._rotation_tasks: Dict[str, "asyncio.Task[None]"] = {}
+
+    # --- rotation -------------------------------------------------------
+
+    def after_rotation(self, scope: str, final_eval: Optional[Awaitable[Any]]) -> None:
+        """A window rotated: await its final extraction, then sweep ``scope``.
+
+        Fire-and-forget like ``request_run``; the new window's bundle waits on
+        it through ``wait_rotation``. The sweep runs even when the final eval
+        fails (the facts already stored still deserve it).
+        """
+        task = asyncio.create_task(self._rotation_sweep(scope, final_eval))
+        self._rotation_tasks[scope] = task
+
+        def _forget(done: "asyncio.Task[None]") -> None:
+            if self._rotation_tasks.get(scope) is done:
+                del self._rotation_tasks[scope]
+
+        task.add_done_callback(_forget)
+
+    async def wait_rotation(self, scope: str, timeout: float) -> bool:
+        """Wait (bounded) for the scope's pending rotation sweep. True when
+        none is pending or it finished; False on timeout. Never cancels it:
+        a late sweep still lands, for the next window."""
+        task = self._rotation_tasks.get(scope)
+        if task is None or task.done():
+            return True
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        return bool(done)
+
+    async def _rotation_sweep(
+        self, scope: str, final_eval: Optional[Awaitable[Any]]
+    ) -> None:
+        if final_eval is not None:
+            try:
+                await final_eval
+            except Exception as e:
+                logger.warning(
+                    "Final evaluation before sweep failed", scope=scope, error=str(e)
+                )
+        try:
+            await self.sweep(scope)
+        except Exception as e:
+            logger.error("Rotation sweep failed", scope=scope, error=str(e))
+
+    # --- valve ----------------------------------------------------------
 
     def request_run(
         self, scope: str, reason: str, snapshot_chars: Optional[int] = None
@@ -98,7 +237,7 @@ class ConsolidationService:
         of the contract). Fire-and-forget, debounced per scope per 24h.
 
         Also leaves an owner-visible trail per review R4: a
-        ``consolidation_needed`` log line and an open ``agent_tasks`` row.
+        ``consolidation_needed`` log line and an open board task.
         """
         now = datetime.now(UTC)
         last = self._last_run.get(scope)
@@ -152,8 +291,10 @@ class ConsolidationService:
             logger.info("Consolidation task updated", task_id=existing.id, scope=scope)
             return
         body = detail + (
-            f"\n\nReview the consolidation report in {self._report_dir}/ and "
-            "apply approved actions with scripts/consolidation_apply.py."
+            "\n\nA stale-fact sweep ran for this scope; what it closed is in "
+            f"{self._report_dir}/ (UNDO lines). Still over budget after it "
+            "means the scope holds that many live facts: review them "
+            "(memory_forget / recall) or raise BUNDLE_FACTS_BUDGET_CHARS."
         )
         task_id = await self._board.add_task(
             title=title,
@@ -164,45 +305,33 @@ class ConsolidationService:
         )
         logger.info("Consolidation task created", task_id=task_id, scope=scope)
 
-    async def run(self, scope: Optional[str] = None) -> Path:
-        """Build the report for one scope (all scopes when None). Returns the
-        report path. Read-only against memory_facts."""
-        scopes = [scope] if scope else await self._active_scopes()
-        date = datetime.now(UTC).strftime("%Y-%m-%d")
-        sections: List[str] = [
-            f"# Consolidation report — {date}",
-            "",
-            "Read-only proposal. Nothing below has been applied. Annotate by",
-            "flipping `- [ ]` to `- [x]` on approved actions, then run:",
-            "",
-            "    python3 scripts/consolidation_apply.py --report <this file>",
-            "",
-        ]
-        total_groups = 0
-        total_expiry = 0
-        for sc in scopes:
-            sec, n_groups, n_expiry = await self._scope_section(sc)
-            sections.append(sec)
-            total_groups += n_groups
-            total_expiry += n_expiry
+    # --- weekly / manual ------------------------------------------------
 
-        self._report_dir.mkdir(parents=True, exist_ok=True)
-        path = self._report_dir / f"report-{date}.md"
-        path.write_text("\n".join(sections), encoding="utf-8")
+    async def run(self, scope: Optional[str] = None) -> Path:
+        """Sweep one scope (every active scope when None), then one owner
+        summary. Returns the day's report path."""
+        scopes = [scope] if scope else await self._active_scopes()
+        results = [await self.sweep(sc, report_empty=True) for sc in scopes]
+        path = self._report_path()
+        self._ensure_report(path)
+        closed = sum(len(r.closed) for r in results)
+        failed = [r.scope for r in results if r.failed]
         logger.info(
-            "Consolidation report written",
+            "Memory sweep run done",
             path=str(path),
             scopes=len(scopes),
-            merge_groups=total_groups,
-            expiry_candidates=total_expiry,
+            closed=closed,
+            failed_scopes=failed,
         )
         if self._notify:
+            message = (
+                f"Memory sweep: {closed} stale fact(s) closed across "
+                f"{len(scopes)} scope(s) → {path} (UNDO lines inside)"
+            )
+            if failed:
+                message += f"; sweep failed for: {', '.join(failed)}"
             try:
-                await self._notify(
-                    f"Consolidation report: {total_groups} merge group(s), "
-                    f"{total_expiry} expiry candidate(s) across {len(scopes)} "
-                    f"scope(s) → {path}"
-                )
+                await self._notify(message)
             except Exception:
                 pass  # notification failure is not critical
         return path
@@ -210,118 +339,154 @@ class ConsolidationService:
     async def _active_scopes(self) -> List[str]:
         return await self._repo.active_scopes()
 
-    async def _scope_section(self, scope: str) -> tuple[str, int, int]:
+    # --- the sweep ------------------------------------------------------
+
+    async def sweep(self, scope: str, report_empty: bool = False) -> SweepResult:
+        """One model call over the scope's active facts, validated closures.
+
+        Bad or failed model output closes nothing (never a partial guess
+        from a reply that did not parse).
+        """
+        lock = self._locks.setdefault(scope, asyncio.Lock())
+        async with lock:
+            result = await self._sweep(scope)
+        if result.closed or report_empty:
+            self._append_report(result)
+        return result
+
+    async def _sweep(self, scope: str) -> SweepResult:
+        result = SweepResult(scope=scope)
         facts = await self._repo.get_facts(scope)
-        groups = self._lexical_clusters(facts)
-        semantic = await self._semantic_clusters(scope, facts)
-        # Union, deduped on frozenset of ids; lexical evidence first.
-        seen_groups = {frozenset(g) for g in groups}
-        for g in semantic:
-            if frozenset(g) not in seen_groups and len(g) >= 2:
-                groups.append(g)
-                seen_groups.add(frozenset(g))
-
-        expiry = await self._expiry_candidates(scope)
-
-        by_id = {f.id: f for f in facts}
-        lines = [f"## Scope `{scope}` — {len(facts)} active fact(s)", ""]
-        if groups:
-            lines.append("### Proposed merge groups (full verbatim texts)")
-            lines.append("")
-            for group in groups:
-                members = [by_id[i] for i in group if i in by_id]
-                if len(members) < 2:
-                    continue
-                survivor = max(members, key=lambda f: f.id)
-                closing = ",".join(str(f.id) for f in members if f.id != survivor.id)
-                lines.append(
-                    f"- [ ] MERGE scope={scope} survivor={survivor.id} "
-                    f"close={closing}"
-                )
-                for f in members:
-                    lines.append(f"  - `{f.id}` ({f.tier}): {f.content}")
-                lines.append("")
-        else:
-            lines.append("No merge candidates.")
-            lines.append("")
-        if expiry:
-            lines.append(
-                f"### Expiry candidates (invalid > {EXPIRY_DAYS} days, age-only)"
-            )
-            lines.append("")
-            for f in expiry:
-                lines.append(f"- [ ] EXPIRE scope={scope} id={f.id}")
-                lines.append(
-                    f"  - `{f.id}` invalid since {f.invalid_at}: " f"{f.content[:120]}"
-                )
-            lines.append("")
-        return "\n".join(lines), len(groups), len(expiry)
-
-    def _lexical_clusters(self, facts: List["MemoryFact"]) -> List[List[int]]:
-        """Greedy single-link clustering at the looser candidate ratio."""
-        normalized = [(f.id, normalize_fact(f.content)) for f in facts]
-        clusters: List[List[int]] = []
-        assigned: Dict[int, int] = {}
-        for i, (id_a, norm_a) in enumerate(normalized):
-            for id_b, norm_b in normalized[i + 1 :]:
-                if not norm_a or not norm_b:
-                    continue
-                shorter, longer = sorted((len(norm_a), len(norm_b)))
-                if longer and shorter / longer < CANDIDATE_RATIO:
-                    continue
-                if SequenceMatcher(None, norm_a, norm_b).ratio() < CANDIDATE_RATIO:
-                    continue
-                if id_a in assigned:
-                    clusters[assigned[id_a]].append(id_b)
-                    assigned[id_b] = assigned[id_a]
-                elif id_b in assigned:
-                    clusters[assigned[id_b]].append(id_a)
-                    assigned[id_a] = assigned[id_b]
-                else:
-                    clusters.append([id_a, id_b])
-                    assigned[id_a] = assigned[id_b] = len(clusters) - 1
-        return [sorted(set(c)) for c in clusters]
-
-    async def _semantic_clusters(
-        self, scope: str, facts: List["MemoryFact"]
-    ) -> List[List[int]]:
-        """One haiku call per scope for cross-language restatements.
-
-        Failure returns [] — the lexical pass still stands, and the report
-        notes nothing (a missing semantic pass is visible in the logs)."""
         if len(facts) < 2:
-            return []
-        listing = "\n".join(f"{f.id} | {f.content}" for f in facts)
+            return result
+        by_id = {f.id: f for f in facts}
+        general_count = sum(1 for f in facts if f.tier == "general")
+        fuse = max(FUSE_FLOOR, int(general_count * FUSE_SHARE))
+
+        listing = "\n".join(self._fact_line(f) for f in sorted(facts, key=_order_key))
         try:
             raw = await complete_text(
-                SEMANTIC_PROMPT.format(facts=listing),
+                SWEEP_PROMPT.format(facts=listing),
                 purpose="consolidation",
                 model=self._model,
-                system_prompt=SEMANTIC_SYSTEM_PROMPT,
+                system_prompt=SWEEP_SYSTEM_PROMPT,
+                timeout=SWEEP_TIMEOUT_SECONDS,
             )
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            data = json.loads(cleaned)
-            valid_ids = {f.id for f in facts}
-            groups: List[List[int]] = []
-            if isinstance(data, list):
-                for group in data:
-                    if (
-                        isinstance(group, list)
-                        and len(group) >= 2
-                        and all(isinstance(i, int) and i in valid_ids for i in group)
-                    ):
-                        groups.append(sorted(set(group)))
-            return groups
+            proposals = _parse_proposals(raw)
         except Exception as e:
-            logger.warning(
-                "Semantic consolidation pass failed; lexical only",
-                scope=scope,
-                error=str(e),
-            )
-            return []
+            logger.warning("Memory sweep closed nothing", scope=scope, error=str(e))
+            result.failed = True
+            return result
 
-    async def _expiry_candidates(self, scope: str) -> List["MemoryFact"]:
-        cutoff = datetime.now(UTC) - timedelta(days=EXPIRY_DAYS)
-        return await self._repo.expiry_candidates(scope, cutoff)
+        result.proposed = len(proposals)
+        closed_ids: set[int] = set()
+        for old_id, newer_id, reason in proposals:
+            old, newer = by_id.get(old_id), by_id.get(newer_id)
+            if (
+                old is None
+                or newer is None
+                or old_id == newer_id
+                or old.tier != "general"
+                or old.conflict_group is not None
+                or old_id in closed_ids
+                or newer_id in closed_ids
+                or _order_key(newer) <= _order_key(old)
+            ):
+                result.rejected += 1
+                continue
+            if len(result.closed) >= fuse:
+                result.over_fuse += 1
+                continue
+            if not await self._repo.close_superseded(
+                old_id, newer_id, scope, source="sweep"
+            ):
+                result.rejected += 1
+                continue
+            closed_ids.add(old_id)
+            result.closed.append((old_id, newer_id))
+            result.details.append((old, newer, reason))
+            logger.info(
+                "memory_sweep_closed",
+                scope=scope,
+                old_id=old_id,
+                newer_id=newer_id,
+                reason=reason,
+            )
+        if result.over_fuse:
+            logger.warning(
+                "Memory sweep fuse hit; rest left for the next sweep",
+                scope=scope,
+                fuse=fuse,
+                over_fuse=result.over_fuse,
+            )
+        logger.info(
+            "Memory sweep done",
+            scope=scope,
+            facts=len(facts),
+            proposed=result.proposed,
+            closed=len(result.closed),
+            rejected=result.rejected,
+        )
+        return result
+
+    @staticmethod
+    def _fact_line(fact: "MemoryFact") -> str:
+        text = " ".join(fact.content.split())[:SWEEP_FACT_CHARS]
+        recorded = _as_utc(fact.recorded_at).strftime("%Y-%m-%d %H:%M")
+        return f"{fact.id} | {fact.kind} | {fact.tier} | {recorded} | {text}"
+
+    # --- report ---------------------------------------------------------
+
+    def _report_path(self) -> Path:
+        date = datetime.now(UTC).strftime("%Y-%m-%d")
+        return self._report_dir / f"report-{date}.md"
+
+    def _ensure_report(self, path: Path) -> None:
+        if path.exists():
+            return
+        self._report_dir.mkdir(parents=True, exist_ok=True)
+        date = path.stem.removeprefix("report-")
+        path.write_text(
+            "\n".join(
+                [
+                    f"# Memory sweep — {date}",
+                    "",
+                    "Every closure below is already applied (soft: the row is",
+                    "kept, superseded_by points at the newer fact). To undo one,",
+                    "flip its `- [ ]` to `- [x]` and run:",
+                    "",
+                    "    python3 scripts/consolidation_apply.py --report <this file>",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    def _append_report(self, result: SweepResult) -> None:
+        path = self._report_path()
+        try:
+            self._ensure_report(path)
+            stamp = datetime.now(UTC).strftime("%H:%M")
+            lines = [
+                "",
+                f"## Scope `{result.scope}` — {stamp} UTC, "
+                f"{len(result.closed)} closed",
+                "",
+            ]
+            if result.failed:
+                lines.append("Sweep failed (model error or bad reply); nothing closed.")
+            elif not result.closed:
+                lines.append("Nothing stale.")
+            for old, newer, reason in result.details:
+                lines.append(f"- [ ] UNDO scope={result.scope} id={old.id}")
+                lines.append(f"  - closed `{old.id}`: {old.content[:200]}")
+                lines.append(f"  - by `{newer.id}`: {newer.content[:200]}")
+                if reason:
+                    lines.append(f"  - why: {reason}")
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except OSError as e:
+            # The closures stand (logged per row); only the UNDO list is lost.
+            logger.error(
+                "Memory sweep report not written", path=str(path), error=str(e)
+            )

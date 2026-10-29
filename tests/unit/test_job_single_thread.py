@@ -11,6 +11,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+
 from src.events.bus import EventBus
 from src.events.types import AgentResponseEvent
 from src.notifications.routing import ReportsRouter

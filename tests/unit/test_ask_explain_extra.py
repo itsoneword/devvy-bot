@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from src.claude.confirmation import ConfirmationManager
 from src.security.ask_explain import render
@@ -40,7 +40,7 @@ async def test_timeout_rewrite_keeps_the_explanation() -> None:
     async def update(chat_id: int, message_id: int, text: str, token: str) -> None:
         updates.append((chat_id, message_id, text, token))
 
-    async def explain(reason: str, preview: str) -> Optional[str]:
+    async def explain(reason: str, preview: str, context: Any = None) -> Optional[str]:
         return "🔎 пояснение"
 
     manager = ConfirmationManager(
@@ -67,7 +67,7 @@ async def test_no_update_callback_means_no_explainer_call() -> None:
     async def send(chat_id: int, text: str, token: str) -> int:
         return 1
 
-    async def explain(reason: str, preview: str) -> Optional[str]:
+    async def explain(reason: str, preview: str, context: Any = None) -> Optional[str]:
         calls.append(reason)
         return "x"
 

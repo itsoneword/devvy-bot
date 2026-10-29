@@ -20,7 +20,22 @@
     "and runs only on a board with that block. Default none.",
     "Optional acceptance.light_args (dv-7a10): argv appended to the command for a",
     "task the architect (or the owner's answer) set to `light`; without it light runs full.",
+    "Optional acceptance.full_paths (dv-87b4): globs (fnmatch, `*` crosses `/`) of",
+    "schema/migration/DB/test-infra files; a branch diff touching one raises the task",
+    "to full, and so do a `pytest.` criterion tag and a perf/db/migration/load/scale",
+    "label; otherwise the architect's level (none = light where light_args exist).",
+    "Optional acceptance.max_minutes (dv-2514, default 60): the pump runs the command",
+    "itself before the acceptance agent starts; past this it is killed as a hang",
+    "(a mechanical stop, one auto-retry, then the owner), never a FAIL.",
+    "On a board with acceptance, build/review/test design run changed-area tests only.",
     "This repo's own board takes them from PUMP_OWN_STAGES (default architect,review).",
+    "Optional deploy (dv-2263): where the board's prod says what it runs, so a",
+    "merged card can be marked live (pump_live, status done). Either log = an",
+    "absolute path to a deploy.py-style journal (`<ts> <old> -> <new> build=<b> ok`;",
+    "`rolled-back` lines put the old sha back), or started = argv printing when prod",
+    "last started (ISO or systemd @unix): live once it started after the merge.",
+    "Without it merges are tracked but never called live, and the pin never warns.",
+    "This repo's own board uses claude-bot's systemd start time.",
     "This repo's own board is always served and needs no entry."
   ],
   "boards": [
@@ -42,6 +57,9 @@
           "--mark-handled",
           "{id}"
         ]
+      },
+      "deploy": {
+        "log": "/abs/path/to/prod/logs/deploy.log"
       }
     }
   ]

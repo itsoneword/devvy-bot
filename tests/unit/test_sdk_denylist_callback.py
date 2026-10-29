@@ -612,7 +612,7 @@ class _FakeConfirm:
         self.approve = approve
         self.calls: list = []  # type: ignore[type-arg]
 
-    async def request(self, reason: str, preview: str) -> bool:
+    async def request(self, reason: str, preview: str, **_: object) -> bool:
         self.calls.append((reason, preview))
         return self.approve
 

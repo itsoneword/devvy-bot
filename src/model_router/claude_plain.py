@@ -9,17 +9,27 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, List, Optional
+from datetime import UTC, datetime
+from typing import Any, List, Optional, Tuple
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    RateLimitEvent,
     ResultMessage,
     SystemMessage,
 )
 
+from . import quota
 from .harness import CLAUDE_ACCOUNT_ENV, claude_program
-from .types import CallRequest, CallResult, ModelCallError, ModelCallTimeout
+from .types import (
+    CLAUDE_HARNESS,
+    CallRequest,
+    CallResult,
+    ModelCallError,
+    ModelCallTimeout,
+    refuse_images,
+)
 
 
 def lean_options(
@@ -52,6 +62,7 @@ class ClaudePlainCaller:
         self._cli_path = cli_path
 
     async def __call__(self, request: CallRequest) -> CallResult:
+        refuse_images(request, CLAUDE_HARNESS)
         client = ClaudeSDKClient(lean_options(request, self._cli_path))
         messages: List[Any] = []
 
@@ -59,12 +70,19 @@ class ClaudePlainCaller:
         # be left by the task that entered it. A timeout cancels this task and
         # the ``finally`` stops the CLI child.
         async def _run() -> None:
+            # dv-55ad: the last usage event, recorded once after the stream
+            # (also on timeout or error), never inside the loop.
+            latest: Optional[Tuple[Any, datetime]] = None
             try:
                 await client.connect()
                 await client.query(request.prompt)
                 async for message in client.receive_response():
                     messages.append(message)
+                    if isinstance(message, RateLimitEvent):
+                        latest = (message.rate_limit_info.raw, datetime.now(UTC))
             finally:
+                if latest is not None:
+                    quota.record_usage_soon(latest[0], "claude-call", latest[1])
                 await client.disconnect()
 
         task = asyncio.ensure_future(_run())

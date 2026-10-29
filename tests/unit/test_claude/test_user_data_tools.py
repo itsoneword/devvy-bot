@@ -149,7 +149,7 @@ class TestMounting:
 class TestIsolation:
     async def test_injected_user_id_wins_over_crafted_args(self, repo) -> None:
         """A model-supplied user_id argument is ignored, not honored."""
-        (day_summary, *_rest) = build_user_data_read_tools(
+        day_summary, *_rest = build_user_data_read_tools(
             repo, USER_A, frozenset({"logs"})
         )
         result = await day_summary.handler({"date": "2026-08-15", "user_id": USER_B})
@@ -406,7 +406,7 @@ class TestWriteTools:
 
 class TestValidation:
     async def test_day_summary_rejects_bad_date(self, repo) -> None:
-        (day_summary, *_rest) = build_user_data_read_tools(
+        day_summary, *_rest = build_user_data_read_tools(
             repo, USER_A, frozenset({"logs"})
         )
         result = await day_summary.handler({"date": "today"})

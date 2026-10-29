@@ -268,6 +268,47 @@ class CallbacksMixin(OrchestratorBase):
             return
         await query.edit_message_text("Unknown model action.")
 
+    async def _handle_limits_callback(
+        self,
+        query: Any,
+        context: ContextTypes.DEFAULT_TYPE,
+        data: str,
+        markup: Optional[InlineKeyboardMarkup] = None,
+    ) -> None:
+        """lim:* — freeze/thaw on the /menu Pump screen, and taps on an old
+        /limits message (that panel had buttons until dv-f6af). No agent
+        turn: with Claude out of quota the agent cannot answer pump_control,
+        so these run taskpump directly. Owner-only, like /limits itself — a
+        button bypasses the command gate (dv-6b6c). ``markup``: what the
+        freeze/thaw result keeps (the /menu Pump screen's « Назад, dv-6104)."""
+        if self._resolve_role(query.from_user.id, context) != "owner":
+            await query.edit_message_text("🚫 Owner only.")
+            return
+        action = data.split(":", 1)[1]
+        if action in ("freeze", "thaw"):
+            from ...claude.agent_tools import run_repo_script
+
+            rc, out = await run_repo_script("taskpump", action, "--by", "owner")
+            head = (
+                ("⏸ Pump заморожен." if action == "freeze" else "▶ Pump разморожен.")
+                if rc == 0
+                else f"taskpump {action} failed (exit {rc})."
+            )
+            await self._drop_buttons(query, f"{head}\n{out[-800:]}".strip(), markup)
+            return
+        if action == "codex":
+            # The /model callback is the one way to switch backends; this
+            # button is a shortcut to its default Codex model.
+            model = str(policy_for(CODEX_BACKEND).resolve_model(None))
+            await self._handle_model_callback(
+                query, context, f"model:codex:{model.split('/', 1)[-1]}"
+            )
+            return
+        if action == "claude":
+            await self._handle_model_callback(query, context, "model:claude")
+            return
+        await query.edit_message_text("Unknown limits action.")
+
     async def _handle_agent_callback(
         self, query: Any, context: ContextTypes.DEFAULT_TYPE, data: str
     ) -> None:
@@ -403,7 +444,9 @@ class CallbacksMixin(OrchestratorBase):
                     sandbox_default=self.settings.sandbox_enabled,
                 )
             except ValueError as exc:
-                await query.edit_message_text(f"⚠️ Not changed: {escape_html(str(exc))}")
+                await query.edit_message_text(
+                    f"⚠️ Not changed: {escape_html(str(exc))}"
+                )
                 return
             if audit_logger and user_id is not None:
                 await audit_logger.log_command(
@@ -600,6 +643,17 @@ class CallbacksMixin(OrchestratorBase):
             await handle_voice_callback(query, context, data)
             return
 
+        if data.startswith("limits:"):
+            # Stale /limits job-switch buttons (limits:jobs:*) stay owner-only,
+            # like the menu switch (a callback bypasses the command gate, dv-6b6c).
+            if self._resolve_role(query.from_user.id, context) != "owner":
+                await query.edit_message_text("🚫 Owner only.")
+                return
+            from .commands.info import handle_limits_callback
+
+            await handle_limits_callback(query, context, data)
+            return
+
         if data.startswith("onb:"):
             # Same reason as vset: a button bypasses the owner-only command gate.
             if self._resolve_role(query.from_user.id, context) != "owner":
@@ -608,6 +662,10 @@ class CallbacksMixin(OrchestratorBase):
             from .commands.setup import handle_callback
 
             await handle_callback(update, context, data)
+            return
+
+        if data.startswith("lim:"):
+            await self._handle_limits_callback(query, context, data)
             return
 
         if data.startswith("auth:"):

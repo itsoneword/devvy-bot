@@ -1,0 +1,52 @@
+{
+  "source": "dv-6104 /menu → Настройки, build_settings() at 390322a (frozen: dv-f6af rewrites it). Caps at their defaults, no undo.",
+  "id": "menu.settings@6104",
+  "goal": "change how many Pump jobs run and how often a task may launch",
+  "parse_mode": null,
+  "text": "🛠 Настройки\n\nPump — файл ~/.config/systemd/user/taskpump.service (тик по таймеру):\n• Pump параллельно: 1 [1–6] — со следующего тика Pump\n• Слоты bgjob у Pump: 2 [1–10] — со следующего тика Pump\n• Кап запусков на задачу: 15 [5–40] — со следующего тика Pump\n  (слоты bgjob у Pump не меньше Pump параллельно + 1)\n• Слоты bgjob у бота: 2 — только просмотр (файл env бота), нужен рестарт бота\n\nПамять: каждый параллельный запуск Pump — отдельный процесс claude, хост маленький (OOM уже был). Поднимайте по одному.\nМодель этого чата: /model.",
+  "rows": [
+    [
+      {
+        "text": "➖ Pump параллельно",
+        "callback_data": "menu:set:PUMP_MAX_CONCURRENT:-"
+      },
+      {
+        "text": "➕ Pump параллельно",
+        "callback_data": "menu:set:PUMP_MAX_CONCURRENT:+"
+      }
+    ],
+    [
+      {
+        "text": "➖ Слоты bgjob у Pump",
+        "callback_data": "menu:set:BGJOB_MAX_CONCURRENT:-"
+      },
+      {
+        "text": "➕ Слоты bgjob у Pump",
+        "callback_data": "menu:set:BGJOB_MAX_CONCURRENT:+"
+      }
+    ],
+    [
+      {
+        "text": "➖ Кап запусков на задачу",
+        "callback_data": "menu:set:PUMP_TASK_CAP:-"
+      },
+      {
+        "text": "➕ Кап запусков на задачу",
+        "callback_data": "menu:set:PUMP_TASK_CAP:+"
+      }
+    ],
+    [
+      {
+        "text": "🧠 Модели стадий",
+        "callback_data": "menu:models"
+      }
+    ],
+    [
+      {
+        "text": "« Назад",
+        "callback_data": "menu:root"
+      }
+    ]
+  ],
+  "render_ms": null
+}

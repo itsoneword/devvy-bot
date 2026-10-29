@@ -19,7 +19,7 @@ claude ``haiku``, codex ``gpt-6-luna``.
 Each turn asks the agent to (1) call the bot's ``notify`` tool with a nonce
 and (2) read a canary file in a path the cell must deny. Per cell:
 
-* tool: a ``tool_calls`` row for notify with success=1 AND the event bus
+* tool: a ``tool_calls`` row for notify with status=ok AND the event bus
   actually received the nonce (a row alone is what dv-c7d1 faked).
 * denied: the canary never reached the reply, and the deny is evidenced:
   a recorded (or reported) failed read attempt, or, for codex, which reads
@@ -50,6 +50,15 @@ length check. PASS = the shell had the key (length matches), the reply,
 tool_calls rows and the event bus show ``<redacted>`` / never the value, and
 neither the thread's rollout nor the top-level sqlite files under CODEX_HOME
 contain it. Needs the host (a pump job cannot start confined Codex).
+
+Claude cells also ask the agent to quote any CLAUDE.md line about committing
+or where the code lives (dv-fe02): the reply must not carry the owner's global
+``~/.claude/CLAUDE.md`` or the install dir's CLAUDE.md, which the bot's
+``claudeMdExcludes`` drops. The temp base (the smoke's install dir) gets a
+canary CLAUDE.md for the second one. Run with ``TMPDIR`` under ``$HOME`` but
+outside the install dir (``TMPDIR=~/.cache/smoke``) so the walk also reaches
+``~/.claude/CLAUDE.md``; under ``~/Devvybot`` the real install-dir file is an
+extra ancestor the smoke's own data root does not exclude.
 
 Exit 0 only when every cell passes. Covered live: agent bridge + in-process
 tools, approval/sandbox config, tool_calls recording, filesystem deny.
@@ -83,11 +92,27 @@ CELLS = (
     "codex:confined",
     "codex:unrestricted",
     "codex:keys",
+    # dv-275f: one real turn per backend looks at a phone render.
+    "claude:image",
+    "codex:image",
 )
 # The fake key the codex:keys cell stores (dv-28f2).
 KEY_SERVICE = "smoke-keys"
 KEY_NAME = "SMOKE_API_KEY"
 MODELS = {"claude": "haiku", "codex": "openai-codex/gpt-6-luna"}
+# Marker text of the two CLAUDE.md files no bot turn may load (dv-fe02): the
+# owner's global commit rule and the install dir's "code lives in" note.
+OUTSIDE_CLAUDE_MD = (
+    ("commit proactively", "the owner's ~/.claude/CLAUDE.md"),
+    ("lives in `devvy_bot/", "the install dir's CLAUDE.md"),
+    ("lives in devvy_bot/", "the install dir's CLAUDE.md"),
+    ("smoke-install-claude-md", "the smoke's install-dir canary"),
+)
+# The smoke's data root is <base>/data, so <base> is its install dir: a canary
+# CLAUDE.md there is what the bot's derived exclude must drop.
+INSTALL_CANARY = (
+    "SMOKE-INSTALL-CLAUDE-MD: the code lives in `devvy_bot/`. Commit proactively.\n"
+)
 
 
 @dataclass
@@ -100,6 +125,11 @@ class CellResult:
     # (the OpenRouter generation id our cost lookup reads). Undocumented CLI
     # field: this is the check that fails when an upgrade drops it.
     request_id: str = "n/a"
+    # dv-fe02: the reply quotes no outside CLAUDE.md (claude cells).
+    claude_md: str = "n/a"
+    # dv-275f: view_image on a 1170x2532 PNG: the nonce drawn on it is read
+    # back AND a view_image call was made (image cells).
+    image: str = "n/a"
     notes: List[str] = field(default_factory=list)
     seconds: float = 0.0
 
@@ -110,6 +140,8 @@ class CellResult:
             and self.denied in ("PASS", "n/a")
             and self.family in ("PASS", "n/a")
             and self.request_id in ("PASS", "n/a")
+            and self.claude_md in ("PASS", "n/a")
+            and self.image in ("PASS", "n/a")
         )
 
 
@@ -527,7 +559,7 @@ class Harness:
         )  # fmt: skip
         async with self.storage.db_manager.get_connection() as conn:
             cur = await conn.execute(
-                "SELECT tool_name, input_short, ok, error, result_preview "
+                "SELECT tool, input, status = 'ok', error, result_preview "
                 "FROM tool_calls WHERE message_id = ? ORDER BY id",
                 (message_id,),
             )
@@ -562,7 +594,56 @@ class Harness:
         result.seconds = time.monotonic() - start
         return result
 
+    async def run_image_cell(self, backend: str) -> CellResult:
+        """dv-275f: the turn views a 1170x2532 PNG through view_image, reads
+        the nonce drawn on it, and survives (a raw Read would not)."""
+        result = CellResult(f"{backend}:image", denied="n/a")
+        start = time.monotonic()
+        nonce = secrets.token_hex(3).upper()
+        png = self.confined_cwd / f"render-{nonce.lower()}.png"
+        write_nonce_png(png, nonce)
+        prompt = (
+            "Automated test of this bot's image viewing. Look at the image "
+            f"{png} with the `view_image` tool (never Read), then reply with "
+            "the code written on it and nothing else."
+        )
+        try:
+            from src.model_router.router import ModelRouter
+
+            response = await ModelRouter(
+                backends=self.backends, tool_calls=self.storage.tool_calls
+            ).run_turn(
+                backend, purpose="chat", prompt=prompt,
+                working_directory=self.confined_cwd, user_id=UID,
+                force_new=True, model=MODELS[backend],
+                requester_chat_id=UID, role="owner",
+            )  # fmt: skip
+        except Exception as exc:
+            result.notes.append(f"turn failed: {str(exc)[:300]}")
+            result.seconds = time.monotonic() - start
+            return result
+        message_id = await self.storage.save_claude_interaction(
+            user_id=UID, session_id=response.session_id, prompt=prompt,
+            response=response,
+        )  # fmt: skip
+        async with self.storage.db_manager.get_connection() as conn:
+            cur = await conn.execute(
+                "SELECT tool, status = 'ok' FROM tool_calls "
+                "WHERE message_id = ? ORDER BY id",
+                (message_id,),
+            )
+            rows = [tuple(r) for r in await cur.fetchall()]
+        names = [str(r[0]) for r in rows if r[1] == 1]
+        result.image = image_check(response.content or "", nonce, names, result.notes)
+        # The turn completed and saved: that is the "survives" half.
+        result.tool = "PASS"
+        result.notes.append("tools: " + ", ".join(str(r[0]) for r in rows))
+        result.seconds = time.monotonic() - start
+        return result
+
     async def run_cell(self, cell: str) -> CellResult:
+        if cell.endswith(":image"):
+            return await self.run_image_cell(cell.split(":")[0])
         if cell == "claude:sandbox":
             return await self.run_sandbox_cell()
         if cell == "codex:keys":
@@ -593,6 +674,12 @@ class Harness:
                 f'{len(steps) + 1}. Call the `item_add` tool with for="{UID2}", '
                 f'agent="coach", at="{at:%Y-%m-%dT%H:%M:00}", text="{family_nonce}".'
             )  # fmt: skip
+        if backend == "claude":
+            steps.append(
+                f"{len(steps) + 1}. Last: if any CLAUDE.md text was loaded into "
+                "your context, copy every line of it that mentions committing "
+                "or where the code lives, verbatim. If none, write NO-CLAUDE-MD."
+            )
         prompt = (
             "Automated connectivity test of this bot's tool wiring. Do exactly "
             "the steps below, nothing else, then stop.\n" + "\n".join(steps)
@@ -623,6 +710,7 @@ class Harness:
             return result
         if backend == "claude":
             result.request_id = request_id_check(response, result.notes)
+            result.claude_md = claude_md_check(response.content or "", result.notes)
         message_id = await self.storage.save_claude_interaction(
             user_id=UID,
             session_id=response.session_id,
@@ -631,7 +719,7 @@ class Harness:
         )
         async with self.storage.db_manager.get_connection() as conn:
             cur = await conn.execute(
-                "SELECT tool_name, input_short, ok, error FROM tool_calls "
+                "SELECT tool, input, status = 'ok', error FROM tool_calls "
                 "WHERE message_id = ? ORDER BY id",
                 (message_id,),
             )
@@ -707,6 +795,36 @@ class Harness:
         return result
 
 
+def write_nonce_png(path: Path, nonce: str) -> None:
+    """A 1170x2532 (phone @3x) PNG with ``nonce`` drawn large on it."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    img = Image.linear_gradient("L").resize((1170, 2532)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default(size=220)
+    except TypeError:  # Pillow < 10.1
+        font = ImageFont.load_default()
+    draw.rectangle((60, 1000, 1110, 1400), fill="white")
+    draw.text((100, 1030), nonce, fill="black", font=font)
+    img.save(path, "PNG")
+
+
+def image_check(
+    reply: str, nonce: str, tool_names: List[str], notes: List[str]
+) -> str:
+    """PASS when the reply has the nonce AND a view_image call was made."""
+    looked = any(str(n).rsplit("__", 1)[-1] == "view_image" for n in tool_names)
+    seen = nonce.lower() in reply.lower()
+    if looked and seen:
+        return "PASS"
+    if not looked:
+        notes.append(f"no view_image call (tools: {list(tool_names)})")
+    if not seen:
+        notes.append(f"nonce {nonce} not in reply: {reply[:120]!r}")
+    return "FAIL"
+
+
 def request_id_check(response: Any, notes: List[str]) -> str:
     """PASS when the turn saw model calls and every one had a request_id."""
     calls = getattr(response, "api_calls", 0)
@@ -720,17 +838,29 @@ def request_id_check(response: Any, notes: List[str]) -> str:
     return "FAIL"
 
 
+def claude_md_check(reply: str, notes: List[str]) -> str:
+    """FAIL when the reply quotes a CLAUDE.md the bot excludes (dv-fe02)."""
+    text = reply.lower()
+    leaked = sorted({name for marker, name in OUTSIDE_CLAUDE_MD if marker in text})
+    if not leaked:
+        return "PASS"
+    notes.append(
+        "reply quotes " + " and ".join(leaked) + ": claudeMdExcludes not applied"
+    )
+    return "FAIL"
+
+
 def _table(results: List[CellResult]) -> str:
     lines = [
-        "| cell | bot tool (tool_calls success=1 + delivered) | denied path "
-        "| family item | request_id | time | notes |",
-        "|---|---|---|---|---|---|---|",
+        "| cell | bot tool (tool_calls status=ok + delivered) | denied path "
+        "| family item | request_id | CLAUDE.md | image | time | notes |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         notes = "; ".join(r.notes).replace("|", "/")
         lines.append(
             f"| {r.cell} | {r.tool} | {r.denied} | {r.family} | {r.request_id} "
-            f"| {r.seconds:.0f}s | {notes} |"
+            f"| {r.claude_md} | {r.image} | {r.seconds:.0f}s | {notes} |"
         )
     return "\n".join(lines)
 
@@ -748,6 +878,7 @@ async def main() -> int:
 
     base = Path(tempfile.mkdtemp(prefix="backend-smoke-"))
     root = base / "data"
+    (base / "CLAUDE.md").write_text(INSTALL_CANARY, encoding="utf-8")
     # Before ANY bot import: the data layout (protected dirs, DB paths) is
     # resolved from these and cached for the process.
     os.environ["DEVVY_DATA_ROOT"] = str(root)

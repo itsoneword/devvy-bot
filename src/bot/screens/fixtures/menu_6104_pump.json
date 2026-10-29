@@ -1,0 +1,58 @@
+{
+  "source": "dv-6104 /menu → Pump, build_pump() at 390322a with a representative status and three tasks (frozen: dv-f6af rewrites it).",
+  "id": "menu.pump@6104",
+  "goal": "see what the Pump is doing and push one task first",
+  "parse_mode": null,
+  "text": "⚙ Pump\n\ndevvy: 2 running, 1 queued · gymbro: idle · pl: idle\n▶ dv-f6af building 2/3 (review next) · 41 min\n▶ dv-4cd8 testdesign 1/3 · 3 min\n⏳ dv-9133 waiting_user: 2 questions\nSlots: 2/2 bgjob · cap 15 launches/task",
+  "rows": [
+    [
+      {
+        "text": "⏸ Заморозить Pump",
+        "callback_data": "menu:lim:freeze"
+      }
+    ],
+    [
+      {
+        "text": "⚡ dv-f6af Admin menu v2: one scre…",
+        "callback_data": "menu:first:dv-f6af"
+      },
+      {
+        "text": "🚨 dv-f6af",
+        "callback_data": "menu:urgent:dv-f6af"
+      }
+    ],
+    [
+      {
+        "text": "⚡ dv-4cd8 Pump UI gate for bot sc…",
+        "callback_data": "menu:first:dv-4cd8"
+      },
+      {
+        "text": "🚨 dv-4cd8",
+        "callback_data": "menu:urgent:dv-4cd8"
+      }
+    ],
+    [
+      {
+        "text": "⚡ dv-9133 gymbro designer loop wi…",
+        "callback_data": "menu:first:dv-9133"
+      },
+      {
+        "text": "🚨 dv-9133",
+        "callback_data": "menu:urgent:dv-9133"
+      }
+    ],
+    [
+      {
+        "text": "🛑 Стоп этого чата",
+        "callback_data": "menu:stop"
+      }
+    ],
+    [
+      {
+        "text": "« Назад",
+        "callback_data": "menu:root"
+      }
+    ]
+  ],
+  "render_ms": null
+}

@@ -106,8 +106,11 @@ async def test_owner_menu_is_the_settled_short_list_in_order(tmp_dir, deps):
     names = [c.command for c in await orchestrator.get_bot_commands()]
 
     # /agents needs a profile registry; without one the rest must still hold.
+    # dv-6104: /menu listed second; /tasks unlisted (the /menu Pump screen
+    # replaces it, owner 26.10.26) so the menu stays at 12.
     assert names == [
         "start",
+        "menu",
         "new",
         "stop",
         "resume",
@@ -118,7 +121,6 @@ async def test_owner_menu_is_the_settled_short_list_in_order(tmp_dir, deps):
         "usage",
         "limits",
         "model",
-        "tasks",
     ]
 
 
@@ -171,6 +173,8 @@ def test_callback_pattern_covers_every_prefix(agentic_settings, deps):
         "confirm:yes",
         "watchdog:hold",
         "qi:ab12cd34",
+        "lim:freeze",
+        "lim:codex",
     ]
     for data in samples:
         assert any(p.match(data) for p in patterns), f"no handler routes {data!r}"
@@ -221,9 +225,9 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
     # 4 message handlers (text, document, photo, voice)
     assert len(msg_handlers) == 4
-    # 3 callback handlers (cd:/model:/agent: selection + confirm: gate +
-    # watchdog: hold/dismiss gate)
-    assert len(cb_handlers) == 3
+    # 4 callback handlers (cd:/model:/agent: selection + confirm: gate +
+    # watchdog: hold/dismiss gate + menu: hub, dv-6104)
+    assert len(cb_handlers) == 4
 
 
 def test_agentic_message_handlers_reject_edited_messages(agentic_settings, deps):
@@ -1450,3 +1454,31 @@ class TestThinkingProgressRendering:
         assert "Answer text." in rendered
         # The redacted block contributed nothing.
         assert len(tool_log) == 3
+
+
+async def test_restart_command_is_immediate_even_while_a_turn_runs(deps):
+    """dv-da50: only the agent's restart_bot drains in-flight turns. The
+    owner's /restart is the escape hatch and still restarts at once."""
+    import os
+    import signal
+    from unittest.mock import patch
+
+    from src.bot.orchestration.commands.system import restart_command
+    from src.utils.turn_locks import TurnLocks
+
+    turn_locks = TurnLocks()
+    lock = turn_locks.get(123, "devops")
+    await lock.acquire()  # a turn is in flight
+    try:
+        update = MagicMock()
+        update.effective_user.id = 123
+        update.message.reply_text = AsyncMock()
+        context = MagicMock()
+        context.bot_data = {"audit_logger": None, "turn_locks": turn_locks}
+
+        with patch("src.bot.orchestration.commands.system.os.kill") as mock_kill:
+            await restart_command(update, context)
+
+        mock_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+    finally:
+        lock.release()

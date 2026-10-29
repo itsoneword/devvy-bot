@@ -1387,6 +1387,7 @@ class TestJobToolsRoleGate:
         "pump_status",
         "pump_pending",
         "pump_answer",
+        "pump_control",
     )
 
     @staticmethod
@@ -1553,6 +1554,49 @@ class TestJobStartCommand:
         assert r.get("isError") is not True
         assert "--cmd" in spawned[0] and "make test" in spawned[0]
 
+    async def _spawned_argv(self, services, captured_tools, monkeypatch, args):
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return (b"started x", b"")
+
+        spawned: list = []
+
+        async def fake_exec(*argv: str, **kw: Any) -> FakeProc:
+            spawned.append(argv)
+            return FakeProc()
+
+        monkeypatch.setattr(agent_tools.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(
+            agent_tools, "_command_job_argv", lambda s, c, cmd: (cmd, "")
+        )
+        tools = await self._tools(services, captured_tools)
+        r = await tools["job_start"].handler(args)
+        assert r.get("isError") is not True
+        assert len(spawned) == 1
+        return spawned[0]
+
+    async def test_command_job_queues_for_a_slot_instead_of_being_refused(
+        self, services, captured_tools, monkeypatch
+    ):
+        """dv-5432: job_start(command) with the job cap full is queued: the
+        tool passes `--queue`, and the flag sits before the command text."""
+        argv = await self._spawned_argv(
+            services, captured_tools, monkeypatch, {"command": "make test"}
+        )
+        assert "--queue" in argv, argv
+        assert argv.index("--queue") < argv.index("--cmd"), argv
+
+    async def test_prompt_job_does_not_queue(
+        self, services, captured_tools, monkeypatch
+    ):
+        """dv-5432: prompt jobs keep being refused at the cap (no `--queue`)."""
+        argv = await self._spawned_argv(
+            services, captured_tools, monkeypatch, {"prompt": "deep research"}
+        )
+        assert "--queue" not in argv, argv
+
 
 class TestJobStartBoardTask:
     """dv-a438: job_start(task_id) starts the board pipeline instead of a
@@ -1700,3 +1744,209 @@ class TestTaskBoard:
         result = await tools["task_done"].handler({"task_id": "dv-0000"})
 
         assert json.loads(result["content"][0]["text"])["status"] == "not_found"
+
+
+class TestRestartBotTool:
+    """dv-da50: ``restart_bot`` — a restart that runs after the turn is saved.
+
+    Owner-only (same fail-closed gate as the job tools) and mounted only when
+    ``AgentServices.request_restart`` is wired. The handler re-checks the role,
+    so a bridge call with a guest/None context cannot reach the executor.
+    """
+
+    @pytest.fixture
+    def restart_services(
+        self, event_bus: FakeEventBus, scheduler: AsyncMock
+    ) -> AgentServices:
+        return AgentServices(
+            event_bus=event_bus,
+            task_repo=AsyncMock(),
+            scheduler=scheduler,
+            request_restart=AsyncMock(return_value="scheduled"),
+        )
+
+    async def test_owner_turn_gets_restart_bot_and_it_schedules(
+        self, restart_services: AgentServices, captured_tools: Dict[str, Any]
+    ) -> None:
+        tools = _build(
+            restart_services,
+            captured_tools,
+            requester_chat_id=555,
+            user_id=111,
+            role="owner",
+        )
+
+        assert "restart_bot" in tools
+        result = await tools["restart_bot"].handler({"reason": "apply config"})
+
+        assert result.get("isError") is not True
+        assert "scheduled" in result["content"][0]["text"]
+        restart_services.request_restart.assert_awaited_once()
+        reason, ctx = restart_services.request_restart.await_args.args
+        assert reason == "apply config"
+        assert ctx.role == "owner" and ctx.user_id == 111
+
+    @pytest.mark.parametrize("role", ["guest", None])
+    async def test_guest_or_unresolved_turn_has_no_restart_bot(
+        self,
+        restart_services: AgentServices,
+        captured_tools: Dict[str, Any],
+        role: str | None,
+    ) -> None:
+        tools = _build(
+            restart_services,
+            captured_tools,
+            requester_chat_id=555,
+            user_id=111,
+            role=role,
+        )
+
+        assert "restart_bot" not in tools
+        # Same filter the Codex bridge applies.
+        ctx = agent_tools.TurnContext(user_id=111, role=role)
+        names = {
+            s.name for s in agent_tools.available_tool_specs(restart_services, ctx)
+        }
+        assert "restart_bot" not in names
+
+    async def test_not_mounted_without_request_restart_wired(
+        self, services: AgentServices, captured_tools: Dict[str, Any]
+    ) -> None:
+        tools = _build(
+            services, captured_tools, requester_chat_id=555, user_id=111, role="owner"
+        )
+
+        assert "restart_bot" not in tools
+
+    async def test_handler_refuses_a_non_owner_context(
+        self, restart_services: AgentServices
+    ) -> None:
+        """A bridge call with a guest context must not reach the executor."""
+        spec = next(s for s in agent_tools.ALL_TOOL_SPECS if s.name == "restart_bot")
+        ctx = agent_tools.TurnContext(user_id=222, role="guest")
+
+        result = await spec.handler(restart_services, ctx, {"reason": "x"})
+
+        assert result.get("isError") is True
+        restart_services.request_restart.assert_not_awaited()
+
+
+class TestNotifyChatHistory:
+    """dv-da50: a direct ``notify`` is written to the chat history (messages)
+    of the user's session for this working dir, so the next turn and
+    ``recall_conversation`` see it. Report-route notifies are not.
+
+    ``AgentServices`` carries ``storage`` (facade: ``.sessions``,
+    ``.messages``) and ``window_repo``, as main.py wires them.
+    """
+
+    WORKDIR = Path("/tmp/ws")
+
+    @pytest.fixture
+    async def storage(self, tmp_path: Path):
+        from src.storage.facade import Storage
+
+        st = Storage(f"sqlite:///{tmp_path / 'bot.db'}")
+        await st.initialize()
+        yield st
+        await st.close()
+
+    async def _seed_session(self, storage: Any, session_id: str = "s-devops") -> None:
+        async with storage.db_manager.get_connection() as conn:
+            await conn.execute("INSERT INTO users (user_id) VALUES (111)")
+            await conn.execute(
+                "INSERT INTO sessions (session_id, user_id, project_path) "
+                "VALUES (?, 111, ?)",
+                (session_id, str(self.WORKDIR)),
+            )
+            await conn.commit()
+
+    @staticmethod
+    async def _messages(storage: Any) -> list:
+        async with storage.db_manager.get_connection() as conn:
+            cur = await conn.execute("SELECT * FROM messages ORDER BY message_id")
+            return [dict(r) for r in await cur.fetchall()]
+
+    @pytest.fixture
+    def notify_services(self, event_bus: FakeEventBus, storage: Any) -> AgentServices:
+        from src.storage.window_repository import WindowRepository
+
+        return AgentServices(
+            event_bus=event_bus,
+            task_repo=AsyncMock(),
+            message_repo=storage.messages,
+            storage=storage,
+            window_repo=WindowRepository(storage.db_manager),
+        )
+
+    async def test_notify_text_is_saved_and_found_by_recall(
+        self,
+        storage: Any,
+        notify_services: AgentServices,
+        captured_tools: Dict[str, Any],
+        event_bus: FakeEventBus,
+    ) -> None:
+        await self._seed_session(storage)
+        tools = _build(
+            notify_services,
+            captured_tools,
+            requester_chat_id=555,
+            user_id=111,
+            role="owner",
+        )
+
+        await tools["notify"].handler(
+            {"text": "Raised PUMP_MAX_CONCURRENT from 3 to 5, restarting now"}
+        )
+
+        assert len(event_bus.published) == 1  # still delivered
+        rows = await self._messages(storage)
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "s-devops"
+        assert "PUMP_MAX_CONCURRENT" in rows[0]["response"]
+        result = await tools["recall_conversation"].handler(
+            {"query": "PUMP_MAX_CONCURRENT"}
+        )
+        assert "PUMP_MAX_CONCURRENT" in result["content"][0]["text"]
+
+    async def test_report_route_notify_adds_no_row(
+        self,
+        storage: Any,
+        notify_services: AgentServices,
+        captured_tools: Dict[str, Any],
+        event_bus: FakeEventBus,
+    ) -> None:
+        await self._seed_session(storage)
+        tools = _build(
+            notify_services,
+            captured_tools,
+            requester_chat_id=555,
+            user_id=111,
+            role="owner",
+        )
+
+        await tools["notify"].handler({"text": "disk 91%", "source": "server-monitor"})
+
+        assert len(event_bus.published) == 1
+        assert await self._messages(storage) == []
+
+    async def test_notify_without_a_session_sends_and_saves_nothing(
+        self,
+        storage: Any,
+        notify_services: AgentServices,
+        captured_tools: Dict[str, Any],
+        event_bus: FakeEventBus,
+    ) -> None:
+        tools = _build(
+            notify_services,
+            captured_tools,
+            requester_chat_id=555,
+            user_id=111,
+            role="owner",
+        )
+
+        result = await tools["notify"].handler({"text": "first ever message"})
+
+        assert result.get("isError") is not True
+        assert len(event_bus.published) == 1
+        assert await self._messages(storage) == []

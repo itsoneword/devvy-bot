@@ -13,6 +13,7 @@ from src.model_router.routes import (
     PROVIDER_ANTHROPIC_SUB,
     PROVIDER_OPENROUTER,
     Route,
+    cost_for,
     cost_from_tokens,
     provider_env,
     resolve_turn_route,
@@ -137,6 +138,18 @@ def test_provider_env_points_cli_at_openrouter():
         provider_env(Route("claude", PROVIDER_OPENROUTER, GLM), None)
 
 
+def test_provider_env_maps_the_fable_tier_to_the_slug():
+    """dv-d63d: a fable-tier side request on OpenRouter must not leak an
+    Anthropic model name the endpoint cannot serve."""
+    env = provider_env(Route("claude", PROVIDER_OPENROUTER, GLM), "k-123")
+    assert env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == GLM
+    for tier in ("OPUS", "SONNET", "HAIKU"):
+        assert env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == GLM
+    # The subscription route still sets nothing.
+    sub = provider_env(Route("claude", PROVIDER_ANTHROPIC_SUB, "fable"), "k")
+    assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in sub
+
+
 # --- cost -------------------------------------------------------------------
 
 
@@ -242,3 +255,29 @@ async def test_model_keyboard_lists_profile_allowed_models(tmp_path, monkeypatch
         f"model:or:{GLM}",
         f"model:or:{OTHER}",
     ]
+
+
+# --- dv-d63d: Fable pricing -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["claude-fable-5", "claude-fable-5-1", "claude-fable-5-1-x", "claude-fable-6"],
+)
+def test_any_fable_id_prices_on_a_fable_rule_not_default(model):
+    from src.model_router.routes import pricing_rule_for
+
+    rule = pricing_rule_for(model)
+    assert rule is not None, f"{model} fell to the Opus default"
+    assert "fable" in rule
+    assert "opus" not in rule
+
+
+def test_unknown_fable_version_costs_fable_rates_not_opus_default():
+    usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+    sub = Route("claude", PROVIDER_ANTHROPIC_SUB, "fable")
+    fable = cost_for(sub, model="claude-fable-6", usage=usage)
+    opus_default = cost_for(sub, model="claude-opus-legacy-unknown-x", usage=usage)
+    # Fable list price (10 in / 50 out) is above the Opus default (5 / 25).
+    assert fable == pytest.approx(10.0 + 50.0)
+    assert fable != opus_default

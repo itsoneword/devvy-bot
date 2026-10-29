@@ -33,7 +33,7 @@ from .denylist import (
     protected_path_error,
     protected_search_error,
 )
-from .destructive import _is_temp_path, classify, exchange_tool_ask
+from .destructive import _is_free_path, classify, exchange_tool_ask
 from .read_scope import ReadScope, build_read_scope
 
 ALLOW = "allow"
@@ -45,6 +45,19 @@ _BASH_TOOLS = {"Bash", "bash", "shell"}
 # root itself must pass the search-ancestor rule on guest sessions (dv-7de7).
 SEARCH_TOOLS = {"Grep", "Glob", "LS"}
 _PATH_KEYS = ("file_path", "path", "notebook_path")
+# A list of paths (``view_image``'s ``paths``): every entry is a candidate.
+_PATH_LIST_KEYS = ("paths",)
+
+# Images are looked at only through ``mcp__agent__view_image`` (dv-275f): a
+# raw ``Read`` returns the whole file base64-encoded, which once killed a turn
+# (FINDINGS 2026-08-04). By suffix, so the rule stays pure (no stat); SVG is
+# XML text and stays readable.
+RASTER_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
+_IMAGE_READ_TOOLS = {"Read"}
+_VIEW_IMAGE_TOOL = "mcp__agent__view_image"
+# Codex's own image viewer: off in its argv (``features.view_image=false``);
+# denied here as the backstop, because it never sees the image roots.
+_NATIVE_IMAGE_TOOLS = {"view_image"}
 
 # Codex edits files through `apply_patch`; its input is the patch text.
 _PATCH_TOOLS = {"apply_patch"}
@@ -64,6 +77,9 @@ class TurnPolicy:
     # Profile flag (dv-e38e): skip the data-root areas; credential rules stay.
     unrestricted: bool = False
     read_scope: Optional[ReadScope] = None
+    # A pump job's own git worktree (dv-58db): deleting inside it needs no
+    # owner. Only ``src/model_router/job.py`` sets it; chat turns never do.
+    free_root: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -161,11 +177,32 @@ def _deny_reason(
                 return error or "Denied path"
         return None
 
+    if tool_name in _NATIVE_IMAGE_TOOLS:
+        return (
+            f"Codex's built-in view_image is switched off: use {_VIEW_IMAGE_TOOL} "
+            f"(same arguments: path), which downscales and checks the path."
+        )
+    file_path = tool_input.get("file_path")
+    if (
+        tool_name in _IMAGE_READ_TOOLS
+        and isinstance(file_path, str)
+        and Path(file_path).suffix.lower() in RASTER_IMAGE_SUFFIXES
+    ):
+        return (
+            f"Reading image files is blocked: a raw image can kill the turn and "
+            f"wastes context. Use the view_image tool ({_VIEW_IMAGE_TOOL}) -- "
+            f"it downscales the image and checks the path."
+        )
+
     candidates: List[str] = [
         value
         for value in (tool_input.get(key) for key in _PATH_KEYS)
         if isinstance(value, str) and value
     ]
+    for key in _PATH_LIST_KEYS:
+        values = tool_input.get(key)
+        if isinstance(values, list):
+            candidates.extend(v for v in values if isinstance(v, str) and v)
     # Glob's `pattern` may itself be a path (`/root/secrets/**`); its
     # literal prefix is checked like a search root (dv-2c1c).
     pattern = tool_input.get("pattern")
@@ -227,7 +264,7 @@ def _decide_one(
     # Ask-gate: full-access profiles only; sandboxed profiles can't do
     # cross-FS/network damage from bash.
     if turn.full_access:
-        reason = classify(tool_name, tool_input, turn.working_directory)
+        reason = classify(tool_name, tool_input, turn.working_directory, turn.free_root)
         if reason:
             preview = (
                 tool_input.get("command")
@@ -254,7 +291,7 @@ def decide(tool_name: str, tool_input: Dict[str, Any], turn: TurnPolicy) -> Deci
                 decision.action == ALLOW
                 and operation == "Delete File"
                 and turn.full_access
-                and not _is_temp_path(path, turn.working_directory)
+                and not _is_free_path(path, turn.working_directory, turn.free_root)
             ):
                 decision = Decision(ASK, "file deletion (apply_patch)", path)
             if decision.action == DENY:

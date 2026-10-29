@@ -65,3 +65,24 @@ def test_build_argv_resume_places_subcommand_after_exec_options(settings, tmp_pa
         i for i, a in enumerate(argv) if a.startswith("default_permissions=")
     )
     assert sandbox < ri
+
+
+@pytest.mark.parametrize("resume_id", [None, "abc-123"])
+def test_build_argv_switches_off_native_view_image(settings, tmp_path, resume_id):
+    """dv-275f: Codex's own view_image bypasses our roots check; ours is
+    mcp__agent__view_image. The native one is off on new and resumed turns."""
+    integ = CodexCliIntegration(
+        config=settings, session_store=InMemoryCodexSessionStore()
+    )
+    argv = integ._build_argv(
+        model="openai-codex/gpt-5.4-mini",
+        cwd=tmp_path,
+        out_file=tmp_path / "o.txt",
+        resume_id=resume_id,
+        images=None,
+    )
+    assert "features.view_image=false" in argv
+    i = argv.index("features.view_image=false")
+    assert argv[i - 1] == "-c"
+    if resume_id:
+        assert i < argv.index("resume")

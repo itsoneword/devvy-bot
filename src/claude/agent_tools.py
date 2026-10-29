@@ -33,6 +33,7 @@ from ..events.types import AgentResponseEvent
 from ..storage import board_policy
 from .exchange_tools import EXCHANGE_SPECS, ONCHAIN_SPECS
 from .hireli_tools import HIRELI_SPECS
+from .image_tools import IMAGE_SPECS
 from .item_tools import ITEM_SPECS
 from .tool_context import (
     AgentServices,
@@ -307,7 +308,73 @@ async def notify(
     )
     await services.event_bus.publish(event)
     logger.info("agent tool notify", profile=ctx.profile_slug, chat_id=chat_id)
+    if not source:
+        await _persist_notify(services, ctx, text)
     return _text({"status": "sent", "event_id": event.id})
+
+
+async def _persist_notify(services: AgentServices, ctx: TurnContext, text: str) -> None:
+    """Save a direct notify to the chat history (dv-da50).
+
+    Without it the text exists only in Telegram: a turn cut short after its
+    notify (a restart, a crash) leaves the next turn no trace of what the user
+    was told. Report-route notifies go to report topics, not the chat, and are
+    not saved. A failure here never fails the send.
+    """
+    if services.storage is None or ctx.user_id is None or ctx.working_dir is None:
+        return
+    from ..storage.delivered import persist_delivered_text
+
+    sent_at = datetime.now(UTC).strftime("%H:%M UTC")
+    try:
+        await persist_delivered_text(
+            services.storage,
+            services.window_repo,
+            ctx.user_id,
+            ctx.working_dir,
+            prompt=f"[notify sent by the agent at {sent_at}]",
+            response=text,
+        )
+    except Exception as e:
+        logger.warning("notify history persist failed", error=str(e))
+
+
+def _restart_available(services: AgentServices, ctx: TurnContext) -> bool:
+    """Owner-only, same fail-closed gate as the job tools (dv-da50)."""
+    return services.request_restart is not None and _job_tools_allowed(ctx.role)
+
+
+@_spec(
+    "restart_bot",
+    "Restart the bot process to apply code or config changes. The restart "
+    "runs AFTER this turn's reply is sent and saved and every other agent's "
+    "turn in flight has ended (at most 10 min). Call it, then finish your "
+    "reply normally. Never run `systemctl restart claude-bot` yourself: it "
+    "kills this turn before it is saved and the next turn will not know it "
+    "happened.",
+    tool_schema({"reason": str}),
+    available=_restart_available,
+)
+async def restart_bot(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    if services.request_restart is None or not _job_tools_allowed(ctx.role):
+        return _err("restart_bot is owner-only")
+    reason = _str_arg(args, "reason") or f"requested by {ctx.profile_slug or 'agent'}"
+    status = await services.request_restart(reason, ctx)
+    logger.info(
+        "agent tool restart_bot",
+        profile=ctx.profile_slug,
+        user_id=ctx.user_id,
+        status=status,
+    )
+    return _text(
+        {
+            "status": status,
+            "fires": "after this turn is saved and every in-flight turn "
+            "ends (max 10 min)",
+        }
+    )
 
 
 @_spec(
@@ -677,9 +744,21 @@ async def _run_script(ctx: TurnContext, name: str, *argv: str) -> Dict[str, Any]
             role=ctx.role,
         )
         return _err("background jobs are not available in this session")
+    rc, text = await run_repo_script(name, *argv)
+    if rc != 0:
+        return _err(text or f"{name} exited {rc}")
+    return _text(text)
+
+
+async def run_repo_script(name: str, *argv: str) -> "tuple[int, str]":
+    """Run scripts/<name> out-of-sandbox: (exit code, combined output).
+
+    No role check here: every caller gates first (_run_script for agent
+    tools, the owner-only lim:* buttons on the /menu Pump screen, dv-7ad9).
+    """
     script = Path(__file__).resolve().parents[2] / "scripts" / name
     if not script.exists():
-        return _err(f"{name} not found at {script}")
+        return 127, f"{name} not found at {script}"
     env = dict(os.environ)
     # systemd --user needs this; the bot process does not have it set.
     env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
@@ -692,9 +771,8 @@ async def _run_script(ctx: TurnContext, name: str, *argv: str) -> Dict[str, Any]
     )
     out, _ = await proc.communicate()
     text = (out or b"").decode("utf-8", errors="replace").strip()
-    if proc.returncode != 0:
-        return _err(text or f"{name} exited {proc.returncode}")
-    return _text(text)
+    rc = proc.returncode
+    return (rc if isinstance(rc, int) else 0), text
 
 
 async def _caller_board(ctx: TurnContext) -> "tuple[str, Dict[str, Any] | None]":
@@ -827,6 +905,8 @@ def _command_job_argv(
     "(the FULL test suite, a long build) pass `command` instead of prompt: "
     "it runs detached, judged by the same policy as your Bash tool, and "
     "its pass/fail line is pinged to Jobs. Reply right away that it started. "
+    "With the job cap full a command job is queued (starts when a slot "
+    "frees, gives up after 2h) and a prompt job is refused. "
     "A prompt job whose name matches a job running or finished "
     "OK in the last 30 min is refused (error names that job); pass "
     "force=true only for an intentional re-run. Jobs you start in the same "
@@ -876,6 +956,10 @@ async def job_start(
             ctx.profile_slug,
             "--name",
             name,
+            # Command jobs (release check, full suite) wait for a slot when
+            # the cap is full instead of being refused; prompt jobs still
+            # are refused (dv-5432).
+            "--queue",
             "--cmd",
             run_cmd,
         )
@@ -979,6 +1063,41 @@ async def pump_answer(
     return await _run_script(ctx, "taskpump", "answer", full, "--", text)
 
 
+_PUMP_ACTIONS = ("freeze", "thaw", "urgent")
+
+
+@_spec(
+    "pump_control",
+    "Pause / resume the task pipeline on EVERY board (dv-b17e). "
+    "action=freeze: no new launches anywhere, running pump jobs stop, every "
+    "task keeps its status, branch and committed phases. action=urgent + "
+    "task_id (any board, `board:dv-xxxx`): freeze, then run that one task "
+    "alone past caps and deps; the owner is told when it reaches review. "
+    "action=thaw: every stopped stage reruns as a fresh job. Only on the "
+    "owner's explicit 'freeze/stop the pump' or 'do X first' — never on a "
+    "casual 'pause' or to tidy up, since it stops every board's work.",
+    tool_schema({"action": str, "task_id": str}, "action"),
+    available=_jobs_available,
+)
+async def pump_control(
+    services: AgentServices, ctx: TurnContext, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    action = (args.get("action") or "").strip().lower()
+    task_id = (args.get("task_id") or "").strip()
+    if action not in _PUMP_ACTIONS:
+        return _err("action must be one of: freeze, thaw, urgent")
+    argv = [action, "--by", ctx.profile_slug]
+    if action == "urgent":
+        if not _PUMP_ID_RE.match(task_id):
+            return _err("urgent needs task_id like dv-xxxx or board:dv-xxxx")
+        # Global, not _caller_board: freeze/urgent span every board.
+        argv += ["--", task_id]
+    logger.info(
+        "agent tool pump_control", profile=ctx.profile_slug, action=action, task=task_id
+    )
+    return await _run_script(ctx, "taskpump", *argv)
+
+
 @_spec(
     "jobs_refresh_pin",
     "Re-render the pinned 'jobs running now' status post. Call this after "
@@ -1053,8 +1172,11 @@ async def job_output(
     "metrics, goals, training availability, the current agreed plan, "
     "standing defaults. Core facts change only when the user's life "
     "changes — never day to day. "
-    "'general' (the default) = soft preferences, history, status, project "
-    "notes; only the newest are injected, the rest reachable via recall. "
+    "'general' (the default) = soft preferences, history, project notes, "
+    "decisions, findings; only the newest are injected, the rest reachable "
+    "via recall. Not for task/ticket status ('dv-xxxx merged', 'started X', "
+    "'raised Y to 5', 'implemented in <sha>'): it goes stale and contradicts "
+    "the next status; status lives on the board (task_comment on that card). "
     "Pinned and core facts enter EVERY future turn, so use them for what "
     "matters and nothing else. scope: 'private' (default, only this user) or 'family' "
     "(shared with the user's household; silently downgraded to private if "
@@ -1557,10 +1679,11 @@ async def memory_correct(
 
 
 # Every tool both transports can offer, in mount order: platform + jobs +
-# memory first, then the profile's data.db tools, then Hireli, then the
-# exchange tools. Built at import time, after every decorator above has run.
+# memory first, then view_image, then the profile's data.db tools, then
+# Hireli, then the exchange tools. Built at import time, after every decorator above has run.
 ALL_TOOL_SPECS: List[ToolSpec] = (
     AGENT_TOOL_SPECS
+    + IMAGE_SPECS
     + ITEM_SPECS
     + USER_DATA_READ_SPECS
     + USER_DATA_WRITE_SPECS

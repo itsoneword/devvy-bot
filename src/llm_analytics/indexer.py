@@ -8,21 +8,32 @@ CLI: poetry run python -m src.llm_analytics.indexer --once [--stats] [--session 
 
 import argparse
 import json
-import os
 import sqlite3
 import sys
 import time
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 import structlog
 
+from .attribution import (
+    ATTRIBUTION_VERSION,
+    AgentDirs,
+    JobsCache,
+    SessionFacts,
+    attribute,
+    build_context,
+    cwd_label,
+    load_agent_dirs,
+    load_boards,
+    load_model_calls,
+)
 from .botdb import mirror_bot_db
 from .config import AnalyticsConfig
 from .db import connect, init_db
+from .grafana_export import EXPORT_INTERVAL_S, export_usage
 from .models import AgentSpawnInput, ParsedEntry, ScanStats
 from .parser import estimate_tokens, is_seeded_text, normalize_ts, parse_entry
 from .pricing import PricingTable
@@ -57,22 +68,6 @@ def _now_iso() -> str:
     return normalize_ts(datetime.now(UTC).isoformat())
 
 
-def _profile_from_cwd(cwd: str | None) -> str | None:
-    if not cwd:
-        return None
-    # Sessions may record a symlinked cwd (~/chef-workspace -> workspaces/chef);
-    # resolve so aliases collapse into one profile.
-    with suppress(OSError):
-        if os.path.exists(cwd):
-            cwd = os.path.realpath(cwd)
-    parts = PurePosixPath(cwd).parts
-    if "workspaces" in parts:
-        idx = parts.index("workspaces")
-        if idx + 1 < len(parts):
-            return parts[idx + 1]
-    return parts[-1] if parts else None
-
-
 class Indexer:
     def __init__(
         self,
@@ -83,6 +78,7 @@ class Indexer:
         self._conn = conn
         self._config = config
         self._pricing = pricing
+        self._jobs = JobsCache()
 
     # ------------------------------------------------------------------
     # Scan cycle
@@ -102,7 +98,9 @@ class Indexer:
             if self._scan_file(target, agent_inputs, stats):
                 touched_scopes.add((target.session_id, target.agent_id))
         mirrored = mirror_bot_db(self._conn, self._config.bot_db_path)
-        mirror_quality(self._conn, self._config.bot_db_path)
+        agents = load_agent_dirs(self._config.profiles_path)
+        mirror_quality(self._conn, self._config.bot_db_path, agents)
+        self._maybe_export_grafana()
         self._apply_agent_inputs(agent_inputs)
         touched_sessions = {sid for sid, _ in touched_scopes} | repriced_sessions
         for session_id in sorted(touched_sessions):
@@ -117,6 +115,7 @@ class Indexer:
                 "UPDATE sessions SET turn_count = (SELECT COUNT(*) FROM turns t"
                 " WHERE t.session_id = sessions.session_id)"
             )
+        self._attribute_all(agents)
         self._set_meta("schema_version", SCHEMA_VERSION)
         self._set_meta("pricing_config_hash", self._pricing.config_hash)
         self._set_meta("last_scan_at", _now_iso())
@@ -427,7 +426,7 @@ class Indexer:
             " entrypoint = COALESCE(sessions.entrypoint, excluded.entrypoint),"
             " git_branch = COALESCE(sessions.git_branch, excluded.git_branch),"
             " cli_version = COALESCE(sessions.cli_version, excluded.cli_version)",
-            (session_id, cwd, _profile_from_cwd(cwd), entrypoint, git_branch, version),
+            (session_id, cwd, cwd_label(cwd), entrypoint, git_branch, version),
         )
 
     def _upsert_subagent_stub(self, session_id: str, agent_id: str) -> None:
@@ -609,6 +608,77 @@ class Indexer:
         )
 
     # ------------------------------------------------------------------
+    # Attribution (dv-d2a3)
+    # ------------------------------------------------------------------
+
+    def _attribute_all(self, agents: AgentDirs) -> int:
+        """Recompute every session's source and write the rows that changed.
+
+        Whole-set each cycle: the job<->session match depends on every
+        session in a cwd, and a model_calls row can land after the session
+        was first indexed. Bulk loads + dict lookups, ~3k rows."""
+        stored = self._get_meta("attribution_version")
+        if stored != ATTRIBUTION_VERSION:
+            logger.info(
+                "attribution_changed_recomputing", old=stored, new=ATTRIBUTION_VERSION
+            )
+        excerpts = {
+            row["session_id"]: row["prompt_excerpt"]
+            for row in self._conn.execute(
+                "SELECT session_id, prompt_excerpt, MIN(ts) FROM turns"
+                " WHERE source = 'transcript' GROUP BY session_id"
+            )
+        }
+        rows = self._conn.execute(
+            "SELECT s.session_id, s.cwd, s.entrypoint, s.first_ts, s.in_bot_db,"
+            " b.project_path, s.attr_group, s.attr_key, s.attr_detail,"
+            " s.attr_archived FROM sessions s"
+            " LEFT JOIN bot_sessions b ON b.session_id = s.session_id"
+        ).fetchall()
+        facts = [
+            SessionFacts(
+                session_id=row["session_id"],
+                cwd=row["cwd"],
+                entrypoint=row["entrypoint"],
+                first_ts=row["first_ts"],
+                in_bot_db=bool(row["in_bot_db"]),
+                bot_project_path=row["project_path"],
+                first_excerpt=excerpts.get(row["session_id"]),
+            )
+            for row in rows
+        ]
+        calls = load_model_calls(self._config.bot_db_path)
+        ctx = build_context(
+            agents=agents,
+            calls=calls,
+            jobs=self._jobs.load(self._config.jobs_dir),
+            sessions=facts,
+            jobs_dir=self._config.jobs_dir,
+            pump_worktrees_dir=self._config.pump_worktrees_dir,
+            boards=load_boards(self._config.boards_path),
+        )
+        changed: list[tuple[Any, ...]] = []
+        for row, fact in zip(rows, facts):
+            new = attribute(fact, ctx).row()
+            old = (
+                row["attr_group"],
+                row["attr_key"],
+                row["attr_detail"],
+                row["attr_archived"],
+            )
+            if new != old:
+                changed.append((*new, fact.session_id))
+        self._conn.executemany(
+            "UPDATE sessions SET attr_group = ?, attr_key = ?, attr_detail = ?,"
+            " attr_archived = ? WHERE session_id = ?",
+            changed,
+        )
+        self._set_meta("attribution_version", ATTRIBUTION_VERSION)
+        if changed:
+            logger.info("sessions_attributed", changed=len(changed), total=len(rows))
+        return len(changed)
+
+    # ------------------------------------------------------------------
     # Pricing refresh / meta
     # ------------------------------------------------------------------
 
@@ -657,6 +727,25 @@ class Indexer:
         )
         self._set_meta("parser_version", PARSER_VERSION)
         self._conn.commit()
+
+    def _maybe_export_grafana(self) -> None:
+        """Restricted usage export for Grafana (dv-e005), at most once per
+        EXPORT_INTERVAL_S. A failure is logged and retried next cycle; it
+        never breaks the scan."""
+        out = self._config.grafana_export_path
+        if out is None:
+            return
+        last = self._get_meta("grafana_export_at")
+        now = time.time()
+        if last is not None and now - float(last) < EXPORT_INTERVAL_S:
+            return
+        try:
+            written = export_usage(self._config.bot_db_path, out)
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("grafana_export_failed", path=str(out), error=str(exc))
+            return
+        if written:
+            self._set_meta("grafana_export_at", str(now))
 
     def _get_meta(self, key: str) -> str | None:
         row = self._conn.execute(

@@ -773,6 +773,7 @@ class TurnsMixin(OrchestratorBase):
                 ),
                 agent_id=self._agent_id_for(context, current_dir, user_id),
                 family_id=self._family_id_for(context, user_id, current_dir),
+                consolidation=context.bot_data.get("consolidation_service"),
             )
             force_new = True
         _storage = context.bot_data.get("storage")
@@ -1383,6 +1384,7 @@ class TurnsMixin(OrchestratorBase):
                     ),
                     agent_id=agent_id,
                     family_id=state.family_id,
+                    consolidation=context.bot_data.get("consolidation_service"),
                 )
         except Exception as e:
             logger.warning(state.request.accounting_log_error, error=str(e))

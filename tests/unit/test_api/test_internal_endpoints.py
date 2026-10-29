@@ -414,6 +414,7 @@ class TestInternalPolicyAsk:
             "rm x",
             timeout_seconds=ASK_TIMEOUT_SECONDS,
             source="pump-1",
+            context=None,
         )
 
     def test_ask_without_a_manager_is_denied(self) -> None:
@@ -465,6 +466,28 @@ class TestInternalModelCalls:
         assert stored["provider"] == "anthropic" and stored["model"] == "sonnet"
         assert stored["cost_usd"] == 0.5 and stored["outcome"] == "ok"
 
+    async def test_job_name_is_stored(self, db) -> None:
+        """dv-87d8: a pump stage's job name is kept for its Phoenix trace."""
+        from src.storage.model_calls import ModelCallRepository
+
+        app = create_api_app(
+            EventBus(), make_settings(), model_calls=ModelCallRepository(db)
+        )
+        row = {
+            "purpose": "background_job",
+            "kind": "turn",
+            "harness": "claude",
+            "outcome": "ok",
+            "job_name": "pump-dv-87d8-implement-p1",
+        }
+        response = TestClient(app).post("/internal/model_calls", json=row, headers=AUTH)
+        assert response.status_code == 200, response.text
+        async with db.get_connection() as conn:
+            cur = await conn.execute("SELECT job_name, exported_at FROM model_calls")
+            (stored,) = [dict(r) for r in await cur.fetchall()]
+        assert stored["job_name"] == "pump-dv-87d8-implement-p1"
+        assert stored["exported_at"] is None
+
     async def test_unknown_purpose_is_rejected(self, db) -> None:
         from src.storage.model_calls import ModelCallRepository
 
@@ -478,3 +501,65 @@ class TestInternalModelCalls:
             .status_code
             == 400
         )
+
+    async def test_tools_are_written_under_the_call_row(self, db) -> None:
+        """dv-2260: a job's tool rows ride along and get the new row's id."""
+        from src.storage.model_calls import ModelCallRepository
+        from src.storage.tool_calls import ToolCallRepository
+
+        app = create_api_app(
+            EventBus(),
+            make_settings(),
+            model_calls=ModelCallRepository(db),
+            tool_calls=ToolCallRepository(db),
+        )
+        row = {
+            "purpose": "background_job",
+            "kind": "turn",
+            "harness": "claude",
+            "session_id": "job-s",
+            "outcome": "ok",
+            "trace_id": "tr1",
+            "tools": [
+                {
+                    "tool_use_id": "u1",
+                    "seq": 1,
+                    "tool": "Bash",
+                    "status": "ok",
+                    "started_at": datetime.now(UTC).isoformat(),
+                }
+            ],
+        }
+        response = TestClient(app).post("/internal/model_calls", json=row, headers=AUTH)
+        assert response.status_code == 200, response.text
+
+        async with db.get_connection() as conn:
+            cur = await conn.execute("SELECT id FROM model_calls")
+            (call_id,) = [r[0] for r in await cur.fetchall()]
+        (tool,) = await ToolCallRepository(db).for_model_call(call_id)
+        assert tool["trace_id"] == "tr1" and tool["session_id"] == "job-s"
+        assert tool["tool"] == "Bash" and tool["status"] == "ok"
+
+    async def test_trace_write_failure_keeps_the_call_row(self, db) -> None:
+        from src.storage.model_calls import ModelCallRepository
+
+        broken = MagicMock()
+        broken.upsert = AsyncMock(side_effect=RuntimeError("disk"))
+        app = create_api_app(
+            EventBus(),
+            make_settings(),
+            model_calls=ModelCallRepository(db),
+            tool_calls=broken,
+        )
+        row = {
+            "purpose": "background_job",
+            "kind": "turn",
+            "harness": "claude",
+            "outcome": "ok",
+            "tools": [{"tool_use_id": "u1", "seq": 1, "tool": "Read"}],
+        }
+        response = TestClient(app).post("/internal/model_calls", json=row, headers=AUTH)
+        assert response.status_code == 200, response.text
+        async with db.get_connection() as conn:
+            cur = await conn.execute("SELECT COUNT(*) FROM model_calls")
+            assert (await cur.fetchone())[0] == 1

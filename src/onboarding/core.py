@@ -201,8 +201,12 @@ def merge_extraction(answers: Answers, data: Dict[str, Any]) -> None:
         answers.facts = facts.strip()[:600]
 
 
-async def extract_answers(text: str, answers: Answers, model: str) -> None:
-    """Free-form message -> answers, via the model router (never raises)."""
+async def extract_answers(
+    text: str, answers: Answers, model: Optional[str] = None
+) -> None:
+    """Free-form message -> answers, via the model router (never raises).
+
+    ``model`` None = the onboarding call route (models.yaml)."""
     known = {f: getattr(answers, f) for f in FIELDS if getattr(answers, f) is not None}
     prompt = EXTRACT_PROMPT.format(
         agents=sorted(OPTIONAL_AGENTS), known=json.dumps(known), message=text

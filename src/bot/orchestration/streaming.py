@@ -17,8 +17,9 @@ from ..utils.draft_streamer import DraftStreamer
 from ..utils.ephemeral_updater import EphemeralUpdater
 from ..utils.image_extractor import (
     ImageAttachment,
+    attachment_from_tool_call,
+    is_send_file_call,
     should_send_as_photo,
-    validate_image_path,
 )
 from .base import OrchestratorBase
 from .formatting import _condense, _redact_secrets, _tool_icon, _truncate
@@ -191,18 +192,9 @@ class StreamingMixin(OrchestratorBase):
             # so match both the bare name and the namespaced variant.
             if update_obj.tool_calls and need_mcp_intercept:
                 for tc in update_obj.tool_calls:
-                    tc_name = tc.get("name", "")
-                    bare = tc_name.rsplit("__", 1)[-1]
-                    if bare in ("send_image_to_user", "send_file_to_user"):
-                        tc_input = tc.get("input", {})
-                        file_path = tc_input.get("file_path", "")
-                        caption = tc_input.get("caption", "")
-                        img = validate_image_path(
-                            file_path,
-                            approved_directory,
-                            caption,
-                            any_file=bare == "send_file_to_user",
-                        )
+                    if is_send_file_call(tc):
+                        file_path = (tc.get("input") or {}).get("file_path", "")
+                        img = attachment_from_tool_call(tc, approved_directory)
                         if img:
                             mcp_images.append(img)
                         else:

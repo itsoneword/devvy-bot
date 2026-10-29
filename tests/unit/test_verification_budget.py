@@ -413,17 +413,15 @@ async def test_contradiction_escalates_exactly_once(monkeypatch) -> None:  # typ
 def coach_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE sessions (session_id TEXT, user_id INTEGER,
             project_path TEXT);
         CREATE TABLE messages (message_id INTEGER, session_id TEXT,
             user_id INTEGER, timestamp TEXT, prompt TEXT, response TEXT);
         CREATE TABLE tool_calls (id INTEGER, session_id TEXT,
-            message_id INTEGER, tool_name TEXT, started_at TEXT,
+            message_id INTEGER, tool TEXT, started_at TEXT,
             parent_tool_use_id TEXT);
-        """
-    )
+        """)
     conn.execute("INSERT INTO sessions VALUES ('s', 7, '/w/workspaces/coach')")
     ts = "2026-09-22T10:00:00+00:00"
     conn.executemany(
@@ -437,7 +435,7 @@ def coach_db() -> sqlite3.Connection:
     )
     rows = [(1817, name) for name in TURN_1817_TOOLS] + [(1702, "WebSearch")]
     conn.executemany(
-        "INSERT INTO tool_calls (id, session_id, message_id, tool_name, started_at)"
+        "INSERT INTO tool_calls (id, session_id, message_id, tool, started_at)"
         " VALUES (?,?,?,?,?)",
         [(i, "s", mid, name, ts) for i, (mid, name) in enumerate(rows)],
     )

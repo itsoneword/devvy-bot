@@ -12,8 +12,8 @@ import httpx
 import structlog
 from telegram import Voice
 
-from src.config.settings import Settings
 from src.bot.telegram_retry import with_telegram_retry
+from src.config.settings import Settings
 from src.config.voice import voice_api_key
 
 logger = structlog.get_logger(__name__)

@@ -63,6 +63,7 @@ async def test_committed_write_survives_return(db: DatabaseManager) -> None:
         assert row[0] == 1
 
 
+@pytest.mark.timing
 async def test_checkout_past_size_and_overflow_times_out(tmp_path: Path) -> None:
     """Past ``pool_size + max_overflow`` simultaneous checkouts, a new
     request must fail fast with a real timeout -- the old pool grew
@@ -166,8 +167,7 @@ def test_process_exits_with_unclosed_manager(tmp_path: Path) -> None:
     and exits WITHOUT calling close() must not hang -- the daemon-thread
     flag on every physical connection (set in _new_connection, unchanged by
     the pool swap) is what makes that true."""
-    script = textwrap.dedent(
-        f"""
+    script = textwrap.dedent(f"""
         import asyncio
         import sys
         sys.path.insert(0, {str(Path(__file__).resolve().parents[3])!r})
@@ -181,8 +181,7 @@ def test_process_exits_with_unclosed_manager(tmp_path: Path) -> None:
             # Deliberately no manager.close() -- process just exits.
 
         asyncio.run(main())
-        """
-    )
+        """)
     script_path = tmp_path / "unclosed_manager.py"
     script_path.write_text(script)
 

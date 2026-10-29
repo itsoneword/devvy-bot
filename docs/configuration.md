@@ -139,6 +139,133 @@ AGENT_TIMEOUT_SECONDS=600
 OPENAI_CODEX_CREDENTIALS_PATH=data/model_auth/openai_codex.json
 ```
 
+#### Plain-call model routes (dv-781f)
+
+Every model call that is not an agent turn picks its harness and model from
+one per-purpose route table; the caller names only the purpose. Agent turns
+route per profile (`profiles.yaml`, "Profiles" below), not here.
+
+```bash
+# The owner's overlay on the built-in routes. Missing file = built-in routes.
+# A relative path is from the repo root.
+MODEL_ROUTES_PATH=config/models.yaml
+```
+
+Built-in routes (`src/model_router/routes.py`, `DEFAULT_CALL_ROUTES`) are the
+behaviour before dv-781f; `config/models.example.yaml` documents them and
+every key. `config/models.yaml` (gitignored) only lists what you change:
+
+| purpose | caller | built-in harness | built-in model |
+|---|---|---|---|
+| `extraction`, `screen_extraction` | memory evaluator | the chat's backend | claude: sonnet, openai_codex: openai-codex/gpt-6-sol |
+| `reconcile` | evaluator reconciler, reconcile gate's decide leg | claude | haiku |
+| `consolidation` | stale-fact sweep (rotation, valve, weekly) | claude | haiku |
+| `fact_quality` | daily fact-quality judge | claude | haiku |
+| `onboarding` | `/setup` free-form extraction | claude | sonnet (default row) |
+| `ask_explain` | ask-card explanation (sees the task title, dv-781f) | claude | sonnet |
+| `scorer` | `scripts/score_answers.py` | openrouter | live Qwen pick (claude: opus) |
+| `screen` | evaluator screen's decide leg (off) | claude | haiku |
+
+Precedence for one call: an explicit harness/model in code (offline A/B tools
+only) > the purpose row > `default`. A harness missing from a purpose's
+`models` takes `default.models[harness]`. The deprecated `EVALUATOR_MODEL`,
+`EVALUATOR_CODEX_MODEL`, `FACT_QUALITY_CHECK_MODEL` sit between the built-in
+rows and the file. An optional `fallback: {harness, model}` (per purpose or on
+`default`) runs once more on that route when a call fails or times out; both
+attempts get a `model_calls` row. No fallback is configured by default.
+
+A call with a JSON schema gets the same answer on every route: the router
+sends each harness the schema in the form it takes (array root wrapped;
+strict for Codex and OpenRouter, whose `response_format` is resent once
+without it when a model rejects it), then validates and canonicalises the
+answer. Invalid JSON is retried once on the same route; with a fallback that
+is at most 4 calls, each its own row. `json: {<harness>: native|validate}` on
+a row picks the form: `native` (default) sends the schema, `validate` keeps
+prompt-only JSON and only checks the root (built-in: `extraction` and
+`screen_extraction` on `claude`, as before).
+
+`ask_explain` (the 🔎 block on an ask card) also sees who asks: the profile,
+and for a pump job the task id + title and the stage, fixed by
+`scripts/taskpump` at launch (`bgjob run --ask-context` → `agentjob
+--ask-context`). Never the task's description or the agent's reasoning. That
+context is untrusted (a title may come from public intake): it sits in its own
+nonce-tagged block, single-lined, capped at 200 chars, tag-like text defanged.
+The verdict stays advisory; the explanation lands within 45 s
+(`deadline_seconds`) or not at all.
+
+Switch everything to Codex:
+
+```yaml
+default:
+  harness: openai_codex
+  models: {openai_codex: openai-codex/gpt-6-sol}
+purposes:              # extraction otherwise follows the chat's backend
+  extraction:        {harness: openai_codex}
+  screen_extraction: {harness: openai_codex}
+```
+
+Switch everything to OpenRouter (any model it lists, incl. GLM / Qwen / Kimi;
+key: `/setkey openrouter OPENROUTER_API_KEY`; cost priced from
+`config/llm_pricing.json`, None when no rule matches):
+
+```yaml
+default:
+  harness: openrouter
+  models: {openrouter: z-ai/glm-5.3}
+purposes:
+  extraction:        {harness: openrouter}
+  screen_extraction: {harness: openrouter}
+```
+
+The bot reads the file once at boot: an edit takes effect on `/restart`.
+Check it first with `poetry run python scripts/show_config.py routes` (prints
+the resolved route per purpose; exit 1 and the reason on a bad file). A bad
+file at boot does not stop the bot: it starts on the built-in routes and
+sends the owner one message saying why. Scripts read the file per process
+(`MODEL_ROUTES_PATH` env, else the repo's `config/models.yaml`).
+
+On OpenRouter a plain call goes over its HTTP API; the Claude CLI pointed at
+OpenRouter is for agent turns only.
+
+#### Background-job routes (dv-d63d)
+
+Background jobs (bgjob / `job_start`, the server monitor, each Pump stage) take
+harness, provider and model from the `jobs:` section of the same
+`models.yaml`. `scripts/agentjob` resolves the row itself, so an edit applies
+to the next job without `/restart`. Rows have the purpose rows' keys except
+`fallback`: a job never falls back to another harness (owner 2026-10-26).
+`jobs.default` is the jobs' own default row; the top-level `default` does not
+move jobs.
+
+| job route | runs | built-in model (claude) |
+|---|---|---|
+| `background_job` | `bgjob run` / `job_start` without `--route` | sonnet (`jobs.default`) |
+| `monitor` | `agentjob --purpose monitor` | sonnet |
+| `pump_analyze`, `pump_testdesign`, `pump_implement` | Pump stages | opus |
+| `pump_architect`, `pump_review`, `pump_acceptance` | Pump stages | sonnet |
+
+Job harnesses: `claude` (CLI on the subscription), `openrouter` (the same CLI
+pointed at OpenRouter: base URL, key-store key, every tier alias and the
+subagent model on the slug; the slug needs a `config/llm_pricing.json` rule,
+checked at load, and the `model_calls` row is `claude` / `openrouter` priced
+from tokens), `openai_codex` (Codex CLI). An explicit `bgjob --model` /
+`job_start` model beats the row only on `claude`; elsewhere it is ignored
+with a log line. The old `PUMP_<STAGE>_MODEL` env vars still set their
+stage's claude model, below the file, with a warning; bgjob forwards them
+and `MODEL_ROUTES_PATH` into the job unit. `agentjob --print-route --route
+NAME` prints the resolved route.
+
+**Owner switch.** `/menu → 🧠 Модели → «Фоновые задачи на: …»` opens a switch
+`Claude · Codex · OpenRouter · По таблице` (owner only, no agent turn). A tap moves every job (Pump stages,
+bgjob, the monitor) to that harness from the next job on, no restart; each
+row keeps its model for that harness, else `jobs.default.models.<harness>`.
+Reset returns to the table. The tap is refused, writing nothing, when Codex is
+not logged in, there is no OpenRouter key, or a job has no model for the
+harness. The switch is the `job_route` key of `model_quota.json`
+(`<root>/workspaces/devops/`, `src/model_router/quota.py`), above the rows
+and above an explicit `--model`. It never turns on by itself after a quota
+error. `taskpump status` and `show_config.py routes` show it while it is on.
+
 #### Agent Tools Bridge (Codex)
 
 The Claude path mounts the bot's own tools in-process; a subprocess backend
@@ -189,10 +316,9 @@ reaches the roll threshold is only evaluated on "remember" or `/new`.
 context level) on the others, so it cannot be compared with the thresholds.
 
 ```bash
-# Model alias for the evaluator's Claude CLI call (sonnet, haiku, or a full id)
+# Deprecated (dv-781f): use purposes.extraction.models in config/models.yaml
+# (see "Plain-call model routes"). Still honoured, ranked below the file.
 EVALUATOR_MODEL=sonnet
-
-# Model for the extraction call when the active backend is Codex
 EVALUATOR_CODEX_MODEL=openai-codex/gpt-6-sol
 
 # Hard cap on the conversation slice one run may carry (chars)
@@ -228,6 +354,25 @@ MEMORY_SCREEN_MODE=shadow
 MEMORY_SCREEN_CHUNK_TOKENS=12000
 MEMORY_SCREEN_FACT_SEND_MIN=0.3
 MEMORY_SCREEN_FACT_SEND_MAX=40
+
+# Facts per window (dv-cf07). The frozen window bundle (and the per-turn
+# fallback retriever) inject every pinned and core fact, the newest
+# MEMORY_SNAPSHOT_GENERAL_CAP general user_facts and the newest
+# MEMORY_POINTER_CAP conversation_result pointers; older rows stay reachable
+# via recall(). 60/60 costs 19-26k ch (~5.5-10k tokens) per scope (26.10.26).
+# The roll seed still carries at most 15 facts and 15 pointers.
+MEMORY_SNAPSHOT_GENERAL_CAP=60
+MEMORY_POINTER_CAP=60
+# Pressure valve, not a cap (dv-5e2a): a bundle whose pinned + general +
+# conflict + family chars exceed this is still injected whole, and a
+# consolidation run is requested for the scope. Pointers are not counted.
+BUNDLE_FACTS_BUDGET_CHARS=24000
+# A window rotation (roll or /new) runs the final extraction, then a
+# stale-fact sweep of the scope (dv-cf07): one haiku call proposes facts a
+# newer fact made stale, code validates and closes them softly (UNDO lines in
+# the consolidation report). The new window's first turn waits up to this
+# many seconds for it, then freezes its snapshot without it.
+MEMORY_SWEEP_WAIT_SECONDS=60
 
 # TypeSafe Jev key (dv-e690). Primary: this variable in the bot's dotenv or
 # secrets file; main.py hands it to the router at startup (the loader keeps it
@@ -293,7 +438,8 @@ FACT_QUALITY_CHECK_ENABLED=false
 # Cron schedule, standard 5 fields, UTC
 FACT_QUALITY_CHECK_CRON=0 7 * * *
 
-# Model alias for the judge call
+# Deprecated (dv-781f): use purposes.fact_quality.models.claude in
+# config/models.yaml. Still honoured, ranked below the file.
 FACT_QUALITY_CHECK_MODEL=haiku
 ```
 
@@ -433,6 +579,11 @@ DATABASE_URL=sqlite:///data/bot.db
 # radii; own migration chain (src/storage/user_data.py).
 USER_DATABASE_URL=sqlite:///data/data.db
 
+# Harness trace retention (dv-2260): tool_calls rows (every turn's tool calls,
+# bot turns and background jobs alike) older than this many days are deleted
+# at bot startup and then at most once a day from the write path.
+TRACE_RETENTION_DAYS=90
+
 # Session management
 SESSION_TIMEOUT_HOURS=24           # Session timeout in hours
 MAX_SESSIONS_PER_USER=5            # Max concurrent sessions per user
@@ -566,6 +717,20 @@ ENABLE_TELEMETRY=false
 
 # Sentry DSN for error tracking
 SENTRY_DSN=https://your-sentry-dsn@sentry.io/project
+```
+
+**Phoenix traces (dv-87d8).** With `PHOENIX_URL` set, a native scheduler job
+(`phoenix-export`, every minute) sends each settled `model_calls` row (120 s
+old) and its `tool_calls` to Phoenix REST as OpenInference spans, once
+(`model_calls.exported_at`). Bot turns, bgjobs and pump stages alike; a pump
+stage's trace is named `pump <stage> <task>`. Chat question/answer text is not
+sent. Unset = exporter off. Phoenix has no login: use the local URL only.
+
+```bash
+# Phoenix base URL (local only; unset = off)
+PHOENIX_URL=http://127.0.0.1:6006
+# Phoenix project the spans go to
+PHOENIX_PROJECT=devvy
 ```
 
 #### Development

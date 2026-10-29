@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from telegram.error import BadRequest, NetworkError
 
 from src.bot.core import is_stale_callback_error
@@ -124,6 +125,7 @@ async def test_failed_interrupt_hard_stops_the_tree(tmp_path, monkeypatch):
     assert run.hard_stopped
 
 
+@pytest.mark.timing
 async def test_hanging_interrupt_is_cut_at_the_grace(tmp_path, monkeypatch):
     """The 2026-10-20 case: interrupt() never answers; stop must not wait 60 s."""
     m = _manager(tmp_path)

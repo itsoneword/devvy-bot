@@ -4,6 +4,8 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from src.bot.orchestration.streaming import StreamingMixin
 from src.bot.rate_limit import DevvyRateLimiter
 from src.bot.utils.draft_streamer import DraftStreamer
@@ -23,6 +25,7 @@ class _Upd:
         self.tool_calls = tool_calls
 
 
+@pytest.mark.timing
 async def test_reader_not_blocked_and_final_after_progress(monkeypatch):
     order = []
     real_sleep = asyncio.sleep
@@ -59,6 +62,7 @@ async def test_reader_not_blocked_and_final_after_progress(monkeypatch):
     assert order.count("progress") == updater.sent  # nothing lands after stop
 
 
+@pytest.mark.timing
 async def test_draft_streamer_uses_updater_and_final_after():
     bot = MagicMock()
     sent = []
@@ -93,6 +97,7 @@ async def test_updater_counts_failures():
     assert up.failed == 1
 
 
+@pytest.mark.timing
 async def test_chat_action_bypasses_group_limiter():
     rl = DevvyRateLimiter(group_max_rate=1, group_time_period=60)
     cb = AsyncMock(return_value=True)

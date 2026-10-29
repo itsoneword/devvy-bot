@@ -88,7 +88,9 @@ def needs_search_retry(response: str, tool_names: Sequence[str]) -> bool:
 # tag, or the tag appearing on a later line -- is not a recognized verdict;
 # the caller falls back to today's behaviour (a separate message) rather
 # than guess at a malformed response.
-_VERDICT_LINE_RE = re.compile(r"^(?:\*\*|__)?\[(OK|CORRECTED)\](?:\*\*|__)?$", re.IGNORECASE)
+_VERDICT_LINE_RE = re.compile(
+    r"^(?:\*\*|__)?\[(OK|CORRECTED)\](?:\*\*|__)?$", re.IGNORECASE
+)
 
 
 def parse_retry_verdict(

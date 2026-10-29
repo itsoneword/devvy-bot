@@ -260,3 +260,134 @@ async def test_repository_first_write_wins(bundle_repo, tmp_path):
 
     stored = await bundle_repo.get(1, Path(tmp_path / "ws"), 1)
     assert stored is not None and stored.bundle_sha256 == "sha-first"
+
+
+# --- dv-cf07 phase 1: fact caps are settings (60/60), valve budget 24k -----
+
+
+def _settings(**overrides):
+    """Real Settings with no env file: defaults plus env plus overrides."""
+    from src.config.settings import Settings
+
+    return Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        _env_file=None,
+        **overrides,
+    )
+
+
+def _capped_provider(window_repo, bundle_repo, memory_repo, composer, settings):
+    """Provider wired the way src/main.py wires it (caps + budget from config)."""
+    return make_provider(
+        window_repo,
+        bundle_repo,
+        memory_repo,
+        composer,
+        facts_budget_chars=settings.bundle_facts_budget_chars,
+        general_cap=settings.memory_snapshot_general_cap,
+        pointer_cap=settings.memory_pointer_cap,
+    )
+
+
+async def test_devops_bundle_injects_all_21_general_and_60_pointers(
+    window_repo, bundle_repo, memory_repo, composer, tmp_path, monkeypatch
+):
+    """Today's devops shape: 21 general user_facts, 71 conversation_results.
+    At the 60/60 defaults every general fact and 60 pointers go in."""
+    monkeypatch.delenv("MEMORY_SNAPSHOT_GENERAL_CAP", raising=False)
+    monkeypatch.delenv("MEMORY_POINTER_CAP", raising=False)
+    settings = _settings()
+    assert settings.memory_snapshot_general_cap == 60
+    assert settings.memory_pointer_cap == 60
+
+    general = [f"devops general fact number {i:02d}" for i in range(21)]
+    for content in general:
+        await memory_repo.add_fact("devops", "general", content)
+    for i in range(71):
+        await memory_repo.add_fact(
+            "devops",
+            "general",
+            f"conclusion body {i:02d}",
+            label=f"conclusion label {i:02d}",
+            kind="conversation_result",
+        )
+
+    provider = _capped_provider(
+        window_repo, bundle_repo, memory_repo, composer, settings
+    )
+    bundle = await provider.get_or_materialize(tmp_path / "ws", user_id=1)
+    assert bundle is not None
+    assert bundle.facts_count == 21
+    for content in general:
+        assert content in bundle.text
+    assert bundle.pointers_count == 60
+    # Newest 60 pointers: the 11 oldest are the ones left to recall().
+    assert "conclusion label 70" in bundle.text
+    assert "conclusion label 11" in bundle.text
+    assert "conclusion label 10" not in bundle.text
+
+
+async def test_cap_env_values_change_bundle_counts(
+    window_repo, bundle_repo, memory_repo, composer, tmp_path, monkeypatch
+):
+    """MEMORY_SNAPSHOT_GENERAL_CAP / MEMORY_POINTER_CAP are real settings:
+    the env value, not a module constant, decides how many go in."""
+    monkeypatch.setenv("MEMORY_SNAPSHOT_GENERAL_CAP", "5")
+    monkeypatch.setenv("MEMORY_POINTER_CAP", "7")
+    settings = _settings()
+    assert settings.memory_snapshot_general_cap == 5
+    assert settings.memory_pointer_cap == 7
+
+    for i in range(30):
+        await memory_repo.add_fact("devops", "general", f"general fact {i}")
+    for i in range(30):
+        await memory_repo.add_fact(
+            "devops",
+            "general",
+            f"result {i}",
+            label=f"result label {i}",
+            kind="conversation_result",
+        )
+    await memory_repo.add_fact("devops", "pinned", "never push to main")
+
+    provider = _capped_provider(
+        window_repo, bundle_repo, memory_repo, composer, settings
+    )
+    bundle = await provider.get_or_materialize(tmp_path / "ws", user_id=1)
+    assert bundle is not None
+    # Pinned stays uncapped; general follows the env cap.
+    assert bundle.facts_count == 1 + 5
+    assert bundle.pointers_count == 7
+
+
+async def test_valve_quiet_for_gymbro_sized_scope_at_60(
+    window_repo, bundle_repo, memory_repo, composer, tmp_path, monkeypatch
+):
+    """Gymbro on 26.10: 89 general, ~1.16k ch pinned; at 60 general the
+    valve-counted chars are ~22.8k. The new 24k default budget must not fire
+    the consolidation valve every window."""
+    monkeypatch.delenv("MEMORY_SNAPSHOT_GENERAL_CAP", raising=False)
+    monkeypatch.delenv("BUNDLE_FACTS_BUDGET_CHARS", raising=False)
+    settings = _settings()
+    assert settings.bundle_facts_budget_chars == 24_000
+
+    calls = []
+
+    class FakeConsolidation:
+        def request_run(self, scope, reason, snapshot_chars=None):
+            calls.append((scope, reason, snapshot_chars))
+
+    for i in range(3):
+        await memory_repo.add_fact("devops", "pinned", f"pin {i} " + "p" * 370)
+    for i in range(89):
+        await memory_repo.add_fact("devops", "general", f"g{i:02d} " + "x" * 346)
+
+    provider = _capped_provider(
+        window_repo, bundle_repo, memory_repo, composer, settings
+    )
+    provider.attach_consolidation(FakeConsolidation())
+    bundle = await provider.get_or_materialize(tmp_path / "ws", user_id=1)
+    assert bundle is not None
+    assert bundle.facts_count == 3 + 60
+    assert calls == []

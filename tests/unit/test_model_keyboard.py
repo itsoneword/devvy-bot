@@ -58,17 +58,38 @@ async def test_model_keyboard_lists_every_live_codex_model(catalog):
     markup = update.message.reply_text.await_args.kwargs["reply_markup"]
     callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
     assert callbacks[:2] == ["model:claude:sonnet", "model:claude:opus"]
+    # Three Codex models, like the Claude row: the catalog's top three.
     assert [c for c in callbacks if c.startswith("model:codex:")] == [
         "model:codex:gpt-5.6-sol",
         "model:codex:gpt-5.6-terra",
         "model:codex:gpt-5.6-luna",
-        "model:codex:gpt-5.5",
     ]
-    # The login/logout row is still last.
-    assert callbacks[-2:] == ["model:codex_login", "model:codex_logout"]
+    # One auth action, last, and only the one that applies now.
+    assert callbacks[-1] in ("model:codex_login", "model:codex_logout")
+    assert not {"model:codex_login", "model:codex_logout"} <= set(callbacks)
     labels = [b.text for row in markup.inline_keyboard for b in row]
-    assert "Codex GPT-5.6-Terra" in labels
+    assert "GPT 5.6 Terra" in labels
+    # Short Claude labels fit three to a row; the current pick is ticked.
+    assert labels[:3] == ["✓ Sonnet", "Opus", "Fable"]
     catalog.get.assert_awaited_once_with(force=True)
+
+
+async def test_a_current_codex_pick_outside_the_top_three_stays_visible(catalog):
+    orch = _orchestrator()
+    update = SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()))
+    context = SimpleNamespace(
+        user_data={
+            "agent_backend": "openai_codex",
+            "agent_model": "openai-codex/gpt-5.5",
+        },
+        bot_data={},
+    )
+
+    await orch.agentic_model(update, context)
+
+    markup = update.message.reply_text.await_args.kwargs["reply_markup"]
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert "✓ GPT 5.5" in labels
 
 
 async def test_a_live_only_model_is_accepted_by_the_callback(catalog):
@@ -174,3 +195,102 @@ def test_an_unknown_model_ref_is_reset_to_the_default(monkeypatch):
     )
     assert orch._selected_model(context) == _CODEX_DEFAULT_MODEL
     assert context.user_data["agent_model"] == _CODEX_DEFAULT_MODEL
+
+
+# --- dv-d63d phase 1: Fable selectable like Opus/Sonnet ---------------------
+
+
+async def test_model_keyboard_offers_a_claude_fable_button(catalog):
+    orch = _orchestrator()
+    update = SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()))
+    context = SimpleNamespace(user_data={}, bot_data={})
+
+    await orch.agentic_model(update, context)
+
+    markup = update.message.reply_text.await_args.kwargs["reply_markup"]
+    buttons = [b for row in markup.inline_keyboard for b in row]
+    callbacks = [b.callback_data for b in buttons]
+    # Fable sits in the Claude block right after Opus.
+    assert callbacks[:3] == [
+        "model:claude:sonnet",
+        "model:claude:opus",
+        "model:claude:fable",
+    ]
+    assert "Fable" in [b.text for b in buttons]
+
+
+def _query(user_id=42):
+    return SimpleNamespace(
+        from_user=SimpleNamespace(id=user_id),
+        edit_message_text=AsyncMock(),
+        message=SimpleNamespace(chat_id=1),
+    )
+
+
+async def test_fable_pick_is_stored_and_reaches_the_next_turn(catalog):
+    orch = _orchestrator()
+    storage = SimpleNamespace(preferences=AsyncMock())
+    context = SimpleNamespace(
+        user_data={"role": "owner"}, bot_data={"storage": storage}
+    )
+    query = _query()
+
+    await orch._handle_model_callback(query, context, "model:claude:fable")
+
+    # Stored as the tier, not as the "claude" default sentinel.
+    assert context.user_data["agent_backend"] == "claude"
+    assert context.user_data["agent_model"] == "fable"
+    storage.preferences.set.assert_awaited_once_with(
+        42, agent_backend="claude", agent_model="fable"
+    )
+    # The confirmation names the tier instead of "default model".
+    text = query.edit_message_text.await_args.args[0]
+    assert "fable" in text
+    assert "default model" not in text
+    # The next turn's run_command(model=) kwarg is fable.
+    assert orch._model_override(context) == "fable"
+    assert orch._selected_model(context) == "fable"
+
+
+async def test_switching_from_opus_to_fable_replaces_the_stored_pick(catalog):
+    """Bad sequence: an existing opus pick, then fable, then fable again."""
+    orch = _orchestrator()
+    storage = SimpleNamespace(preferences=AsyncMock())
+    context = SimpleNamespace(
+        user_data={"role": "owner", "agent_backend": "claude", "agent_model": "opus"},
+        bot_data={"storage": storage},
+    )
+
+    await orch._handle_model_callback(_query(), context, "model:claude:fable")
+    await orch._handle_model_callback(_query(), context, "model:claude:fable")
+
+    assert context.user_data["agent_model"] == "fable"
+    assert orch._model_override(context) == "fable"
+    assert storage.preferences.set.await_args.kwargs == {
+        "agent_backend": "claude",
+        "agent_model": "fable",
+    }
+
+
+def test_fable_pick_survives_a_restart_via_the_prefs_row(catalog):
+    """A stored fable prefs row is not repaired back to the config default."""
+    from src.bot.orchestration.routing import seed_prefs_into_user_data
+
+    orch = _orchestrator()
+    context = SimpleNamespace(user_data={}, bot_data={})
+    seed_prefs_into_user_data(
+        context.user_data, {"agent_backend": "claude", "agent_model": "fable"}
+    )
+    assert orch._model_override(context) == "fable"
+    assert context.user_data["agent_model"] == "fable"
+
+
+def test_claude_policy_accepts_fable_as_a_tier():
+    from src.agent_backends.protocol import policy_for
+
+    claude = policy_for("claude")
+    assert claude.resolve_model("fable") == "fable"
+    # Existing tiers still pass; a random id still does not.
+    assert claude.resolve_model("opus") == "opus"
+    assert claude.resolve_model("sonnet") == "sonnet"
+    assert claude.resolve_model("haiku-ish") is None

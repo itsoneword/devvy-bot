@@ -19,8 +19,8 @@ import aiosqlite
 
 from src.config.settings import DEFAULT_WINDOW_REFRESH_THRESHOLD_TOKENS
 
+from .attribution import GROUPS, agent_for_path
 from .growth import build_rows, summarize
-from .indexer import _profile_from_cwd
 
 # Chain annotations. These are the thresholds the bot actually applies, read
 # from the same env vars its Settings use (window_eval_interval_tokens /
@@ -29,9 +29,11 @@ from .indexer import _profile_from_cwd
 # 50k/150k were the pre-dv-9f31 numbers, counted against uncached input only —
 # they drew lines the bot has not used since 2026-08-04.
 EVAL_THRESHOLD = int(os.getenv("WINDOW_EVAL_INTERVAL_TOKENS", "120000"))
-REFRESH_THRESHOLD = int(os.getenv(
+REFRESH_THRESHOLD = int(
+    os.getenv(
         "WINDOW_REFRESH_THRESHOLD_TOKENS", str(DEFAULT_WINDOW_REFRESH_THRESHOLD_TOKENS)
-    ))
+    )
+)
 
 # Reconciliation tolerances (plan: tunable, query-time).
 TURN_COUNT_TOLERANCE = 2
@@ -40,6 +42,9 @@ COST_REL_TOLERANCE = 0.10
 TIME_SKEW_MAX_S = 300.0
 
 TIMELINE_ROW_CAP = 10_000
+
+# Display order of the attribution groups (dv-d2a3 / dv-87d8 names).
+_GROUP_ORDER = {group: i for i, group in enumerate(GROUPS)}
 
 _INPUT_CATEGORIES = frozenset(
     {"tool_result", "subagent_result", "reminder", "user_text", "seed", "turn_prefix"}
@@ -76,6 +81,34 @@ def _add_user_cond(
     elif user_id is not None:
         conds.append("s.user_id = ?")
         params.append(user_id)
+
+
+def _add_source_cond(
+    conds: list[str],
+    params: list[Any],
+    *,
+    profile: str | None = None,
+    source: str | None = None,
+) -> None:
+    """Attributed source filter (dv-d2a3). ``source`` is
+    ``group[/key[/detail]]``; a detail matches itself or its sub-path
+    (``pump/gymbro/gb-1a72`` covers every stage). ``profile=<slug>`` is the
+    old spelling of ``source=agent/<slug>`` and keeps old links working."""
+    if profile:
+        source = f"agent/{profile}"
+    if not source:
+        return
+    group, _, rest = source.partition("/")
+    key, _, detail = rest.partition("/")
+    conds.append("s.attr_group = ?")
+    params.append(group)
+    if key:
+        conds.append("s.attr_key = ?")
+        params.append(key)
+    if detail:
+        conds.append("(s.attr_detail = ? OR s.attr_detail LIKE ? ESCAPE '\\')")
+        escaped = detail.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params.extend([detail, escaped + "/%"])
 
 
 def _norm_bound(value: str, *, end: bool) -> str:
@@ -195,16 +228,21 @@ class Store:
         )
         if local:
             users.append("local")
-        # Only profiles with indexed traffic — cwd-derived one-offs and
-        # transcript-less bot sessions would otherwise clutter the dropdown.
-        profiles = [
-            row[0]
+        # Only sources with indexed traffic — transcript-less bot sessions
+        # would otherwise clutter the dropdown. `profiles` = live agents.
+        sources = [
+            dict(row)
             for row in await self._all(
-                "SELECT profile FROM sessions"
-                f" WHERE profile IS NOT NULL{in_range} GROUP BY profile"
-                " HAVING SUM(api_call_count) > 0 ORDER BY profile",
+                'SELECT attr_group AS "group", attr_key AS key,'
+                " MAX(attr_archived) AS archived FROM sessions"
+                f" WHERE attr_group IS NOT NULL{in_range}"
+                " GROUP BY attr_group, attr_key HAVING SUM(api_call_count) > 0",
                 range_params,
             )
+        ]
+        sources.sort(key=lambda r: (_GROUP_ORDER.get(r["group"], 99), r["key"]))
+        profiles = [
+            r["key"] for r in sources if r["group"] == "agent" and not r["archived"]
         ]
         models = [
             row[0]
@@ -223,6 +261,7 @@ class Store:
         return {
             "users": users,
             "profiles": profiles,
+            "sources": sources,
             "models": models,
             "entrypoints": entrypoints,
             "date_range": {
@@ -242,6 +281,7 @@ class Store:
         to: str | None = None,
         user_id: int | str | None = None,
         profile: str | None = None,
+        source: str | None = None,
     ) -> dict[str, Any]:
         conds: list[str] = []
         params: list[Any] = []
@@ -252,9 +292,7 @@ class Store:
             conds.append("a.ts <= ?")
             params.append(_norm_bound(to, end=True))
         _add_user_cond(conds, params, user_id)
-        if profile:
-            conds.append("s.profile = ?")
-            params.append(profile)
+        _add_source_cond(conds, params, profile=profile, source=source)
         where = f" WHERE {' AND '.join(conds)}" if conds else ""
         base = f"FROM api_calls a JOIN sessions s ON s.session_id = a.session_id{where}"
         agg = (
@@ -292,6 +330,18 @@ class Store:
                 params,
             )
         ]
+        # One row per attributed source; the UI nests group > key > detail.
+        by_source = [
+            dict(row)
+            for row in await self._all(
+                'SELECT s.attr_group AS "group", s.attr_key AS key,'
+                " s.attr_detail AS detail, s.attr_archived AS archived,"
+                f" COUNT(DISTINCT a.session_id) AS sessions, {agg} {base}"
+                " GROUP BY s.attr_group, s.attr_key, s.attr_detail,"
+                " s.attr_archived ORDER BY est_cost_usd DESC",
+                params,
+            )
+        ]
         daily = [
             dict(row)
             for row in await self._all(
@@ -304,6 +354,7 @@ class Store:
             "totals": totals,
             "by_model": by_model,
             "by_profile": by_profile,
+            "by_source": by_source,
             "daily": daily,
         }
 
@@ -388,6 +439,7 @@ class Store:
         to: str | None = None,
         user_id: int | str | None = None,
         profile: str | None = None,
+        source: str | None = None,
         entrypoint: str | None = None,
         sort: str = "last_ts",
         order: str = "desc",
@@ -407,9 +459,7 @@ class Store:
             conds.append("s.first_ts <= ?")
             params.append(_norm_bound(to, end=True))
         _add_user_cond(conds, params, user_id)
-        if profile:
-            conds.append("s.profile = ?")
-            params.append(profile)
+        _add_source_cond(conds, params, profile=profile, source=source)
         if entrypoint:
             conds.append("s.entrypoint = ?")
             params.append(entrypoint)
@@ -617,7 +667,7 @@ class Store:
         )
         rows: list[dict[str, Any]] = []
         for bot in bot_rows:
-            bot_profile = _profile_from_cwd(bot["project_path"])
+            bot_profile = agent_for_path(bot["project_path"])
             if user_id is not None and bot["user_id"] != user_id:
                 continue
             if profile and bot_profile != profile:
@@ -731,7 +781,7 @@ class Store:
         )
         params: list[Any] = []
         if profile:
-            sql += " AND profile = ?"
+            sql += " AND attr_group = 'agent' AND attr_key = ?"
             params.append(profile)
         sql += " ORDER BY first_ts"
         return [dict(row) for row in await self._all(sql, params)]

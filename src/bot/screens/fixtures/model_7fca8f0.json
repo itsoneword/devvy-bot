@@ -1,0 +1,54 @@
+{
+  "source": "dv-d63d /model at 7fca8f0 (agentic_model + _codex_model_rows): Claude backend on sonnet, Codex logged in, the four live catalog models of test_model_keyboard.py.",
+  "id": "model@7fca8f0",
+  "goal": "pick the chat's model",
+  "parse_mode": "HTML",
+  "text": "<b>Model backend</b>\n\nCurrent: <code>claude</code> / <code>sonnet</code>\nOpenAI Codex: authenticated",
+  "rows": [
+    [
+      {
+        "text": "Claude Sonnet",
+        "callback_data": "model:claude:sonnet"
+      },
+      {
+        "text": "Claude Opus",
+        "callback_data": "model:claude:opus"
+      },
+      {
+        "text": "Claude Fable",
+        "callback_data": "model:claude:fable"
+      }
+    ],
+    [
+      {
+        "text": "Codex GPT-5.6-Sol",
+        "callback_data": "model:codex:gpt-5.6-sol"
+      },
+      {
+        "text": "Codex GPT-5.6-Terra",
+        "callback_data": "model:codex:gpt-5.6-terra"
+      }
+    ],
+    [
+      {
+        "text": "Codex GPT-5.6-Luna",
+        "callback_data": "model:codex:gpt-5.6-luna"
+      },
+      {
+        "text": "Codex GPT-5.5",
+        "callback_data": "model:codex:gpt-5.5"
+      }
+    ],
+    [
+      {
+        "text": "Login OpenAI Codex",
+        "callback_data": "model:codex_login"
+      },
+      {
+        "text": "Logout Codex",
+        "callback_data": "model:codex_logout"
+      }
+    ]
+  ],
+  "render_ms": null
+}

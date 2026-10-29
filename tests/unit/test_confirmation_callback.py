@@ -37,9 +37,7 @@ def _context(matched: bool) -> Any:
 
 async def test_approve_shows_toast_and_edits_with_escaped_html() -> None:
     update = _update("confirm:abc:y")
-    await AdminCommandsMixin._confirmation_callback(
-        MagicMock(), update, _context(True)
-    )
+    await AdminCommandsMixin._confirmation_callback(MagicMock(), update, _context(True))
     q = update.callback_query
     q.answer.assert_awaited_once_with("✅ Approved")
     sent = q.edit_message_text.await_args.args[0]
@@ -49,9 +47,7 @@ async def test_approve_shows_toast_and_edits_with_escaped_html() -> None:
 
 async def test_deny_toast() -> None:
     update = _update("confirm:abc:n")
-    await AdminCommandsMixin._confirmation_callback(
-        MagicMock(), update, _context(True)
-    )
+    await AdminCommandsMixin._confirmation_callback(MagicMock(), update, _context(True))
     update.callback_query.answer.assert_awaited_once_with("⛔ Denied")
 
 

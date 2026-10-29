@@ -55,7 +55,7 @@ Then:
                   │                │   commit "<id>: phase k/M — <goal>", short note
                   │                ▼
                   └─── pump: answered, pump_phase k+1/M (same tick launches it)
-  … last phase ──► status review, pump done, branch + one line per phase
+  … last phase ──► [acceptance, whole branch] ──► status review, pump done
 ```
 
 **Test design (step 2).** A step with approved SCENARIOS (a SPLIT phase, or
@@ -233,12 +233,43 @@ context (templates `config/taskpump/<stage>.md`); this board takes them from
   architect.md/review.md list drift signs (easier problem solved, masked
   symptom, untraceable changes, unproven claims, padding); each finding must
   cite a task line plus file:line or command.
+  **UI gate (dv-4cd8):** a step whose branch diff touches `src/bot/` (not
+  only `src/bot/screens/fixtures/`; this repo only) gets a bgjob pre-step on
+  its review: `scripts/screens render --out .pump/screens --base <branch
+  base>` under testrun (10 min guard, log `.pump/screens/render.log`). The
+  review's `{{PHASE}}` block makes any violation of a non-`known_bad` screen
+  in `report.json`, or a missing report / render error, a RETURN, and asks
+  per `after/*.png` whether a first-time user would understand the screen
+  given the ticket's goal (answers under `## Screens` in REVIEW.md). The
+  step's result message (▶ phase done or the ✅ card) carries up to 4 after
+  PNGs (`agentctl notify --image`). `.pump/screens/` is cleared at every
+  review launch.
 - `acceptance` — after review PASS, only on a board with an `acceptance`
   block `{"command": [argv], "what": "…"}`. The job runs the command in the
   worktree against `.pump/acceptance.md` and judges every criterion: `PASS` /
   `FAIL` + findings in `.pump/ACCEPTANCE.md`. an app repo's command is its own
   acceptance script (seeded data, staging, a browser click-through,
   screenshots, query counts). No Android emulator: no vmx/svm.
+
+  **The pump runs the command, not the agent** (dv-2514). The agent's Bash
+  tool stops at 600 s and a full gymbro run takes ~24 min, so the job runs it
+  as a step before its agent: `bgjob run <prompt> --pre-cmd "testrun --mem
+  $BGJOB_MEMORY_MAX -- <command (+light_args)>" --pre-log
+  .pump/acceptance/run.log --pre-timeout <max_minutes×60>`. run.sh runs it in
+  the job's own bwrap box (it is code the build wrote), to completion, writes
+  `pre_exit_code` in the job dir and appends `pre-step: exit N after XmYYs` to
+  run.log; only then does the agent start. Any exit code hands over (failing
+  scenarios are the agent's to judge); the agent reads run.log and the
+  artefacts, may re-run one targeted check, never the full command.
+  `.pump/acceptance/` is emptied at launch, so a `verdict.json` an older sha
+  left is never judged. `acceptance.max_minutes` (default 60) is a hang
+  guard, not a budget: past it `timeout` kills the command's process group
+  (TERM, KILL 120 s later), bgjob writes `pre_timed_out`, exit_code 124 and
+  skips the agent; the reaper treats it as a mechanical stop (not a FAIL, no
+  RETURN.md, the step's return unspent) with **one** auto-retry whatever
+  `PUMP_AUTO_RETRIES` says (owner 26.10.26), then the owner's card ("hang
+  guard"). The step runs inside the `accepting` job, so `PUMP_MAX_ACCEPTANCE`
+  still serialises it.
 
 **Acceptance level** (dv-7a10). How much of the acceptance stage a task gets
 is the pump-owned key `pump_accept_level`: `full` (default), `light` (the
@@ -251,6 +282,63 @@ lowered level. The owner overrides it in the answer ("acceptance full",
 "приёмка: без"). A task whose title/labels/description name user or account
 isolation (`ISOLATION_WORDS`) is always full. Review always runs. The build
 cannot change the level: it lives on the board, outside the worktree.
+
+**Level from the diff, test tier** (dv-87b4). `accept_decision(task)` returns
+the level and a short reason the card shows (`Acceptance queued: light (no
+heavy paths)`); `accept_level` is its level. Order: non-final phase → skip;
+isolation → full; the owner's answer, kept in its own key
+`pump_accept_owner` (the architect keeps `pump_accept_level`); then floors that
+raise to full — a label in `FULL_LABELS` (perf, db, migration, load, scale), a
+`pytest.` tag in `.pump/acceptance.md` (a light run never reaches that tier),
+a branch diff (`git diff --name-only <branch_base> HEAD`) touching a board
+`acceptance.full_paths` glob (fnmatch), or a diff git cannot produce ("branch
+diff failed"); then the architect's level, and with none `light` on a board
+with `light_args`, else full. The diff is read at review PASS / acceptance
+launch, not at plan time. The architect prompt says "when unsure, light".
+gymbro's `full_paths`: alembic, storage models/db, demo/seed, the test and
+acceptance infra; not `storage/repository.py` (in 8 of 17 recent diffs; owner
+26.10). On a board with acceptance, `test_run` (`{{TEST_RUN}}`) tells build,
+review and test design to run changed-area tests only, never the whole suite:
+the full acceptance run owns it. Boards without acceptance are unchanged: there
+the build's tests are the only ones before merge. Measured on 17 recent gymbro
+tasks (`docs/research/dv-87b4/analysis.md` §2-3): 14 full → ~6 full, ~8 fewer
+full runs × ~14 min ≈ 2 h of acceptance, ≈8 000 fewer TRUNCATE cycles, and no
+whole-suite build runs (≈100 min / ~44 DB cycles per 3 days).
+
+**Acceptance once per task, on the last phase** (dv-41ef). `accept_level`
+returns `skip` for phase k<M, so a non-final phase goes from review PASS to the
+next phase ("Acceptance deferred to phase M/M"); phase M runs the task's level
+over the whole branch. Isolation tasks defer too. The architect prompt gets the
+level section and the tag rule only on a board with acceptance (`accept_note`,
+`{{ACCEPT}}`): every UI/flow criterion ends with `[journey.<id>]` or
+`[pytest.tests/…_flow.py]` (needs full), or the acceptance script's TAG path
+cannot fail it. Test design lists the `pytest.tests/` tags of
+`.pump/acceptance.md` as files to create, plus one existing-data / duplicate
+case per flow. Acceptance reports a criterion with only source evidence as
+FAIL `not exercised`.
+
+**Question triage** (dv-84c2). The architect also triages every card
+question (`config/taskpump/triage.md`, rendered into architect.md as
+`{{TRIAGE}}` with `taskpump decisions` for the task's own board: the owner's
+earlier answers, never another board's). It ends its report with `TRIAGE`:
+`KEEP <n> <category>` or `DECIDE <n>: <choice> — <reason>`, numbers as on the
+card. `PUMP_TRIAGE` decides what the card does with it:
+
+- `shadow` (default, owner 25.10): every question asked as before, a
+  `🤖 would decide: …` note under each DECIDE. Watch-only data.
+- `on`: a DECIDE is not asked; it stays on the card under its own number as
+  `🤖 1 decided: <choice> — <reason>`, numbers never shift, `pump_open` lists
+  only the kept ones. Nothing kept → "reply “go”"; the task still waits. The
+  owner overrides by number ("1 no, …"); implement.md tells the build that a
+  decided item stands unless his reply names it.
+- `off`: no triage in the prompt, card as before.
+
+A DECIDE on a question matching `TRIAGE_FLOOR` (keys, prod, deletion, money,
+…) or on an isolation task is always asked, with `⚠ always asked` on the
+card. No TRIAGE, no valid line, a RETURN or a failed architect → the card is
+exactly the untriaged one. The architect's PASS comment records the marks;
+its `Not asked (triage decided): …` line keeps a decided item the owner let
+stand out of later precedents (the pump's answer is not his).
 
 **One return per step.** `pump_return: 1` marks it spent. A review RETURN and
 an acceptance FAIL share it: the first rebuilds (then review, then acceptance
@@ -283,23 +371,67 @@ One frontmatter key, `pump`, kept separate from the human `status` column:
 | `testing` | test-design job running | reap → `answered` (tests committed), or stop (`asked`) |
 | `building` | build job running | reap → `done`, next phase (`answered`), `answered` + `pump_review: due`, or stop (`asked`; also on any protected-test edit) |
 | `reviewing` | review job running | PASS → `done` / next phase / `pump_accept: due`; RETURN → rebuild once, then `asked` |
-| `accepting` | acceptance job running | PASS → `done` / next phase; FAIL → rebuild if the step's return is unspent, else `asked` |
+| `accepting` | acceptance job running (the command step, then the agent) | hang guard / pre-step OOM / BLOCKED (environment, dv-6423) → one auto-retry (`ENV_RETRIES`), then `asked` ("not a FAIL", reply re-runs acceptance); PASS → `done` / next phase (a `DEFERRED` finding on an `(after deploy)` criterion adds "owed after deploy"); FAIL → rebuild if the step's return is unspent, else `asked` |
 | `done` | implemented, `status: review` | you merge |
-| `error` | a job failed; **no automatic retry** | `taskpump retry <id>` (same step) or `reset <id>` (start over) |
-| `capped` | the task used its launch cap; `status: waiting_user`, everything kept | `taskpump retry <id> [--more N]` or answer "go" / "more N" → the same step |
+| `error` | an analysis or SMALL build failed and its auto-retries are spent | `taskpump retry <id>` (same step) or `reset <id>` (start over) |
+| `capped` | the task made `PUMP_STALL_CAP` launches with no progress; `status: waiting_user`, everything kept | `taskpump retry <id> [--more N]` or answer "go" / "more N" → the same step |
 | `skip` | pump ignores this task forever | `taskpump reset <id>` |
 
 `pump_job` and `pump_branch` record which bgjob and which branch own the task;
 `pump_phase: k/M` (SPLIT tasks only) the phase that builds next;
 `pump_open` the question numbers sent and not yet answered; `pump_blocked`
 why a task is blocked on its repo; `pump_failed` the step an `error` task
-re-arms to on `retry` (`analyzing` or `answered`); `pump_launches` the
-stage launches made for the task, `pump_cap` its raised limit (empty =
-`PUMP_TASK_CAP`), `pump_capped` where a capped task resumes (`answered` or
-`new`). Owner-set keys: `repo`, `pump_allow`, `deps`, `start_at` (see
+re-arms to on `retry` (`analyzing` or `answered`); `pump_stall` the
+stage launches made since the task's last progress, `pump_cap` its raised
+limit (empty = `PUMP_STALL_CAP`), `pump_capped` where a capped task resumes (`answered` or
+`new`), `pump_autoretry` the mechanical stops of the current step that
+were retried automatically (see Bounded auto-retry). Owner-set keys: `repo`, `pump_allow`, `deps`, `start_at` (see
 Launch order below). The
 test-design record is `.pump/TESTFILES` in the worktree (step, commit, blob
 hash per file); `reset` deletes it.
+
+### Cards the pump leaves alone: label `designloop` (dv-9133)
+
+A card labelled `designloop` is run by the designloop runner, never the pump
+(`is_designloop()`): the tick does not launch it even when it is
+`in_progress` or `answered`, it takes no slot, `is_queued` is false (no pin
+**Queued**, no "eligible next tick"), and `taskpump start` / `urgent` refuse
+it with one line and leave the card file as it was. The plain label `design`
+is a topic tag (gb-1aa9, gb-1a80 mid-pipeline) and filters nothing. The UI
+task a design card serves carries `deps: [<designloop card>]`, so the dep
+hold below keeps it waiting until the owner's pick sets the design card
+`done`.
+
+**The runner** (phase 3): `taskpump design run <board:id>`, started from the
+board agent's chat with `job_start(command=…)` / `scripts/bgjob run --cmd`,
+never by the tick. The card needs `labels: [designloop]`, `design_screen:
+<features.yaml screen id>` and the problem in its `## Description`; the
+board needs a `design` block in `boards.json` (render / gate argv, the
+board's python). Steps: brief (`src/designloop/brief.py`) → one
+`scripts/agentjob` turn per variant on the `design_generate` job route
+(Claude, sonnet, not opus: owner 27.10), each in its own worktree
+`pump-worktrees/<board>/<card>-vN` on branch `design/<card>/vN`, committed by
+the runner → render + mechanical gate per variant (a failure goes back to the
+generator and is not a round) → Codex critic (`design_critic`) → stop on all
+ready, 3 rounds, or the same notes twice (`src/designloop/loop.py`). A ready
+run sets `design_state: awaiting_pick` + `design_variants: [...]` and sends
+ONE collage to the board's chat (`notify(images=…)`, outbox-safe); anything
+else sets `design_state: failed` and sends a short "design failed: reasons"
+note, no choice (owner 26.10 22:31). Unresolved critic notes go in the card
+comment, per variant.
+
+**The pick** uses the usual answer channel: `taskpump pending` lists an
+`awaiting_pick` card as `DESIGN PICK`, and `taskpump answer <card> "2"` sets
+`design_pick: v2`, `design_branch`, `status: done`. Anything but a number of
+an offered variant exits non-zero with "ask again", the card unchanged. The
+build card's dep is then met, and every stage prompt of it gets a "Design
+input" block naming the branch (`design_input_note`).
+
+**Who files designloop cards:** the gymbro agent or the owner, by hand, when
+a task adds a screen or a block; text and spacing tweaks skip it. The build
+card gets `deps: [<designloop card>]`. The gymbro side (`scripts/design_render.py`,
+`scripts/design_gate.py`, the `frontend-design` skill) is a gymbro card
+(owner 3.1); until it lands `design run` refuses with the missing script.
 
 ### Launch order: deps and start_at (dv-67a6)
 
@@ -322,7 +454,32 @@ only) or an unparseable `start_at` holds too and shows under **Needs you**
 not repeat every 5 minutes. `taskpump status` prints `dv-x  held: <why>` and
 leaves it out of "eligible next tick"; `taskpump start` says when it is held.
 
-### Size and one L build per repo (dv-67a6 phase 2)
+### Waiting on you: the hourly summary (dv-5e12)
+
+A hold that only the owner can release used to be silent (gb-1a84/1a85 sat
+39 h behind an unmerged dep). `notify_waits()` runs every tick and collects
+what waits on the owner: a queued task whose unmet dep is in review
+(`pump: done`, unmerged; age from `pump_done_at`, else `updated`), asked,
+capped, blocked, failed, or not in the pump at all (todo / hand-set
+`waiting_user`); a dep cycle or bad `start_at`; an open pump question
+(`asked`), a capped / blocked / failed task; and a card in `waiting_user`
+with no `pump` key (`⚠ gb-x · waiting_user outside the pump: nothing will
+run it → taskpump start gb-x`, also a Needs-you line in the pin). A dep still
+queued or running is not the owner's and is never listed.
+
+Once one of them has waited `PUMP_HOLD_NOTIFY_HOURS` (1) and was not told
+yet, the board's chat (home board: Pump topic; others `--profile P
+--deliver`) gets one plain message `🔔 <board> · waiting on you (k)` with
+every due wait on that board, oldest first, e.g. `⏸ gb-1a84 waits on
+gb-1a7c — in review 10h → merge it`. At most one per board per hour; a told
+wait is not repeated alone, only listed again in a later summary that a new
+wait triggers. Nothing new = no message (owner 27.10 09:44). The state file
+keeps `waits` (`<id>|<blocker>` → first seen, told) and `waits_told`
+(board → last summary); the hold itself stays computed. A changed blocker is
+a new wait. "First seen" is the first tick that sees it, except a hand-set
+`waiting_user` card, which counts from its `updated`.
+
+### Size (dv-67a6 phase 2; L-hold dropped in dv-5e12)
 
 `size: S|M|L` is an owner-visible key (not `pump_*`; `reset` keeps it). The
 analysis report may carry a top-level `SIZE: L` line; the pump writes it only
@@ -332,14 +489,13 @@ when the task has no size, so an owner-set size wins. An answer containing
 - **S** reaches the architect prompt as a hint (`{{SIZE}}`: expect the fast
   PASS path). It never changes the acceptance level: the architect sets that
   (dv-7a10) and the isolation floor stays.
-- **L** builds alone on its repo. An L task whose next launch is its first
-  build stage (testdesign/implement) is held while another L task on the same
-  repo has `pump_build_started` set and is not merged (`done`/archived, the
-  same `dep_met()`; a built task in `review` still holds). Pin: `⏸ dv-b · L:
-  waits dv-a`. Analysis and architect are never held; a task already building
-  is never held, so two L tasks cannot deadlock. In one tick the higher-ranked
-  L wins. `pump_build_started` is written at every task's first build launch
-  and cleared by `reset`.
+- **L** holds nothing (dv-5e12, DECISIONS 2026-10-27): L tasks on one repo
+  build in parallel, like M and S, and their conflicts are resolved at merge.
+  The old one-L-per-repo hold serialised builds but not merges (the holder
+  reaches HEAD only when you merge it), so it never cut the conflict rate
+  and held answered work for up to 39 h. After merging the second of two
+  branches, re-run the board's tests on the result. `pump_build_started` is
+  still written at every task's first build launch and cleared by `reset`.
 - Before an L task's first build, the pump merges the repo's current HEAD
   into its branch (it was cut at analysis). Conflict: `git merge --abort`, a
   comment and a note, and the build runs on the old base.
@@ -349,13 +505,16 @@ when the task has no size, so an owner-set size wins. An answer containing
 ```bash
 scripts/taskpump tick                  # one pass (what the timer runs)
 scripts/taskpump status [--board app]   # one line per task + today's job budget
+scripts/taskpump status --json          # [{id, title, pump, status, board, group, why, hours, first}] (/menu Pump)
 scripts/taskpump pending [--board app]  # open question blocks (+ phase, repo)
 scripts/taskpump answer dv-4b71 "..."  # record an answer, queue implementation
 scripts/taskpump unblock dv-3668       # re-arm after pump_allow / a repos line
+scripts/taskpump decisions [--board app]   # owner's past answers = triage precedents
 scripts/taskpump retry dv-4b71         # re-run the failed step (pump: error)
 scripts/taskpump retry dv-4b71 --more 10   # capped: 10 more launches, same step
 scripts/taskpump skip dv-4b71          # take a task out of the pump
 scripts/taskpump reset dv-4b71 [--drop-worktree]   # put it back in
+scripts/taskpump gc [--dry-run]        # remove finished cards' worktrees (dv-4b6f)
 ```
 
 `status` lines, compact for Telegram:
@@ -366,12 +525,94 @@ dv-4b71   asked     · phase 1/3 · waiting: 1.2, 2.1 · repo /home/x/other
 dv-77aa   blocked   · blocked: repo · repo /home/x/unlisted
 ```
 
+### Usage-limit pause (dv-7ad9)
+
+A stage whose agentjob ends on a usage limit ("You've hit your weekly limit ·
+resets 9am (UTC)") did not fail. `src/model_router/quota.py::parse_limit`
+classifies the text; agentjob then exits `QUOTA_EXIT` (4) and prints
+`agentjob quota: <message> · until <ISO UTC>` on stderr (the model_calls row
+stays `outcome=error`). A job from before that change (exit 1 with the raw
+`agentjob failed: <limit text>` line) is recognised too; only agentjob's own
+lines count.
+
+`reap` checks this first, before any per-stage handling, and pauses through
+the one freeze (dv-b17e), no second pause path:
+
+- the task goes back to its step as a freeze leaves it (`pump: answered`, or
+  `""` for analysis, `pump_frozen: <stage>`); no auto-retry, no question, no
+  `error`; its launch and the day's launch are refunded;
+- `frozen = {by: "quota", until, reason}`; `until` is the parsed reset
+  (bare clock = next occurrence; `Oct 27, 9am (Europe/X)`; `resets in 2h`),
+  else now + 1h. Every other running job is stopped, the urgent one too;
+- one Telegram line per pause: `⏸ лимит кончился, Pump на паузе до HH:MM UTC`.
+  A second job hitting the limit only moves `until` later;
+- the first tick at or after `until` thaws (`thaw_all`, the code behind
+  `taskpump thaw`), silently, and relaunches in the same tick. If the limit
+  is still on, that relaunch hits it and pauses again: that is the re-probe.
+
+An owner freeze (`taskpump freeze`, `urgent`) is never given an `until` and
+never auto-thawed; a limit hit then only stops that task (an urgent task also
+gives up its lane, with one line). `taskpump freeze` during a quota pause
+turns it into the owner's.
+
+**Shared limit record (phase 2).** Any bgjob that ends on the limit (exit 4
+plus the quota line; pump stages are bgjobs too) is recorded by `bgjob
+summarize` in `DataLayout.model_quota`
+(`<root>/workspaces/devops/model_quota.json`): `quota.record(limit, source)`.
+`quota.active(now)` returns it until its reset and `None` after; nobody
+deletes it, and an unreadable file blocks nothing. An earlier reset never
+shortens an active record. Readers:
+
+- every pump tick: an active record freezes the pump exactly like its own
+  stage would (`by: quota`, one line), or moves a quota pause's `until` out.
+  So a merge job that hits the limit first pauses the pump too. An owner
+  freeze is left alone;
+- `bgjob run` of a prompt job is refused with the reset time (`--force`
+  starts it anyway); `--cmd` jobs make no model call and always run;
+- `agentjob` itself refuses at start (exit 4 and the quota line, no model
+  call), for any caller that skips bgjob; bgjob `--force` passes
+  `--ignore-quota`.
+
+The finish ping of an exit-4 job reads `⏸ … stopped on usage limit (resets
+HH:MM UTC)` instead of `FAILED (rc=4)`. Any failed job whose cwd is left with
+`MERGE_HEAD` / `rebase-merge` / `rebase-apply` adds `⚠ <cwd> is mid-merge
+(mid-rebase) — resolve by hand`; nothing aborts it automatically.
+
+**Расход / outage panel.** `/limits` (owner, no LLM; same text as /menu →
+Расход) shows the Claude line (`Claude: лимит кончился, до HH:MM UTC` from
+`quota.active()`, or "записи нет"), paid spend today/7d per provider, and the
+Codex limits only if Codex was used in the last 7 days. It has no buttons:
+freeze/thaw (`taskpump freeze|thaw --by owner`) lives on the Pump screen
+only, the chat Claude/Codex switch is /model, the jobs switch is
+/menu → 🧠 Модели. Old taps still work: `lim:*` (freeze/thaw/chat switch) go to
+`_handle_limits_callback`, only `limits:jobs:*` lands in `switch_jobs`. A chat or scheduled Claude turn whose
+result is a limit line is `is_error`, `error_type "quota"` (model_calls
+`outcome=error`) and writes the same record (`sdk_integration`, once on the
+final result), so the next pump tick freezes too.
+
+**Owner /menu (dv-6104).** `/menu` (owner, no LLM,
+`src/bot/orchestration/admin_menu.py`) is the hub over the same pieces:
+Расход = the /limits text (`limits_panel`), Pump = ONE `status --json` call (dv-f6af): "работает N/max", "Ждут
+тебя" (needs-group rows and review cards older than 6 h) as buttons that open
+the task's card (`menu:task:<id>`: ⚡ first, 🚨 urgent — asks "freeze
+everything?" first —, "всё по умолчанию" / "Ещё 5" = `answer <id> go`), running
+and held tasks one line each, Freeze/Thaw (the `lim:` handler above, only on
+this screen) and the scoped /stop. `status --json` rows come from `pin_items`,
+the classifier the status pin also renders from: `group` is
+needs/running/queued/waiting/stopped/review, `why` the pin's reason, `hours`
+the running elapsed or review age, `first` the ⚡ flag. `src/model_router`
+imports `router` lazily so `taskpump` no longer loads claude_agent_sdk
+(`status --json` 2.3 s → ~1 s). Every `menu:*` tap is
+owner-gated in the callback itself and edits the menu message in place.
+
 ### Status pin (dv-3d3d)
 
 One pinned post in the Pump topic, edited in place: **Needs you** (answer /
 `taskpump unblock <id>` / `taskpump reset <id>`), **Running (n/MAX_CONCURRENT)**
 with stage, phase k/M and minutes, **Queued**, **Waiting** (held by deps /
-`start_at`, dv-67a6), and **Today** (launched
+`start_at`, dv-67a6), **In review (k)** (`👀 id · in review 10h → merge it`,
+built and unmerged longer than `PUMP_REVIEW_HOURS` (6), dv-5e12; not idle),
+and **Today** (launched
 X/DAILY_CAP, agent tasks Y/AGENT_DAILY_CAP). Idle: `🟢 Pump idle · today X/200`;
 the pin is never retired. `render_status_pin()` reads every board's
 frontmatter, no LLM; `refresh_pin()` pushes it with
@@ -380,6 +621,11 @@ tick (early cap/slot exits too) and after `answer`, `start`, `unblock`, `skip`,
 `reset`. Bot down = skipped, never outboxed; the next tick redraws. The
 started/result cards still post (owner 24.10.26: the pin shows state, the
 topic the events).
+
+Every task line in the pin, `taskpump status` (held and `eligible next tick`
+lines too) and the digest names the task's title next to its id, cut to 40
+chars with … (`_short`); the FROZEN header reads `urgent: <id> — <title>`
+(dv-6104).
 
 Service control:
 
@@ -390,6 +636,68 @@ systemctl --user stop    taskpump.timer     # pause the whole loop
 journalctl --user -u taskpump.service -n 50
 ```
 
+### Merged and on prod (dv-2263)
+
+`pump: done` / `status: review` means the branch is ready, not merged, and a
+merge is not prod. Every tick `check_deploys()` looks at each `pump: done`
+card without `pump_live` (pure git, no job):
+
+- **Merged** = the branch tip (`pump_tip`, recorded at the ✅ card; older
+  cards fall back to `pump/<id>` when its tip is a pump commit) is in the
+  repo's checked-out `HEAD`. Written once as `pump_merged: <sha12> <time>`:
+  the merge commit (oldest first-parent commit of HEAD descending from the
+  tip) or, on a fast-forward, the tip. Squash and cherry-pick merges are not
+  seen. Status stays `review`.
+- **Live** = the board's `deploy` source (boards.json) runs a build that
+  contains the merge. `{"log": path}` replays a deploy.py journal (gymbro):
+  `ok` lines move prod to their target, `rolled-back` lines move it back;
+  live since the first line of the last run of deploys containing the merge,
+  with that line's `build=`. `{"started": argv}` (pl: `docker inspect`
+  Created; this board: claude-bot's `ExecMainStartTimestamp`) counts the card
+  live once prod started after the merge commit. Written once as
+  `pump_live: <build> <time>`, and `review` → `done` (owner, Q1.1).
+- No `deploy` block (or a task in another repo than its board's) → merged is
+  tracked, live never set. A source that fails (missing log, docker down,
+  garbage output) is skipped for the tick; the tick never fails on it. Each
+  source is read once per board per tick, only when a merged card needs it.
+- Comments `Merged @ …` / `Live on prod: …` on the card; merges older than
+  7 days (the first run catching up) get the keys without comments. No
+  Telegram message — the daily digest reports.
+- The pin gains **Merged, not on prod (k)**: `🕓 <id> · merged 31h ago, not
+  live` for cards merged more than `PUMP_UNDEPLOYED_HOURS` (24) ago on a
+  board with a deploy source. It counts as not idle. `status` shows
+  `merged <sha>, not live` / `live <build>` instead of `review`.
+- **Daily prod digest** (phase 2): the first tick at/after `PUMP_DIGEST_HOUR`
+  (7) UTC sends each board one plain message `📦 <board> · prod digest`:
+  `On prod since the last digest` (`✅ id — title (build X)`), `Merged, not
+  deployed` (`🕓 id — title · merged 2d 4h ago`, every one still waiting) and,
+  for a board without a deploy source, `Merged (no deploy source)` (cards
+  merged since the last digest, so each once), and `In review, not merged`
+  (`👀 id — title · in review 10h`, built cards unmerged over
+  `PUMP_REVIEW_HOURS`, dv-5e12). Nothing to say → no message.
+  The home board's goes to the Pump topic, a board with its own profile's to
+  that chat (`--profile P --deliver`). The day is marked in the state file
+  (`digest.<board>`) when composed, so a digest the bot could not take waits
+  in the outbox (`-dig@<profile>`) and is not composed twice. A board's first
+  digest looks back 24 h.
+
+### Worktree gc (dv-4b6f)
+
+A finished card's worktree (archived, `status: done` or `pump_merged`) is
+only disk: its commits are on `pump/<id>`, and `ensure_worktree` makes the
+tree again from that branch on a reset. `taskpump gc` walks `PUMP_WORKTREES`
+(top-level ids and `<board>/<id>`), moves each finished tree's `.pump/` to
+`PUMP_WORKTREES/.reports/<id>/` (`.reports/<board>/<id>/` off the home board),
+then `git worktree remove` + `prune` in the task's repo. The branch stays.
+Never removed: a tree with changes outside `.pump` (printed `dirty`), a card
+with a stage running, a dir no live or archived card names (printed, kept).
+`--dry-run` only lists. A merge younger than 7 days gets a card comment.
+
+The tick does the same right after the merge check only with
+`PUMP_REAP_WORKTREES=1`. Default off: owner 26.10, no automatic deletion for
+now. Run gc from the live checkout: `PUMP_WORKTREES` defaults to
+`<repo>/../pump-worktrees`, which from a pump worktree is the wrong dir.
+
 ## Why each constraint exists
 
 - **Isolated git worktree per task** (`../pump-worktrees/<id>`, branch
@@ -397,6 +705,11 @@ journalctl --user -u taskpump.service -n 50
   agent editing it would change the running bot's code mid-request. bwrap makes
   the worktree the only writable path, so this is enforced, not merely asked
   for. A checkout is ~6.5 MB of tracked files.
+- **Deleting inside the job's own worktree needs no owner** (dv-58db). The
+  job's tool policy gets the worktree as `free_root` (agentjob logs
+  `free_root=…` at start); `rm`/`unlink`/`rmdir`/apply_patch deletes strictly
+  inside it run without an ask. Everything else still asks, and a job ask
+  waits 1 h (`ASK_TIMEOUT_SECONDS`) before it is denied.
 - **Widening the sandbox is a per-task, hand-typed decision.** Add
   `pump_allow: [/abs/path, …]` to a task's frontmatter and both its jobs get
   that path read-write (`bgjob --allow-dir`). Nothing infers it, and there is no
@@ -424,26 +737,49 @@ journalctl --user -u taskpump.service -n 50
   the bot is capped at 2.5 GB, and parallel `claude` processes have already
   caused one OOM reboot. Two is the right ceiling when a human is watching a
   run; unattended it is not.
-- **Per-task launch cap, daily fuse** (dv-32a5, `docs/DECISIONS.md`
-  2026-10-24). Every stage launch the tick makes (analysis, architect, tests,
-  build, review, acceptance; reruns after a RETURN too) adds one to the task's
-  `pump_launches`. At `PUMP_TASK_CAP` (15) the next launch is not made: the
-  task goes to `capped` / `waiting_user` with branch, worktree, phase, answers
-  and return state untouched, gets one `⏸ <id> · launch cap 15/15` card
+- **Per-task launch cap = launches with no progress, daily fuse** (dv-32a5,
+  reworked by dv-5e12, `docs/DECISIONS.md` 2026-10-27). Every stage launch the
+  tick makes (analysis, architect, tests, build, review, acceptance; reruns
+  after a RETURN, auto-retries and owner retries too) adds one to the task's
+  `pump_stall`. Progress — an owner answer (`answer`, not "go") or a finished
+  phase — zeroes it and drops any grant. A new commit is not progress: a loop
+  can commit every round. At `PUMP_STALL_CAP` (12) the next launch is not
+  made: the task goes to `capped` / `waiting_user` with branch, worktree,
+  phase, answers and return state untouched, gets one
+  `⏸ <id> · no progress in 12 launches (cap 12)` card
   (stage and phase it stopped before) and a "Needs you" line in the pin; it
   shows in `pending` and `status`. `taskpump retry <id>` grants
   `PUMP_TASK_GRANT` (5) more, `--more N` grants N, and so does a chat reply
   "go" / "more N" through `answer` (board agents' `pump_answer`); the grant
-  is recorded as a @taskpump comment, not a @user one. The count survives
-  retry, answers, RETURN reruns and phases; only `reset` and a fresh `start`
-  zero it. A failed launch is not counted. `PUMP_DAILY_CAP` (200, was 16,
+  is recorded as a @taskpump comment, not a @user one, so it adds to the cap
+  instead of zeroing the count. The count survives retry and RETURN reruns;
+  progress, `reset` and a fresh `start` zero it. A same-stage loop inside one
+  window needs no rule of its own: a step returns once and auto-retries
+  `PUMP_AUTO_RETRIES` times, then asks the owner. A failed launch is not counted. `PUMP_DAILY_CAP` (200, was 16,
   live 100) is only a fuse against a runaway pump / the subscription quota.
 - **A systemd timer, not the bot's APScheduler.** That scheduler has known
   weekday and workspace defects (dv-3e91), caps a turn at 300 s, and stops
   reaping while the bot restarts.
-- **Failures do not retry.** `pump: error` is terminal until you run `retry`
-  or `reset`. A loop that retries a failing job every 10 minutes burns tokens
-  all night and tells you nothing new. `retry` (dv-c5ac) re-runs only the step
+- **Bounded auto-retry** (dv-6ffc, `docs/DECISIONS.md` 2026-10-25; replaces
+  "failures do not retry"). A mechanical stop — crash, exit code, no report,
+  no TESTS line / verdict, tests fail — of analysis, architect, test design,
+  build (phase or SMALL), review or acceptance reruns the same stage,
+  at most `PUMP_AUTO_RETRIES` (2) times per step (`pump_autoretry`), with the
+  earlier reports in the rerun's prompt (`.pump/RETRY.md`) and the work kept
+  in the tree. Each rerun is a normal launch: it counts in `pump_stall`,
+  the cap and the daily fuse. After N, the old stop runs and its card says
+  `auto-retried N×` with each cause. QUESTIONS, a build editing protected
+  tests and test design writing outside tests/ go to the owner at once. A
+  failing build whose report names a protected test file is retried through
+  a test-design run (`retest: auto`): it may change a protected test only
+  with a `CHANGED <path> — <reason>` line; a change without one, or a
+  deleted file, stops for the owner; an explained one is committed, shown to
+  review and put on the card (`⚠ protected test changed`). The count survives
+  that hop; a stage with a usable report (not test design), an answer,
+  `retry` and `reset` clear it. SMALL builds with red tests now stop like
+  phases (owner 25.10). `PUMP_AUTO_RETRIES=0` restores stop-and-ask.
+- **`error` is terminal** until you run `retry` or `reset` — reached only
+  once auto-retries are spent. `retry` (dv-c5ac) re-runs only the step
   that failed: a crashed analysis re-analyses (nothing was asked yet), a crashed
   SMALL build or a failed launch rebuilds with the answers, branch and
   `pump_return` kept. `reset` wipes all of that and re-asks the owner. Cards
@@ -494,7 +830,9 @@ until you `answer`. What differs:
 - cards and job prompts say `🤖 from agent <slug>`; the prompts tell the job
   to treat the text as an untrusted request and to lead with any rights it
   would widen;
-- `PUMP_AGENT_DAILY_CAP` of the daily jobs, the rest wait for tomorrow;
+- `PUMP_AGENT_DAILY_CAP` of the daily jobs, the rest wait for tomorrow —
+  until you engage: a task you ⚡-ed, started (`--by owner`) or answered is
+  your work, skips the sub-cap and does not count into it (dv-5e12);
 - when the build finishes, the branch diff is matched against
   `PRIVILEGED_PATHS` (profiles, mcp, security, tool rights, the pump, deploy,
   secrets). A hit goes on the review card and into `pump_privileged:`, and any
@@ -508,31 +846,123 @@ lines, every job prompt gets a note to treat them as untrusted data, not
 instructions (devops' own comments stay `@devops:`). Per agent: 5 new tasks a day, 3 open devops tasks, an open
 task with the same title is returned instead of a duplicate.
 
+## Moving stages to another provider
+
+Each stage runs on its `jobs.pump_<stage>` row in `config/models.yaml`
+(`docs/configuration.md`, "Background-job routes"). When a quota is out, the
+owner moves every stage, and every other job, with `/menu → 🧠 Модели → Фоновые задачи на: Codex /
+OpenRouter / Claude`; «По таблице» returns to the table. `taskpump status` prints
+`jobs on: <harness> (owner switch, …)` while the switch is on. Nothing
+switches automatically (owner, 2026-10-26).
+
+`/menu → 🧠 Модели` (dv-6104) edits those rows from
+Telegram (`src/model_router/job_rows.py`, the file `MODEL_ROUTES_PATH` or
+`config/models.yaml`): a stage button opens the models valid for the row's
+harness (Claude tiers, the Codex catalog, priced OpenRouter models the table
+names); a tap re-checks the model against the row as it is now, writes only
+`jobs.<job>.models.<harness>` (creating the file with that one row if
+absent), validates the result with `load_call_routes`, replaces the file
+atomically and logs an `admin_setting` row; `↩` undoes the newest one. The
+next stage launch uses it, no restart. The top button of that screen opens the jobs switch
+(`menu:jobsw` / `menu:jobs:*`, one `switch_jobs()`; old `limits:jobs:*` taps land there too). PyYAML
+keeps the file's leading comment block but drops comments further down.
+
 ## Tuning
 
 Env vars, all read at tick time — set them in `deploy/taskpump.service.template`
 (rendered by `scripts/render_deploy.py`) or the installed unit:
 
+`/menu → Настройки` (dv-6104, layout dv-f6af) edits two of them in the
+installed unit `~/.config/systemd/user/taskpump.service`
+(`src/config/pump_unit.py`): «Параллельно задач» = `PUMP_MAX_CONCURRENT` 1–6
+and «Запусков без прогресса» = `PUMP_STALL_CAP` 4–40 (default 12, dv-5e12).
+Each setting is a full-width "name: value" row, then one row `−` `+`. A tap
+rewrites only that `Environment=` line (or appends one after the last),
+atomically, then `systemctl --user daemon-reload`; the next tick uses it. Each
+change is an `admin_setting` audit row (owner, time, old→new, unit path); `↩`
+undoes the newest one. A missing unit, a non-int value or a name set twice →
+"edit by hand", nothing written.
+
+bgjob slots are not a setting (dv-f6af, owner answer 3.1): the tick launches
+each `bgjob run` with `BGJOB_MAX_CONCURRENT = max(the unit's value or 2,
+PUMP_MAX_CONCURRENT + 1)` (`BGJOB_SLOTS` / `bgjob_env()` in
+`scripts/taskpump`), so raising parallel never starves pump jobs of slots. A
+higher value set by hand in the unit stays (live: 8). The bot's own
+`BGJOB_MAX_CONCURRENT` (its env file, for chat `job_start` jobs) is not shown.
+
 | var | default | |
 | --- | --- | --- |
 | `PUMP_MAX_CONCURRENT` | `1` | simultaneous pump jobs |
-| `PUMP_TASK_CAP` | `15` | stage launches per task before it stops in `capped` |
+| `PUMP_STALL_CAP` | `12` | stage launches with no owner answer or finished phase before the task stops in `capped` (was `PUMP_TASK_CAP` 15 over the whole task) |
+| `PUMP_AUTO_RETRIES` | `2` | automatic reruns of a mechanically stopped step before the owner's card; `0` = stop and ask at once |
 | `PUMP_TASK_GRANT` | `5` | launches one `retry` / "go" on a capped task adds |
 | `PUMP_DAILY_CAP` | `200` | fuse: jobs launched per UTC day across all tasks |
 | `PUMP_AGENT_DAILY_CAP` | `4` | of those, jobs for agent-filed tasks (label `agent`) |
-| `PUMP_ANALYZE_MODEL` | `opus` | same tier the devops chat uses (was `sonnet` until 2026-10-04: all 26 jobs to then ran Sonnet 5) |
-| `PUMP_IMPLEMENT_MODEL` | `opus` | |
-| `PUMP_TESTDESIGN_MODEL` | `PUMP_IMPLEMENT_MODEL` | test-design job |
-| `PUMP_ARCHITECT_MODEL` | `sonnet` | architect job (reading, owner answer dv-a438 2.2) |
-| `PUMP_REVIEW_MODEL` | `sonnet` | review job |
-| `PUMP_ACCEPTANCE_MODEL` | `sonnet` | acceptance job |
+| `PUMP_ANALYZE_MODEL` | `opus` | **deprecated (dv-d63d)**: use `jobs.pump_analyze` in `config/models.yaml`; still applied below the file, with a warning. Opus = the devops chat tier (was `sonnet` until 2026-10-04) |
+| `PUMP_IMPLEMENT_MODEL` | `opus` | deprecated, `jobs.pump_implement` |
+| `PUMP_TESTDESIGN_MODEL` | `PUMP_IMPLEMENT_MODEL` | deprecated, `jobs.pump_testdesign` |
+| `PUMP_ARCHITECT_MODEL` | `sonnet` | deprecated, `jobs.pump_architect` (reading, owner answer dv-a438 2.2) |
+| `PUMP_REVIEW_MODEL` | `sonnet` | deprecated, `jobs.pump_review` |
+| `PUMP_ACCEPTANCE_MODEL` | `sonnet` | deprecated, `jobs.pump_acceptance` |
+| `PUMP_TRIAGE` | `shadow` | architect's question triage on the card: `off`, `shadow` (asks all, notes "would decide"), `on` (decided ones not asked) — dv-84c2 |
 | `PUMP_OWN_STAGES` | `architect,review` | this board's optional stages |
 | `PUMP_OWN_PROFILE` | `devops` | this board's job profile |
+| `PUMP_UNDEPLOYED_HOURS` | `24` | a card merged this long and not on prod shows in the pin (dv-2263) |
+| `PUMP_DIGEST_HOUR` | `7` | UTC hour from which a tick sends each board's daily prod digest (dv-2263) |
+| `PUMP_REVIEW_HOURS` | `6` | a built card unmerged this long shows in the pin and the digest (dv-5e12) |
+| `PUMP_HOLD_NOTIFY_HOURS` | `1` | a wait on the owner this old goes into its board's hourly summary (dv-5e12) |
 | `PUMP_WORKTREES` | `../pump-worktrees` | |
+| `PUMP_REAP_WORKTREES` | off | `1`: the tick removes finished cards' worktrees, as `taskpump gc` (dv-4b6f) |
 | `PUMP_TEST_MEMORY_MAX` | `1500M` | `scripts/testrun` scope cap for a job's tests, on top of `BGJOB_MEMORY_MAX`; bgjob forwards it into the job unit |
 | `PUMP_VENV` | `poetry env info -p`, else `sys.prefix` | the one venv with the full dep set |
 
 Timer interval lives in `deploy/taskpump.timer.template` (`OnUnitActiveSec=10min`).
+
+## Outcome analytics (dv-3162)
+
+`scripts/pump_outcomes.py` reports how the pump's stages perform. It breaks the
+figures down by stage × harness/model × prompt version:
+
+- first-pass accept;
+- returns and rebuilds;
+- launches per task;
+- owner questions and the triage "would decide" count;
+- tokens and cost-equivalent;
+- wall time;
+- time to merge and to prod;
+- post-merge fixes and reverts;
+- the top cost sinks.
+
+It is read-only and adds no pipeline step. It reads:
+
+- the job dirs;
+- `model_calls` by `job_name`;
+- the llm_analytics index, for older jobs;
+- the task comments of every board, loaded through this script's own
+  `load_tasks` / `board_cards`;
+- git.
+
+```bash
+poetry run python scripts/pump_outcomes.py --out docs/research/pump-outcomes-$(date -u +%F).md
+poetry run python scripts/pump_outcomes.py --json --since 2026-11-01   # machine-readable
+```
+
+**Stop classes.** Every stop is either mechanical or a real verdict. Mechanical
+stops are quota, launch cap, timeout / no report, failed to run, infra, crash
+and freeze. Real verdicts are architect or review RETURN, acceptance FAIL, and a
+build whose tests fail. Only real verdicts count toward first pass and returns.
+The comment table that does the classifying is `RULES` in the script. When a
+new pump comment is added here, give it a row there.
+
+**Prompt version.** It is the short sha of the last commit of
+`config/taskpump/<stage>.md` before the job started. A template commit
+therefore starts a new group.
+
+**Baseline.** `--baseline` defaults to 2026-10-26 16:24 UTC, the restart with
+dv-7ad9, dv-2514 and dv-d63d. A task belongs to the window of its first job.
+Older tasks print in a last section headed "Pre-baseline".
+
+Reports live in `docs/research/pump-outcomes-<date>.md`.
 
 ## Known sharp edges
 

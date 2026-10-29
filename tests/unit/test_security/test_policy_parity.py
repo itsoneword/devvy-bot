@@ -32,7 +32,7 @@ from src.agent_bridge.server import build_app
 from src.agent_bridge.tokens import TokenRegistry
 from src.claude.sdk_integration import _make_pre_tool_use_hook
 from src.claude.tool_context import AgentServices, TurnContext
-from src.security import policy
+from src.security import denylist, policy
 
 ALLOW, DENY, ASK = policy.ALLOW, policy.DENY, policy.ASK
 
@@ -66,6 +66,31 @@ _KILL_IN_SQL_HEREDOC = (
     ".fetchall())\n"
     "EOF"
 )
+
+
+# dv-275f: a real protected dir of this install (secrets/), not a guess.
+# Placeholder resolved at run time by _live(): the suite pins DEVVY_DATA_ROOT
+# per test (conftest), so a path computed at import (from the shell's data
+# root) need not be the protected dir decide() sees.
+_SECRETS_PNG = "<secrets>/leak.png"
+
+
+def _live(call: Any) -> Any:
+    """Swap the secrets placeholder for the protected dir decide() uses."""
+    secrets = str(denylist.protected_dirs().everyone[0] / "leak.png")
+    name, tool_input = call
+
+    def sub(v: Any) -> Any:
+        if v == _SECRETS_PNG:
+            return secrets
+        if isinstance(v, list):
+            return [sub(x) for x in v]
+        return v
+
+    return name, {k: sub(v) for k, v in tool_input.items()}
+
+
+_RENDER = str(CWD / "renders" / "home.png")
 
 
 # (label, (tool_name, tool_input), full_access, expected action)
@@ -154,6 +179,21 @@ CASES: List[Tuple[str, Tuple[str, Dict[str, Any]], bool, str]] = [
     ("merge a flagged pump branch", _bash("git merge pump/dv-ab12"), True, ASK),
     ("merge an unflagged pump branch", _bash("git merge pump/dv-cd34"), True, ALLOW),
     ("write to a system path", ("Write", {"file_path": "/etc/hosts"}), True, ASK),
+    # dv-d760: the stream pseudo-files are exact-match allowed paths; the rest
+    # of /dev/ stays denied (curl -o /dev/null was denied 11x in one week).
+    (
+        "curl output to /dev/null",
+        _bash("curl -s -o /dev/null https://example.com"),
+        True,
+        ALLOW,
+    ),
+    ("cat /dev/null", _bash("cat /dev/null"), True, ALLOW),
+    ("tee to /dev/stderr", _bash("echo hi | tee /dev/stderr"), True, ALLOW),
+    ("read a block device", _bash("cat /dev/sda"), True, DENY),
+    ("read /dev/zero", _bash("cat /dev/zero"), True, DENY),
+    ("read /dev/mem", _bash("cat /dev/mem"), True, DENY),
+    # added: the allowance is an exact match, not a /dev/null* prefix.
+    ("/dev/null prefix is not allowed", _bash("cat /dev/nullx"), True, DENY),
     # Sandboxed profiles: the denylist holds, the ask-gate does not apply.
     ("sandboxed delete", _bash("rm notes.txt"), False, ALLOW),
     ("sandboxed credential read", _bash("cat .env"), False, DENY),
@@ -230,6 +270,42 @@ CASES: List[Tuple[str, Tuple[str, Dict[str, Any]], bool, str]] = [
         False,
         ASK,
     ),
+    # dv-275f: images are looked at only through view_image. Read of any
+    # raster file is denied by suffix (pure, no stat), on every profile.
+    ("Read a png", ("Read", {"file_path": _RENDER}), True, DENY),
+    ("Read a jpg", ("Read", {"file_path": "/tmp/shot.jpg"}), True, DENY),
+    ("Read an upper-case JPG", ("Read", {"file_path": "/tmp/A.JPG"}), True, DENY),
+    ("Read a jpeg", ("Read", {"file_path": "/tmp/a.jpeg"}), False, DENY),
+    ("Read a gif", ("Read", {"file_path": "/tmp/a.gif"}), True, DENY),
+    ("Read a webp", ("Read", {"file_path": "/tmp/a.webp"}), False, DENY),
+    ("Read a bmp", ("Read", {"file_path": "/tmp/a.bmp"}), True, DENY),
+    ("Read an svg stays allowed", ("Read", {"file_path": "/tmp/a.svg"}), True, ALLOW),
+    (
+        "Read a .png.txt stays allowed",
+        ("Read", {"file_path": "/tmp/a.png.txt"}),
+        True,
+        ALLOW,
+    ),
+    ("Codex native view_image", ("view_image", {"path": _RENDER}), True, DENY),
+    ("agent view_image", ("mcp__agent__view_image", {"path": _RENDER}), True, ALLOW),
+    (
+        "agent view_image sheet",
+        ("mcp__agent__view_image", {"paths": [_RENDER, "/tmp/b.png"]}),
+        False,
+        ALLOW,
+    ),
+    (
+        "agent view_image on secrets/",
+        ("mcp__agent__view_image", {"path": _SECRETS_PNG}),
+        True,
+        DENY,
+    ),
+    (
+        "agent view_image paths entry in secrets/",
+        ("mcp__agent__view_image", {"paths": [_RENDER, _SECRETS_PNG]}),
+        True,
+        DENY,
+    ),
     (
         "read-only name on another server asks",
         ("mcp__other__exchange_report", {}),
@@ -266,9 +342,23 @@ def _confirmation(approved: bool) -> Any:
 
 @pytest.mark.parametrize("label,call,full_access,expected", CASES, ids=IDS)
 def test_decide(label, call, full_access, expected, tmp_path) -> None:
-    tool_name, tool_input = call
+    tool_name, tool_input = _live(call)
     decision = policy.decide(tool_name, tool_input, _turn(CWD, full_access))
     assert decision.action == expected, decision
+
+
+def test_raster_read_deny_points_to_view_image() -> None:
+    """The refusal tells the agent what to use instead (dv-275f)."""
+    for path in (_RENDER, "/tmp/A.JPG"):
+        decision = policy.decide("Read", {"file_path": path}, _turn(CWD, True))
+        assert decision.action == DENY
+        assert "view_image" in decision.reason
+
+
+def test_native_view_image_deny_points_to_the_agent_tool() -> None:
+    decision = policy.decide("view_image", {"path": _RENDER}, _turn(CWD, True))
+    assert decision.action == DENY
+    assert "mcp__agent__view_image" in decision.reason
 
 
 def _outcome(expected: str, approved: bool) -> str:
@@ -283,7 +373,7 @@ def _outcome(expected: str, approved: bool) -> str:
 async def test_claude_hook(
     label, call, full_access, expected, approved, tmp_path
 ) -> None:
-    tool_name, tool_input = call
+    tool_name, tool_input = _live(call)
     manager = _confirmation(approved)
     hook = _make_pre_tool_use_hook(
         working_directory=CWD,
@@ -324,7 +414,7 @@ def _bridge_client(tmp_path: Path, full_access: bool, manager: Any):
 @pytest.mark.parametrize("approved", [True, False])
 @pytest.mark.parametrize("label,call,full_access,expected", CASES, ids=IDS)
 def test_codex_route(label, call, full_access, expected, approved, tmp_path) -> None:
-    tool_name, tool_input = call
+    tool_name, tool_input = _live(call)
     manager = _confirmation(approved)
     app, headers = _bridge_client(tmp_path, full_access, manager)
     with TestClient(app) as client:
@@ -672,3 +762,227 @@ def test_codex_route_judges_without_rewriting(tmp_path) -> None:
         )
     assert response.json()["decision"] == ALLOW
     assert "updatedInput" not in response.json()
+
+
+# ---------------------------------------------------------------------------
+# dv-58db: a pump job may delete inside its own worktree without an ask.
+#
+# The job turn carries ``TurnPolicy.free_root`` = the pump worktree. Chat
+# turns (Claude hook, Codex route) never set it, and a non-pump job has none,
+# so the very same calls keep asking there. Escapes keep asking in the job
+# too. ``_temp_roots`` is narrowed to a fake dir so that pytest's tmp_path
+# (under /tmp, where deletions are free) cannot make a row pass by accident.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def job_tree(tmp_path: Path, monkeypatch: Any) -> Dict[str, Path]:
+    from src.security import destructive
+
+    base = tmp_path.resolve()
+    fake_tmp = base / "faketmp"
+    (fake_tmp / "x").mkdir(parents=True)
+    monkeypatch.setattr(destructive, "_temp_roots", lambda: (str(fake_tmp),))
+
+    root = base / "pump-worktrees" / "dv-ab12"
+    (root / "tests").mkdir(parents=True)
+    (root / ".git").write_text("gitdir: /elsewhere/.git/worktrees/dv-ab12\n")
+    (root / "tests" / "x.py").write_text("x\n")
+    (root / ".pump" / "d").mkdir(parents=True)
+    (root / ".pump" / "d" / "f").write_text("f\n")
+    (root / ".pump" / "a").write_text("a\n")
+    (root / ".pump" / "smoke_1.jsonl").write_text("{}\n")
+    (root / ".pump" / "smoke_2.jsonl").write_text("{}\n")
+    (root / "src").mkdir()
+    (root / "src" / "y.py").write_text("y\n")
+
+    outside = base / "outside"
+    outside.mkdir()
+    (outside / "x").write_text("x\n")
+    (root / "link").symlink_to(outside, target_is_directory=True)
+    (root / "flink").symlink_to(outside / "x")
+    (base / "pump-worktrees" / "dv-other").mkdir()
+    (base / "pump-worktrees" / "dv-other" / "x").write_text("x\n")
+
+    allow_dir = base / "data" / "workspaces" / "coach"
+    allow_dir.mkdir(parents=True)
+    (allow_dir / "notes.md").write_text("n\n")
+    (base / "data" / "db").mkdir(parents=True)
+    (base / "data" / "db" / "bot.db").write_text("")
+    job_dir = base / "jobs" / "20261025-pump-dv-ab12-build"
+    job_dir.mkdir(parents=True)
+    (job_dir / "output.md").write_text("o\n")
+    (job_dir / "meta.json").write_text("{}\n")
+
+    live = base / "Devvybot" / "devvy_bot"
+    (live / "src").mkdir(parents=True)
+    (live / ".git").mkdir()
+    (live / "src" / "x.py").write_text("x\n")
+    return {
+        "root": root,
+        "tmp": fake_tmp,
+        "outside": outside,
+        "allow_dir": allow_dir,
+        "db": base / "data" / "db" / "bot.db",
+        "job_dir": job_dir,
+        "live": live,
+    }
+
+
+# Commands as format strings over the ``job_tree`` keys.
+JOB_FREE_CASES: List[Tuple[str, str]] = [
+    ("rm own test file", "rm tests/x.py"),
+    ("rm glob in .pump", "rm .pump/smoke_*.jsonl"),
+    ("rm -rf .pump dir and temp", "rm -rf .pump/d {tmp}/x"),
+    ("unlink in .pump", "unlink .pump/a"),
+    ("rmdir in .pump", "rmdir .pump/d"),
+]
+JOB_FREE_IDS = [c[0] for c in JOB_FREE_CASES]
+
+JOB_ASK_CASES: List[Tuple[str, str]] = [
+    ("rm -rf . (the root itself)", "rm -rf ."),
+    ("rm -rf the absolute root", "rm -rf {root}"),
+    ("rm -rf * at the root", "rm -rf *"),
+    ("rm .git", "rm .git"),
+    ("rm -rf .git/hooks", "rm -rf .git/hooks"),
+    ("rm ../x (sibling worktree)", "rm ../dv-other/x"),
+    ("rm through a dir symlink out", "rm link/x"),
+    ("rm a file symlink pointing out", "rm flink"),
+    ("rm $HOME/x", "rm $HOME/x"),
+    ("rm ~/x", "rm ~/x"),
+    ('rm "$PWD/x"', 'rm "$PWD/x"'),
+    ("rm absolute path outside", "rm {outside}/x"),
+    ("rm in an allow-dir", "rm {allow_dir}/notes.md"),
+    ("rm bot.db", "rm {db}"),
+    ("cd elsewhere && rm", "cd {outside} && rm x"),
+    ("xargs rm", "ls tests | xargs rm tests/x.py"),
+    ("sudo rm", "sudo rm tests/x.py"),
+    ("find -delete", "find .pump -name '*.jsonl' -delete"),
+    ("rm job dir output.md", "rm {job_dir}/output.md"),
+    ("rm job dir meta.json", "rm -f {job_dir}/meta.json"),
+]
+JOB_ASK_IDS = [c[0] for c in JOB_ASK_CASES]
+
+
+def _job_turn(tree: Dict[str, Path]) -> policy.TurnPolicy:
+    return policy.TurnPolicy(
+        working_directory=tree["root"],
+        full_access=True,
+        unrestricted=True,
+        free_root=tree["root"],
+    )
+
+
+def _fmt(command: str, tree: Dict[str, Path]) -> str:
+    return command.format(**{k: str(v) for k, v in tree.items()})
+
+
+async def _through_job_hook(
+    turn: policy.TurnPolicy, command: str
+) -> Tuple[Dict[str, Any], int]:
+    from src.model_router.job import BotLink, policy_hook
+
+    link = BotLink("http://127.0.0.1:1", "s")
+    link.ask = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    hook = policy_hook(turn, link, source="pump-dv-ab12-build")
+    result = await hook(
+        {"tool_name": "Bash", "tool_input": {"command": command}}, "t1", None
+    )
+    return result, link.ask.await_count
+
+
+@pytest.mark.parametrize("label,command", JOB_FREE_CASES, ids=JOB_FREE_IDS)
+def test_pump_job_deletes_inside_its_worktree_without_asking(
+    label, command, job_tree
+) -> None:
+    decision = policy.decide(
+        "Bash", {"command": _fmt(command, job_tree)}, _job_turn(job_tree)
+    )
+    assert decision.action == ALLOW, decision
+
+
+@pytest.mark.parametrize("label,command", JOB_FREE_CASES, ids=JOB_FREE_IDS)
+async def test_pump_job_hook_runs_worktree_deletes_without_an_ask(
+    label, command, job_tree
+) -> None:
+    result, asks = await _through_job_hook(_job_turn(job_tree), _fmt(command, job_tree))
+    assert result == {}
+    assert asks == 0
+
+
+@pytest.mark.parametrize("label,command", JOB_FREE_CASES, ids=JOB_FREE_IDS)
+async def test_same_delete_in_a_claude_chat_turn_still_asks(
+    label, command, job_tree
+) -> None:
+    manager = _confirmation(False)
+    hook = _make_pre_tool_use_hook(
+        working_directory=job_tree["root"],
+        full_access=True,
+        confirmation_manager=manager,
+    )
+    result = await hook(
+        {"tool_name": "Bash", "tool_input": {"command": _fmt(command, job_tree)}},
+        "t1",
+        None,
+    )
+    assert manager.request.await_count == 1
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("label,command", JOB_FREE_CASES, ids=JOB_FREE_IDS)
+def test_same_delete_in_a_codex_chat_turn_still_asks(label, command, job_tree) -> None:
+    """Codex runs no jobs: its turns never carry a free root."""
+    manager = _confirmation(False)
+    tokens = TokenRegistry()
+    app = build_app(AgentServices(event_bus=None, task_repo=None), tokens)
+    app.state.policy_gate = PolicyGate(
+        lambda ctx: _turn(ctx.working_dir, True), manager
+    )
+    token = tokens.mint(
+        TurnContext(profile_slug="devops", working_dir=job_tree["root"])
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            POLICY_PATH,
+            json={
+                "tool_name": "Bash",
+                "tool_input": {"command": _fmt(command, job_tree)},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == 200
+    assert response.json()["decision"] == DENY
+    assert manager.request.await_count == 1
+
+
+@pytest.mark.parametrize("command", ["rm src/x.py", "rm -rf src", "unlink src/x.py"])
+async def test_non_pump_job_in_the_live_checkout_still_asks(command, job_tree) -> None:
+    turn = policy.TurnPolicy(
+        working_directory=job_tree["live"], full_access=True, unrestricted=True
+    )
+    assert policy.decide("Bash", {"command": command}, turn).action == ASK
+    result, asks = await _through_job_hook(turn, command)
+    assert asks == 1
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("label,command", JOB_ASK_CASES, ids=JOB_ASK_IDS)
+async def test_pump_job_still_asks_for_escapes(label, command, job_tree) -> None:
+    command = _fmt(command, job_tree)
+    turn = _job_turn(job_tree)
+    decision = policy.decide("Bash", {"command": command}, turn)
+    assert decision.action == ASK, decision
+    _, asks = await _through_job_hook(turn, command)
+    assert asks == 1
+
+
+def test_pump_job_apply_patch_delete_inside_worktree_needs_no_ask(
+    job_tree,
+) -> None:
+    patch = "*** Begin Patch\n*** Delete File: tests/x.py\n*** End Patch\n"
+    job = policy.decide("apply_patch", {"command": patch}, _job_turn(job_tree))
+    assert job.action == ALLOW, job
+    chat = policy.decide(
+        "apply_patch", {"command": patch}, _turn(job_tree["root"], True)
+    )
+    assert chat.action == ASK, chat

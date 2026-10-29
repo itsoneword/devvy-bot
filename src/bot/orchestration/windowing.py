@@ -7,7 +7,7 @@ Extracted verbatim from src/bot/orchestrator.py (behavior-preserving move).
 import asyncio
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Optional
 
 import structlog
 
@@ -174,6 +174,10 @@ async def account_turn_and_maybe_eval(
 
 
 SEED_NOTES_FACT_LIMIT = 15
+# The bundle now carries up to MEMORY_POINTER_CAP (60) pointers (dv-cf07);
+# the seed keeps only the newest few so it stays a compact reminder, not a
+# second copy of the bundle's pointer list.
+SEED_NOTES_POINTER_LIMIT = 15
 
 
 async def _session_notes_for_seed(memory_repo: Any, agent_id: str) -> str:
@@ -203,7 +207,10 @@ async def _session_notes_for_seed(memory_repo: Any, agent_id: str) -> str:
     conflict_ids = {fact.id for pair in snapshot.conflicts for fact in pair}
     facts = [f for f in snapshot.pinned + snapshot.general if f.id not in conflict_ids]
     fact_lines = [f"- {render_fact_line(f)}" for f in facts[:SEED_NOTES_FACT_LIMIT]]
-    pointer_lines = [f"- {render_pointer_line(p)}" for p in snapshot.pointers]
+    pointer_lines = [
+        f"- {render_pointer_line(p)}"
+        for p in snapshot.pointers[:SEED_NOTES_POINTER_LIMIT]
+    ]
     sections: list[str] = []
     if fact_lines:
         sections.append(
@@ -353,6 +360,22 @@ async def arm_backend_switch(
     user_data["force_new_session"] = True
 
 
+def _hand_off_final_eval(
+    consolidation: Any, agent_id: str, final_eval: Optional[Awaitable[Any]]
+) -> None:
+    """Start a rotation's final extraction (fire-and-forget, as before).
+
+    With a consolidation service the stale-fact sweep of the scope follows
+    it (dv-cf07), and the new window's bundle waits for both, bounded by
+    MEMORY_SWEEP_WAIT_SECONDS. Without one (tests, callers outside the
+    bot) the eval runs alone, as before.
+    """
+    if consolidation is not None:
+        consolidation.after_rotation(agent_id, final_eval)
+    elif final_eval is not None:
+        asyncio.ensure_future(final_eval)
+
+
 async def refresh_window(
     window_repo: Any,
     evaluator: Any,
@@ -364,6 +387,7 @@ async def refresh_window(
     conversation_text: str,
     agent_id: str = "devops",
     family_id: Optional[int] = None,
+    consolidation: Any = None,
 ) -> None:
     """Compaction transition: final eval on the active backend, roll the
     window, and arm the seed for the next turn. (A backend switch no longer
@@ -378,19 +402,19 @@ async def refresh_window(
     # the outgoing window's checkpoint cursor (its slice boundary), not
     # whatever the roll below writes.
     state = await window_repo.get_or_create(user_id, working_dir)
+    final_eval = None
     if evaluator:
-        asyncio.create_task(
-            evaluator.run(
-                session_id=f"{user_id}:{working_dir}:refresh",
-                user_id=user_id,
-                conversation_text=conversation_text,
-                cumulative_tokens=0,
-                backend=backend,
-                agent_id=agent_id,
-                family_id=family_id,
-                since_message_id=state.last_checkpoint_message_id,
-            )
+        final_eval = evaluator.run(
+            session_id=f"{user_id}:{working_dir}:refresh",
+            user_id=user_id,
+            conversation_text=conversation_text,
+            cumulative_tokens=0,
+            backend=backend,
+            agent_id=agent_id,
+            family_id=family_id,
+            since_message_id=state.last_checkpoint_message_id,
         )
+    _hand_off_final_eval(consolidation, agent_id, final_eval)
     # Estimate what the continuity seed will occupy in the fresh window so
     # the token counter starts there instead of lying with "0/150k". Uses the
     # same select_tail as consume_pending_seed so estimate == actual seed.
@@ -457,6 +481,7 @@ async def reset_window(
     conversation_text: str,
     agent_id: str = "devops",
     family_id: Optional[int] = None,
+    consolidation: Any = None,
 ) -> None:
     """/new — explicit user reset. Same data care as ``refresh_window``
     (final extraction over the un-extracted tail, then a window roll so the
@@ -470,19 +495,19 @@ async def reset_window(
     session the user just asked to be clean.
     """
     state = await window_repo.get_or_create(user_id, working_dir)
+    final_eval = None
     if evaluator and conversation_text.strip():
-        asyncio.create_task(
-            evaluator.run(
-                session_id=f"{user_id}:{working_dir}:reset",
-                user_id=user_id,
-                conversation_text=conversation_text,
-                cumulative_tokens=0,
-                backend=backend,
-                agent_id=agent_id,
-                family_id=family_id,
-                since_message_id=state.last_checkpoint_message_id,
-            )
+        final_eval = evaluator.run(
+            session_id=f"{user_id}:{working_dir}:reset",
+            user_id=user_id,
+            conversation_text=conversation_text,
+            cumulative_tokens=0,
+            backend=backend,
+            agent_id=agent_id,
+            family_id=family_id,
+            since_message_id=state.last_checkpoint_message_id,
         )
+    _hand_off_final_eval(consolidation, agent_id, final_eval)
     await window_repo.roll_window(user_id, working_dir, new_backend=backend)
     await window_repo.set_pending_transition(
         user_id, working_dir, seed_window=None, force_new_session=True

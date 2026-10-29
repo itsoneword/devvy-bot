@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Calibrate the design critic on 3 current gymbro screens (dv-9133).
+
+Critiques the current refs of feed/main, event_page/other and profile_tab/main
+(dark + light) against Strava, Meetup/Partiful and Airbnb through the model
+router's `design_critic` route (Codex, no fallback; one model_calls row per
+screen, recorded through the bot) and writes the raw output per screen.
+
+Usage:
+    poetry run python scripts/designloop_calibrate [--board gymbro]
+        [--repo DIR] [--out FILE] [--point-by-point]
+
+Costs real tokens: 3 Codex calls with images. Needs a writable ~/.codex, so
+it runs from the devops chat (job_start with command), not a pump build job.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from src.designloop.calibrate import calibrate  # noqa: E402
+from src.model_router.job import install_job_router  # noqa: E402
+
+BOARDS = REPO_ROOT / "config" / "taskpump" / "boards.json"
+DEFAULT_OUT = REPO_ROOT / "docs" / "research" / "dv-9133" / "calibration.md"
+
+
+def board_repo(name: str) -> Path:
+    boards = json.loads(BOARDS.read_text(encoding="utf-8"))["boards"]
+    for board in boards:
+        if board.get("name") == name:
+            return Path(board["repo"])
+    sys.exit(f"error: no board {name!r} in {BOARDS}")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--board", default="gymbro", help="board whose repo to read")
+    p.add_argument("--repo", type=Path, help="board repo (default: from boards.json)")
+    p.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    p.add_argument(
+        "--point-by-point",
+        action="store_true",
+        help="compare with each reference pattern in turn",
+    )
+    args = p.parse_args(argv)
+    repo = args.repo or board_repo(args.board)
+    install_job_router(REPO_ROOT)
+    outcomes = asyncio.run(
+        calibrate(repo, args.out, point_by_point=args.point_by_point)
+    )
+    for outcome in outcomes:
+        found = outcome.critique
+        state = (
+            f"{found.verdict} {found.score}/10" if found else f"error: {outcome.error}"
+        )
+        print(f"{outcome.target.screen_id}/{outcome.target.state}: {state}")
+    print(f"report: {args.out}")
+    return 0 if all(o.critique for o in outcomes) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

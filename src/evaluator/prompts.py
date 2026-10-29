@@ -26,7 +26,8 @@ Kind rules:
 - "user_fact": something the user stated or that is true of the user.
 - "conversation_result": something YOU (the agent) produced — research, a
   diagnosis, a decision reached. If a workspace file holds the full text, put
-  its path in "source_ref" and keep "content" to a one-line summary.
+  its path in "source_ref" and keep "content" to a one-line summary. A
+  decision reached is not work done: "X was implemented/shipped" is status.
 
 Durability rules:
 - A fact must still be true and useful weeks from now. Dated one-off events —
@@ -43,6 +44,13 @@ Durability rules:
   because a fact has no done state. Todos live in items, tickets on the
   board. Emit nothing for them. A DECISION reached is a fact; the work it
   leads to is not.
+- Task status is not a fact: "dv-xxxx merged", "started the pump work",
+  "raised the concurrency to 5", "implemented in <sha>", deployed/released
+  vN, "the repo is at version N", a follow-up owed, a ticket closed or
+  reopened. Such status changes again and the old row then contradicts the
+  new one; the board (cards, comments, git log) is where it lives. Emit
+  nothing for it. The decision, finding, root cause, lesson or owner rule
+  behind the work still IS a fact — keep extracting those.
 
 Lifecycle rules:
 - One statement per op. NEVER combine an old fact and new information into one
@@ -67,7 +75,8 @@ Tier rules:
   plan/program, standing defaults ("drinks 3.2% milk unless stated").
   Core facts are permanent context — they change only when the user's life
   changes, never day to day. Not for status, events, or observations.
-- "general" = soft preferences, history, status, project notes.
+- "general" = soft preferences, history, project notes, decisions and
+  findings (never task status, see Durability rules).
 - Emit nothing ([]) if there is nothing new or changed.
 - Never restate facts already present unchanged."""
 
