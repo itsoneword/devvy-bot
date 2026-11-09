@@ -2,7 +2,7 @@
 
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
@@ -116,6 +116,9 @@ class ProfileDefinition:
     # extra folder; this is the narrow grant. Owner-only profiles only: the
     # loader refuses the key on a guest-allowed profile.
     extra_dirs: Tuple[Path, ...] = ()
+    # Explicit external project guide injected into the shared first-turn
+    # bundle. Cwd project files remain the CLI's responsibility.
+    project_instructions: Optional[Path] = None
     # Directories a *sandboxed* profile's bash may READ (not write), beyond its
     # workspace (dv-98f2): shared tool checkouts such as ~/tools/fetchcrypto.
     # Mounted read-only into the bash box (src/security/bash_box.py). Owner-only
@@ -163,10 +166,41 @@ class ProfileRegistry:
 
     def __init__(self, profiles: List[ProfileDefinition]) -> None:
         self._profiles = profiles
-        self._by_slug: Dict[str, ProfileDefinition] = {p.slug: p for p in profiles}
-        self._by_dir: Dict[Path, ProfileDefinition] = {
-            p.working_dir.resolve(): p for p in profiles
+        self._index()
+        # Profiles switched off for this run because their paths failed boot
+        # validation (dv-86f4): slug -> reason. Not written to the YAML, so
+        # the next boot tries them again.
+        self.boot_disabled: Dict[str, str] = {}
+
+    def _index(self) -> None:
+        self._by_slug: Dict[str, ProfileDefinition] = {
+            p.slug: p for p in self._profiles
         }
+        self._by_dir: Dict[Path, ProfileDefinition] = {
+            p.working_dir.resolve(): p for p in self._profiles
+        }
+
+    def disable_for_run(self, slug: str, reason: str) -> None:
+        """Turn one profile off until the next boot, recording why (dv-86f4).
+
+        Boot-time only: callers that already hold the old definition keep it.
+        Goes through ``enabled=False`` so every consumer that honours a YAML
+        disable (``enabled_profiles``, ``get_enabled_by_slug``) honours this.
+        """
+        self._profiles = [
+            replace(p, enabled=False) if p.slug == slug else p for p in self._profiles
+        ]
+        self._index()
+        self.boot_disabled[slug] = reason
+
+    def owner_only_for_run(self, slug: str) -> None:
+        """Narrow one profile to owner-only until the next boot (dv-86f4 safe
+        mode). Boot-time only, like ``disable_for_run``; YAML untouched."""
+        self._profiles = [
+            replace(p, allowed_roles=DEFAULT_ALLOWED_ROLES) if p.slug == slug else p
+            for p in self._profiles
+        ]
+        self._index()
 
     @property
     def profiles(self) -> List[ProfileDefinition]:
@@ -606,11 +640,18 @@ def _validate_profile_paths(defn: "ProfileDefinition") -> None:
         elif not os.access(extra, os.W_OK | os.X_OK):
             errors.append(f"extra_dirs entry is not writable: {extra}")
 
+    if defn.project_instructions is not None:
+        source = defn.project_instructions
+        if not source.is_file() or not os.access(source, os.R_OK):
+            errors.append(f"project_instructions is not a readable file: {source}")
+
     if errors:
         raise ValueError(f"Profile '{defn.slug}': " + "; ".join(errors))
 
 
-def validate_registry_paths(registry: "ProfileRegistry") -> None:
+def validate_registry_paths(
+    registry: "ProfileRegistry", *, degrade: bool = False
+) -> Dict[str, str]:
     """Validate every profile's paths after the fact.
 
     ``load_profile_registry(validate_paths=True)` validates during parsing,
@@ -618,9 +659,24 @@ def validate_registry_paths(registry: "ProfileRegistry") -> None:
     parse, let ``bootstrap_profiles`` materialise directories and personas from
     templates, *then* validate — otherwise a first run always fails on files it
     was about to create.
+
+    Strict by default: the first bad profile raises (check_install and the
+    restart preflight rely on that). ``degrade=True`` is for the live boot
+    (dv-86f4): a bad non-default profile is disabled for this run instead of
+    taking the whole bot down; the default profile still raises. Returns
+    ``{slug: reason}`` for the profiles it disabled.
     """
+    disabled: Dict[str, str] = {}
     for defn in registry.profiles:
-        _validate_profile_paths(defn)
+        try:
+            _validate_profile_paths(defn)
+        except ValueError as exc:
+            if not degrade or defn.default:
+                raise
+            disabled[defn.slug] = str(exc)
+    for slug, reason in disabled.items():
+        registry.disable_for_run(slug, reason)
+    return disabled
 
 
 def load_profile_registry(
@@ -746,6 +802,11 @@ def load_profile_registry(
             )
 
         extra_dirs = _parse_extra_dirs(item, slug, _resolve)
+        project_instructions = (
+            _resolve(item["project_instructions"], "project_instructions")
+            if item.get("project_instructions")
+            else None
+        )
         # Extra write roots widen a sandboxed profile's reach beyond its own
         # workspace. On a guest-reachable profile that hands every guest a
         # write path into the owner's files, so the grant is owner-only —
@@ -878,6 +939,7 @@ def load_profile_registry(
             hireli=bool(item.get("hireli", False)),
             exchange=exchange,
             extra_dirs=extra_dirs,
+            project_instructions=project_instructions,
             sandbox_read_dirs=read_dirs,
             sandbox_keys=sandbox_keys,
             sandbox_allowed_domains=allowed_domains,

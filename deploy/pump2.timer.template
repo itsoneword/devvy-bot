@@ -1,0 +1,13 @@
+-- rendered by scripts/render_deploy.py; do not install this file directly --
+# Enable by hand: systemctl --user enable --now pump2.timer
+[Unit]
+Description=Tick pump2 every 2 minutes
+
+[Timer]
+OnStartupSec=2min
+OnUnitActiveSec=2min
+Persistent=true
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

@@ -110,7 +110,7 @@ SERVICES_SYSTEM = (
     "llm-analytics.service",
     "channel-intel.service",
 )
-SERVICES_USER = ("taskpump.timer", "taskpump.service")
+SERVICES_USER = ("pump2.timer", "pump2.service")
 
 
 # --- plan model --------------------------------------------------------------
@@ -741,7 +741,7 @@ def render(plan: Plan) -> str:
     w("")
     w("Not done by this script (cutover checklist, manual):")
     w(
-        "  - stop claude-bot only at 0 in-flight turns; stop llm-analytics, channel-intel, taskpump.timer"
+        "  - stop claude-bot only at 0 in-flight turns; stop llm-analytics, channel-intel, pump2.timer"
     )
     w(
         "  - /etc/systemd/system/channel-intel.service: drop Environment=CHANNEL_INTEL_DB_PATH=...; daemon-reload"

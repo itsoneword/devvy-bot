@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
@@ -28,6 +29,9 @@ PLAIN_PURPOSES = frozenset(
         "screen",
         "ask_explain",
         "design_critic",
+        "pump_summary",  # pump2's pinned board summary (dv-5c22)
+        "feedback_question",  # the feature-feedback question (dv-a42c)
+        "feedback_extract",  # fields of the owner's feedback answer (dv-a42c)
     }
 )
 PURPOSES = TURN_PURPOSES | PLAIN_PURPOSES
@@ -44,11 +48,27 @@ PUMP_STAGES = (
     "implement",
     "review",
     "acceptance",
+    # dv-ca8b: the owner-started merge job of the retired taskpump (rows stay).
+    "merge",
+    # dv-2c5c: pump2's mergefix stage (a mechanical merge that did not land).
+    "mergefix",
 )
+# Rows only the removed taskpump ran (dv-81a7). Still parsed, so an old
+# models.yaml loads; the 🧠 Модели menu does not show them.
+RETIRED_JOB_ROUTES = frozenset({"pump_architect", "pump_acceptance", "pump_merge"})
 JOB_ROUTE_NAMES = frozenset(
     {"background_job", "monitor", "design_generate"}
     | {f"pump_{stage}" for stage in PUMP_STAGES}
 )
+
+_PUMP_ROUTE = re.compile(r"pump_[a-z0-9]+")
+
+
+def is_job_route(name: str) -> bool:
+    """A ``jobs:`` row name: a static one, or ``pump_<stage>`` for a board's
+    custom pump2 stage (dv-3b99); an unconfigured one runs on ``jobs.default``."""
+    return name in JOB_ROUTE_NAMES or bool(_PUMP_ROUTE.fullmatch(name))
+
 
 # ``DecideRequest.fallback_model``: run the LLM leg on the purpose's route.
 ROUTE = "route"

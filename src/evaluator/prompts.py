@@ -1,6 +1,6 @@
 """Evaluator prompt templates for memory extraction (op-based)."""
 
-from typing import List, Optional
+from typing import AbstractSet, List, Optional
 
 MEMORY_OP_INSTRUCTIONS = """\
 You maintain an agent's long-term memory. You are shown the CURRENT facts and a
@@ -99,6 +99,27 @@ Scope (this user belongs to a family):
   "Anna: the family dinner is at 19:00") so other members see attribution.
 - Facts listed under "Current Family Facts" are family-scoped; supersede
   them only with ops carrying "scope": "family"."""
+
+# Appended ONLY for agents with their own repo (dv-32fe: the profiles of
+# config/taskpump/boards.json plus devops). Owner decision 31.10.26: per-task
+# project decisions live in the repo's docs/DECISIONS.md or the task card;
+# memory keeps a pointer, so they stop crowding the injected facts. Content
+# stays the FULL statement: the writer checks the ref against the repo and
+# keeps an unverified decision as a flagged full fact, never a bare pointer.
+PROJECT_DECISION_INSTRUCTIONS = """\
+
+Project decisions (this agent has its own repo):
+- A per-task product or project decision (a feature's behaviour, a design
+  choice, a limit, a rollout, usually tied to a task id such as gb-1ab3) is
+  "conversation_result" EVEN WHEN THE OWNER STATED IT. Put where it is
+  recorded in "source_ref": "docs/DECISIONS.md", or the card id (e.g.
+  "gb-1ab3") when it lives only on the card.
+- For these, "content" is the FULL decision statement with its task id and
+  reason, not a one-line summary: memory injects only a one-line pointer, and
+  the full text is what recall() returns.
+- "user_fact" stays for the owner's preferences, working rules and decisions
+  that cut across tasks (how to talk to them, how to work, what never to do).
+  When unsure whether a decision is per-task, keep it a "user_fact"."""
 
 
 EVALUATOR_PROMPT = """You maintain an agent's long-term memory.
@@ -219,13 +240,20 @@ def build_evaluator_prompt(
     conversation_text: str,
     current_facts: str,
     family_facts: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    repo_agents: AbstractSet[str] = frozenset(),
 ) -> str:
     """Build the full evaluator prompt from components.
 
     ``family_facts`` is None for users without a family — the prompt then
     never mentions family scope, so the evaluator cannot emit it.
+    ``repo_agents`` are the profile slugs with their own repo; for those
+    (``agent_id``'s ``#u…`` suffix ignored) the project-decision block is
+    added. Every other agent's prompt is byte-identical to before dv-32fe.
     """
     instructions = MEMORY_OP_INSTRUCTIONS
+    if agent_id is not None and agent_id.split("#", 1)[0] in repo_agents:
+        instructions += PROJECT_DECISION_INSTRUCTIONS
     family_section = ""
     if family_facts is not None:
         instructions += FAMILY_SCOPE_INSTRUCTIONS

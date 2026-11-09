@@ -40,6 +40,8 @@ async def test_text_turn_prompt_and_storage_carry_tag(tmp_path, monkeypatch) -> 
     prof = ProfileDefinition(
         "devops", "devops", root, root / "m", root / "p.md", default=True
     )
+    # the router binds topic 22 to "monitoring"; its profile must exist
+    mon = ProfileDefinition("monitoring", "monitoring", root, root / "m", root / "p.md")
     settings = Settings(
         telegram_bot_token="t:t",
         telegram_bot_username="b",
@@ -65,7 +67,7 @@ async def test_text_turn_prompt_and_storage_carry_tag(tmp_path, monkeypatch) -> 
     context.user_data = {"active_profile": "devops", "current_directory": Path(root)}
     context.bot_data = {
         "settings": settings,
-        "profile_registry": ProfileRegistry([prof]),
+        "profile_registry": ProfileRegistry([prof, mon]),
         "reports_router": _router(),
         "rate_limiter": None,
         "auth_manager": SimpleNamespace(get_user_role=lambda uid: "owner"),
@@ -114,6 +116,8 @@ async def test_media_turn_carries_tag(tmp_path, monkeypatch) -> None:
     prof = ProfileDefinition(
         "devops", "devops", root, root / "m", root / "p.md", default=True
     )
+    # the router binds topic 22 to "monitoring"; its profile must exist
+    mon = ProfileDefinition("monitoring", "monitoring", root, root / "m", root / "p.md")
     settings = Settings(
         telegram_bot_token="t:t",
         telegram_bot_username="b",
@@ -136,7 +140,7 @@ async def test_media_turn_carries_tag(tmp_path, monkeypatch) -> None:
     context.user_data = {"active_profile": "devops", "current_directory": Path(root)}
     context.bot_data = {
         "settings": settings,
-        "profile_registry": ProfileRegistry([prof]),
+        "profile_registry": ProfileRegistry([prof, mon]),
         "reports_router": _router(),
         "auth_manager": SimpleNamespace(get_user_role=lambda uid: "owner"),
     }

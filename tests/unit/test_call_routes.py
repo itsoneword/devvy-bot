@@ -395,7 +395,9 @@ def test_every_plain_purpose_has_exactly_one_route_row():
     from src.model_router.routes import DEFAULT_CALL_ROUTES
     from src.model_router.types import PLAIN_PURPOSES, PURPOSES, TURN_PURPOSES
 
-    assert set(PLAIN_PURPOSES) == NINE_PLAIN
+    # Purposes added after the dv-781f golden table (no golden row yet).
+    later = {"pump_summary", "feedback_question", "feedback_extract"}
+    assert set(PLAIN_PURPOSES) == NINE_PLAIN | later
     assert set(DEFAULT_CALL_ROUTES) == set(PLAIN_PURPOSES)
     assert not set(TURN_PURPOSES) & set(PLAIN_PURPOSES)
     assert set(TURN_PURPOSES) | set(PLAIN_PURPOSES) == set(PURPOSES)

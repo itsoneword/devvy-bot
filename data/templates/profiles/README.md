@@ -16,12 +16,13 @@ is one copy of that text rather than two that drift.
 
 `install.sh` instantiates **`devops` + `general`** into `config/profiles.yaml`
 (which is gitignored — it is per-machine deployment config, not source).
-`chef`, `coach`, `pm` and `channel` ship as templates only.
+`chef`, `coach`, `pm`, `channel` and `monitoring` ship as templates only.
 
 ```bash
 python3 scripts/install_profiles.py --list          # what is available/installed
 python3 scripts/install_profiles.py --add coach     # append one, idempotent
 python3 scripts/install_profiles.py --add pm --slug work   # under a different slug
+python3 scripts/install_profiles.py --add monitoring       # separate reports context
 ```
 
 Adding a profile is a config change, and `PROFILES_CONFIG_PATH` is read once at
@@ -43,7 +44,7 @@ Make a directory, drop in `profile.yaml` and `persona.md`, and it is offered by
 `--list` immediately. Two rules the loader enforces, so get them right here:
 
 - A profile that allows the `guest` role can never resolve to `sandbox: false`.
-  `unrestricted: true` (the server-admin flag, devops only) likewise needs
+  `unrestricted: true` (the server-admin flag) likewise needs
   `sandbox: false` and no `guest` role.
   `install_profiles.py` refuses such a template up front rather than writing a
   config that aborts startup.

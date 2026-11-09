@@ -40,6 +40,7 @@ from typing import Any, Iterable
 
 import structlog
 
+from src.utils.boards import read_board_entries
 from src.utils.paths import REPO_ROOT
 
 logger = structlog.get_logger(__name__)
@@ -59,7 +60,7 @@ JOB_PURPOSES = frozenset({"background_job", "monitor"})
 # after the job dir was created (measured on 667 jobs, analysis §3).
 JOB_MATCH_WINDOW_S = 300.0
 
-# scripts/taskpump job names: pump-{task}-{stage}; other boards' task ids are
+# old taskpump job names (rows stay): pump-{task}-{stage}; other boards' task ids are
 # board:id, older dirs had ':' -> '-'. No board = this repo's own board.
 PUMP_JOB_RE = re.compile(
     r"^pump-(?:(?P<board>[a-z][a-z0-9_]*)[:-])?"
@@ -310,13 +311,12 @@ def load_boards(path: Path | None) -> frozenset[str]:
     if path is None:
         return frozenset()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        boards = read_board_entries(path)
     except (OSError, ValueError):
         return frozenset()
-    boards = data.get("boards") if isinstance(data, dict) else None
     return frozenset(
         b["name"]
-        for b in boards or []
+        for b in boards
         if isinstance(b, dict) and isinstance(b.get("name"), str)
     )
 

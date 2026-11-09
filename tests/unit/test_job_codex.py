@@ -146,7 +146,12 @@ for i, command in enumerate(turn.get("commands", [])):
               "type": "command_execution", "command": command,
               "aggregated_output": "", "status": "declined"}}}})
 
+for event in turn.get("events", []):
+    emit(event)
+
 answer = turn.get("answer", "ok")
+if turn.get("error"):
+    emit({{"type": "error", "message": turn["error"]}})
 if "-o" in argv:
     with open(argv[argv.index("-o") + 1], "w") as fh:
         fh.write(answer)
@@ -319,6 +324,109 @@ async def test_codex_job_that_fails_exits_nonzero_and_records_an_error_row(
     (row,) = await _rows(bot_db, "model_calls")
     assert row["harness"] == "openai_codex"
     assert row["outcome"] == "error"
+
+
+async def test_codex_usage_limit_exits_with_quota_marker(
+    tmp_path: Path, fake_codex: FakeCodex, bot_db: Any, capsys: Any
+) -> None:
+    from src.model_router.quota import QUOTA_EXIT, find_limit
+
+    work = tmp_path / "work"
+    work.mkdir()
+    fake_codex.set_plan(
+        [
+            {
+                "answer": "",
+                "error": "You’ve hit your usage limit. Try again at 10:24 PM.",
+                "exit": 1,
+            }
+        ]
+    )
+
+    code = await _run(
+        _codex_spec(work, _codex_route(tmp_path)), _AppLink(_bot_app(bot_db))
+    )
+
+    assert code == QUOTA_EXIT
+    assert find_limit(capsys.readouterr().err) is not None
+
+
+OBSERVED_LIMIT = (
+    "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+    "visit https://chatgpt.com/codex/settings/usage to purchase more credits "
+    "or try again at 10:24 PM."
+)
+
+
+async def test_observed_codex_limit_exits_as_openai_quota_with_reset(
+    tmp_path: Path, fake_codex: FakeCodex, bot_db: Any, capsys: Any
+) -> None:
+    """The text is from the incident stderr; the JSON envelope is modeled."""
+    from datetime import UTC
+
+    from src.model_router import quota
+
+    work = tmp_path / "work"
+    work.mkdir()
+    fake_codex.set_plan(
+        [
+            {
+                "answer": "",
+                "exit": 1,
+                "events": [
+                    {"type": "turn.failed", "error": {"message": OBSERVED_LIMIT}}
+                ],
+            }
+        ]
+    )
+    code = await _run(
+        _codex_spec(work, _codex_route(tmp_path)), _AppLink(_bot_app(bot_db))
+    )
+
+    assert code == quota.QUOTA_EXIT
+    limit = quota.find_limit(capsys.readouterr().err)
+    assert limit is not None
+    assert limit.provider == "openai"
+    assert (limit.until.hour, limit.until.minute) == (22, 24)
+    assert limit.until.tzinfo == UTC
+    (row,) = await _rows(bot_db, "model_calls")
+    assert row["provider"] == "openai" and row["outcome"] == "error"
+
+
+async def test_modeled_codex_envelopes_keep_limit_before_generic_tail_and_ordinary_error(
+    tmp_path: Path, fake_codex: FakeCodex, bot_db: Any, capsys: Any
+) -> None:
+    """Both supported stdout envelopes are modeled; raw incident stdout was not retained."""
+    from src.model_router import quota
+
+    work = tmp_path / "work"
+    work.mkdir()
+    fake_codex.set_plan(
+        [
+            {
+                "answer": "",
+                "exit": 1,
+                "events": [
+                    {"type": "error", "message": OBSERVED_LIMIT},
+                    {"type": "turn.failed", "error": {"message": "Request failed"}},
+                ],
+            },
+            {
+                "answer": "",
+                "exit": 1,
+                "events": [
+                    {"type": "turn.failed", "error": {"message": "API overloaded"}}
+                ],
+            },
+        ]
+    )
+    spec = _codex_spec(work, _codex_route(tmp_path))
+    link = _AppLink(_bot_app(bot_db))
+
+    assert await _run(spec, link) == quota.QUOTA_EXIT
+    assert quota.find_limit(capsys.readouterr().err) is not None
+    assert await _run(spec, link) == 1
+    assert quota.find_limit(capsys.readouterr().err) is None
 
 
 # -- A destructive command in a Codex job asks the owner; deny blocks it --

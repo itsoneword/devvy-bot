@@ -49,6 +49,9 @@ purposes:
   fact_quality:      {models: {claude: haiku}}
   onboarding:        {}                          # = default (sonnet)
   ask_explain:       {models: {claude: sonnet}}
+  pump_summary:      {models: {claude: sonnet}}  # pump2 pin recommendation
+  feedback_question: {models: {claude: sonnet}}  # feature survey question
+  feedback_extract:  {models: {claude: sonnet}}  # owner answer -> JSON fields
   scorer:                                        # a different family on purpose
     harness: openrouter
     models: {openrouter: null, claude: opus}     # null = live best Qwen pick
@@ -89,12 +92,13 @@ jobs:
   background_job:  {}                         # = jobs.default (sonnet)
   monitor:         {}
   pump_analyze:    {models: {claude: opus}}
-  pump_architect:  {models: {claude: sonnet}}
   pump_testdesign: {models: {claude: opus}}
   pump_implement:  {models: {claude: opus}}
   pump_review:     {models: {claude: sonnet}}
-  pump_acceptance: {models: {claude: sonnet}}
+  pump_merge:      {models: {claude: opus}}  # dv-ca8b owner-started merge job
+  pump_mergefix:   {models: {claude: opus}}  # dv-2c5c pump2: a merge that did not land
   design_generate: {models: {claude: sonnet}}  # dv-9133 design variants; not opus
+  # pump_copy:     {models: {claude: sonnet}}  # a board's custom stage `copy` (docs/pump.md)
 
 # --- Presets: put ONE of these in config/models.yaml -----------------------
 #

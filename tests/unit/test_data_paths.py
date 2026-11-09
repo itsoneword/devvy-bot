@@ -71,6 +71,7 @@ def test_legacy_layout_matches_todays_paths():
     assert layout.taskpump_state == Path("data/taskpump.json")
     assert layout.legacy_taskpump_lock == Path("data/taskpump.lock")
     assert layout.taskpump_outbox == Path("data/taskpump-outbox")
+    assert layout.lkg_dir == Path("data/lkg")
     assert layout.workspaces_dir is None
 
 

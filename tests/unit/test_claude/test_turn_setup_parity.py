@@ -28,7 +28,11 @@ from src.claude.turn_setup import (
     resolve_turn_context,
 )
 from src.config.settings import Settings
-from src.profiles.registry import ProfileDefinition, ProfileRegistry
+from src.profiles.registry import (
+    ProfileDefinition,
+    ProfileRegistry,
+    load_profile_registry,
+)
 
 USER_ID = 111
 FAMILY_ID = 7
@@ -128,6 +132,28 @@ def pair(tmp_path: Path) -> Tuple[ClaudeSDKManager, CodexCliIntegration, Any]:
 
 
 class TestTurnContextParity:
+    def test_owner_user_workspace_uses_bare_profile_for_tools(
+        self, pair, tmp_path
+    ) -> None:
+        claude, codex, _ = pair
+        cwd = tmp_path / "coach" / "users" / str(USER_ID)
+        cwd.mkdir(parents=True)
+        left = claude._turn_context_for(cwd, user_id=USER_ID, role="owner")
+        right = codex._turn_context(cwd, USER_ID, CHAT_ID, None, "owner")
+        assert left.profile_slug == right.profile_slug == "coach"
+        assert left.memory_agent_id == right.memory_agent_id == f"coach#u{USER_ID}"
+        assert left.working_dir == right.working_dir == cwd
+
+    def test_devops_guest_workspace_keeps_scoped_identity_and_no_job_tools(
+        self, pair, tmp_path
+    ) -> None:
+        claude, _, _ = pair
+        cwd = tmp_path / "devops" / "guests" / str(USER_ID)
+        cwd.mkdir(parents=True)
+        ctx = claude._turn_context_for(cwd, user_id=USER_ID, role="guest")
+        assert ctx.profile_slug == f"devops#u{USER_ID}"
+        assert ctx.memory_agent_id == f"devops#u{USER_ID}"
+
     def test_both_backends_resolve_the_same_context(self, pair, tmp_path) -> None:
         claude, codex, _ = pair
         coach = tmp_path / "coach"
@@ -258,6 +284,116 @@ class TestPersonaParity:
         assert from_claude == from_codex == "FROZEN BUNDLE"
         assert retriever.selects == []  # no live compose behind a bundle
         assert [c["family_id"] for c in provider.calls] == [FAMILY_ID, FAMILY_ID]
+
+
+def _instruction_registry(tmp_path: Path) -> tuple[ProfileRegistry, dict[str, Path]]:
+    """A workspace, two explicit project sources, and a workspace-only profile."""
+    roots = {name: tmp_path / name for name in ("devops", "gymbro", "pl", "general")}
+    for name, root in roots.items():
+        root.mkdir()
+        (root / "persona.md").write_text(f"{name} persona", encoding="utf-8")
+    gym_repo = tmp_path / "gymbro-repo"
+    pl_repo = tmp_path / "pl-repo"
+    for repo in (gym_repo, pl_repo):
+        repo.mkdir()
+    (gym_repo / "CLAUDE.md").write_text(
+        f"GYMBRO_PROJECT_GUIDE: Draft cards directly in {gym_repo}/.deviz/tasks; "
+        "this repo board is writable.",
+        encoding="utf-8",
+    )
+    (pl_repo / "CLAUDE.md").write_text(
+        f"PL_PROJECT_GUIDE: Draft cards in {pl_repo}/.deviz/tasks.",
+        encoding="utf-8",
+    )
+    config = tmp_path / "profiles.yaml"
+    config.write_text(
+        "profiles:\n"
+        + "\n".join(
+            f"  - slug: {name}\n"
+            f"    name: {name}\n"
+            f"    working_dir: {root}\n"
+            f"    memory_dir: {root}/memory\n"
+            f"    persona: {root}/persona.md\n"
+            + ("    default: true\n    sandbox: false\n" if name == "devops" else "")
+            + (
+                f"    extra_dirs: [{gym_repo}]\n"
+                f"    project_instructions: {gym_repo}/CLAUDE.md\n"
+                if name == "gymbro"
+                else (
+                    f"    extra_dirs: [{pl_repo}]\n"
+                    f"    project_instructions: {pl_repo}/CLAUDE.md\n"
+                    if name == "pl"
+                    else ""
+                )
+            )
+            for name, root in roots.items()
+        ),
+        encoding="utf-8",
+    )
+    return load_profile_registry(config, data_root=None), {
+        **roots,
+        "gym_repo": gym_repo,
+        "pl_repo": pl_repo,
+    }
+
+
+async def test_gymbro_fresh_backends_receive_writable_repo_board(
+    tmp_path: Path,
+) -> None:
+    registry, roots = _instruction_registry(tmp_path)
+    settings = _settings(tmp_path)
+    claude = ClaudeSDKManager(settings, profile_registry=registry)
+    codex = CodexCliIntegration(
+        config=settings,
+        session_store=InMemoryCodexSessionStore(),
+        profile_registry=registry,
+    )
+
+    claude_system = await claude._persona_text(roots["gymbro"], "draft a card")
+    codex_first_message = await codex._with_persona(roots["gymbro"], "draft a card")
+
+    assert claude_system is not None
+    assert codex_first_message.startswith(claude_system)
+    for bundle in (claude_system, codex_first_message):
+        assert bundle.count("GYMBRO_PROJECT_GUIDE") == 1
+        assert str(roots["gym_repo"] / ".deviz/tasks") in bundle
+        assert str(roots["gym_repo"]) in bundle
+        assert "writable" in bundle
+        assert f"All file operations must stay within {roots['gymbro']}" not in bundle
+
+
+async def test_other_profiles_receive_only_their_write_roots_and_guidance(
+    tmp_path: Path,
+) -> None:
+    registry, roots = _instruction_registry(tmp_path)
+    settings = _settings(tmp_path)
+    claude = ClaudeSDKManager(settings, profile_registry=registry)
+    codex = CodexCliIntegration(
+        config=settings,
+        session_store=InMemoryCodexSessionStore(),
+        profile_registry=registry,
+    )
+
+    for name, expected_guide, own_repo in (
+        ("pl", "PL_PROJECT_GUIDE", roots["pl_repo"]),
+        ("general", None, None),
+    ):
+        from_claude = await claude._persona_text(roots[name], "where can I write?")
+        from_codex = await codex._persona_text(roots[name], "where can I write?")
+        assert from_claude == from_codex
+        assert from_claude is not None
+        assert str(roots[name]) in from_claude
+        assert str(roots["gym_repo"]) not in from_claude
+        assert "GYMBRO_PROJECT_GUIDE" not in from_claude
+        if own_repo is None:
+            assert str(roots["pl_repo"]) not in from_claude
+            assert "PL_PROJECT_GUIDE" not in from_claude
+        else:
+            assert str(own_repo) in from_claude
+            assert expected_guide in from_claude
+            assert (
+                f"All file operations must stay within {roots[name]}" not in from_claude
+            )
 
     async def test_bundle_needs_a_user_id_to_key_the_window(
         self, pair, tmp_path

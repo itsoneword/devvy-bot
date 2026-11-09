@@ -38,6 +38,7 @@ from .types import (
     OPENROUTER_HARNESS,
     PLAIN_PURPOSES,
     TURN_PURPOSES,
+    is_job_route,
 )
 
 if TYPE_CHECKING:
@@ -86,6 +87,31 @@ def resolve_turn_route(
     if user_model and user_model in allowed:
         return Route(CLAUDE_HARNESS, provider, user_model)
     return Route(CLAUDE_HARNESS, provider, profile.model)
+
+
+def profiles_off_pick(
+    profiles: Any, user_model: Optional[str]
+) -> List[Tuple[Any, Route]]:
+    """The profiles whose chat turns do not run on the ``/model`` pick: a
+    ``provider:`` profile routes to its own provider and model
+    (:func:`resolve_turn_route`). /menu → Модели and /model list them
+    (dv-3881) so the pick is never shown as applying where it does not."""
+    out: List[Tuple[Any, Route]] = []
+    for profile in profiles or ():
+        route = resolve_turn_route(profile, user_model)
+        if route.provider != PROVIDER_ANTHROPIC_SUB:
+            out.append((profile, route))
+    return out
+
+
+def scheduled_turn_model(saved: Optional[str], default: Optional[str]) -> Optional[str]:
+    """The Claude model a scheduled / webhook turn runs on: the owner's saved
+    pick, else the configured ``agent_model``, through the one Claude tier
+    gate; None = the CLI default (``CLAUDE_MODEL``). Those turns always run
+    Claude. One function for ``AgentHandler`` and the /menu → Модели line."""
+    from src.agent_backends.protocol import CLAUDE_BACKEND, policy_for
+
+    return policy_for(CLAUDE_BACKEND).resolve_model(saved or default)
 
 
 def user_pick_allowed(
@@ -316,6 +342,13 @@ DEFAULT_CALL_ROUTES: Mapping[str, RouteRow] = {
     "onboarding": RouteRow(),
     # Sonnet: Haiku judging safety is doubtful (owner, dv-781f).
     "ask_explain": RouteRow(models={CLAUDE_HARNESS: "sonnet"}),
+    # pump2's pinned board summary (dv-5c22): 1-3 recommendation lines, only
+    # when the board's card set changed.
+    "pump_summary": RouteRow(models={CLAUDE_HARNESS: "sonnet"}),
+    # The owner's feature survey (dv-a42c): one sentence on what a feature
+    # does; the JSON fields of the owner's answer (stateless, no session).
+    "feedback_question": RouteRow(models={CLAUDE_HARNESS: "sonnet"}),
+    "feedback_extract": RouteRow(models={CLAUDE_HARNESS: "sonnet"}),
     # The answer scorer: a different family than the bot's. No openrouter
     # model = the judge picks one from the live catalogue (judges.py).
     "scorer": RouteRow(
@@ -348,13 +381,17 @@ JOB_HARNESS_ROUTES: Mapping[str, Tuple[str, str]] = {
     CODEX_HARNESS: (CODEX_HARNESS, PROVIDER_OPENAI),
 }
 
+# The harnesses one job may name explicitly over the owner's switch (dv-a8e4):
+# Claude only, so a single failing Codex job can be retried on purpose.
+JOB_HARNESS_OVERRIDES = frozenset({CLAUDE_HARNESS})
+
 # The jobs' default row: Sonnet, what bgjob / agentjob passed by default.
 DEFAULT_JOB_ROUTE = RouteRow(
     harness=CLAUDE_HARNESS,
     models={CLAUDE_HARNESS: "sonnet", CODEX_HARNESS: DEFAULT_CODEX_MODEL},
 )
 
-# One row per job: exactly the model each ran on before dv-d63d (taskpump's
+# One row per job: exactly the model each ran on before dv-d63d (the old pump's
 # ANALYZE_MODEL / IMPLEMENT_MODEL / ... constants), so a host with no
 # models.yaml behaves as before.
 DEFAULT_JOB_ROUTES: Mapping[str, RouteRow] = {
@@ -367,6 +404,12 @@ DEFAULT_JOB_ROUTES: Mapping[str, RouteRow] = {
     # The review is a reading job (owner answer dv-a438 2.2).
     "pump_review": RouteRow(models={CLAUDE_HARNESS: "sonnet"}),
     "pump_acceptance": RouteRow(models={CLAUDE_HARNESS: "sonnet"}),
+    # dv-ca8b: merges resolve conflicts (about half of them have some), the
+    # same model as the hand-written merge jobs it replaces.
+    "pump_merge": RouteRow(models={CLAUDE_HARNESS: "opus"}),
+    # dv-2c5c: pump2's mergefix stage judges a failed merge and resolves its
+    # conflicts, like pump_merge.
+    "pump_mergefix": RouteRow(models={CLAUDE_HARNESS: "opus"}),
     # dv-9133: the design loop's variant generator. Claude, so the Codex
     # critic is another family; not opus (owner 27.10 on 3.2: generation can
     # run on a cheaper model, the brief and the critic carry the quality).
@@ -391,24 +434,40 @@ class CallRoutes:
     # harness, above the rows. Set by process_call_routes, never by a file.
     job_switch: Optional[str] = None
 
-    def resolve_job(self, name: str, *, model: Optional[str] = None) -> Route:
+    def resolve_job(
+        self,
+        name: str,
+        *,
+        model: Optional[str] = None,
+        harness: Optional[str] = None,
+    ) -> Route:
         """The route one background job runs on (dv-d63d).
 
-        The harness: the owner's switch (``job_switch``) > the job row > the
-        jobs default row. Precedence for the model: the caller's explicit
+        The harness: the caller's explicit ``harness`` > the owner's switch
+        (``job_switch``) > the job row > the jobs default row. The explicit
+        harness is a one-job override (dv-a8e4: ``bgjob --harness claude``,
+        ``job_start(harness=...)``): only ``claude`` is accepted, it changes
+        nothing in the table, and no job ever gets it implicitly (a failed
+        Codex job is reported, never retried on Claude). Precedence for the model: the caller's explicit
         ``model`` > the job row > the jobs default row (for the harness in
         force). The explicit model is a Claude pick
         (``bgjob --model``, ``job_start``): it applies only on the Claude
         subscription; on any other route it is ignored with a log line, so
         ``sonnet`` is never sent to OpenRouter or Codex.
         """
-        if name not in JOB_ROUTE_NAMES:
+        if not is_job_route(name):
             raise ValueError(
                 f"unknown job route {name!r}; one of {sorted(JOB_ROUTE_NAMES)}"
             )
+        if harness is not None and harness not in JOB_HARNESS_OVERRIDES:
+            raise ValueError(
+                f"unknown job harness override {harness!r}; one of "
+                f"{sorted(JOB_HARNESS_OVERRIDES)}"
+            )
         row = self.jobs.get(name, RouteRow())
         harness = (
-            self.job_switch
+            harness
+            or self.job_switch
             or row.harness
             or self.jobs_default.harness
             or CLAUDE_HARNESS
@@ -552,7 +611,7 @@ def with_job_switch(routes: CallRoutes) -> CallRoutes:
     return replace(routes, job_switch=switch) if switch else routes
 
 
-# taskpump's per-stage model env vars before dv-d63d. Testdesign followed the
+# The old pump's per-stage model env vars before dv-d63d. Testdesign followed the
 # implement model unless set itself.
 _LEGACY_JOB_ENV: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("pump_analyze", ("PUMP_ANALYZE_MODEL",)),
@@ -666,12 +725,14 @@ def load_call_routes(
             if job == "default":
                 jobs_default = _overlay(jobs_default, raw, where, allow_follow=False)
                 continue
-            if job not in JOB_ROUTE_NAMES:
+            if not is_job_route(job):
                 raise ValueError(
                     f"{where}: unknown job route; job routes are "
                     f"{sorted(JOB_ROUTE_NAMES)}"
                 )
-            jobs[job] = _overlay(jobs[job], raw, where, allow_follow=False)
+            jobs[job] = _overlay(
+                jobs.get(job, RouteRow()), raw, where, allow_follow=False
+            )
         source = str(path)
     routes = CallRoutes(
         default=default,
@@ -884,7 +945,9 @@ __all__ = [
     "openrouter_key",
     "pricing_rule_for",
     "provider_env",
+    "profiles_off_pick",
     "resolve_turn_route",
+    "scheduled_turn_model",
     "user_pick_allowed",
     "with_job_switch",
 ]

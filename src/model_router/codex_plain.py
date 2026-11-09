@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from src.utils.agent_env import agent_child_env
 
+from . import quota
 from .types import CallRequest, CallResult, ModelCallError, ModelCallTimeout
 
 _MODEL_PREFIX = "openai-codex/"
@@ -54,6 +55,12 @@ class CodexPlainCaller:
         return argv + ["-o", str(workdir / "out.txt"), "-"]
 
     async def __call__(self, request: CallRequest) -> CallResult:
+        limit = quota.active(provider="openai")
+        if limit is not None:
+            raise ModelCallError(
+                f"OpenAI usage limit exhausted until "
+                f"{limit.until.strftime('%H:%M UTC')}: {limit.message}"
+            )
         prompt = request.prompt
         if request.system_prompt:
             prompt = f"{request.system_prompt}\n\n{prompt}"
@@ -82,7 +89,17 @@ class CodexPlainCaller:
                 raise
             if process.returncode != 0:
                 err = stderr.decode("utf-8", errors="replace").strip()
-                err = err or codex_stdout_error(stdout) or "(no output)"
+                stdout_error = codex_stdout_error(stdout)
+                limit = quota.parse_limit(
+                    "\n".join((stdout_error, err)), provider="openai"
+                )
+                if limit is not None:
+                    quota.record(limit, "codex-plain")
+                    raise ModelCallError(
+                        f"OpenAI usage limit exhausted until "
+                        f"{limit.until.strftime('%H:%M UTC')}: {limit.message}"
+                    )
+                err = err or stdout_error or "(no output)"
                 raise ModelCallError(
                     f"Codex CLI failed (exit {process.returncode}): {err[-500:]}"
                 )

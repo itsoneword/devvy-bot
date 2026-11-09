@@ -8,7 +8,9 @@
 # owner identity, .env, profiles, workspaces, personas, database, systemd unit,
 # sudoers rule -- is set up here, and every step is safe to run again.
 #
-# Linux + systemd only (v1). See --help for the flags.
+# Linux + systemd for the Telegram bot. `--local` (dv-fe4d, beta) is the
+# laptop install instead: no Telegram, a headless server + the Pump TUI, and on
+# macOS two launchd agents (server, 2-minute pump tick). See --help.
 #
 # ---------------------------------------------------------------------------
 # Why there is no `set -e`
@@ -41,6 +43,7 @@ DO_UNINSTALL=0
 ASSUME_YES=0
 SKIP_AUTH=0
 SKIP_SERVICE=0
+LOCAL=0
 FAILED=0
 
 # ---------------------------------------------------------------------------
@@ -119,6 +122,10 @@ usage() {
     cat <<'USAGE'
 Usage: ./install.sh [options]
 
+  --local              Local mode (beta): no Telegram. A headless server and
+                       the Pump TUI (scripts/devvy-tui); on macOS launchd
+                       runs the server and the 2-minute pump tick. The
+                       default (and only) mode on macOS.
   --token <token>      Telegram bot token from @BotFather.
                        Also read from $TELEGRAM_BOT_TOKEN, or prompted for.
   --owner-id <id>      Your Telegram user id. Skips the interactive owner
@@ -128,7 +135,7 @@ Usage: ./install.sh [options]
                        python3 scripts/install_profiles.py --list
   --service-name <n>   systemd unit name (default: claude-bot).
   --skip-auth          Do not ask about Claude/Anthropic login. Finish later
-                       with /auth in Telegram or by editing .env.
+                       with claude auth login (local) or /auth (Telegram).
   --no-service         Configure everything, install no systemd unit. Run the
                        bot by hand with: poetry run python -m src.main
   --dry-run            Print every action, change nothing.
@@ -157,6 +164,7 @@ while [ $# -gt 0 ]; do
         --service-name=*) SERVICE_NAME="${1#*=}"; shift ;;
         --skip-auth)      SKIP_AUTH=1; shift ;;
         --no-service)     SKIP_SERVICE=1; shift ;;
+        --local)          LOCAL=1; shift ;;
         --dry-run)        DRY_RUN=1; shift ;;
         --uninstall)      DO_UNINSTALL=1; shift ;;
         -y|--yes)         ASSUME_YES=1; shift ;;
@@ -167,6 +175,30 @@ done
 
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SUDOERS_PATH="/etc/sudoers.d/${SERVICE_NAME}"
+
+# Darwin / Linux / WSL (WSL = WSL2 without systemd). DEVVY_PLATFORM overrides,
+# the same variable scripts/preflight.py reads, so the Mac path is testable.
+PLATFORM="${DEVVY_PLATFORM:-}"
+if [ -z "$PLATFORM" ]; then
+    case "$(uname -s)" in
+        Darwin) PLATFORM=Darwin ;;
+        *)  if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null &&
+               [ ! -d /run/systemd/system ]; then
+                PLATFORM=WSL
+            else
+                PLATFORM=Linux
+            fi ;;
+    esac
+fi
+# The Telegram service install needs systemd; a Mac gets local mode only.
+[ "$PLATFORM" = Darwin ] && LOCAL=1
+
+# Local mode (dv-fe4d): launchd agents on macOS.
+LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+LAUNCHD_AGENTS="server pump2"
+# One pump job at a time on a laptop: an implement job peaks around 2 GB.
+LOCAL_PUMP_MAX=1
+LOCAL_API_PORT=8080
 
 # ---------------------------------------------------------------------------
 # Uninstall
@@ -200,8 +232,31 @@ uninstall() {
     info "  sudo loginctl disable-linger ${USER:-$(id -un)}"
 }
 
+uninstall_local() {
+    say "${C_BOLD}Removing the local-mode launchd agents${C_OFF}"
+    say ""
+    local agent uid
+    uid="$(id -u)"
+    for agent in $LAUNCHD_AGENTS; do
+        run launchctl bootout "gui/$uid/com.devvy.$agent" 2>/dev/null
+        run rm -f "$LAUNCH_AGENTS/com.devvy.$agent.plist"
+    done
+    ok "launchd agents removed"
+    say ""
+    say "${C_BOLD}Left in place -- delete by hand if you mean to:${C_OFF}"
+    local p
+    for p in "$ENV_FILE" "$PROFILES_CONFIG" "$SCRIPT_DIR/data" \
+             "$SCRIPT_DIR/workspaces" "$SCRIPT_DIR/logs" "$RENDERED_DIR"; do
+        [ -e "$p" ] && info "$p"
+    done
+}
+
 if [ "$DO_UNINSTALL" = 1 ]; then
-    uninstall
+    if [ "$PLATFORM" = Darwin ]; then
+        uninstall_local
+    else
+        uninstall
+    fi
     exit 0
 fi
 
@@ -209,7 +264,11 @@ fi
 say "${C_BOLD}Devvy -- install${C_OFF}"
 [ "$DRY_RUN" = 1 ] && say "${C_YELLOW}--dry-run: nothing will be changed.${C_OFF}"
 info "root:    $SCRIPT_DIR"
-info "service: $SERVICE_NAME"
+if [ "$LOCAL" = 1 ]; then
+    info "mode:    local (beta) on $PLATFORM -- no Telegram"
+else
+    info "service: $SERVICE_NAME"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Preflight
@@ -218,7 +277,11 @@ step "1/10  Preflight"
 
 if ! command -v python3 >/dev/null 2>&1; then
     err "python3 is not installed, and this installer is written in it."
-    err "  fix: sudo apt-get update && sudo apt-get install -y python3"
+    if [ "$PLATFORM" = Darwin ]; then
+        err "  fix: brew install python@3.12"
+    else
+        err "  fix: sudo apt-get update && sudo apt-get install -y python3"
+    fi
     exit 1
 fi
 
@@ -253,6 +316,7 @@ for item in json.load(sys.stdin):
     case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
 }
 
+export DEVVY_PLATFORM="$PLATFORM"
 python3 scripts/preflight.py
 PREFLIGHT_RC=$?
 if [ "$PREFLIGHT_RC" != 0 ]; then
@@ -274,6 +338,11 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Bot token
 # ---------------------------------------------------------------------------
+if [ "$LOCAL" = 1 ]; then
+    step "2/10  Channel"
+    info "local: no Telegram. The Pump TUI (scripts/devvy-tui) is the interface."
+    ok "channel" "local"
+else
 step "2/10  Telegram bot token"
 
 if [ -z "$BOT_TOKEN" ] && [ -f "$ENV_FILE" ]; then
@@ -308,6 +377,7 @@ else
     fi
     ok "token valid" "@$BOT_USERNAME"
 fi
+fi  # LOCAL
 
 # ---------------------------------------------------------------------------
 # 3. Configuration (.env)
@@ -321,11 +391,24 @@ fi
 # ---------------------------------------------------------------------------
 step "3/10  Configuration (.env)"
 
+if [ "$LOCAL" = 1 ]; then
+    # One owner, id 1: the local channel's only address (LOCAL_CHAT_ID). The
+    # API server carries the inbox the TUI reads, bound to 127.0.0.1.
+    ENV_ARGS=(--env "$ENV_FILE"
+              --set "CHANNEL=local"
+              --set "ENABLE_API_SERVER=true"
+              --set "PROFILES_CONFIG_PATH=$PROFILES_CONFIG"
+              --set "DEVELOPMENT_MODE=false")
+    grep -qE '^[[:space:]]*ALLOWED_USERS[[:space:]]*=[[:space:]]*[0-9]' "$ENV_FILE" 2>/dev/null ||
+        ENV_ARGS+=(--set "ALLOWED_USERS=1")
+    info "CHANNEL=local, ENABLE_API_SERVER=true (127.0.0.1:$LOCAL_API_PORT)"
+else
 ENV_ARGS=(--env "$ENV_FILE"
           --set "TELEGRAM_BOT_TOKEN=$BOT_TOKEN"
           --set "TELEGRAM_BOT_USERNAME=$BOT_USERNAME"
           --set "PROFILES_CONFIG_PATH=$PROFILES_CONFIG"
           --set "DEVELOPMENT_MODE=false")
+fi
 [ "$DRY_RUN" = 1 ] && ENV_ARGS+=(--dry-run)
 
 if python3 scripts/render_env.py "${ENV_ARGS[@]}"; then
@@ -340,7 +423,9 @@ fi
 # ---------------------------------------------------------------------------
 step "4/10  Owner"
 
-if grep -qE '^[[:space:]]*ALLOWED_USERS[[:space:]]*=[[:space:]]*[0-9]' "$ENV_FILE" 2>/dev/null; then
+if [ "$LOCAL" = 1 ]; then
+    ok "owner" "local: this machine's user (ALLOWED_USERS=1)"
+elif grep -qE '^[[:space:]]*ALLOWED_USERS[[:space:]]*=[[:space:]]*[0-9]' "$ENV_FILE" 2>/dev/null; then
     skipped "owner capture" "ALLOWED_USERS already set in .env"
 elif [ "$DRY_RUN" = 1 ]; then
     info "would drain pending updates, wait for your /start, and confirm your id"
@@ -377,9 +462,15 @@ fi
 # ---------------------------------------------------------------------------
 step "6/10  Dependencies (poetry install)"
 
-if ! command -v poetry >/dev/null 2>&1; then
+if ! command -v poetry >/dev/null 2>&1 && [ "$DRY_RUN" = 1 ]; then
+    # Same rule as preflight: --dry-run reports the gap and keeps going.
+    info "would run: poetry install --no-interaction --no-ansi"
+    skipped "poetry install" "poetry is not on PATH, continuing because --dry-run"
+elif ! command -v poetry >/dev/null 2>&1; then
     failed "poetry install" "poetry is not on PATH"
-elif run poetry install --no-interaction --no-ansi; then
+elif [ "$LOCAL" = 1 ] && run poetry install --extras tui --no-interaction --no-ansi; then
+    ok "dependencies installed"
+elif [ "$LOCAL" != 1 ] && run poetry install --no-interaction --no-ansi; then
     ok "dependencies installed"
 else
     failed "poetry install" "see the output above"
@@ -420,6 +511,12 @@ except Exception:
 }
 
 auth_instructions() {
+    if [ "$LOCAL" = 1 ]; then
+        info "Finish the login later -- jobs need it, the server starts without it:"
+        info "  * run: claude auth login"
+        info "  * or put ANTHROPIC_API_KEY=... in $ENV_FILE"
+        return 0
+    fi
     info "Finish the login later, whenever you like -- the bot starts without it:"
     info "  * send /auth in Telegram and follow the buttons, or"
     info "  * run: claude auth login"
@@ -442,17 +539,29 @@ elif [ ! -t 0 ]; then
     auth_instructions
 else
     say ""
-    info "The bot needs a Claude subscription or an Anthropic API key to answer."
+    if [ "$LOCAL" = 1 ]; then
+        info "Local jobs need a Claude subscription or an Anthropic API key."
+    else
+        info "The bot needs a Claude subscription or an Anthropic API key to answer."
+    fi
     info "  1) Log in now in this terminal (opens a browser link)"
     info "  2) Paste an ANTHROPIC_API_KEY"
-    info "  3) Skip -- finish later with /auth in Telegram"
+    if [ "$LOCAL" = 1 ]; then
+        info "  3) Skip -- finish later with claude auth login"
+    else
+        info "  3) Skip -- finish later with /auth in Telegram"
+    fi
     read -r -p "     Choice [1/2/3, default 3]: " AUTH_CHOICE
     case "${AUTH_CHOICE:-3}" in
         1)
             if claude auth login; then
                 ok "Claude login"
             else
-                failed "Claude login" "you can still finish later with /auth"
+                if [ "$LOCAL" = 1 ]; then
+                    failed "Claude login" "finish later with claude auth login"
+                else
+                    failed "Claude login" "you can still finish later with /auth"
+                fi
                 auth_instructions
             fi
             ;;
@@ -504,7 +613,45 @@ install_service() {
     return 0
 }
 
-if [ "$SKIP_SERVICE" = 1 ]; then
+install_launchd() {
+    # Only the com.devvy.* agents: no unit, no root-owned files. The tick's
+    # job cap goes into its plist (BGJOB_MAX_CONCURRENT, read by scripts/bgjob).
+    local uid agent plist
+    uid="$(id -u)"
+    info "PUMP_MAX_CONCURRENT=$LOCAL_PUMP_MAX (one job at a time, about 2 GB each)"
+    run env PUMP_MAX_CONCURRENT="$LOCAL_PUMP_MAX" python3 scripts/render_deploy.py \
+        --launchd --out "$RENDERED_DIR" || return 1
+    run mkdir -p "$SCRIPT_DIR/logs" "$LAUNCH_AGENTS" || return 1
+    for agent in $LAUNCHD_AGENTS; do
+        plist="$LAUNCH_AGENTS/com.devvy.$agent.plist"
+        run cp "$RENDERED_DIR/com.devvy.$agent.plist" "$plist" || return 1
+        # bootout first so a re-run loads the new plist; not loaded = fine.
+        run launchctl bootout "gui/$uid/com.devvy.$agent" 2>/dev/null
+        run launchctl bootstrap "gui/$uid" "$plist" || return 1
+    done
+    return 0
+}
+
+local_by_hand() {
+    info "No launchd here: run the server and the pump tick yourself:"
+    info "  poetry run python -m src.main     # CHANNEL=local is in the config"
+    info "  crontab: */5 * * * * cd $SCRIPT_DIR && BGJOB_MAX_CONCURRENT=$LOCAL_PUMP_MAX scripts/pump2 tick"
+    info "Jobs use the process launcher when systemd is not running."
+}
+
+if [ "$LOCAL" = 1 ]; then
+    if [ "$SKIP_SERVICE" = 1 ]; then
+        skipped "launchd agents" "--no-service"
+        local_by_hand
+    elif [ "$PLATFORM" != Darwin ]; then
+        skipped "launchd agents" "not macOS"
+        local_by_hand
+    elif install_launchd; then
+        ok "launchd agents" "com.devvy.server, com.devvy.pump2 (tick every 2 min)"
+    else
+        failed "launchd agents" "see the output above"
+    fi
+elif [ "$SKIP_SERVICE" = 1 ]; then
     skipped "systemd service" "--no-service"
     info "Run the bot by hand: poetry run python -m src.main"
 elif ! command -v systemctl >/dev/null 2>&1; then
@@ -578,7 +725,30 @@ start_and_verify() {
     return 0
 }
 
-if [ "$SKIP_SERVICE" = 1 ] || ! command -v systemctl >/dev/null 2>&1; then
+local_health() {
+    # launchd started the server at bootstrap (RunAtLoad); wait for /health.
+    local url="http://127.0.0.1:$LOCAL_API_PORT/health" i
+    for i in $(seq 1 40); do
+        curl -fsS "$url" >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    err "no answer from $url within 40s -- last 30 log lines:"
+    tail -n 30 "$SCRIPT_DIR/logs/server.log" 2>/dev/null | sed 's/^/     /'
+    return 1
+}
+
+if [ "$LOCAL" = 1 ]; then
+    if [ "$SKIP_SERVICE" = 1 ] || [ "$PLATFORM" != Darwin ]; then
+        skipped "start" "no launchd agents installed"
+    elif [ "$DRY_RUN" = 1 ]; then
+        info "would wait for http://127.0.0.1:$LOCAL_API_PORT/health"
+        skipped "start" "--dry-run"
+    elif local_health; then
+        ok "server running" "127.0.0.1:$LOCAL_API_PORT"
+    else
+        failed "server did not come up" "tail -n 50 $SCRIPT_DIR/logs/server.log"
+    fi
+elif [ "$SKIP_SERVICE" = 1 ] || ! command -v systemctl >/dev/null 2>&1; then
     skipped "start" "no service installed"
 elif [ "$HAVE_OWNER" = 0 ] && [ "$DRY_RUN" != 1 ]; then
     # Starting an ownerless bot is the failure mode dv-5c83 exists to remove:
@@ -593,6 +763,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+if [ "$LOCAL" = 1 ]; then
+    say ""
+    if [ "$FAILED" = 0 ]; then
+        say "${C_BOLD}${C_GREEN}Done (local mode, beta).${C_OFF}"
+    else
+        say "${C_BOLD}${C_YELLOW}Finished with problems -- see the summary below.${C_OFF}"
+        say "  Fix what is marked ✘ and run ./install.sh --local again."
+    fi
+    say ""
+    say "  Pump TUI: scripts/devvy-tui"
+    say "  Logs:     tail -f $SCRIPT_DIR/logs/server.log $SCRIPT_DIR/logs/pump2.log"
+    if [ "$PLATFORM" = Darwin ]; then
+        say "  Restart:  launchctl kickstart -k gui/\$(id -u)/com.devvy.server"
+        say "  Once:     scripts/seatbelt_probe   (checks the job box on this Mac)"
+    fi
+    say "  Docs:     docs/installation.md (Local mode)"
+    exit "$FAILED"
+fi
+
 say ""
 if [ "$FAILED" = 0 ]; then
     say "${C_BOLD}${C_GREEN}Done.${C_OFF}"

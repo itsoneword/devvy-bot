@@ -73,14 +73,32 @@ def build_agents_manage(
     disagree a restart row is offered — the running registry is boot-only.
     The default profile is listed but has no toggle: the loader refuses to
     disable it.
+
+    A profile the boot switched off because its paths failed validation
+    (dv-86f4, ``live_registry.boot_disabled``) is marked "off this run" with
+    the reason; it does not count as a pending toggle, since a restart alone
+    brings it back only once its paths are fixed.
     """
+    boot_off = live_registry.boot_disabled
     live = {p.slug: p.enabled for p in live_registry.profiles}
     pending = any(
-        live.get(p.slug, p.enabled) != p.enabled for p in file_registry.profiles
+        live.get(p.slug, p.enabled) != p.enabled
+        for p in file_registry.profiles
+        if p.slug not in boot_off
     )
     rows: List[List[InlineKeyboardButton]] = []
     for p in file_registry.profiles:
         state = "✅" if p.enabled else "⛔"
+        if p.slug in boot_off:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{state} {p.name} ({p.slug}) — ⚠ off this run",
+                        callback_data=f"agents:toggle:{p.slug}",
+                    )
+                ]
+            )
+            continue
         if p.default:
             rows.append(
                 [
@@ -113,4 +131,9 @@ def build_agents_manage(
         lines.append("Saved; takes effect after a restart.")
     else:
         lines.append("Disabled agents keep their memory and workspace.")
+    for slug, reason in boot_off.items():
+        lines.append(
+            f"⚠ <code>{escape_html(slug)}</code> is off this run: "
+            f"{escape_html(reason)}. Fix it, then /restart."
+        )
     return "\n".join(lines), InlineKeyboardMarkup(rows)

@@ -24,6 +24,7 @@ from .models import (
 )
 from .pending_notes import PendingNoteRepository
 from .pinned_messages import PinnedMessageRepository
+from .reactions import ReactionRepository
 from .repositories import (
     AnalyticsRepository,
     AuditLogRepository,
@@ -87,6 +88,7 @@ class Storage:
         self.legacy_tasks = TaskRepository(self.db_manager)
         self.bot_users = BotUserRepository(self.db_manager)
         self.sent_messages = SentMessageRepository(self.db_manager)
+        self.reactions = ReactionRepository(self.db_manager)
         self.pending_notes = PendingNoteRepository(self.db_manager)
         self.holds = UserHoldRepository(self.db_manager)
         self.pinned_messages = PinnedMessageRepository(self.db_manager)

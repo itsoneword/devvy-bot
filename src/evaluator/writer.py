@@ -4,11 +4,23 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import structlog
 
-from src.storage.memory_repository import MemoryRepository, truncate_at_word
+from src.storage.memory_repository import (
+    MISSING_REF_PREFIX,
+    MemoryRepository,
+    split_ref,
+    truncate_at_word,
+)
+
+from .decision_refs import is_decision_ref
+
+if TYPE_CHECKING:
+    from src.storage.window_bundle_repository import WindowBundleRepository
+
+    from .decision_refs import DecisionRefChecker
 
 logger = structlog.get_logger()
 
@@ -25,6 +37,17 @@ _APPLIED_OUTCOMES = frozenset(
     {"added", "superseded", "invalidated", "conflict_flagged"}
 )
 
+# Tiers injected into every turn as standing facts. A change to one of these
+# re-freezes the current window's bundle (dv-ef59); general facts wait for
+# the roll (dv-5e2a).
+LIVE_TIERS = frozenset({"pinned", "core"})
+
+
+def effective_from(tier: Optional[str]) -> str:
+    """When a change to a fact of ``tier`` reaches the prompt (dv-ef59):
+    ``next_turn`` for pinned/core, ``next_window`` for everything else."""
+    return "next_turn" if tier in LIVE_TIERS else "next_window"
+
 
 @dataclass
 class OpOutcome:
@@ -39,6 +62,13 @@ class OpOutcome:
     # 'duplicate'|'noop_supersede'|'not_found'|'error'
     fact_id: Optional[int] = None
     scope: str = ""
+    # dv-32fe: a repo agent's decision its repo does not hold yet, written as
+    # a full user_fact flagged "missing:<ref>" (still counted as added).
+    not_in_repo: bool = False
+    # Tier of the fact the op touched: the new row's tier for add/supersede,
+    # the closed row's for invalidate. A supersede that changes tier keeps
+    # the "livelier" one, since either side reaching the prompt matters.
+    tier: Optional[str] = None
 
 
 @dataclass
@@ -75,6 +105,14 @@ class ApplyResult:
     @property
     def conflicts_flagged(self) -> int:
         return self._count("conflict_flagged")
+
+    @property
+    def not_in_repo(self) -> int:
+        return sum(
+            1
+            for o in self.outcomes
+            if o.not_in_repo and o.outcome in ("added", "superseded")
+        )
 
     @property
     def dropped_duplicate(self) -> int:
@@ -138,8 +176,24 @@ class MemoryWriter:
     counted.
     """
 
-    def __init__(self, repo: MemoryRepository, source: str = "evaluator") -> None:
+    def __init__(
+        self,
+        repo: MemoryRepository,
+        source: str = "evaluator",
+        decision_refs: Optional["DecisionRefChecker"] = None,
+        bundle_repo: Optional["WindowBundleRepository"] = None,
+    ) -> None:
         self._repo = repo
+        # dv-ef59: after a pinned/core change the affected scopes' current
+        # window bundles are marked stale here -- the one place every memory
+        # write (evaluator, remember, the audit tools) passes through.
+        # None = no refresh (tests, scripts).
+        self._bundle_repo = bundle_repo
+        # dv-32fe: when set, a repo agent's op whose source_ref names a
+        # decision location (DECISIONS.md, a card) is checked against the repo
+        # before it is written: verified -> pointer, else a flagged full fact.
+        # None = no check (tests, scripts, the audit writer).
+        self._decision_refs = decision_refs
         # Stamped on every row this writer creates (``memory_facts.source``).
         # The batch evaluator uses the default; the in-session ``remember``
         # tool passes "agent_tool", which is what makes "how much memory did
@@ -196,6 +250,7 @@ class MemoryWriter:
                     # by contract (the validator strips any) — the structural
                     # guarantee that nothing rewrites an existing row.
                     target_id = int(op["target_id"])  # type: ignore[call-overload]
+                    outcome.tier = await self._tier_of(target_id, target)
                     if await self._repo.invalidate_fact(
                         target_id, target, source=self._source
                     ):
@@ -224,6 +279,10 @@ class MemoryWriter:
                 label = op.get("label")
                 source_ref = op.get("source_ref")
                 tier_val = str(op.get("tier") or "general")
+                if self._decision_refs is not None and target == agent_id:
+                    kind, source_ref = self._route_decision(
+                        agent_id, kind, source_ref, content, outcome
+                    )
                 if (
                     kind == "user_fact"
                     and tier_val == "general"
@@ -270,8 +329,10 @@ class MemoryWriter:
                     seen[target].append((new_id, normalized))
                     outcome.outcome = "added"
                     outcome.fact_id = new_id
+                    outcome.tier = str(op["tier"])
                 elif op_name == "supersede":
                     old_id = int(op["supersedes_id"])  # type: ignore[call-overload]
+                    old_tier = await self._tier_of(old_id, target)
                     if self._is_noop_supersede(seen[target], old_id, normalized):
                         self.duplicates_rejected += 1
                         outcome.outcome = "noop_supersede"
@@ -299,10 +360,13 @@ class MemoryWriter:
                     seen[target].append((new_id, normalized))
                     outcome.outcome = "superseded"
                     outcome.fact_id = new_id
+                    new_tier = str(op["tier"])
+                    outcome.tier = old_tier if old_tier in LIVE_TIERS else new_tier
                 self.ops_applied += 1
             except Exception as e:
                 logger.error("Failed to apply memory op", op=op, error=str(e))
 
+        await self._refresh_bundles(result)
         if len(ops) != result.applied:
             logger.info(
                 "Memory ops applied",
@@ -312,6 +376,73 @@ class MemoryWriter:
                 duplicates_rejected_total=self.duplicates_rejected,
             )
         return result
+
+    async def _tier_of(self, fact_id: int, agent_id: str) -> Optional[str]:
+        """Tier of an existing fact, read only when bundles can be refreshed
+        (it decides whether closing the fact re-freezes the window)."""
+        if self._bundle_repo is None:
+            return None
+        try:
+            fact = await self._repo.get_fact(fact_id, agent_id)
+        except Exception as e:
+            logger.warning("Fact tier lookup failed", fact_id=fact_id, error=str(e))
+            return None
+        return fact.tier if fact else None
+
+    async def _refresh_bundles(self, result: ApplyResult) -> None:
+        """Mark stale the current bundle of every scope whose pinned/core
+        facts this batch changed (dv-ef59). Never fails the write."""
+        if self._bundle_repo is None:
+            return
+        scopes = {
+            o.scope
+            for o in result.outcomes
+            if o.outcome in ("added", "superseded", "invalidated")
+            and o.tier in LIVE_TIERS
+        }
+        if not scopes:
+            return
+        try:
+            await self._bundle_repo.mark_stale(scopes)
+        except Exception as e:
+            logger.warning(
+                "Bundle stale mark failed; change applies at the next window",
+                scopes=sorted(scopes),
+                error=str(e),
+            )
+
+    def _route_decision(
+        self,
+        agent_id: str,
+        kind: str,
+        source_ref: object,
+        content: str,
+        outcome: OpOutcome,
+    ) -> Tuple[str, object]:
+        """(kind, source_ref) for an op of a repo agent's own scope (dv-32fe).
+
+        Only refs naming a decision location are checked; everything else
+        passes unchanged. Verified -> ``conversation_result`` pointing at the
+        ref (full text stays in the row). Not verified -> ``user_fact`` with
+        ``missing:<ref>``: injected in full with a visible flag until the
+        sweep finds it in the repo.
+        """
+        assert self._decision_refs is not None
+        ref = str(source_ref).strip() if isinstance(source_ref, str) else ""
+        # A ref already carrying the flag (an echoed row) is checked afresh.
+        ref = split_ref(ref)[0] or ""
+        if not self._decision_refs.handles(agent_id) or not is_decision_ref(ref):
+            return kind, source_ref
+        if self._decision_refs.verify(agent_id, ref, content):
+            return "conversation_result", ref
+        outcome.not_in_repo = True
+        logger.info(
+            "memory_decision_not_in_repo",
+            agent_id=agent_id,
+            ref=ref,
+            content=content[:120],
+        )
+        return "user_fact", MISSING_REF_PREFIX + ref
 
     async def _load_scope(self, agent_id: str) -> List[Tuple[Optional[int], str]]:
         """(id, normalised content) for every active fact in a scope."""

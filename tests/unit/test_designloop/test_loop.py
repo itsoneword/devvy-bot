@@ -1,10 +1,11 @@
 """The design loop runner (dv-9133 phase 3): variants, gate, critic rounds,
-collage.
+collage. dv-2d00: a run that ends on rounds / repeated without a ready
+variant still offers the critiqued ones, best score first.
 
 Contract pinned here (docs/research/dv-9133/analysis.md §3 and phase 3):
 ``src.designloop.loop.run_loop(brief, *, generate, render, gate, critic,
 collage, deliver)`` is a coroutine. Every step is injected and awaited, so the
-taskpump subcommand wires the real ones (agentjob on the ``design_generate``
+pump2 subcommand wires the real ones (agentjob on the ``design_generate``
 route, the board's render / gate argv, ``critic.critique`` through the router,
 the board python's collage script, the pump's notify) and these tests wire
 fakes. No real model, browser or Telegram.
@@ -18,7 +19,7 @@ fakes. No real model, browser or Telegram.
   that failed the gate never reaches the critic.
 - ``critic(brief, renders) -> Critique`` (phase 2's class), per variant.
 - ``collage(variants) -> Path``: one image of the variants.
-- ``deliver(text, images)``: the message to the owner's (gymbro) chat.
+- ``deliver(text, images)``: the message to the owner's (app) chat.
 
 Stop: every variant ``ready``, 3 rounds, or the same fixes as last round.
 The outcome has ``.stop`` (``ready`` | ``rounds`` | ``repeated``), ``.rounds``
@@ -37,7 +38,7 @@ import pytest
 from src.designloop.brief import build_brief
 from src.designloop.critic import CRITERIA, Critique
 
-CARD = "gb-d001"
+CARD = "dv-d001"
 BRANCHES = tuple(f"design/{CARD}/v{n}" for n in (1, 2, 3))
 
 
@@ -133,8 +134,8 @@ class Steps:
 
 
 @pytest.fixture
-def brief(gymbro_repo):
-    return build_brief(gymbro_repo, "feed", "Too many filters on top; reduce them")
+def brief(app_repo):
+    return build_brief(app_repo, "feed", "Too many filters on top; reduce them")
 
 
 async def run(brief, steps: Steps):
@@ -219,10 +220,10 @@ async def test_revise_three_rounds_stops_with_notes_on_the_variant(brief, tmp_pa
     # The unresolved notes go with each variant.
     for branch in BRANCHES:
         assert f"round 3: {branch} bell chip" in notes_of(outcome, branch)
-    # Only ready reaches the owner as a choice: no collage, no pick.
-    assert steps.collages == []
-    assert all(images == [] for _, images in steps.delivered)
+    # dv-2d00: no ready variant, still offered with the open remarks.
+    assert len(steps.collages) == 1
     assert len(steps.delivered) == 1
+    assert steps.delivered[0][1]
     assert "bell chip repeats the bell button" in steps.delivered[0][0]
 
 
@@ -239,8 +240,9 @@ async def test_same_notes_twice_stops_early_with_notes_on_the_variant(brief, tmp
     assert steps.generations == 2
     for branch in BRANCHES:
         assert "Saved chip competes" in notes_of(outcome, branch)
-    assert steps.collages == []
-    assert all(images == [] for _, images in steps.delivered)
+    # dv-2d00: offered anyway.
+    assert len(steps.collages) == 1
+    assert steps.delivered[0][1]
 
 
 # --------------------------------------------------------------------------

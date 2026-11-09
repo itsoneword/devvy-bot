@@ -100,6 +100,71 @@ validate the installed copy too, since that is the file sudo actually reads.
 | `data/soul.md`, memory files | No — read at session start |
 | `CLAUDE.md` | No — read at session start |
 
+**Boot check before every planned restart (dv-86f4).** `/restart` and the
+`restart_bot` tool first run `scripts/check_install.py --preflight` in a
+subprocess, from the repo root with a clean environment (it reads the env file
+and secrets file itself): `import src.main`, Settings, the profile registry
+with strict path validation, and a read-only `alembic_version` check of all
+four DBs (a DB stamped with a revision the code does not know = code older
+than the DB). It never creates or migrates a DB. Exit 1 → no restart; the
+reply quotes the first failing line and offers a **⚠ Force restart** button
+(= `/restart force`, no check). `restart_bot` runs the check again after the
+drain and sends the owner the reason if it fails then. The check runs ~3 s.
+
+**owner-actions steps.** A step that edits `config/`, the env file or the
+secrets file ends with
+
+```bash
+(cd ~/Devvybot/devvy_bot && poetry run python scripts/check_install.py --preflight)
+```
+
+so `set -e` stops the script at the step that broke the config, not at the
+next `/restart` (incident 2026-10-28: an `extra_dirs` entry added before the
+dir existed crash-looped the bot for 12 min).
+
+**Crash-loop alert (dv-86f4).** The drop-in
+`deploy/claude-bot-crashwatch.conf.template` adds
+`ExecStopPost=-<repo>/deploy/crashwatch.sh`. After every stop it reads
+systemd's `SERVICE_RESULT`: `success` (clean stop, `/restart`) clears the
+count; anything else appends the time to `<data root>/crashwatch/fails`. Three
+crashes within 120 s send one message
+«🔴 claude-bot падает: … Последняя ошибка: <last error line of the journal>»
+through `deploy/notify-fallback.sh` (agentctl notify, else a direct Bot API send
+with `agents/server-monitor/.env`; `ssh-login-alert.sh` uses the same sender),
+and stamp `crashwatch/alerted`. A boot that stays up 60 s after polling starts
+sends «✅ Бот снова работает после N падений подряд» and clears `fails` and
+`alerted`. Every threshold hit either switches to safe mode (below) or stops
+the bot (`lkg/HALT`), so there is one alert per loop and no quiet window.
+There is no systemd restart backoff (see `docs/FINDINGS.md` 2026-10-31).
+Install once (owner step, sudo; idempotent, no restart):
+
+```bash
+sudo bash ~/Devvybot/devvy_bot/deploy/crashwatch/install.sh
+```
+
+**Safe mode (dv-86f4).** A boot that has run 10 min with polling up, and whose
+restart preflight then passes, copies the live `profiles.yaml` / `models.yaml`
+to `<data root>/lkg/` with `meta.json` (time, git sha) (`src/boot/safemode.py`).
+At the crash-loop threshold, with that snapshot present, crashwatch touches
+`lkg/USE` and `lkg/tried` and says «🛟 Включаю safe mode» in the alert. The next boot loads the snapshot config, keeps
+only the default profile (devops), owner-only, turns every other agent off for
+the run, and sends one «🛟 Safe mode: …» message: snapshot date and sha, the
+agents it turned off, and how devops differs from the live file (or that the
+live file does not parse). Config only, never old code: old code cannot open a
+DB already migrated forward. To leave: fix the live config and `/restart`;
+a passing check removes `USE` (a forced restart does not). If safe mode crashes
+3 times too, crashwatch sends «safe mode failed», touches `lkg/HALT`, and the
+drop-in's `ExecCondition=` (`crashwatch.sh condition`) skips every further
+start: the bot stays down, no endless restarts. The same stop happens when a
+loop hits the threshold and safe mode cannot be entered (no snapshot yet, e.g.
+in the first 10 min after a boot or while a profile is degraded so the strict
+check fails; or safe mode was already tried): «нет последнего рабочего
+конфига — бот остановлен». After fixing, from a shell:
+
+```bash
+bash ~/Devvybot/devvy_bot/deploy/crashwatch.sh reset && sudo systemctl start claude-bot
+```
+
 **Core subset (dv-5206).** Before every restart run `make test-core` (~1 min:
 window roll, evaluator, items, policy parity, export drift; the list is
 `CORE_TESTS` in `tests/conftest.py`). Restart only if it passes; a failure is
@@ -130,7 +195,7 @@ rows before trusting it).
 | Memory consolidation report | `src/main.py` APScheduler | `0 6 * * 1` + debounced pressure-valve runs | `claude` CLI |
 | Fact-quality check | `src/evaluator/fact_quality.py` | `0 7 * * *`, off unless `FACT_QUALITY_CHECK_ENABLED` | `claude` CLI, haiku |
 | Reminders / items | `scheduled_jobs` table, `src/scheduler/` | per row | `deliver=agent`: an agent turn; `message`: none |
-| Task pump | user `taskpump.timer` → `scripts/taskpump tick` | every 10 min | tick: none; spawns agent jobs (`docs/taskpump.md`) |
+| Pump v2 | user `pump2.timer` → `scripts/pump2 tick` | every 2 min; only boards with `"pump2": true` in `boards.json` (docs/pump.md) | tick: none; spawns stage jobs, then runs `scripts/release tick` (public-release check / reminders, best-effort). Install: `python3 scripts/render_deploy.py && cp deploy/rendered/pump2.{service,timer} ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now pump2.timer` |
 | /tmp sweep | user `tmpsweep.timer` → `scripts/tmpsweep --notify` | every 15 min; sweeps only when /tmp >70% or last sweep ≥23h | none |
 | Your own host jobs (backups, monitors) | user crontab or systemd timers | as you set them | outside the bot |
 

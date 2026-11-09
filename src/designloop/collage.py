@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One collage image of the design variants (dv-9133 phase 3).
+"""One collage image of the design variants (the loop's phase 3).
 
 Run by the board's python, which has Pillow (the bot venv does not):
 

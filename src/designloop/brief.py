@@ -1,8 +1,8 @@
-"""The design brief, assembled by script from the board repo's docs (dv-9133).
+"""The design brief, assembled by script from the board repo's docs.
 
 Never written by hand: a hand-written brief prescribed the answer (three
-fixed variants) and lost features (owner, designer audit 2026-10-27). The
-sources, all in the board repo (gymbro today):
+fixed variants) and lost features (a designer audit). The
+sources, all in the board repo:
 
 - ``docs/features.yaml``: must-keep, every feature / action / API route of
   the screen. A feature may move, merge or go behind a tap; it may not be lost.
@@ -27,7 +27,7 @@ REFS_DIR = "docs/screens"
 GUIDE_PATH = "docs/UI_GUIDE.md"
 THEMES = ("dark", "light")
 
-# Owner 27.10 (designer audit): the biggest lever. Who needs a feature, how
+# The designer audit's biggest lever: Who needs a feature, how
 # often, and how much of the screen it deserves decide its weight; not the
 # order the task happens to name them in.
 VALUE_AND_SPACE = """\
@@ -194,7 +194,7 @@ class Screen:
 def load_features(path: Path) -> Dict[str, Screen]:
     """``screens:`` of features.yaml: passport, source and features.
 
-    The file is a YAML subset (gymbro's ``scripts/harness/feature_map.py``
+    The file is a YAML subset (a board's feature map script
     reads it; PyYAML chokes on its quoting), so this walks it by indent and
     keeps only the keys a brief needs: ``screens.<id>.{passport,source}``
     and ``screens.<id>.features.<name>.{action,api}``.

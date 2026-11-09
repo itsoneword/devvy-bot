@@ -20,7 +20,7 @@ it was before this module existed (``data/bot.db`` relative to the repo, and
 so on), so a deployment that has not migrated keeps booting on its current
 files. The migration (dv-4030) moves the data and then sets the variable.
 
-Standard library only: stdlib scripts (``scripts/taskpump``) import this, and
+Standard library only: stdlib scripts (``scripts/release``) import this, and
 the llm_analytics / channel_intel daemons read it without loading Settings.
 """
 
@@ -175,6 +175,22 @@ class DataLayout:
         return None if self.root is None else self.secrets_dir / "bot.env"
 
     @property
+    def tui_secret_file(self) -> Path:
+        """The local TUI's credential (dv-fe4d): the only key that may read
+        the inbox and answer an owner prompt (``/internal/callback``). Its own
+        file, not a line in bot.env: every agent job reads bot.env for the
+        internal bearer, and both job boxes hide this file from the job.
+
+        Always inside a ``secret_dirs`` entry, so the deny every agent gets on
+        key material covers it too: ``<root>/secrets/tui.secret``, and in the
+        legacy layout ``data/model_auth/tui.secret`` (``data/`` itself is not
+        denied there). Relative in the legacy layout: see
+        :func:`tui_secret_path`."""
+        if self.root is None:
+            return self.legacy_dir / "model_auth" / "tui.secret"
+        return self.secrets_dir / "tui.secret"
+
+    @property
     def codex_credentials(self) -> Path:
         return self.secrets_dir / "model_auth" / "openai_codex.json"
 
@@ -210,6 +226,35 @@ class DataLayout:
         if self.root is None:
             return self.legacy_dir / "taskpump-outbox"
         return self.root / "workspaces" / "devops" / "taskpump" / "outbox"
+
+    # --- release front (dv-81a7) -------------------------------------------
+
+    @property
+    def release_state(self) -> Path:
+        """Publish state of ``scripts/release`` (own file; the lock is its
+        ``.lock`` sibling)."""
+        if self.root is None:
+            return self.legacy_dir / "release.json"
+        return self.root / "workspaces" / "devops" / "release" / "state.json"
+
+    @property
+    def release_outbox(self) -> Path:
+        """Cards ``scripts/release`` could not deliver (bot down), retried."""
+        if self.root is None:
+            return self.legacy_dir / "release-outbox"
+        return self.root / "workspaces" / "devops" / "release" / "outbox"
+
+    # --- safe mode --------------------------------------------------------
+
+    @property
+    def lkg_dir(self) -> Path:
+        """``<root>/lkg``: the last-known-good profiles/models config and the
+        safe-mode flags (dv-86f4, ``src/boot/safemode.py``,
+        ``deploy/crashwatch.sh``). Legacy layout: ``data/lkg``, next to
+        ``data/crashwatch`` as crashwatch.sh expects."""
+        if self.root is None:
+            return self.legacy_dir / "lkg"
+        return self.root / "lkg"
 
     # --- model availability ---------------------------------------------
 
@@ -263,6 +308,33 @@ def read_bot_secret(
             if found:
                 return found
     return None
+
+
+def tui_secret_path(layout: Optional[DataLayout] = None) -> Path:
+    """The TUI credential as an absolute path. A legacy-layout path is
+    relative to the checkout, not to the cwd: the server, bgjob's box and the
+    TUI must all name the same file whatever directory they started in."""
+    p = (layout or data_layout()).tui_secret_file
+    return p if p.is_absolute() else REPO_ROOT / p
+
+
+def ensure_tui_secret(path: Path) -> str:
+    """The TUI credential in *path*, created (0600, random) when missing.
+    The server calls this at a local-channel boot; the TUI only reads it."""
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        value = ""
+    if value:
+        return value
+    import secrets
+
+    value = secrets.token_urlsafe(32)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(value + "\n")
+    return value
 
 
 def archive_dir(

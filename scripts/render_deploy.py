@@ -12,12 +12,18 @@ Usage:
 
 Every value is detected from the running system; each has an env override:
     DEVVY_ROOT, SERVICE_USER, SERVICE_GROUP, POETRY_BIN, SYSTEMCTL,
-    SERVICE_PATH, MEMORY_HIGH, MEMORY_MAX, MEMORY_SWAP_MAX
+    SERVICE_PATH, MEMORY_HIGH, MEMORY_MAX, MEMORY_SWAP_MAX, LOG_DIR,
+    PUMP_MAX_CONCURRENT
+
+The com.devvy.*.plist files are the macOS local mode's launchd agents
+(dv-fe4d); rendering them on Linux is harmless, they are just not installed.
+``--launchd`` renders only those (``install.sh --local`` on a Mac).
 
 The rendered sudoers file is validated with ``visudo -cf`` and the renderer
 exits non-zero if it does not parse. A malformed file in /etc/sudoers.d can
 lock you out of the machine, so this check is not optional.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -79,15 +85,13 @@ def build_values(service_name: str) -> dict[str, str]:
         home = Path(pwd.getpwnam(user).pw_dir)
     except KeyError:
         home = Path.home()
-    default_path = os.pathsep.join(
-        [
-            str(home / ".local" / "bin"),
-            str(home / ".npm-global" / "bin"),
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-        ]
-    )
+    path_parts = [str(home / ".local" / "bin"), str(home / ".npm-global" / "bin")]
+    if os.environ.get("DEVVY_PLATFORM") == "Darwin" or sys.platform == "darwin":
+        # launchd does not inherit the login shell's PATH. Apple Silicon brew
+        # installs Python, Node and Poetry under /opt/homebrew/bin.
+        path_parts.extend(["/opt/homebrew/bin", "/opt/homebrew/sbin"])
+    path_parts.extend(["/usr/local/bin", "/usr/bin", "/bin"])
+    default_path = os.pathsep.join(path_parts)
     return {
         "SERVICE_USER": user,
         "SERVICE_GROUP": _detect_group(user),
@@ -99,6 +103,13 @@ def build_values(service_name: str) -> dict[str, str]:
         "MEMORY_HIGH": os.environ.get("MEMORY_HIGH", "2G"),
         "MEMORY_MAX": os.environ.get("MEMORY_MAX", "2.5G"),
         "MEMORY_SWAP_MAX": os.environ.get("MEMORY_SWAP_MAX", "256M"),
+        # launchd agents' stdout/stderr (macOS local mode). Under the checkout,
+        # not $HOME: the service user's home is unknown when it does not exist
+        # on the rendering machine, and a fallback would leak this one's.
+        "LOG_DIR": os.environ.get("LOG_DIR") or str(root / "logs"),
+        # The pump's job cap in the launchd tick (local mode). One job at a
+        # time on a laptop: an implement job peaks around 2 GB (dv-fe4d R2).
+        "PUMP_MAX_CONCURRENT": os.environ.get("PUMP_MAX_CONCURRENT", "1"),
     }
 
 
@@ -145,10 +156,16 @@ def main() -> int:
     ap.add_argument("--out", type=Path, help="directory to write rendered files into")
     ap.add_argument("--print", action="store_true", help="write to stdout instead")
     ap.add_argument("--service-name", default="claude-bot")
+    ap.add_argument(
+        "--launchd",
+        action="store_true",
+        help="only the macOS launchd agents (local mode): no unit, no sudoers",
+    )
     args = ap.parse_args()
 
     values = build_values(args.service_name)
-    templates = sorted(TEMPLATE_DIR.glob("*.template"))
+    pattern = "com.devvy.*.plist.template" if args.launchd else "*.template"
+    templates = sorted(TEMPLATE_DIR.glob(pattern))
     if not templates:
         raise SystemExit(f"no templates found in {TEMPLATE_DIR}")
 
@@ -180,6 +197,8 @@ def main() -> int:
         if "sudoers" in target.name:
             validate_sudoers(target)
 
+    if args.launchd:
+        return 0
     print(f"\nRendered into {out_dir}. Install with:")
     print(
         f"  sudo cp {out_dir}/claude-bot.service /etc/systemd/system/"
@@ -197,6 +216,14 @@ def main() -> int:
     print(
         "  systemctl --user daemon-reload && systemctl --user enable --now tmpsweep.timer"
     )
+    print("macOS local mode (launchd agents, dv-fe4d):")
+    print(f"  mkdir -p {values['LOG_DIR']}")
+    print(f"  cp {out_dir}/com.devvy.*.plist ~/Library/LaunchAgents/")
+    for agent in ("server", "pump2"):
+        print(
+            "  launchctl bootstrap gui/$(id -u)"
+            f" ~/Library/LaunchAgents/com.devvy.{agent}.plist"
+        )
     return 0
 
 

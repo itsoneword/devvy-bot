@@ -1,6 +1,6 @@
-"""Calibrate the design critic on current screens (dv-9133, first step).
+"""Calibrate the design critic on current screens (the loop's first step).
 
-Before the loop trusts the critic, it critiques three current gymbro screens
+Before the loop trusts the critic, it critiques three current screens of the board's app
 (their reference PNGs, dark + light) against well-known apps; the owner has
 no favourites yet, so industry references stand in. The report keeps the raw
 critic output per screen, so a reader can judge whether the critique is
@@ -32,7 +32,7 @@ class Target:
     references: Tuple[str, ...]
 
 
-# Ticket 26.10: Strava (feed + map), Meetup / Partiful (event discovery and
+# The reference apps: Strava (feed + map), Meetup / Partiful (event discovery and
 # the event page), Airbnb (map + list). The feed has a map and a list view.
 TARGETS: Tuple[Target, ...] = (
     Target(
@@ -117,7 +117,7 @@ async def calibrate(
 def render_report(outcomes: Sequence[Outcome], point_by_point: bool) -> str:
     mode = "point-by-point" if point_by_point else "standard"
     lines = [
-        "# dv-9133 — design critic calibration",
+        "# Design critic calibration",
         "",
         f"Run {datetime.now(UTC):%Y-%m-%d %H:%M} UTC, prompt mode: {mode}, "
         "route: design_critic (Codex, no fallback).",

@@ -25,6 +25,7 @@ from ..exceptions import ClaudeCodeTelegramError
 from ..notifications.routing import JOBS_HINT
 from ..security.auth import fallback_role
 from ..utils.loop_lag import monitor_loop_lag
+from .features.feedback import FEEDBACK_SOURCE, handle_feedback_message
 from .features.registry import FeatureRegistry
 from .orchestrator import MessageOrchestrator
 from .rate_limit import DevvyRateLimiter
@@ -193,6 +194,7 @@ class ClaudeCodeBot:
         )
 
         self._add_reports_chat_handlers()
+        self._add_reaction_handler()
 
         logger.info("Middleware added to bot")
 
@@ -268,13 +270,28 @@ class ClaudeCodeBot:
                         or getattr(message, "document", None)
                     )
                 ):
-                    slug = await router.profile_for_message(message)
                     role = None
                     auth = self.deps.get("auth_manager")
                     if auth is not None:
                         role = auth.get_user_role(user.id)
                     if role is None:
                         role = fallback_role(user.id, self.settings)
+                    if await router.is_route_topic(message, FEEDBACK_SOURCE):
+                        # Feedback (dv-a42c): bound to no profile. An owner's
+                        # text / voice answer is stored by the feedback
+                        # handler; it never reaches a turn or a session.
+                        if role == "owner" and (
+                            message.text or getattr(message, "voice", None)
+                        ):
+                            # Group -4 runs before the middleware that fills
+                            # bot_data; an answer can be the first update
+                            # after a restart.
+                            for key, value in self.deps.items():
+                                context.bot_data.setdefault(key, value)
+                            context.bot_data.setdefault("settings", self.settings)
+                            await handle_feedback_message(update, context)
+                        raise ApplicationHandlerStop
+                    slug = await router.profile_for_message(message)
                     topic = await router.topic_name_for_thread(
                         message.chat_id,
                         message.message_thread_id if message.is_topic_message else None,
@@ -302,6 +319,36 @@ class ClaudeCodeBot:
                 ),
                 group=-4,
             )
+
+    def _add_reaction_handler(self) -> None:
+        """Reactions on bot turn replies as answer-quality labels (dv-e1a7).
+
+        ``message_reaction`` updates arrive via ``allowed_updates=ALL_TYPES``;
+        the message middleware never matches them, so the handler checks the
+        sender itself. Group -4: independent of the message handler groups.
+        """
+        from telegram.ext import MessageReactionHandler
+
+        from .features.reactions import handle_message_reaction
+
+        async def on_reaction(
+            update: Update, context: ContextTypes.DEFAULT_TYPE
+        ) -> None:
+            # The middleware fills bot_data lazily; a reaction can be the
+            # first update after a restart.
+            for key, value in self.deps.items():
+                context.bot_data.setdefault(key, value)
+            context.bot_data.setdefault("settings", self.settings)
+            await handle_message_reaction(update, context)
+
+        assert self.app is not None
+        self.app.add_handler(
+            MessageReactionHandler(
+                on_reaction,
+                message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_UPDATED,
+            ),
+            group=-4,
+        )
 
     def _create_middleware_handler(self, middleware_func: Callable) -> Callable:
         """Create middleware handler that injects dependencies.

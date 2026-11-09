@@ -266,8 +266,12 @@ def build(settings_cls: Any, source: str) -> str:
     sections = parse_sections(source)
     blocks: List[str] = [HEADER.rstrip("\n")]
     current: Optional[str] = None
+    # Never written to an env file (the loader refuses them there, dv-fe4d).
+    from src.config.settings import PROCESS_ENV_ONLY
 
     for name, field in settings_cls.model_fields.items():
+        if name.upper() in PROCESS_ENV_ONLY:
+            continue
         section = sections.get(name, "General")
         if section != current:
             current = section

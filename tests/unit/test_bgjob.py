@@ -10,13 +10,19 @@ import pytest
 _BGJOB_PATH = Path(__file__).parents[2] / "scripts" / "bgjob"
 
 
+ROUTE = '{"harness": "claude", "provider": "anthropic_sub", "model": "sonnet"}'
+
+
 @pytest.fixture
-def bgjob():
+def bgjob(monkeypatch):
     loader = SourceFileLoader("bgjob_under_test", str(_BGJOB_PATH))
     spec = importlib.util.spec_from_loader("bgjob_under_test", loader)
     assert spec is not None
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
+    # These wrapper tests stub subprocess output; route resolution is covered
+    # separately and must succeed before a model job can launch.
+    monkeypatch.setattr(mod, "job_harness", lambda *args: "claude")
     return mod
 
 
@@ -120,7 +126,14 @@ def _write_run_sh(bgjob, tmp_path, monkeypatch) -> Path:
         stderr = ""
         stdout = ""
 
-    monkeypatch.setattr(bgjob.subprocess, "run", lambda cmd, **kw: R())
+    monkeypatch.setattr(
+        bgjob.subprocess,
+        "run",
+        # The route probe must answer: an empty answer aborts the launch (dv-a8e4).
+        lambda cmd, **kw: (
+            type("RR", (R,), {"stdout": ROUTE})() if "--print-route" in cmd else R()
+        ),
+    )
     args = type(
         "A",
         (),
@@ -332,19 +345,17 @@ def test_run_prepends_preamble_and_ticket(bgjob, tmp_path, monkeypatch):
     monkeypatch.setattr(bgjob, "load_profiles", lambda: {"general": str(tmp_path)})
     monkeypatch.setattr(bgjob, "live_jobs", lambda: [])
     monkeypatch.setattr(bgjob.shutil, "which", lambda name: "/bin/sh")
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    (tasks / "dv-aaaa.md").write_text("---\nid: dv-aaaa\n---\n")
+    monkeypatch.setattr(bgjob, "HOME_TASKS", tasks)
 
     class R:
         returncode = 0
         stderr = ""
+        stdout = "{}"
 
-        def __init__(self, out):
-            self.stdout = out
-
-    monkeypatch.setattr(
-        bgjob.subprocess,
-        "run",
-        lambda cmd, **kw: R("/x/dv-aaaa.md\n" if "path" in cmd else "{}"),
-    )
+    monkeypatch.setattr(bgjob.subprocess, "run", lambda cmd, **kw: R())
     args = type(
         "A",
         (),
@@ -360,9 +371,26 @@ def test_run_prepends_preamble_and_ticket(bgjob, tmp_path, monkeypatch):
     bgjob.cmd_run(args)
     prompt = next(tmp_path.glob("*/prompt.txt")).read_text()
     assert "<summary>" in prompt
-    assert "Ticket: /x/dv-aaaa.md" in prompt
+    assert f"Ticket: {tasks / 'dv-aaaa.md'}" in prompt
     assert prompt.rstrip().endswith("do it")
     assert "summarize" in next(tmp_path.glob("*/run.sh")).read_text()
+
+
+def test_run_refuses_a_task_the_home_board_does_not_have(bgjob, tmp_path, monkeypatch):
+    monkeypatch.setattr(bgjob, "JOBS_ROOT", tmp_path)
+    monkeypatch.setattr(bgjob, "load_profiles", lambda: {"general": str(tmp_path)})
+    monkeypatch.setattr(bgjob, "live_jobs", lambda: [])
+    monkeypatch.setattr(bgjob.shutil, "which", lambda name: "/bin/sh")
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    (tasks / "dv-aaaa.md").write_text("---\nid: dv-aaaa\n---\n")
+    monkeypatch.setattr(bgjob, "HOME_TASKS", tasks)
+    base = {"prompt": "x", "profile": "general", "name": "t", "allow_dir": None}
+    for task in ("dv-zzzz", "gymbro:dv-aaaa"):
+        args = type("A", (), {**base, "model": "sonnet", "task": task})()
+        with pytest.raises(SystemExit) as exc:
+            bgjob.cmd_run(args)
+        assert "unknown task" in str(exc.value)
 
 
 class TestCmdJobs:
@@ -970,7 +998,7 @@ class TestPromptJobsStillRefusedAtCap:
 # * `--model` has no default any more: without it run.sh passes no
 #   `--model`, so the table row decides (an always-sent `sonnet` would beat
 #   every row, and on a non-Claude route it would be a Claude tier);
-# * the legacy PUMP_*_MODEL env (taskpump's environment) must still reach
+# * the legacy PUMP_*_MODEL env (the pump's environment) must still reach
 #   agentjob, which runs in a transient unit that does not inherit our env.
 # --------------------------------------------------------------------------
 
@@ -1025,7 +1053,7 @@ class TestJobRoutes:
     def test_route_reaches_agentjob_and_no_model_is_forced(
         self, bgjob, tmp_path, monkeypatch
     ):
-        """taskpump's `--route pump_review` gets to agentjob; with no
+        """the pump's `--route pump_review` gets to agentjob; with no
         --model the table row picks the model."""
         line, _unit, _ = _main_run(
             bgjob, tmp_path, monkeypatch, "--route", "pump_review"
@@ -1045,8 +1073,8 @@ class TestJobRoutes:
     def test_legacy_pump_model_env_reaches_the_job_unit(
         self, bgjob, tmp_path, monkeypatch
     ):
-        """PUMP_REVIEW_MODEL set for taskpump must reach agentjob inside the
-        transient unit (it does not inherit taskpump's environment)."""
+        """PUMP_REVIEW_MODEL set for the pump must reach agentjob inside the
+        transient unit (it does not inherit the pump's environment)."""
         monkeypatch.setenv("PUMP_REVIEW_MODEL", "fable")
         line, unit, run_sh = _main_run(
             bgjob, tmp_path, monkeypatch, "--route", "pump_review"
@@ -1056,7 +1084,7 @@ class TestJobRoutes:
 
 
 # --------------------------------------------------------------------------
-# dv-2514: an agent job's optional pre-agent command step (taskpump runs the
+# dv-2514: an agent job's optional pre-agent command step (a pump stage runs the
 # board's acceptance command with it). `bgjob run <prompt> --pre-cmd <shell>
 # --pre-log <file> --pre-timeout <s>`: run.sh runs the command inside the
 # job's box, output to the log, BEFORE agentjob; `pre_exit_code` in the job
@@ -1103,7 +1131,14 @@ def _pre_job(bgjob, tmp_path, monkeypatch, pre_cmd, pre_timeout):
         stderr = ""
         stdout = ""
 
-    monkeypatch.setattr(bgjob.subprocess, "run", lambda cmd, **kw: R())
+    monkeypatch.setattr(
+        bgjob.subprocess,
+        "run",
+        # The route probe must answer: an empty answer aborts the launch (dv-a8e4).
+        lambda cmd, **kw: (
+            type("RR", (R,), {"stdout": ROUTE})() if "--print-route" in cmd else R()
+        ),
+    )
     args = type(
         "A",
         (),
@@ -1236,3 +1271,28 @@ class TestPreAgentStep:
             bgjob.cmd_run(args)
         assert not list(tmp_path.glob("*/run.sh"))
         assert not any(c and c[0] == "systemd-run" for c in started)
+
+
+class TestNoBoxNoJob:
+    """dv-fe4d: with neither bwrap nor sandbox-exec an agent job is refused."""
+
+    def test_refuses_when_no_box_tool_exists(self, bgjob, tmp_path, monkeypatch):
+        monkeypatch.setattr(bgjob, "JOBS_ROOT", tmp_path)
+        monkeypatch.setattr(bgjob, "load_profiles", lambda: {"general": str(tmp_path)})
+        monkeypatch.setattr(bgjob, "live_jobs", lambda: [])
+        monkeypatch.setattr(bgjob.shutil, "which", lambda name: None)
+        args = type(
+            "A",
+            (),
+            {
+                "prompt": "do it",
+                "profile": "general",
+                "name": "t",
+                "allow_dir": None,
+                "model": "sonnet",
+            },
+        )()
+        with pytest.raises(SystemExit) as exc:
+            bgjob.cmd_run(args)
+        assert "refusing to run a job unconfined" in str(exc.value)
+        assert not list(tmp_path.glob("*/run.sh"))

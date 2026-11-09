@@ -12,7 +12,7 @@ def test_quota_stop_notice_points_at_limits():
     assert notice and "/limits" in notice
 
 
-async def test_failed_taskpump_freeze_is_reported_not_hidden(tmp_path):
+async def test_failed_pump2_freeze_is_reported_not_hidden(tmp_path):
     orch = MessageOrchestrator(create_test_config(approved_directory=str(tmp_path)), {})
     context = MagicMock()
     context.user_data = {"role": "owner"}
@@ -25,6 +25,6 @@ async def test_failed_taskpump_freeze_is_reported_not_hidden(tmp_path):
         AsyncMock(return_value=(1, "pump is locked")),
     ) as run:
         await orch._handle_limits_callback(query, context, "lim:freeze")
-    run.assert_awaited_once_with("taskpump", "freeze", "--by", "owner")
+    run.assert_awaited_once_with("pump2", "freeze", "--by", "owner")
     text = query.edit_message_text.await_args.args[0]
     assert "failed (exit 1)" in text and "pump is locked" in text

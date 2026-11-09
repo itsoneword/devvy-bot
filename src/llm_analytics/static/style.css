@@ -373,3 +373,11 @@ table.data tr.muted td { color: var(--muted); }
 
 .btn.active { background: var(--page); color: var(--ink); font-weight: 600; }
 .chain-select input[type="date"] { font: inherit; padding: 3px 6px; border: 1px solid var(--axis); border-radius: 6px; background: var(--surface); color: var(--ink); }
+
+/* phone: the top bar wraps instead of pushing the nav off screen */
+@media (max-width: 600px) {
+  .topbar { flex-wrap: wrap; gap: 6px 12px; padding: 8px 12px; }
+  .topnav { flex-wrap: wrap; }
+  .health { margin-left: 0; width: 100%; }
+  main { padding: 12px 12px 40px; }
+}

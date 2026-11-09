@@ -85,6 +85,58 @@ def head_revision(db_name: str) -> str:
     return head
 
 
+def check_revision(db_name: str, path: Union[str, Path]) -> Optional[str]:
+    """Can the on-disk code open this DB? None = yes, else why not (dv-86f4).
+
+    Read-only: never creates, migrates or stamps the file; the restart
+    preflight runs it against the live DBs while the old code still uses
+    them. A missing file or one without ``alembic_version`` is fine (boot
+    creates or bridges it), and so is any revision the scripts know (boot
+    upgrades it). A revision they do not know means a newer build already
+    migrated the DB, and ``upgrade head`` would fail at boot.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        conn = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+    try:
+        try:
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='alembic_version'"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # mode=ro needs to create -wal/-shm next to a WAL DB; in a
+            # read-only dir that fails at the first read, immutable does not.
+            conn.close()
+            conn = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='alembic_version'"
+            ).fetchone()
+        if not has_table:
+            return None
+        revs = [r[0] for r in conn.execute("SELECT version_num FROM alembic_version")]
+    finally:
+        conn.close()
+    script = ScriptDirectory.from_config(alembic_config(db_name))
+    head = head_revision(db_name)
+    for rev in revs:
+        try:
+            known = script.get_revision(rev) is not None
+        except Exception:  # noqa: BLE001 - alembic raises for unknown ids
+            known = False
+        if not known:
+            return (
+                f"{db_name}.db is at {rev}, code knows only up to {head}: "
+                "code is older than the DB"
+            )
+    return None
+
+
 class _Borrowed:
     """The caller's sqlite3 connection, lent to SQLAlchemy.
 

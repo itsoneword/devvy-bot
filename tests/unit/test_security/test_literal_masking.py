@@ -1,4 +1,4 @@
-"""Command rules skip literal text unless it is a command line (dv-af70)."""
+"""Command rules distinguish shell execution positions from literal data."""
 
 from pathlib import Path
 
@@ -39,6 +39,7 @@ def test_unterminated_quote_masks_nothing() -> None:
         'git commit -m "fix: kill stale lock"',
         "grep -rn 'no kill here' src",
         "python3 -c \"print('a pkill word')\"",
+        "python3 -c \"import os; os.system('kill 1')\"",
         "echo $(ls /x 2>/dev/null)/tools",
     ],
 )
@@ -51,7 +52,6 @@ def test_literal_text_does_not_ask(command: str) -> None:
     [
         "/usr/bin/kill 5",
         "bash -c '/bin/kill 5'",
-        "python3 -c \"import os; os.system('kill 1')\"",
         'echo "`kill 1`"',
         "bash <<EOF\nkill 1\nEOF",
         "cat <<EOF | bash\nsystemctl restart nginx\nEOF",
@@ -64,6 +64,33 @@ def test_commands_inside_literals_still_ask(command: str) -> None:
     assert _ask(command) is not None
 
 
-def test_literal_starting_with_a_command_word_still_asks() -> None:
-    # Fail-safe by design: a literal is checked as a command line.
-    assert _ask("grep -rn 'kill ' src") is not None
+def test_grep_pattern_starting_with_a_command_word_is_data() -> None:
+    assert _ask("grep -rn 'kill ' src") is None
+
+
+# dv-3d18 phase 1: data inside heredocs/quotes is never a command.
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 - <<'PY'\nopen('d.md','w').write('sudo systemctl restart x')\nPY",
+        "python3 - <<'PY'\nx = (nc + 1)\nprint(x)\nPY",
+        "cat > notes.md <<'EOF'\ndocker rm -f c\nrm -rf build\nEOF",
+    ],
+)
+def test_heredoc_data_does_not_ask(command: str) -> None:
+    assert _ask(command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c 'kill 1'",
+        "bash <<EOF\nkill 1\nEOF",
+        "ssh h 'rm -rf x'",
+        "sudo systemctl restart claude-bot",
+        "echo 'kill 1' | sh",
+        "python3 -c \"import os; os.system('rm -rf /')\"",
+    ],
+)
+def test_shell_execution_positions_still_ask(command: str) -> None:
+    assert _ask(command) is not None

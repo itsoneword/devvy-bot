@@ -1,7 +1,7 @@
 """The task board: markdown files under ``.deviz/tasks/``.
 
 Replaces the SQLite ``agent_tasks`` table (dv-1327). One board for agents and
-the owner, one id format (``dv-xxxx``). The owner's kanban UI, the taskpump,
+the owner, one id format (``dv-xxxx``). The owner's kanban UI, the pump,
 the deviz CLI and the agents' ``task_add``/``task_list``/``task_done`` tools
 now all read and write the same files.
 
@@ -12,7 +12,7 @@ unquoted, and real titles contain colons (``dv-1106`` starts "Coach делает
 writes, not what YAML would like it to be.
 
 Unknown frontmatter keys survive a read/write round-trip untouched -- the
-taskpump stores ``pump``/``pump_job``/``pump_branch`` there and must not lose
+pump stores ``pump``/``pump_job``/``pump_branch`` there and must not lose
 them when an agent marks a task done.
 """
 
@@ -125,6 +125,26 @@ def _parse_frontmatter(text: str) -> Tuple[Dict[str, str], str]:
             continue
         fm[key.strip()] = value.strip()
     return fm, m.group(2)
+
+
+def _set_keys(text: str, updates: Dict[str, str]) -> str:
+    """Set top-level frontmatter keys in the raw text, leaving every other
+    line as it is. A parse -> render round trip flattens nested blocks
+    (``pump2:`` with indented ``stage: ...``) and wiped pump2 state on each
+    comment, which made pump2 restart the card from analyze (dv-3b99,
+    2026-11-08)."""
+    m = _FM_RE.match(text)
+    if not m:
+        return text
+    lines = m.group(1).split("\n")
+    for key, value in updates.items():
+        for i, line in enumerate(lines):
+            if not line[:1].isspace() and line.partition(":")[0].strip() == key:
+                lines[i] = f"{key}: {value}"
+                break
+        else:
+            lines.append(f"{key}: {value}")
+    return "---\n" + "\n".join(lines) + "\n---\n" + m.group(2)
 
 
 def _parse_list(raw: str) -> List[str]:
@@ -269,8 +289,10 @@ class DevizBoard:
         priority: str = DEFAULT_PRIORITY,
         labels: Optional[List[str]] = None,
         status: str = DEFAULT_STATUS,
+        parent: str = "",
     ) -> str:
-        """Create a task file. Returns the new ``dv-xxxx`` id."""
+        """Create a task file. Returns the new ``dv-xxxx`` id. ``parent``: the
+        id of the task it was split from."""
 
         def _work() -> str:
             self._dir.mkdir(parents=True, exist_ok=True)
@@ -287,7 +309,7 @@ class DevizBoard:
                 "assignee": assignee or "",
                 "labels": f"[{', '.join(tags)}]",
                 "deps": "[]",
-                "parent": "",
+                "parent": parent,
                 "created": now,
                 "updated": now,
                 "created_by": created_by,
@@ -321,12 +343,11 @@ class DevizBoard:
             path = self._find(task_id)
             if path is None:
                 return False
-            fm, body = _parse_frontmatter(path.read_text(encoding="utf-8"))
-            if not fm:
+            text = path.read_text(encoding="utf-8")
+            if not _parse_frontmatter(text)[0]:
                 return False
-            fm["status"] = status
-            fm["updated"] = _now_iso()
-            path.write_text(self._render(fm, body), encoding="utf-8")
+            text = _set_keys(text, {"status": status, "updated": _now_iso()})
+            path.write_text(text, encoding="utf-8")
             return True
 
         async with self._lock:
@@ -343,14 +364,13 @@ class DevizBoard:
             path = self._find(task_id)
             if path is None:
                 return False
-            fm, body = _parse_frontmatter(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
             line = f"- {comment.strip()}\n"
-            if "## Comments" in body:
-                body = body.rstrip("\n") + "\n" + line
+            if "## Comments" in _parse_frontmatter(text)[1]:
+                text = text.rstrip("\n") + "\n" + line
             else:
-                body = body.rstrip("\n") + "\n\n## Comments\n\n" + line
-            fm["updated"] = _now_iso()
-            path.write_text(self._render(fm, body), encoding="utf-8")
+                text = text.rstrip("\n") + "\n\n## Comments\n\n" + line
+            path.write_text(_set_keys(text, {"updated": _now_iso()}), encoding="utf-8")
             return True
 
         async with self._lock:

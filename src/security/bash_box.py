@@ -62,7 +62,57 @@ _MIN_REDACT = 6
 
 
 class BoxUnavailable(RuntimeError):
-    """bwrap is not installed: the caller must fail closed."""
+    """No box tool (bwrap, or sandbox-exec on macOS): fail closed."""
+
+
+def _box_tool_available() -> bool:
+    """bwrap, else macOS sandbox-exec (dv-fe4d, ``seatbelt.bash_profile``)."""
+    return bool(shutil.which("bwrap") or shutil.which("sandbox-exec"))
+
+
+def build_seatbelt_argv(
+    *,
+    write_dirs: Sequence[Path],
+    read_dirs: Sequence[Path] = (),
+    home: Optional[Path] = None,
+    hidden: Sequence[Path] = (),
+) -> List[str]:
+    """The macOS form of :func:`build_bwrap_argv`: ``sandbox-exec -p`` with
+    the chat profile of ``seatbelt.py`` (loaded by path: stdlib only).
+    *hidden*: paths denied even inside a grant (:func:`secret_paths`)."""
+    import importlib.util
+
+    sandbox_exec = shutil.which("sandbox-exec")
+    if not sandbox_exec:
+        raise BoxUnavailable("neither bwrap nor sandbox-exec is installed")
+    scratch_dir().mkdir(mode=0o700, exist_ok=True)
+    spec = importlib.util.spec_from_file_location(
+        "_box_seatbelt", Path(__file__).resolve().parent / "seatbelt.py"
+    )
+    assert spec and spec.loader
+    sb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sb)
+    profile = sb.bash_profile(
+        write_dirs=[str(d) for d in write_dirs],
+        read_dirs=[str(d) for d in read_dirs],
+        home=str(home or Path.home()),
+        hidden=[str(p) for p in hidden],
+    )
+    return list(sb.sandbox_exec_argv(profile, sandbox_exec))
+
+
+def secret_paths() -> List[Path]:
+    """The data root's key material (``secret_dirs``) and the local TUI's
+    credential (dv-fe4d): what the macOS chat box denies by name. bwrap's
+    tmpfs ``$HOME`` already leaves them out unless a grant covers them."""
+    repo = Path(__file__).resolve().parents[2]
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+    from src.utils.paths import REPO_ROOT, data_layout
+
+    layout = data_layout()
+    out = [*layout.secret_dirs, layout.tui_secret_file]
+    return [p if p.is_absolute() else REPO_ROOT / p for p in out]
 
 
 class KeyEnvError(RuntimeError):
@@ -171,9 +221,9 @@ class BashBox:
         Every word is ``shlex``-quoted and the original command is the single
         argument after ``--``, handed to ``bash -c`` as one argv element, so
         nothing in it is interpreted by an outer shell. Raises
-        :class:`BoxUnavailable` when bwrap is missing.
+        :class:`BoxUnavailable` when no box tool exists.
         """
-        if not shutil.which("bwrap"):
+        if not _box_tool_available():
             raise BoxUnavailable("bwrap is not installed")
         argv = [sys.executable, str(Path(__file__).resolve())]
         if cwd:
@@ -329,16 +379,35 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             sys.exit(126)
         values = _redact_env_values(args.redact_env)
         sys.exit(_run_redacted(["/bin/bash", "-c", args.command[0]], {}, values))
+    use_bwrap = bool(shutil.which("bwrap"))
     try:
-        box = build_bwrap_argv(
-            write_dirs=[Path(d) for d in args.rw],
-            read_dirs=[Path(d) for d in args.ro],
-            chdir=Path(args.cwd) if args.cwd else None,
-        )
+        if use_bwrap:
+            box = build_bwrap_argv(
+                write_dirs=[Path(d) for d in args.rw],
+                read_dirs=[Path(d) for d in args.ro],
+                chdir=Path(args.cwd) if args.cwd else None,
+            )
+        else:
+            # macOS (dv-fe4d): no chdir option and no private /tmp, so the
+            # launcher changes dir itself and points mktemp at the scratch.
+            box = build_seatbelt_argv(
+                write_dirs=[Path(d) for d in args.rw],
+                read_dirs=[Path(d) for d in args.ro],
+                hidden=secret_paths(),
+            )
+            rw = [Path(d) for d in args.rw]
+            target = Path(args.cwd) if args.cwd else None
+            if target is None or not _under(target, rw):
+                target = rw[0] if rw else None
+            if target is not None and target.is_dir():
+                os.chdir(target)
+            os.environ["TMPDIR"] = str(scratch_dir())
     except BoxUnavailable as exc:
         print(f"bash box unavailable: {exc}", file=sys.stderr)
         sys.exit(126)
-    full = [*box, "--", "/bin/bash", "-c", args.command[0]]
+    # bwrap ends its options with "--"; sandbox-exec takes the command as is.
+    sep = ["--"] if use_bwrap else []
+    full = [*box, *sep, "/bin/bash", "-c", args.command[0]]
     if args.key:
         env, values = _key_env(args.key)
         sys.exit(_run_redacted(full, env, values))

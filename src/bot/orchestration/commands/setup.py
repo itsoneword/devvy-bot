@@ -467,7 +467,8 @@ def _env_file(context: ContextTypes.DEFAULT_TYPE) -> Any:
 async def gate_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, role: str
 ) -> bool:
-    """True = the message was consumed by onboarding (caller returns)."""
+    """True = the message was consumed by onboarding (caller returns).
+    Reached through ``next_input.consume`` for text and voice (dv-3881)."""
     if role != "owner":
         return False
     user_id = update.effective_user.id
@@ -480,7 +481,8 @@ async def gate_text(
 async def gate_media(
     update: Update, context: ContextTypes.DEFAULT_TYPE, role: str
 ) -> bool:
-    """Files/photos can't be answers: point at /setup, consume the message."""
+    """Files/photos can't be answers: point at /setup, consume the message.
+    Reached through ``next_input.consume`` for media (dv-3881)."""
     if role != "owner" or not unconfigured(context):
         return False
     await update.message.reply_text("Сначала настройка — отправь текст или /setup.")

@@ -115,7 +115,7 @@ class AskContext:
 
     Title only from the task: never its description, never the agent's own
     reasoning. A chat ask carries the profile; a pump job adds the job name,
-    task id + title and stage, fixed at launch (``scripts/taskpump``).
+    task id + title and stage, fixed at launch (``scripts/pump2``).
     """
 
     profile: Optional[str] = None

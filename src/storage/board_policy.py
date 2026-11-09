@@ -1,7 +1,7 @@
 """Who may do what on the task board, and the pump's privilege flag (dv-535b).
 
 One module so the agent tools (``src/claude/agent_tools.py``), the internal
-HTTP API (``src/api/server.py``), the taskpump and the merge confirmation
+HTTP API (``src/api/server.py``), the pump and the merge confirmation
 rule (``src/security/destructive.py``) apply the same rules.
 
 Owner decisions, 2026-10-18:
@@ -10,7 +10,7 @@ Owner decisions, 2026-10-18:
   **create** tasks and **comment** on them.
 * A task another agent files for devops (``assignee: devops``) is created
   ``in_progress``, labelled ``agent``, so the pump analyses it and asks the
-  owner. Implementation still needs the owner's ``taskpump answer``.
+  owner. Implementation still needs the owner's ``pump2 answer``.
 * Any agent may comment on any open task; its comments are marked
   ``from <slug> (agent)``, count <=10 a day, and the pump treats them as data.
 * Limits per agent: <=3 open devops tasks, <=5 new tasks per UTC day, exact
@@ -20,7 +20,7 @@ Owner decisions, 2026-10-18:
   (``pump_privileged`` frontmatter). This covers the likely routes only; the
   residual risk is in ``docs/DECISIONS.md`` 2026-10-18.
 
-Stdlib only: the taskpump imports this before it re-execs into the venv.
+Stdlib only: the pump imports this before it re-execs into the venv.
 """
 
 from __future__ import annotations
@@ -62,7 +62,9 @@ PRIVILEGED_PATHS: tuple[str, ...] = (
     "src/agent_bridge/*",  # policy gate for Codex
     "src/agent_backends/*",  # sandbox flags per backend
     "src/profiles/*",  # profile parsing (sandbox defaults)
-    "scripts/taskpump",  # the pump itself
+    "scripts/pump2",  # the pump itself
+    "scripts/release",  # public-release publish front
+    "src/release/*",
     "scripts/bgjob",
     "scripts/agentjob",
     "config/taskpump/*",
@@ -80,9 +82,13 @@ PRIVILEGED_PATHS: tuple[str, ...] = (
 TASK_DIRS: List[Path] = [Path(__file__).resolve().parents[2] / ".deviz" / "tasks"]
 
 _PUMP_BRANCH = re.compile(r"\bpump/(dv-[0-9a-z]{3,8})\b")
+# The subcommand is the first word after git's own options (`-C dir`,
+# `-c k=v`, `--no-pager`), matched whole: `merge-base` is not `merge`
+# (dv-3d18).
 _GIT_INTEGRATE = re.compile(
-    r"\bgit\b[^;&|\n]*\b(merge|cherry-pick|rebase|pull|reset|checkout|restore|"
-    r"switch|branch|update-ref|push|am|apply|read-tree)\b"
+    r"\bgit(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+"
+    r"(merge|cherry-pick|rebase|pull|reset|checkout|restore|"
+    r"switch|branch|update-ref|push|am|apply|read-tree)(?![\w-])"
 )
 
 
@@ -186,7 +192,7 @@ async def file_agent_task(
         due_at=due_at,
         labels=labels,
         # in_progress with no pump key = the pump analyses it next tick and
-        # asks the owner; nothing is implemented without `taskpump answer`.
+        # asks the owner; nothing is implemented without `pump2 answer`.
         status="in_progress" if for_devops else "todo",
     )
     out: Dict[str, Any] = {"status": "created", "task_id": task_id}

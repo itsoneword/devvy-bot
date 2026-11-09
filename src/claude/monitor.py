@@ -6,6 +6,8 @@ import shlex
 from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
+from src.security.denylist import SECRET_PATTERN_EXEMPT_NAMES
+
 # Moved to src/security/read_scope.py (dv-7de7) so the denylist can apply the
 # ~/.claude/ exemption without importing this module; re-exported here for
 # compatibility (sdk_integration and tests import them from monitor).
@@ -285,6 +287,8 @@ def check_bash_denied_paths(
 
     candidates = _path_candidates(command)
     for name in candidates:
+        if name in SECRET_PATTERN_EXEMPT_NAMES:
+            continue
         for pattern in _AMBIGUOUS_SECRET_PATTERNS:
             if fnmatch.fnmatch(name, pattern):
                 return False, (

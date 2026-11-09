@@ -2,6 +2,90 @@
 
 Release notes for Devvy. Newest first.
 
+## 1.7 — 2026-11-09
+
+### Pump v2 replaces the old pump
+- A rewrite of the task pipeline (`scripts/pump2`, a timer tick every 2 min):
+  analyze → tests → build → review → merge, each stage a fresh background job
+  in the card's own git worktree, all state in the card's `pump2:` block.
+  The old `scripts/taskpump` is removed.
+- The merge needs no model: pump2 brings the integration branch in, runs the
+  board's test command under a memory cap and fast-forwards on green. A
+  `mergefix` agent stage runs only when that fails. Heavy runs are limited per
+  server and per project.
+- Custom stages: a board's `pipeline` list adds your own stages (a copywriter,
+  a designer) with their own prompt, report and `return_to`; an example prompt
+  ships as `config/taskpump/copy.example.md`.
+- Fewer questions: minor questions are decided by the board's agent; the owner
+  is asked only about money, keys, production, deletion and real product
+  choices. Every merge, return and stop is reported on the card.
+- Visibility: one pinned summary per board in the agent's chat (stage per card,
+  why a held card waits, a clean-run counter); `scripts/pump2 status`.
+- Feedback: review remarks carry a criterion and score, stored for
+  analysis; a stage's own remarks without a criterion count as advice.
+- Design loop for `designloop` cards (`scripts/pump2 design run`): rendered
+  variants, a critic, the owner picks one.
+- A card's worktree is removed after it merges (never one with uncommitted
+  files; branches are kept).
+- Docs: `docs/pump.md` (set up from scratch, how it works, writing a card).
+
+### Bot, feedback and memory
+- Message reactions: a reaction on an agent reply is stored as a rating of
+  that answer (migration 0010).
+- Feature feedback survey: score buttons in a Feedback topic of the owner's
+  group, `FEEDBACK_*` settings (migration 0011).
+- Boot safe mode: the last known good config is kept; a profile with bad
+  paths is switched off for that run and says why.
+- Restart gate: `/restart` and `restart_bot` run the install preflight first
+  and refuse on a failure (`/restart force` skips it).
+- `VOICE_ECHO_TRANSCRIPT`: a voice message is answered with its transcript.
+- Memory: snapshot caps raised (general and pointer facts 60 → 100, bundle
+  facts budget 24k → 40k chars); the sweep no longer closes an old fact that
+  the newer one does not fully cover.
+- A `monitoring` profile template ships for a separate Monitoring topic.
+- `/internal/prompt` accepts `user_id` and `cwd` (the owner's workspace) for
+  jobs.
+
+### Menu and configuration
+- `/menu` reorganised: a Models screen, a Commands page and a Pump screen with
+  a draft answer per pending question; `/status`, `/usage` and `/auth` are off
+  the owner's menu.
+- New profile key `project_instructions:`: an outside project guide added to
+  the shared first-turn bundle.
+- `.env.example`, `.env.sample` and `.env.template` are no longer blocked as
+  secret files.
+
+### Local mode: the Pump on a laptop, without Telegram (beta)
+- `./install.sh --local` (implied on macOS) installs Devvy with no bot token: a
+  headless server (`CHANNEL=local`) and a terminal UI, `scripts/devvy-tui`, that
+  shows the pump pin, the questions waiting for you (answered verbatim, like
+  `pump2 answer`), Approve/Deny for a job's risky action, running jobs with
+  their output, and a New task form. Beta: the chat with the
+  agents stays Telegram-only for now.
+- macOS: two launchd agents (server, 5-minute pump tick), Homebrew fixes in the
+  preflight table, background jobs boxed by `sandbox-exec` with two deny-default
+  Seatbelt profiles. Run `scripts/seatbelt_probe` once on your Mac; until it
+  prints all PASS the box is untested there. No box tool = no background job.
+- Jobs run under a portable process launcher where systemd is absent (macOS,
+  WSL2 without systemd), with a memory cap reported like a cgroup OOM. Local
+  installs run one pump job at a time (`PUMP_MAX_CONCURRENT=1`, ~2 GB a job).
+- The job's risky-action ask is answered only through a TUI credential that
+  jobs cannot read; the inbox and callback endpoints exist only in local mode.
+- Windows: through WSL2 (documented); native Windows is not supported.
+
+### Upgrade
+- From 1.5 or 1.6: follow `docs/upgrading.md` (pull, `./install.sh`,
+  `scripts/pump2 migrate --apply`, timers, `pump2 doctor`, restart).
+
+### Enable
+- Pump v2 on a board: `"pump2": true` in its `config/taskpump/boards.json`
+  entry (`scripts/pump2 migrate --apply` adds it, plus `pump2_home` for this
+  repo's own board); check it with `scripts/pump2 doctor`.
+- The pump2 timer: `systemctl --user enable --now pump2.timer` (install steps:
+  `docs/upgrading.md`); `taskpump.timer` is retired.
+- Custom stages: a board's `pipeline` list (`docs/pump.md`, Custom stages).
+- Local mode: `./install.sh --local` (beta, no bot token).
+
 ## 1.6 — 2026-10-28
 
 ### Owner menu and limits
@@ -80,6 +164,12 @@ Release notes for Devvy. Newest first.
 - One new schema migration for `tool_calls` (status and input columns) applies on start.
 - New optional keys in `config/models.yaml` (`jobs:`); no change needed if unset.
 
+### Enable
+- Design loop: label a UI card `designloop`.
+- Review age in the pin and the "waiting on you" summary: `PUMP_REVIEW_HOURS`.
+- Background-job model routes: a `jobs:` block in `config/models.yaml`.
+- /tmp sweep: install `tmpsweep.timer` (`docs/systemd-operations.md`).
+
 ## 1.5 — 2026-10-25
 
 ### Tracing
@@ -151,6 +241,11 @@ Release notes for Devvy. Newest first.
 ### Upgrade
 - One new schema migration (`tool_calls`) applies on start.
 - `tool_usage` readers now read `tool_calls`.
+
+### Enable
+- `/trace` needs nothing: `tool_calls` fills from the first turn on.
+- Test memory cap: run suites as `scripts/testrun -- <cmd>`
+  (`PUMP_TEST_MEMORY_MAX`).
 
 ## 1.4 — 2026-10-19
 

@@ -225,8 +225,23 @@ class ConfirmationManager:
         fut = self._pending.get(token)
         if fut is None or fut.done():
             return False
-        fut.set_result(approved)
+        loop = fut.get_loop()
+        try:
+            here = asyncio.get_running_loop()
+        except RuntimeError:
+            here = None
+        if here is loop:
+            fut.set_result(approved)
+        else:
+            # Resolved from another loop/thread (an API request served on its
+            # own loop, dv-fe4d): set_result there would not wake the waiter.
+            loop.call_soon_threadsafe(_settle, fut, approved)
         return True
+
+
+def _settle(fut: "asyncio.Future[bool]", approved: bool) -> None:
+    if not fut.done():
+        fut.set_result(approved)
 
 
 def _truncate(text: str, limit: int) -> str:

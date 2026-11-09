@@ -13,7 +13,11 @@ pattern; reshaped by dv-cf07):
 - **how:** one ``complete_text(purpose="consolidation")`` call per scope
   proposes ``[{old_id, newer_id, reason}]``; every pair is validated in code
   before anything is closed (general tier only, never a ``conflict_group``
-  row, both ids active in the scope, newer really newer, a per-run fuse).
+  row, both ids active in the scope, newer really newer, a per-run fuse),
+  plus two content guards (dv-32fe): the newer fact must repeat every
+  identifier of the old one (paths, ENV names, config files, hosts), and a
+  status line (merged, deployed, went live) never closes a fact with
+  substance. Every rejection logs ``memory_sweep_rejected`` with a reason.
 - **writes:** soft and reversible. ``MemoryRepository.close_superseded``
   sets ``superseded_by`` + ``invalidated_by='sweep'``, content untouched;
   one ``memory_sweep_closed`` log line per row and a ``- [ ] UNDO`` line in
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -47,8 +52,10 @@ from typing import (
 import structlog
 
 from src.model_router import complete_text
+from src.storage.memory_repository import split_ref
 
 if TYPE_CHECKING:
+    from src.evaluator.decision_refs import DecisionRefChecker
     from src.storage.database import DatabaseManager
     from src.storage.deviz_board import DevizBoard
     from src.storage.memory_repository import MemoryFact, MemoryRepository
@@ -66,7 +73,78 @@ FUSE_FLOOR = 5
 FUSE_SHARE = 0.25
 
 # Per-fact text shown to the model; pointers carry whole result notes.
-SWEEP_FACT_CHARS = 300
+# 600 = MAX_INJECTABLE_FACT_CHARS (dv-32fe): at 300 the model judged 1263
+# (318 ch) on a cut text, and "fully covers" cannot be judged on a cut text.
+SWEEP_FACT_CHARS = 600
+
+# Identifiers an old fact teaches that a closing fact must repeat (dv-32fe,
+# docs/research/dv-32fe/guard_probe.py over the 17 sweep closures of
+# 27.10.26): file paths, ENV_NAMES, config/code file names, .env, URLs,
+# hosts. Numbers deliberately are not: a value change ("3" -> "5") is the
+# main legitimate supersede.
+_IDENTIFIER_RE = re.compile(
+    r"(?:~/?|/)[\w.\-]+(?:/[\w.\-]+)+"
+    r"|\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b"
+    r"|\b[\w\-]+\.(?:conf|env|md|py|json|ya?ml|sh|db|service|toml|htpasswd)\b"
+    r"|\.env\b"
+    r"|https?://\S+"
+    r"|\b[\w\-]+(?:\.[\w\-]+)+\.(?:xyz|com|io|net|org|app)\b"
+)
+_LETTER_RE = re.compile(r"[A-Za-z]")
+
+# A status line: a short line carrying a merge, a commit sha, a deploy, a
+# go-live or a release number. "raised to N" is deliberately not one
+# (architect, dv-32fe): it is a value update, and the value-changed
+# supersede must keep working. Markers are anchored ("merged to main", not
+# "merged one by one") and the line is short: run over the 17 sweep
+# closures of 27.10.26, bare words and no length bound rejected 4 correct
+# closures by substantive facts of 355-462 ch (docs/FINDINGS.md 2026-10-31);
+# the pure status line 1298 is 167 ch.
+_STATUS_RE = re.compile(
+    r"\bmerged (?:to|into) (?:main|master)\b"
+    r"|\((?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\)"
+    r"|\bcommit [0-9a-f]{7,40}\b"
+    r"|\bdeployed to\b"
+    r"|\bwent live\b"
+    r"|\breleased? v?\d",
+    re.IGNORECASE,
+)
+STATUS_LINE_MAX_CHARS = 240
+
+
+def _identifiers(text: str) -> set[str]:
+    """Lower-cased identifiers of a fact. A path needs a letter in it, so
+    "1/7/30" (days) is not a path."""
+    out = set()
+    for match in _IDENTIFIER_RE.findall(text):
+        ident = match.rstrip(".,;:)'\"").lower()
+        if ident.startswith(("/", "~")) and not _LETTER_RE.search(ident):
+            continue
+        out.add(ident)
+    return out
+
+
+def _uncovered_identifiers(old: str, newer: str) -> List[str]:
+    """Identifiers of ``old`` that ``newer`` does not repeat (substring,
+    case-insensitive): closing ``old`` would lose them."""
+    newer_low = newer.lower()
+    return sorted(i for i in _identifiers(old) if i not in newer_low)
+
+
+def _is_status_fact(text: str) -> bool:
+    """A short merge/deploy/release line: a board or git fact, not memory."""
+    return len(text) <= STATUS_LINE_MAX_CHARS and _STATUS_RE.search(text) is not None
+
+
+def _guard_reason(old: str, newer: str) -> Optional[str]:
+    """Why closing ``old`` by ``newer`` would lose content, or None."""
+    missing = _uncovered_identifiers(old, newer)
+    if missing:
+        return "coverage: newer lacks " + ", ".join(missing[:5])
+    if _is_status_fact(newer) and not _is_status_fact(old):
+        return "status: a status line cannot close a fact with substance"
+    return None
+
 
 # One call reads ~100+ facts; the router's 120 s default timed out on the
 # devops replay under load (27.10.26). Off the turn path: a new window waits
@@ -93,8 +171,11 @@ look alike. One newer fact can make several older ones stale: list each
 pair. Different items are not stale ("likes banana" vs "likes peach"),
 and scope difference is not staleness ("no nuts in desserts" vs "allergic to
 nuts"). Keep a fact that still teaches something after the change: an owner
-rule, a lesson, a root cause, the reason behind a decision. When unsure,
-leave both.
+rule, a lesson, a root cause, the reason behind a decision. Close an old
+fact ONLY when the newer fact repeats everything the old one teaches: config
+locations, file paths, names, where credentials live, reasons. A status line
+(merged, deployed, released) never makes a fact with substance stale. When
+unsure, leave both.
 
 Return ONLY a JSON array, e.g.
 [{{"old_id": 12, "newer_id": 40, "reason": "version 1.3 -> 1.5"}}].
@@ -169,8 +250,12 @@ class ConsolidationService:
         model: Optional[str] = None,
         report_dir: Path = Path("data/consolidation"),
         board: Optional["DevizBoard"] = None,
+        decision_refs: Optional["DecisionRefChecker"] = None,
     ) -> None:
         self._repo = memory_repo
+        # dv-32fe: re-checks a repo agent's "missing:<ref>" decisions at each
+        # sweep and turns the ones the repo now holds into pointers.
+        self._decision_refs = decision_refs
         self._db = db
         self._notify = notify_callback  # async fn(message)
         self._board = board
@@ -354,8 +439,30 @@ class ConsolidationService:
             self._append_report(result)
         return result
 
+    async def _promote_decisions(self, scope: str) -> None:
+        """Flagged decisions the repo now holds become pointers (dv-32fe).
+
+        Deterministic, before the model call, one UPDATE for the scope. The
+        undo is phase 3's REF verb (old kind + source_ref back).
+        """
+        checker = self._decision_refs
+        if checker is None or not checker.handles(scope):
+            return
+        try:
+            flagged = await self._repo.flagged_decisions(scope)
+            ids = [
+                f.id
+                for f in flagged
+                if checker.verify(scope, split_ref(f.source_ref)[0] or "", f.content)
+            ]
+            if ids and await self._repo.promote_flagged(scope, ids):
+                logger.info("memory_decision_promoted", scope=scope, ids=ids)
+        except Exception as e:  # never blocks the sweep itself
+            logger.warning("Decision promotion failed", scope=scope, error=str(e))
+
     async def _sweep(self, scope: str) -> SweepResult:
         result = SweepResult(scope=scope)
+        await self._promote_decisions(scope)
         facts = await self._repo.get_facts(scope)
         if len(facts) < 2:
             return result
@@ -393,6 +500,24 @@ class ConsolidationService:
                 or _order_key(newer) <= _order_key(old)
             ):
                 result.rejected += 1
+                logger.info(
+                    "memory_sweep_rejected",
+                    scope=scope,
+                    old_id=old_id,
+                    newer_id=newer_id,
+                    reason="invalid pair",
+                )
+                continue
+            guard = _guard_reason(old.content, newer.content)
+            if guard:
+                result.rejected += 1
+                logger.info(
+                    "memory_sweep_rejected",
+                    scope=scope,
+                    old_id=old_id,
+                    newer_id=newer_id,
+                    reason=guard,
+                )
                 continue
             if len(result.closed) >= fuse:
                 result.over_fuse += 1

@@ -1,0 +1,25 @@
+-- rendered by scripts/render_deploy.py; do not install this file directly --
+# Pump v2 (docs/pump.md). Touches only boards with "pump2": true in
+# config/taskpump/boards.json.
+[Unit]
+Description=pump2 — one pass over the pump2 boards
+Documentation=file:@DEVVY_ROOT@/docs/pump.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=@DEVVY_ROOT@
+# The project venv's python (poetry), same one the bot runs on.
+ExecStart=@POETRY_BIN@ run python scripts/pump2 tick
+# systemd --user units get a minimal PATH; bgjob needs systemd-run and git.
+Environment=PATH=@SERVICE_PATH@
+# The job slot caps the tick launches jobs under (bgjob's default is 2, which
+# stalled the first merges at the cap).
+Environment=BGJOB_MAX_CONCURRENT=8
+Environment=BGJOB_MEMORY_MAX=4G
+StandardOutput=journal
+StandardError=journal
+# A tick is bookkeeping; the work runs in detached bgjob units. The pin's
+# recommendation runs one Claude CLI call in the tick: python +
+# CLI measured ~230M RSS for the CLI alone, so 256M was too tight.
+TimeoutStartSec=300
+MemoryMax=768M

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# The local Pump TUI (dv-fe4d): pump pin, questions, job asks, jobs, new task.
+# Needs the locked tui extra (`poetry install -E tui`) and, for
+# the pin and asks, the local server (CHANNEL=local) running.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec poetry run python -m src.tui.app "$@"

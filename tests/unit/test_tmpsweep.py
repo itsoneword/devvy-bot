@@ -34,6 +34,9 @@ _BGJOB_PATH = _SCRIPTS / "bgjob"
 H = 3600
 
 
+ROUTE = '{"harness": "claude", "provider": "anthropic_sub", "model": "sonnet"}'
+
+
 def _load(name: str, path: Path):
     loader = SourceFileLoader(name, str(path))
     spec = importlib.util.spec_from_loader(name, loader)
@@ -327,7 +330,14 @@ def test_agent_job_run_sh_sets_tmpdir_under_job_dir(bgjob, tmp_path, monkeypatch
         stderr = ""
         stdout = ""
 
-    monkeypatch.setattr(bgjob.subprocess, "run", lambda cmd, **kw: R())
+    monkeypatch.setattr(
+        bgjob.subprocess,
+        "run",
+        # The route probe must answer: an empty answer aborts the launch (dv-a8e4).
+        lambda cmd, **kw: (
+            type("RR", (R,), {"stdout": ROUTE})() if "--print-route" in cmd else R()
+        ),
+    )
     args = type(
         "A",
         (),

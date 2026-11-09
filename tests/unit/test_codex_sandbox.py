@@ -178,6 +178,21 @@ class TestSelectionPerProfile:
 
 
 class TestConfinedPolicy:
+    def test_confined_tool_denies_canary_outside_write_and_user_bus_escape(
+        self, tree, settings
+    ) -> None:
+        """The native namespace must hide credentials and user-manager sockets."""
+        policy = _policy(_argv(tree, settings, tree.own)[0])
+        assert policy[str(tree.secrets.resolve())] == "none"
+        assert policy[str(Path.home() / ".codex" / "auth.json")] == "none"
+        assert policy[":root"] == "read"
+        assert str(tree.repo.resolve()) not in [
+            path for path, access in policy.items() if access == "write"
+        ]
+        assert (
+            policy["/run/user"] == "none"
+        ), "bus, systemd/private and systemd/io.systemd.Manager must all be hidden"
+
     def test_sandboxed_reads_all_writes_workspace_only(self, tree, settings) -> None:
         policy = _policy(_argv(tree, settings, tree.own)[0])
         assert policy[":root"] == "read"

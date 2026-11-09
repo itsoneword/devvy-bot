@@ -1,7 +1,8 @@
 """pump_control agent tool (dv-b17e): freeze / thaw / urgent from chat.
 
 One owner-only tool beside pump_status. It is global (every board), so it
-does not go through `taskpump board-of`; urgent takes any board's id. Codex
+does not resolve the caller's board; urgent takes any board's id. Since
+dv-44b1 it runs `scripts/pump2` (the old pump is off). Codex
 gets the same spec over the agent bridge (JOB_TOOLS in the bridge tests).
 """
 
@@ -26,29 +27,35 @@ def _taskpump(spawned: list) -> list:
     return [a for a in spawned if Path(a[0]).name == "taskpump"]
 
 
+def _pump2(spawned: list) -> list:
+    return [a for a in spawned if Path(a[0]).name == "pump2"]
+
+
 @pytest.mark.parametrize("action", ["freeze", "thaw"])
-async def test_freeze_and_thaw_run_taskpump_globally(
+async def test_freeze_and_thaw_run_pump2_globally(
     services, captured_tools, monkeypatch, action
 ):
     spawned = pt._fake(monkeypatch)
     tools = _tools(services, captured_tools, "devops")
     r = await tools["pump_control"].handler({"action": action})
     assert r.get("isError") is not True, r
-    (argv,) = _taskpump(spawned)  # no board-of lookup: every board
+    (argv,) = spawned  # no board lookup: every board
+    assert Path(argv[0]).name == "pump2"
     assert list(argv[1:]) == [action, "--by", "devops"]
 
 
-async def test_urgent_passes_any_boards_id_after_double_dash(
+async def test_urgent_bare_id_gets_the_home_board(
     services, captured_tools, monkeypatch
 ):
+    """dv-44b1: pump2 names every card board:id; a bare id is the home
+    board's, whoever calls (urgent is global, not the caller's board)."""
     spawned = pt._fake(monkeypatch)
-    tools = _tools(services, captured_tools, "gymbro")
-    r = await tools["pump_control"].handler(
-        {"action": "urgent", "task_id": "pl:dv-0a1b"}
-    )
+    tools = _tools(services, captured_tools, "app")
+    r = await tools["pump_control"].handler({"action": "urgent", "task_id": "dv-0a1b"})
     assert r.get("isError") is not True, r
-    (argv,) = _taskpump(spawned)
-    assert list(argv[1:]) == ["urgent", "--by", "gymbro", "--", "pl:dv-0a1b"]
+    (argv,) = _pump2(spawned)
+    assert list(argv[1:]) == ["urgent", "--by", "app", "--", "devvy:dv-0a1b"]
+    assert _taskpump(spawned) == []
 
 
 @pytest.mark.parametrize(

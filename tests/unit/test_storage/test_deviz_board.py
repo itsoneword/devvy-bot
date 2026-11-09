@@ -81,7 +81,7 @@ async def test_set_status_maps_open_to_todo_and_reports_missing(
 
 
 async def test_status_write_preserves_pump_frontmatter(board: DevizBoard) -> None:
-    """The taskpump owns `pump*` keys in the same files. An agent marking a
+    """The pump owns `pump*` keys in the same files. An agent marking a
     task done must not drop them."""
     task_id = await board.add_task(title="t", created_by="devops")
     path = board.tasks_dir / f"{task_id}.md"
@@ -95,6 +95,27 @@ async def test_status_write_preserves_pump_frontmatter(board: DevizBoard) -> Non
     text = path.read_text()
     assert "pump: analyzing" in text
     assert "status: done" in text
+
+
+async def test_comment_and_status_keep_nested_pump2_block(board: DevizBoard) -> None:
+    """A parse -> render round trip flattened the indented `pump2:` block, so
+    every task_comment wiped pump2's stage and pump2 restarted the card from
+    analyze (dv-3b99, 2026-11-08)."""
+    task_id = await board.add_task(title="t", created_by="devops")
+    path = board.tasks_dir / f"{task_id}.md"
+    block = 'pump2:\n  stage: "review"\n  attempt: 0\n  branch: "pump2/x"\n'
+    path.write_text(
+        path.read_text().replace("created_by:", block + "created_by:"),
+        encoding="utf-8",
+    )
+
+    assert await board.append_comment(task_id, "a note") is True
+    assert await board.set_status(task_id, "in_progress") is True
+
+    text = path.read_text()
+    assert block in text
+    assert "\nstage:" not in text
+    assert "status: in_progress" in text and text.rstrip().endswith("- a note")
 
 
 async def test_find_open_by_title_and_append_comment(board: DevizBoard) -> None:

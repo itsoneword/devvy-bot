@@ -1,6 +1,6 @@
 """Background jobs on the router (dv-ef90): one agent turn in its own process.
 
-`scripts/bgjob` (and taskpump through it) and the server monitor used to run
+`scripts/bgjob` (and the pump through it) and the server monitor used to run
 the CLI in print mode with every permission bypassed and no checks. They run
 outside the bot process, so the bot's in-process hook cannot reach them. This
 module gives them the same turn through the Agent SDK with:
@@ -152,7 +152,7 @@ def pump_worktree_root(cwd: Path) -> Optional[Path]:
     """*cwd* when it is a pump worktree, else ``None`` (dv-58db).
 
     A pump worktree is ``$PUMP_WORKTREES/<id>`` or ``.../<board>/<id>``
-    (default ``<repo>/../pump-worktrees``, as in ``scripts/taskpump``) whose
+    (default ``<repo>/../pump-worktrees``, as in ``scripts/pump2``) whose
     ``.git`` is a file, i.e. a linked worktree. Resolved first, so a symlink
     into the dir from outside, or out of it, does not count. Not the job's
     cwd in general: a non-pump job runs in the live checkout.
@@ -180,12 +180,23 @@ def _write_session_file(path: Optional[Path], session_id: Any) -> None:
         logger.warning("session_file_write_failed", path=str(path), error=str(exc))
 
 
-class BotLink:
-    """The job's line to the bot: the internal API with the shared secret."""
+# Written in the job dir while an ask waits on the owner, so the pump can
+# say what a slow job is waiting for (dv-97a4); removed when it returns.
+ASK_MARKER = "ask_pending.json"
 
-    def __init__(self, base_url: str, secret: Optional[str]) -> None:
+
+class BotLink:
+    """The job's line to the bot: the internal API with the shared secret.
+
+    ``ask_marker``: the file ``ask`` writes while it waits (``None`` = none;
+    ``run_job`` sets it to ``<job dir>/ask_pending.json``)."""
+
+    def __init__(
+        self, base_url: str, secret: Optional[str], ask_marker: Optional[Path] = None
+    ) -> None:
         self._base = base_url.rstrip("/")
         self._secret = secret
+        self.ask_marker = ask_marker
 
     def post(self, path: str, body: Dict[str, Any], timeout: float) -> Dict[str, Any]:
         if not self._secret:
@@ -214,6 +225,7 @@ class BotLink:
         body: Dict[str, Any] = {"reason": reason, "preview": preview, "source": source}
         if context:
             body["context"] = context
+        self._mark_ask(reason, preview)
         try:
             answer = await asyncio.to_thread(
                 self.post, ASK_PATH, body, ASK_TIMEOUT_SECONDS + 60
@@ -221,7 +233,28 @@ class BotLink:
         except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
             logger.warning("ask could not reach the bot -> denied", error=str(exc))
             return False
+        finally:
+            self._unmark_ask()
         return bool(answer.get("approved"))
+
+    def _mark_ask(self, reason: str, preview: str) -> None:
+        """Best effort: a marker that cannot be written never fails the ask."""
+        if self.ask_marker is None:
+            return
+        since = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        data = {"since": since, "reason": reason, "preview": preview[:200]}
+        try:
+            self.ask_marker.write_text(json.dumps(data), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("ask marker not written", error=str(exc))
+
+    def _unmark_ask(self) -> None:
+        if self.ask_marker is None:
+            return
+        try:
+            self.ask_marker.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("ask marker not removed", error=str(exc))
 
     async def record(self, row: Dict[str, Any]) -> bool:
         try:
@@ -552,6 +585,8 @@ async def run_job(spec: JobSpec, link: BotLink, out: Any = None) -> int:
     if spec.purpose not in PURPOSES:
         raise ValueError(f"unknown model call purpose: {spec.purpose!r}")
     out = out if out is not None else sys.stdout
+    if link.ask_marker is None and spec.session_file is not None:
+        link.ask_marker = spec.session_file.parent / ASK_MARKER
     route = spec.route
     if route is not None and route.harness == CODEX_HARNESS:
         from .job_codex import run_codex_job

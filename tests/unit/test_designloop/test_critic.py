@@ -94,7 +94,7 @@ def _renders(tmp_path: Path) -> List[Path]:
 
 
 async def test_critic_sends_renders_to_codex_as_images_and_gets_the_fixed_json(
-    gymbro_repo, tmp_path, monkeypatch, db
+    app_repo, tmp_path, monkeypatch, db
 ):
     """End to end down to the `codex exec` argv: every render and every
     current-screen reference is an `-i` image, the brief goes over stdin,
@@ -123,7 +123,7 @@ async def test_critic_sends_renders_to_codex_as_images_and_gets_the_fixed_json(
             versions=_Versions(),
         )
     )
-    brief = build_brief(gymbro_repo, "feed", "Make the feed calmer.")
+    brief = build_brief(app_repo, "feed", "Make the feed calmer.")
     renders = _renders(tmp_path)
 
     result = await _maybe(critique(brief, renders))
@@ -156,7 +156,7 @@ async def test_critic_sends_renders_to_codex_as_images_and_gets_the_fixed_json(
 
 
 async def test_critic_refuses_a_criterion_that_is_neither_ok_nor_fix(
-    gymbro_repo, tmp_path
+    app_repo, tmp_path
 ):
     """`great!` is not `ok` or `fix: <what>`: the critique is not accepted as
     is (a vague verdict would reach the owner), and Claude never answers
@@ -179,7 +179,7 @@ async def test_critic_refuses_a_criterion_that_is_neither_ok_nor_fix(
             versions=_Versions(),
         )
     )
-    brief = build_brief(gymbro_repo, "feed", "Make the feed calmer.")
+    brief = build_brief(app_repo, "feed", "Make the feed calmer.")
 
     with pytest.raises((ModelCallError, ValueError)):
         await _maybe(critique(brief, _renders(tmp_path)))

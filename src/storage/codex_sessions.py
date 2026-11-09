@@ -177,6 +177,25 @@ class CodexSessionStore:
             )
             await conn.commit()
 
+    async def bundle_sha_for(self, thread_id: str) -> Optional[str]:
+        """Window-bundle sha this thread last received (dv-ef59), or None."""
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(
+                "SELECT bundle_sha256 FROM sessions WHERE session_id = ?",
+                (thread_id,),
+            )
+            row = await cur.fetchone()
+        return row[0] if row and row[0] else None
+
+    async def set_bundle_sha(self, thread_id: str, sha256: str) -> None:
+        """Record the bundle sha the thread now holds (dv-ef59)."""
+        async with self._db.get_connection() as conn:
+            await conn.execute(
+                "UPDATE sessions SET bundle_sha256 = ? WHERE session_id = ?",
+                (sha256, thread_id),
+            )
+            await conn.commit()
+
     async def clear(self, user_id: int, working_dir: Path) -> None:
         """Drop the resume pointer for (user, dir). Only the flag: the row
         stays active and intact as the FK parent of the thread's messages."""
@@ -263,6 +282,14 @@ class InMemoryCodexSessionStore:
             e["thread_total_output"] = int(thread_total_output)
         e["updated_at"] = datetime.now(UTC).isoformat()
         self._heads[key] = thread_id
+
+    async def bundle_sha_for(self, thread_id: str) -> Optional[str]:
+        e = self._threads.get(thread_id)
+        return e.get("bundle_sha256") if e else None
+
+    async def set_bundle_sha(self, thread_id: str, sha256: str) -> None:
+        if thread_id in self._threads:
+            self._threads[thread_id]["bundle_sha256"] = sha256
 
     async def clear(self, user_id: int, working_dir: Path) -> None:
         self._heads.pop(self._key(user_id, working_dir), None)

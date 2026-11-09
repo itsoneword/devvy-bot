@@ -19,123 +19,30 @@ It does the same three things ``src/main.py`` does at boot, in the same order:
 Idempotent: everything it touches already refuses to overwrite. Run it any time
 to check a deployment, not just from the installer.
 
+The checks themselves live in ``src/boot/check.py``. ``--preflight`` is the
+restart gate (dv-86f4): the bot runs it before ``/restart`` and
+``restart_bot``, and an owner-actions step that edits config ends with it. It
+never creates or migrates a DB.
+
 Usage:
     poetry run python scripts/check_install.py
     poetry run python scripts/check_install.py --skip-db
+    poetry run python scripts/check_install.py --preflight
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-OK = "✔"
-BAD = "✘"
-
-
-class CheckFailed(RuntimeError):
-    """One verification step failed; the message is meant for a human."""
-
-
-def _report(ok: bool, label: str, detail: str = "") -> None:
-    mark = OK if ok else BAD
-    line = f"  {mark}  {label}"
-    if detail:
-        line += f"  --  {detail}"
-    print(line)
-
-
-async def verify(
-    *, skip_db: bool = False, env_file: Optional[Path] = None
-) -> List[Tuple[bool, str]]:
-    """Run every check. Returns (ok, label) per step; never raises for a
-    failed *check* -- only for a bug in the checker itself."""
-    from src.config import load_config
-
-    results: List[Tuple[bool, str]] = []
-
-    # 1. Settings -----------------------------------------------------
-    try:
-        config = load_config(config_file=env_file)
-    except Exception as exc:  # noqa: BLE001 - any config error is the message
-        _report(False, "configuration (.env)", str(exc).splitlines()[0])
-        print("\n     Fix .env and re-run. install.sh --dry-run shows what it writes.")
-        return [(False, "configuration")]
-    _report(True, "configuration (.env)", f"bot @{config.telegram_bot_username}")
-    results.append((True, "configuration"))
-
-    owners = list(config.allowed_users or [])
-    if owners:
-        _report(True, "owner configured", f"ALLOWED_USERS={','.join(map(str, owners))}")
-        results.append((True, "owner"))
-    else:
-        # Not fatal here on purpose: the installer can legitimately reach this
-        # point with the owner capture skipped or still to come. main.py is
-        # where it becomes fatal, and it says so clearly.
-        _report(False, "owner configured", "ALLOWED_USERS is empty")
-        print("     The bot will refuse to start. Re-run install.sh, or set")
-        print("     ALLOWED_USERS=<your telegram id> in .env.")
-        results.append((False, "owner"))
-
-    # 2. Profiles -----------------------------------------------------
-    if config.profiles_config_path:
-        try:
-            from src.boot.profiles import bootstrap_profiles
-            from src.profiles import load_profile_registry, validate_registry_paths
-
-            registry = load_profile_registry(
-                config.profiles_config_path,
-                sandbox_default=config.sandbox_enabled,
-            )
-            await bootstrap_profiles(registry, REPO_ROOT / "data" / "templates")
-            validate_registry_paths(registry)
-        except Exception as exc:  # noqa: BLE001
-            _report(False, "profiles", str(exc).splitlines()[0])
-            results.append((False, "profiles"))
-        else:
-            slugs = ", ".join(p.slug for p in registry.profiles)
-            _report(True, "profiles", f"{len(registry.profiles)} loaded: {slugs}")
-            results.append((True, "profiles"))
-    else:
-        _report(True, "profiles", "single-profile mode (PROFILES_CONFIG_PATH unset)")
-        results.append((True, "profiles"))
-
-    # 3. Database -----------------------------------------------------
-    if skip_db:
-        return results
-    try:
-        from src.storage.facade import Storage
-        from src.storage.user_repository import UserStore
-
-        storage = Storage(
-            config.database_url,
-            tasks_dir=config.deviz_tasks_dir,
-            user_database_url=config.user_database_url,
-        )
-        await storage.initialize()
-        try:
-            user_store = UserStore(storage.bot_users)
-            await user_store.seed_env_owners(owners)
-            await user_store.refresh()
-            count = len(user_store.owner_ids())
-        finally:
-            close = getattr(storage, "close", None)
-            if close is not None:
-                await close()
-    except Exception as exc:  # noqa: BLE001
-        _report(False, "database", str(exc).splitlines()[0])
-        results.append((False, "database"))
-    else:
-        _report(True, "database", f"schema ready, {count} owner row(s)")
-        results.append((True, "database"))
-
-    return results
+from src.boot.check import BAD, OK, verify  # noqa: E402
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -146,6 +53,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="config and profiles only; do not create or open the database",
     )
     p.add_argument(
+        "--preflight",
+        action="store_true",
+        help="restart preflight (dv-86f4): also import the code, and check the "
+        "DBs read-only instead of migrating them; exit 0/1, first line = the "
+        "first problem",
+    )
+    p.add_argument(
         "--env-file",
         type=Path,
         help="path to the .env to check (default: ./.env, as the service uses)",
@@ -153,12 +67,34 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def preflight(skip_db: bool = False, env_file: Optional[Path] = None) -> int:
+    """The restart gate: the first failure is the first line on stdout (the
+    bot quotes it when it refuses a restart), then every step."""
+    # Library logging (structlog prints to stdout) must not come first.
+    with contextlib.redirect_stdout(sys.stderr):
+        results = asyncio.run(
+            verify(skip_db=skip_db, env_file=env_file, preflight=True)
+        )
+    failed = [(label, detail) for ok, label, detail in results if not ok]
+    if failed:
+        label, detail = failed[0]
+        print(f"{BAD} {label}: {detail}" if detail else f"{BAD} {label}")
+    else:
+        print(f"{OK} boot check passed")
+    for ok, label, detail in results:
+        line = f"  {OK if ok else BAD}  {label}"
+        print(f"{line}  --  {detail}" if detail else line)
+    return 1 if failed else 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    if args.preflight:
+        return preflight(skip_db=args.skip_db, env_file=args.env_file)
     print("\nVerifying the installed configuration")
     print("-------------------------------------")
     results = asyncio.run(verify(skip_db=args.skip_db, env_file=args.env_file))
-    failed = [label for ok, label in results if not ok]
+    failed = [label for ok, label, _detail in results if not ok]
     print()
     if failed:
         print(f"{BAD} not ready: {', '.join(failed)}")

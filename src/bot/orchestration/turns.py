@@ -49,12 +49,8 @@ from .routing import (
 # Thresholds are read off the live WindowRepository instance (settings-driven),
 # not imported as constants — see dv-9f31.
 from .windowing import (
-    _context_tokens_of,
-    account_turn_and_maybe_eval,
-    consume_pending_seed,
     effective_refresh_threshold,
     mentions_remember_trigger,
-    refresh_window,
     window_conversation_text,
 )
 
@@ -62,6 +58,10 @@ if TYPE_CHECKING:
     from ...claude.sdk_integration import ClaudeResponse, StreamUpdate
 
 logger = structlog.get_logger()
+
+# Telegram caps a message at 4096 chars; leave room for the HTML wrapper and
+# the escaping of <, > and & in the transcript.
+VOICE_ECHO_MAX_CHARS = 3500
 
 # Uploads that are NOT UTF-8 text: never inline these into the prompt, save
 # them to disk and give the agent the path instead.
@@ -433,22 +433,20 @@ class TurnsMixin(OrchestratorBase):
         runs when the current turn finishes — against the session state that
         turn produced, like the CLI's own input queueing.
         """
-        # A reply carrying a /auth login code is an ordinary text message, so
-        # it must be intercepted before the turn lock -- otherwise an in-flight
-        # turn holds the code until it finishes and the login has expired.
-        from .commands.auth import consume_login_code
-
-        if await consume_login_code(update, context):
-            return
+        # A message that is input, not a turn (dv-3881 ``next_input``): a
+        # /auth login code, the onboarding interview (dv-bf1e), a Pump answer
+        # draft. Before the turn lock -- otherwise an in-flight turn holds a
+        # login code until it finishes and the login has expired.
+        from . import next_input
 
         user_id = update.effective_user.id
-        # First-run gate (dv-bf1e): an unconfigured bot sends every owner
-        # message into the onboarding interview instead of a model turn.
-        from .commands.setup import gate_text
-
         gated = override_text if override_text is not None else update.message.text
-        if await gate_text(
-            update, context, gated or "", self._resolve_role(user_id, context)
+        if await next_input.consume(
+            update,
+            context,
+            kind="text",
+            text=gated or "",
+            role=self._resolve_role(user_id, context),
         ):
             return
         # A plain message sent while an album is still collecting is its
@@ -720,14 +718,28 @@ class TurnsMixin(OrchestratorBase):
         context = state.context
         user_id = state.user_id
         current_dir = state.current_dir
-        # The transition also set force_new_session=True. Read it from the
-        # window row, not just user_data, so a restart between the roll
-        # and this turn cannot cancel the rotation (dv-9f31).
-        _wstate = await window_repo.get_or_create(user_id, current_dir)
-        refresh_threshold = effective_refresh_threshold(
-            window_repo.refresh_threshold_tokens,
-            backend=state.selected_backend,
-            model_ref=self._selected_model(context),
+        # One lifecycle for both channels: ChatTurnService.prepare (dv-fe4d).
+        from ...chat.turn_service import ChatTurnService
+
+        force_new, prompt_text, _wstate, refresh_threshold = (
+            await ChatTurnService.prepare(
+                window_repo=window_repo,
+                storage=context.bot_data.get("storage"),
+                evaluator=context.bot_data.get("evaluator_service"),
+                user_data=context.user_data,
+                user_id=user_id,
+                working_dir=current_dir,
+                backend=state.selected_backend,
+                model_ref=self._selected_model(context),
+                prompt=prompt_text,
+                force_new=force_new,
+                agent_id=self._agent_id_for(context, current_dir, user_id),
+                family_id=self._family_id_for(context, user_id, current_dir),
+                consolidation=context.bot_data.get("consolidation_service"),
+                conversation_text=lambda window: self._window_conversation_text(
+                    context, user_id, current_dir, window
+                ),
+            )
         )
         state.window_refresh_threshold_for_footer = refresh_threshold
         # A switch arms a seed from the CURRENT window; a roll seeds from the
@@ -735,56 +747,6 @@ class TurnsMixin(OrchestratorBase):
         state.switch_rebuild_for_footer = (
             _wstate.pending_seed_window is not None
             and _wstate.pending_seed_window == _wstate.window_id
-        )
-        force_new = (
-            force_new
-            or _wstate.force_new_session
-            or bool(context.user_data.get("force_new_session"))
-        )
-        if not force_new and window_repo.should_refresh(_wstate, refresh_threshold):
-            # Backstop: the window is already over the roll threshold and
-            # nothing armed a transition (older build, lost flag, threshold
-            # lowered under a running window, manual DB edit). Run the SAME
-            # transition a normal turn-end crossing would — final
-            # extraction over the outgoing slice, window roll (so the
-            # bundle re-materializes for the new window_id), armed seed —
-            # then let THIS turn consume it via consume_pending_seed
-            # below, so the user's message still goes out with continuity.
-            # The previous bare force_new dropped ~164k tokens of context
-            # with no seed, no extraction, and a stale frozen bundle
-            # (dv-d9e2, live incident 2026-08-08 10:21:08Z).
-            logger.warning(
-                "Window over refresh threshold with no armed transition; "
-                "forcing a fresh session",
-                user_id=user_id,
-                working_dir=str(current_dir),
-                context_tokens=_wstate.last_context_tokens,
-                refresh_threshold_tokens=refresh_threshold,
-            )
-            await refresh_window(
-                window_repo,
-                context.bot_data.get("evaluator_service"),
-                context.user_data,
-                user_id=user_id,
-                working_dir=current_dir,
-                backend=state.selected_backend,
-                conversation_text=await self._window_conversation_text(
-                    context, user_id, current_dir, _wstate
-                ),
-                agent_id=self._agent_id_for(context, current_dir, user_id),
-                family_id=self._family_id_for(context, user_id, current_dir),
-                consolidation=context.bot_data.get("consolidation_service"),
-            )
-            force_new = True
-        _storage = context.bot_data.get("storage")
-        prompt_text = await consume_pending_seed(
-            window_repo,
-            context.user_data,
-            user_id=user_id,
-            working_dir=current_dir,
-            user_message=prompt_text,
-            memory_repo=getattr(_storage, "memory_repository", None),
-            agent_id=self._agent_id_for(context, current_dir, user_id),
         )
         return force_new, prompt_text
 
@@ -855,12 +817,14 @@ class TurnsMixin(OrchestratorBase):
             )
         if storage:
             try:
-                state.saved_message_id = await storage.save_claude_interaction(
+                from ...chat.turn_service import ChatTurnService
+
+                state.saved_message_id = await ChatTurnService.store(
+                    storage,
                     user_id=user_id,
                     session_id=claude_response.session_id,
                     prompt=state.storage_prompt,
                     response=claude_response,
-                    ip_address=None,
                     window_id=state_before.window_id if state_before else None,
                 )
             except Exception as e:
@@ -1344,16 +1308,15 @@ class TurnsMixin(OrchestratorBase):
             convo = await self._window_conversation_text(
                 context, user_id, current_dir, wstate
             )
-            await account_turn_and_maybe_eval(
+            from ...chat.turn_service import ChatTurnService
+
+            await ChatTurnService.account(
                 window_repo=window_repo,
                 evaluator=evaluator,
                 user_id=user_id,
                 working_dir=current_dir,
                 backend=state.selected_backend,
-                added_tokens=(
-                    claude_response.input_tokens + claude_response.output_tokens
-                ),
-                context_tokens=_context_tokens_of(claude_response),
+                response=claude_response,
                 conversation_text=convo,
                 max_message_id=await self._max_message_id(
                     context, user_id, current_dir
@@ -1363,29 +1326,29 @@ class TurnsMixin(OrchestratorBase):
                 # Trigger runs on the user's raw text only — a quoted
                 # «запомнил» in the reply envelope cannot force an
                 # eval (dv-7783, msg-766).
-                force_eval=mentions_remember_trigger(state.trigger_text),
+                trigger_text=state.trigger_text,
                 refresh_threshold_tokens=refresh_threshold,
             )
             # Model-aware context roll on the SAME backend; arm the seed so
             # the next turn continues fresh.
-            state_after = await window_repo.get_or_create(user_id, current_dir)
+            state_after, rolled = await ChatTurnService.roll_if_needed(
+                window_repo=window_repo,
+                evaluator=evaluator,
+                user_data=context.user_data,
+                user_id=user_id,
+                working_dir=current_dir,
+                backend=state.selected_backend,
+                refresh_threshold_tokens=refresh_threshold,
+                conversation_text=lambda window: self._window_conversation_text(
+                    context, user_id, current_dir, window
+                ),
+                agent_id=agent_id,
+                family_id=state.family_id,
+                consolidation=context.bot_data.get("consolidation_service"),
+            )
             state.window_state_for_footer = state_after
-            if window_repo.should_refresh(state_after, refresh_threshold):
+            if rolled:
                 state.window_rotated_for_footer = True
-                await refresh_window(
-                    window_repo,
-                    evaluator,
-                    context.user_data,
-                    user_id=user_id,
-                    working_dir=current_dir,
-                    backend=state.selected_backend,
-                    conversation_text=await self._window_conversation_text(
-                        context, user_id, current_dir, state_after
-                    ),
-                    agent_id=agent_id,
-                    family_id=state.family_id,
-                    consolidation=context.bot_data.get("consolidation_service"),
-                )
         except Exception as e:
             logger.warning(state.request.accounting_log_error, error=str(e))
 
@@ -1794,15 +1757,23 @@ class TurnsMixin(OrchestratorBase):
         )
 
         session_key = self._session_key(selected_backend)
-        session_id = context.user_data.get(session_key)
+        remembered_session = context.user_data.get(session_key)
         if context.bot_data.get("profile_registry"):
-            # Per-profile isolation: let the facade auto-resume by working_dir
-            # (_find_resumable_session) rather than the single global session id.
-            session_id = None
+            # Per-profile isolation: the facade auto-resumes by working_dir.
+            remembered_session = None
 
         # Check if /new was used — skip auto-resume for this first message.
         # Flag is only cleared after a successful run so retries keep the intent.
-        force_new = bool(context.user_data.get("force_new_session"))
+        # With windows the per-(user, working_dir) window row is the only
+        # source: ``user_data`` is per Telegram user and shared by every
+        # profile's chat, so a roll in one agent's chat used to reset the
+        # session of whichever other agent the user wrote to next (dv-3114,
+        # 02.11.26: gymbro roll 21:24 -> devops fresh session 21:40).
+        force_new = (
+            False
+            if context.bot_data.get("window_repo") is not None
+            else bool(context.user_data.get("force_new_session"))
+        )
 
         # BPC: if a transition (backend switch / 150k compaction) armed a seed,
         # prepend the previous window's recent tail so the fresh backend
@@ -1821,12 +1792,16 @@ class TurnsMixin(OrchestratorBase):
                 force_new=force_new,
                 prompt_text=prompt_text,
             )
-        if force_new:
-            # A fresh session is owed: never hand the backend an explicit id
-            # to resume. Without a profile registry this is the user_data id,
-            # which after a backend switch-back is the stale session that
-            # lacks the other model's turns (dv-168e).
-            session_id = None
+        from ...chat.turn_service import ChatTurnService
+
+        session_id = await ChatTurnService.session(
+            backend=active_integration,
+            user_id=user_id,
+            working_dir=current_dir,
+            remembered=remembered_session,
+            force_new=force_new,
+            auto_resume=False,
+        )
 
         # One-shot pending notes for this workspace (e.g. a verbatim
         # scheduled reminder delivered since the last turn): prepend so the
@@ -1900,9 +1875,12 @@ class TurnsMixin(OrchestratorBase):
             extra_kwargs: Dict[str, Any] = (
                 {"images": request.images} if request.pass_images_kwarg else {}
             )
-            claude_response = await self._router(context).run_turn(
+            from ...chat.turn_service import ChatTurnService
+
+            claude_response = await ChatTurnService.run(
+                self._router(context),
                 active_integration,
-                purpose="chat",
+                window_repo=window_repo,
                 prompt=prompt_text,
                 working_directory=current_dir,
                 user_id=user_id,
@@ -1926,8 +1904,6 @@ class TurnsMixin(OrchestratorBase):
             # both places it can live.
             if force_new:
                 context.user_data["force_new_session"] = False
-                if window_repo:
-                    await window_repo.clear_pending_transition(user_id, current_dir)
 
             context.user_data[session_key] = claude_response.session_id
 
@@ -2046,9 +2022,15 @@ class TurnsMixin(OrchestratorBase):
     ) -> None:
         """Process file upload -> Claude, minimal chrome."""
         user_id = update.effective_user.id
-        from .commands.setup import gate_media
+        from . import next_input
 
-        if await gate_media(update, context, self._resolve_role(user_id, context)):
+        if await next_input.consume(
+            update,
+            context,
+            kind="media",
+            text=None,
+            role=self._resolve_role(user_id, context),
+        ):
             return
         document = update.message.document
 
@@ -2175,9 +2157,15 @@ class TurnsMixin(OrchestratorBase):
     ) -> None:
         """Process photo -> Claude, minimal chrome."""
         user_id = update.effective_user.id
-        from .commands.setup import gate_media
+        from . import next_input
 
-        if await gate_media(update, context, self._resolve_role(user_id, context)):
+        if await next_input.consume(
+            update,
+            context,
+            kind="media",
+            text=None,
+            role=self._resolve_role(user_id, context),
+        ):
             return
 
         features = context.bot_data.get("features")
@@ -2289,20 +2277,23 @@ class TurnsMixin(OrchestratorBase):
                     voice, update.message.caption
                 )
 
-                from .commands.setup import gate_text
+                from . import next_input
 
-                if await gate_text(
+                if await next_input.consume(
                     update,
                     context,
-                    processed_voice.transcription,
-                    self._resolve_role(user_id, context),
+                    kind="voice",
+                    text=processed_voice.transcription,
+                    role=self._resolve_role(user_id, context),
                 ):
-                    # Onboarding answers by voice (dv-bf1e): transcript in,
-                    # no model turn.
+                    # Onboarding (dv-bf1e) or a Pump answer draft (dv-3881)
+                    # by voice: transcript in, no model turn.
                     await progress_msg.delete()
                     return
 
-                await progress_msg.edit_text("Working...")
+                progress_msg = await self._echo_voice_transcript(
+                    update, progress_msg, processed_voice.transcription
+                )
                 await self._run_agentic_media_turn(
                     update=update,
                     context=context,
@@ -2321,6 +2312,34 @@ class TurnsMixin(OrchestratorBase):
                 logger.error(
                     "Claude voice processing failed", error=str(e), user_id=user_id
                 )
+
+    async def _echo_voice_transcript(
+        self, update: Update, progress_msg: Any, transcription: str
+    ) -> Any:
+        """Turn the progress message into the voice's transcript, shown as a
+        collapsed quote, and open a fresh "Working..." message for the turn.
+
+        The turn deletes its progress message at the end, so the transcript
+        cannot stay in that message; it keeps it and hands back a new one.
+        Off (VOICE_ECHO_TRANSCRIPT=false) or on any send error: the old
+        behaviour, the same progress message reset to "Working...".
+        """
+        if not self.settings.voice_echo_transcript or not transcription.strip():
+            await progress_msg.edit_text("Working...")
+            return progress_msg
+        text = transcription.strip()
+        if len(text) > VOICE_ECHO_MAX_CHARS:
+            text = text[:VOICE_ECHO_MAX_CHARS].rstrip() + " …"
+        try:
+            await progress_msg.edit_text(
+                f"🎙 <blockquote expandable>{html.escape(text)}</blockquote>",
+                parse_mode="HTML",
+            )
+            return await update.message.reply_text("Working...")
+        except Exception as e:
+            logger.warning("Voice transcript echo failed", error=str(e))
+            await progress_msg.edit_text("Working...")
+            return progress_msg
 
     async def _begin_media_turn(
         self,

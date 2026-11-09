@@ -1,5 +1,4 @@
-"""The design critic: Codex judges variant renders through the model router
-(dv-9133).
+"""The design critic: Codex judges variant renders through the model router.
 
 The generator is Claude, so the critic is another family: purpose
 ``design_critic`` is pinned to Codex with no fallback (routes.py). It sees
@@ -27,8 +26,7 @@ from .brief import Brief
 PURPOSE = "design_critic"
 TIMEOUT_SECONDS = 600.0
 
-# The ticket's six criteria (26.10) with the owner's 26.10/27.10 additions
-# folded in: grouping into hierarchy, laconism into density, structural
+# Six criteria, with the owner's later additions folded in: grouping into hierarchy, laconism into density, structural
 # parity of sibling screens into consistency.
 CRITERIA: Mapping[str, str] = {
     "hierarchy": (
@@ -44,7 +42,7 @@ CRITERIA: Mapping[str, str] = {
     ),
     "consistency": (
         "same structure and components as the app's other screens; sibling "
-        "screens (own / other profile) share one structure"
+        "screens (e.g. two views of the same object) share one structure"
     ),
     "reference_match": (
         "as good as the reference (the current screen, and the named "
@@ -65,7 +63,7 @@ CRITIC_SCHEMA: Dict[str, Any] = {
             "additionalProperties": False,
             "properties": {name: {"type": "string"} for name in CRITERIA},
         },
-        # Owner 27.10: a scored critic, so its verdicts can be compared with
+        # A scored critic, so its verdicts can be compared with
         # the owner's picks over time.
         "score": {"type": "integer", "minimum": 1, "maximum": 10},
         "verdict": {"enum": list(VERDICTS)},
@@ -75,8 +73,8 @@ CRITIC_SCHEMA: Dict[str, Any] = {
 _VALUE = re.compile(r"^(ok|fix:\s*\S.*)$", re.IGNORECASE | re.DOTALL)
 
 SYSTEM_PROMPT = """\
-You are a senior product designer reviewing mobile screens of a Telegram
-Mini App. You judge only what the images show against the brief. You are
+You are a senior product designer reviewing mobile screens of an
+app. You judge only what the images show against the brief. You are
 strict: "ready" means you would ship it as is.
 
 Answer the JSON schema. For each criterion write exactly "ok" or

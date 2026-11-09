@@ -11,6 +11,7 @@ import pytest
 
 from src.claude import agent_tools
 from src.claude.agent_tools import AgentServices, build_agent_mcp_server
+from src.claude.turn_setup import resolve_turn_context
 from src.evaluator.writer import MemoryWriter
 from src.events.types import AgentResponseEvent
 from src.storage.database import DatabaseManager
@@ -22,6 +23,7 @@ from src.storage.repositories import (
     SessionRepository,
     UserRepository,
 )
+from tests.unit.test_claude.test_turn_setup_parity import _registry
 
 
 class FakeEventBus:
@@ -158,6 +160,23 @@ class TestNotify:
 
 
 class TestScheduleAdd:
+    async def test_owner_schedule_without_profile_keeps_user_workspace(
+        self, services, captured_tools, scheduler, tmp_path
+    ) -> None:
+        registry = _registry(tmp_path)
+        services.profile_registry = registry
+        cwd = tmp_path / "coach" / "users" / "111"
+        cwd.mkdir(parents=True)
+        ctx = resolve_turn_context(registry, cwd, user_id=111, role="owner")
+        build_agent_mcp_server(
+            services, ctx.profile_slug, cwd, user_id=111, role="owner"
+        )
+        result = await captured_tools["schedule_add"].handler(
+            {"name": "remind", "prompt": "ping", "cron": "0 9 * * *"}
+        )
+        assert result.get("isError") is not True, result
+        assert scheduler.add_job.call_args.kwargs["working_directory"] == cwd
+
     async def test_schedule_add_persists_requester_chat(
         self,
         services: AgentServices,
@@ -573,7 +592,15 @@ class TestRemember:
         schema = tools["remember"].input_schema
         # dv-6f2a: an explicit JSON Schema now, so the params are one level
         # down under "properties" — the boundary being asserted is unchanged.
-        assert set(schema["properties"]) == {"fact", "tier", "scope", "label"}
+        # dv-32fe: source_ref names where a decision is recorded in the repo,
+        # not a memory store; the row still lands in the session's own scope.
+        assert set(schema["properties"]) == {
+            "fact",
+            "tier",
+            "scope",
+            "label",
+            "source_ref",
+        }
 
     async def test_duplicate_of_an_existing_fact_collapses(
         self,
@@ -1598,15 +1625,33 @@ class TestJobStartCommand:
         assert "--queue" not in argv, argv
 
 
+@pytest.fixture(autouse=True)
+def _boards_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A tmp boards.json: devops = the home board, pl and coach their own."""
+    import json
+
+    from src.utils import boards as boards_mod
+
+    bf = tmp_path / "boards.json"
+    bf.write_text(
+        json.dumps(
+            {
+                "pump2_home": {"profile": "devops"},
+                "boards": [
+                    {"name": "pl", "repo": "/x/pl", "profile": "pl"},
+                    {"name": "coach", "repo": "/x/coach", "profile": "coach"},
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(boards_mod, "BOARDS_FILE_DEFAULT", bf)
+
+
 class TestJobStartBoardTask:
     """dv-a438: job_start(task_id) starts the board pipeline instead of a
     one-shot bgjob. The caller's PROFILE picks the board (pl and devvy both
-    use dv- ids), looked up through `scripts/taskpump` (the one parser of
-    boards.json), then `scripts/taskpump start <board>:<id>` runs. Every
-    subprocess is faked: a taskpump call without "start" is the board lookup
-    and answers by the profile slug in its argv."""
-
-    BOARDS = {"pl": "pl", "devops": "devvy"}
+    use dv- ids) through `boards.board_of_profile`, then
+    `scripts/pump2 start <board>:<id>` runs. Every subprocess is faked."""
 
     @classmethod
     def _fake(cls, monkeypatch: pytest.MonkeyPatch) -> list:
@@ -1622,11 +1667,6 @@ class TestJobStartBoardTask:
 
         async def fake_exec(*argv: str, **kw: Any) -> FakeProc:
             spawned.append(argv)
-            if Path(argv[0]).name == "taskpump" and "start" not in argv:
-                hit = next((b for p, b in cls.BOARDS.items() if p in argv), None)
-                if hit:
-                    return FakeProc(0, hit.encode() + b"\n")
-                return FakeProc(1, b"error: no board for this profile\n")
             return FakeProc(0, b"started\n")
 
         monkeypatch.setattr(agent_tools.asyncio, "create_subprocess_exec", fake_exec)
@@ -1639,7 +1679,7 @@ class TestJobStartBoardTask:
         )
         return captured
 
-    async def test_pl_agent_task_id_runs_taskpump_start_not_bgjob(
+    async def test_pl_agent_task_id_runs_pump2_start_not_bgjob(
         self, services, captured_tools, monkeypatch
     ):
         spawned = self._fake(monkeypatch)
@@ -1651,7 +1691,7 @@ class TestJobStartBoardTask:
         assert not any(Path(a[0]).name == "bgjob" for a in spawned)
         starts = [a for a in spawned if "start" in a]
         assert len(starts) == 1
-        assert Path(starts[0][0]).name == "taskpump"
+        assert Path(starts[0][0]).name == "pump2"
         assert "pl:dv-0a1b" in starts[0]
 
     async def test_profile_without_board_gets_a_clear_error(
@@ -1950,3 +1990,36 @@ class TestNotifyChatHistory:
         assert result.get("isError") is not True
         assert len(event_bus.published) == 1
         assert await self._messages(storage) == []
+
+
+class TestCommandJobPump2Hint:
+    """dv-92ee: a pump2 command job in the bash box exits 127; refuse it with
+    a pointer to job_start(task_id=...)."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "pump2 design run gymbro:gb-1aff",
+            "scripts/pump2 design run gymbro:gb-1aff",
+            "/opt/repo/scripts/pump2 design run x:y",
+            "cd /tmp && pump2 status",
+        ],
+    )
+    def test_C3_pump2_command_is_refused_with_task_id_hint(self, command, monkeypatch):
+        from types import SimpleNamespace
+
+        from src.claude import agent_tools
+        from src.security import policy
+
+        turn = SimpleNamespace(full_access=False)
+        monkeypatch.setattr(policy, "turn_policy_for", lambda *a, **k: turn)
+        monkeypatch.setattr(
+            policy,
+            "decide",
+            lambda *a, **k: SimpleNamespace(action=policy.ALLOW, reason=""),
+        )
+        services = SimpleNamespace(profile_registry=None)
+        ctx = SimpleNamespace(working_dir="/tmp", user_id=1, role="owner")
+        run_cmd, err = agent_tools._command_job_argv(services, ctx, command)
+        assert run_cmd == ""
+        assert "job_start(task_id=" in err

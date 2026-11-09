@@ -1,6 +1,6 @@
-"""The design loop's real steps on a board repo (dv-9133 phase 3).
+"""The design loop's real steps on a board repo (phase 3).
 
-``taskpump design run`` builds a :class:`BoardSteps` and hands its methods to
+``pump2 design run`` builds a :class:`BoardSteps` and hands its methods to
 :func:`src.designloop.loop.run_loop`:
 
 - generate: one ``scripts/agentjob`` turn per variant on the
@@ -9,6 +9,11 @@
   ``design/<card>/vN`` cut from the board repo's HEAD. The job edits the real
   app; this process commits what it left (jobs never write git, as in the
   pump).
+- current: the board's render argv, once per run, on the base commit in a
+  branchless worktree ``<worktrees>/<board>/<card>-current``, into
+  ``<out>/current/``. That render, not ``docs/screens``, is the
+  reference: the gate's ``{refs}``, the critic's reference images and the
+  collage's tile 0 (same commit, language and size as the variants).
 - render / gate: the board's argv (``boards.json`` ``design`` block). The gate
   also fails, without the board's script, a variant with no commit against
   the current app or with no renders.
@@ -20,12 +25,14 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from ..pump2.template import fill_template
 from .brief import Brief
 from .critic import Critique, critique
 from .loop import Variant
@@ -77,6 +84,17 @@ def parse_config(raw: object) -> Optional[DesignConfig]:
         python=python,
         variants=max(2, min(3, variants)),
     )
+
+
+def missing_scripts(config: DesignConfig, repo: Path) -> List[str]:
+    """The render / gate ``.py`` arguments absent from ``repo`` (relative ones
+    resolve against it): ``pump2 design run`` refuses, ``pump2 doctor`` reports."""
+    return [
+        a
+        for a in (*config.render, *config.gate)
+        if a.endswith(".py")
+        and not (Path(a) if Path(a).is_absolute() else repo / a).exists()
+    ]
 
 
 def _fill(argv: Sequence[str], values: Mapping[str, str]) -> List[str]:
@@ -139,6 +157,8 @@ class BoardSteps:
         self.run = run
         self.base = ""
         self.attempts: Dict[str, int] = {}
+        self.current_pngs: Optional[List[Path]] = None
+        self.fresh: List[str] = []
 
     # -- git -----------------------------------------------------------------
 
@@ -147,6 +167,14 @@ class BoardSteps:
 
     def worktree(self, branch: str) -> Path:
         return self.worktrees / f"{self.card}-{branch.rsplit('/', 1)[-1]}"
+
+    @property
+    def current_worktree(self) -> Path:
+        return self.worktrees / f"{self.card}-current"
+
+    @property
+    def current_dir(self) -> Path:
+        return self.out / "current"
 
     def _git(self, *args: str, cwd: Optional[Path] = None) -> str:
         r = self.run(
@@ -158,12 +186,17 @@ class BoardSteps:
 
     def prepare(self) -> List[str]:
         """One worktree per variant, cut from the board repo's HEAD (the
-        current app). A rerun reuses them: their commits are the work."""
+        current app). A rerun reuses them (their commits are the work) and
+        merges the current base into each, so the variant's own render
+        scripts are not stale; a variant whose merge fails starts fresh from
+        the base and is listed in ``self.fresh`` (dv-af52)."""
         self.base = self._git("rev-parse", "HEAD")
+        self.fresh = []
         branches = [self.branch(n) for n in range(1, self.config.variants + 1)]
         for branch in branches:
             path = self.worktree(branch)
             if (path / ".git").exists():
+                self._update(branch)
                 continue
             path.parent.mkdir(parents=True, exist_ok=True)
             exists = (
@@ -177,9 +210,38 @@ class BoardSteps:
             )
             if exists:
                 self._git("worktree", "add", "-q", str(path), branch)
+                self._update(branch)
             else:
                 self._git("worktree", "add", "-q", "-b", branch, str(path), self.base)
+        current = self.current_worktree
+        if (current / ".git").exists():
+            self._git("checkout", "-q", "--detach", self.base, cwd=current)
+        else:
+            current.parent.mkdir(parents=True, exist_ok=True)
+            self._git("worktree", "add", "-q", "--detach", str(current), self.base)
         return branches
+
+    def _update(self, branch: str) -> None:
+        """Merge the base into a reused variant; on failure reset it to the
+        base (the variant worktree is the loop's own, old work stays in the
+        reflog) and note it for the run summary."""
+        path = self.worktree(branch)
+        n = branch.rsplit("/", 1)[-1]
+        self._commit(branch, f"design {self.card} {n}: leftovers before rerun")
+        merged = self.run(
+            ["git", "merge", "--no-edit", "-q", self.base],
+            cwd=str(path),
+            capture_output=True,
+            text=True,
+        )
+        if merged.returncode == 0:
+            return
+        self.run(
+            ["git", "merge", "--abort"], cwd=str(path), capture_output=True, text=True
+        )
+        self._git("reset", "-q", "--hard", self.base, cwd=path)
+        self._git("clean", "-q", "-fd", cwd=path)
+        self.fresh.append(f"{n} started fresh: merging {self.base[:7]} conflicted")
 
     def _commit(self, branch: str, message: str) -> None:
         path = self.worktree(branch)
@@ -231,10 +293,7 @@ class BoardSteps:
                 else "(first draft: no feedback yet)"
             ),
         }
-        text = self.template.read_text(encoding="utf-8")
-        for key, value in values.items():
-            text = text.replace("{{" + key + "}}", value)
-        return text
+        return fill_template(self.template.read_text(encoding="utf-8"), values)
 
     def _agentjob(self, branch: str, prompt: str) -> None:
         path = self.worktree(branch)
@@ -265,7 +324,36 @@ class BoardSteps:
                 f"{(r.stderr or r.stdout or '').strip()[-400:]}"
             )
 
+    def _render_current(self) -> List[Path]:
+        """The current app at ``self.base``, rendered once per run."""
+        if self.current_pngs is not None:
+            return self.current_pngs
+        out = self.current_dir
+        out.mkdir(parents=True, exist_ok=True)
+        for old in out.glob("*.png"):
+            old.unlink()
+        cwd = self.current_worktree
+        argv = _fill(
+            self.config.render,
+            {"worktree": str(cwd), "out": str(out), "screen": self.screen},
+        )
+        r = self.run(argv, cwd=str(cwd), capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"render of the current app failed (rc {r.returncode}): "
+                f"{(r.stderr or r.stdout or '').strip()[-400:]}"
+            )
+        pngs = sorted(out.glob("*.png"))
+        if not pngs:
+            raise RuntimeError("render of the current app produced no PNG")
+        self.current_pngs = pngs
+        return pngs
+
+    async def current(self) -> List[Path]:
+        return await asyncio.to_thread(self._render_current)
+
     async def render(self, branch: str) -> List[Path]:
+        await self.current()
         self.attempts[branch] = self.attempts.get(branch, 0) + 1
         out = self.out / branch.rsplit("/", 1)[-1] / f"a{self.attempts[branch]}"
         out.mkdir(parents=True, exist_ok=True)
@@ -302,12 +390,13 @@ class BoardSteps:
         if not renders:
             return [f"{branch}: the render produced no PNG"]
         folder = Path(renders[0]).parent
+        await self.current()
         argv = _fill(
             self.config.gate,
             {
                 "worktree": str(self.worktree(branch)),
                 "renders": str(folder),
-                "refs": str(self.repo / "docs" / "screens" / self.screen),
+                "refs": str(self.current_dir),
                 "screen": self.screen,
             },
         )
@@ -328,6 +417,11 @@ class BoardSteps:
             ) from exc
 
     async def critic(self, brief: Brief, renders: Sequence[Path]) -> Critique:
+        """The current render is the reference; ``brief.refs`` (docs/screens)
+        only when it left no PNG."""
+        current = sorted(self.current_dir.glob("*.png"))
+        if current:
+            brief = dataclasses.replace(brief, refs=tuple(current))
         return await critique(brief, renders)
 
     async def describe(self, branch: str) -> str:
@@ -337,6 +431,10 @@ class BoardSteps:
     async def collage(self, variants: Sequence[Variant]) -> Path:
         path = self.out / "collage.png"
         cmd = [self.config.python, str(COLLAGE_SCRIPT), "--out", str(path)]
+        current = sorted(self.current_dir.glob("*.png"))
+        if current:
+            dark = [p for p in current if "dark" in p.name]
+            cmd += ["--tile", str((dark or current)[0]), "--label", "0. current"]
         for i, variant in enumerate(variants, 1):
             dark = [p for p in variant.renders if "dark" in p.name]
             tile = (dark or list(variant.renders))[0]

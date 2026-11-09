@@ -88,15 +88,20 @@ class CommandSpec:
 _OWNER = frozenset({"owner"})
 _EVERYONE = frozenset({"owner", "guest"})
 
-# The order of this table is the order of the Telegram menu (D5, 2026-08-11):
-# core + safety first, then the owner's four at the bottom.
+# The order of this table is the order of the Telegram menu (D5, 2026-08-11;
+# dv-3881: start, menu, new, agents, model, limits, stop, resume, restart, help).
 COMMAND_TABLE: tuple[CommandSpec, ...] = (
     CommandSpec("start", "Start the bot", "core", _EVERYONE),
-    CommandSpec("menu", "Меню: лимиты, расход, Pump, настройки", "core", _OWNER),
+    CommandSpec("menu", "Меню: лимиты, Pump, модели, команды", "core", _OWNER),
     CommandSpec("new", "Start a fresh session", "core", _EVERYONE),
     CommandSpec(
         "agents", "Pick active agent (keyboard)", "core", _EVERYONE, requires="profiles"
     ),
+    CommandSpec("model", "Choose model backend / log in", "session", _OWNER),
+    CommandSpec(
+        "limits", "Claude/Codex limits, Pump pause, chat backend", "session", _OWNER
+    ),
+    # Safety stays in the owner's menu (owner 02.11.26, dv-3881).
     CommandSpec(
         "stop", "Stop this chat's agent (/stop all = killswitch)", "safety", _OWNER
     ),
@@ -104,14 +109,14 @@ COMMAND_TABLE: tuple[CommandSpec, ...] = (
         "resume", "Clear killswitch: resume runs + scheduler", "safety", _OWNER
     ),
     CommandSpec("restart", "Restart the bot", "safety", _OWNER),
-    CommandSpec("auth", "Show / add backend logins", "safety", _OWNER),
     CommandSpec("help", "List every command you can run", "core", _EVERYONE),
-    CommandSpec("status", "Show session status", "session", _OWNER),
-    CommandSpec("usage", "Show cost spent and budget caps", "session", _EVERYONE),
+    # /status, /usage, /auth left the owner's menu (dv-3881 5.1): /usage is the
+    # tail of /limits, /auth is /model's login. /usage stays in the guest menu.
+    CommandSpec("auth", "Show / add backend logins", "safety"),
+    CommandSpec("status", "Show session status", "session"),
     CommandSpec(
-        "limits", "Claude/Codex limits, Pump pause, chat backend", "session", _OWNER
+        "usage", "Show cost spent and budget caps", "session", frozenset({"guest"})
     ),
-    CommandSpec("model", "Choose model backend / log in", "session", _OWNER),
     # --- Unlisted from here down: registered and working, surfaced by /help.
     # /tasks: the /menu Pump screen replaces it (owner 26.10.26, dv-6104).
     CommandSpec("tasks", "Show the shared task board", "session"),
@@ -306,7 +311,7 @@ class MessageOrchestrator(
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
-                pattern=r"^(cd:|model:|agent:|agents:|auth:|rem:|vset:|onb:|qi:|lim:|limits:)",
+                pattern=r"^(cd:|model:|agent:|agents:|auth:|rem:|vset:|onb:|qi:|lim:|limits:|publish:)",
             )
         )
 
@@ -323,6 +328,31 @@ class MessageOrchestrator(
             CallbackQueryHandler(
                 self._inject_deps(self._confirmation_callback),
                 pattern=r"^confirm:",
+            )
+        )
+
+        # /restart refusal's "Force restart" button (dv-86f4). Same owner
+        # gate as /restart; registered unconditionally for the same reason.
+        from .orchestration.commands import system as _system
+
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(
+                    self._owner_only(_system.restart_force_callback, "restart")
+                ),
+                pattern=f"^{_system.FORCE_CALLBACK}$",
+            )
+        )
+
+        # Feature-feedback score buttons (dv-a42c), owner only.
+        from .features.feedback import handle_feedback_callback
+
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(
+                    self._owner_only(handle_feedback_callback, "feedback")
+                ),
+                pattern=r"^fb:",
             )
         )
 
@@ -367,6 +397,13 @@ class MessageOrchestrator(
         """
         user = update.effective_user
         role = self._resolve_role(user.id if user else None, context)
+        await update.message.reply_text(
+            self.help_text(role, context), parse_mode="HTML"
+        )
+
+    def help_text(self, role: str, context: ContextTypes.DEFAULT_TYPE) -> str:
+        """The /help text (HTML) for *role*; /menu → Команды shows the same
+        (dv-3881: one renderer, not a second command list)."""
         is_owner = role == "owner"
         menu = {
             spec.name for spec in self._available_commands() if role in spec.menu_roles
@@ -406,7 +443,7 @@ class MessageOrchestrator(
 
         lines.append("")
         lines.append("<i>· = not in the Telegram menu, but works if you type it.</i>")
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return "\n".join(lines)
 
     def _make_switch_handler(self, slug: str) -> Callable:  # type: ignore[type-arg]
         """Build a /<slug> command handler that switches the active profile."""

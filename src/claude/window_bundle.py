@@ -3,8 +3,15 @@
 One system prompt per conversation window, materialized on the window's first
 turn (get-or-create by ``(user_id, working_dir, window_id)``) and reused
 byte-identical on every later turn -- including across restarts, which reload
-the persisted row instead of recomposing. Persona or fact edits therefore take
-effect at the next roll (or explicit /new), never mid-window.
+the persisted row instead of recomposing. Persona and general-fact edits
+therefore take effect at the next roll (or explicit /new), never mid-window.
+
+Exception (dv-ef59, amends dv-5e2a): a pinned or core fact add / correct /
+forget marks the current bundle stale (``MemoryWriter`` ->
+``WindowBundleRepository.mark_stale``); the next turn re-materializes the
+same window. Those changes are rare (~22 in 30 days against 74 windows), so
+the extra prompt-cache break is cheap, and a rule the user just asked for
+binds the session that heard it.
 
 Growth is handled by a pressure valve, not a cap: when the facts snapshot
 exceeds its character budget the bundle is composed and injected anyway, and a
@@ -132,7 +139,7 @@ class WindowBundleProvider:
         key = (user_id, str(Path(working_directory)))
 
         row = await self._bundle_repo.get(user_id, working_directory, state.window_id)
-        if row is not None:
+        if row is not None and row.stale_at is None:
             result = BundleResult(
                 text=row.bundle_text,
                 sha256=row.bundle_sha256,
@@ -153,6 +160,14 @@ class WindowBundleProvider:
                 sha256=row.bundle_sha256,
             )
             return result
+        if row is not None:
+            logger.info(
+                "bundle_refresh",
+                window_id=row.window_id,
+                agent_id=row.agent_id,
+                old_sha256=row.bundle_sha256,
+                revision=row.revision,
+            )
 
         result = await self._materialize(
             composer=composer,
@@ -198,6 +213,7 @@ class WindowBundleProvider:
         pointer_lines = [render_pointer_line(p) for p in snapshot.pointers]
 
         family_lines: List[str] = []
+        family_scope: Optional[str] = None
         if family_id is not None:
             family_scope = family_agent_id_for_agent(agent_id, family_id)
             family_lines = self._family_lines(
@@ -248,6 +264,7 @@ class WindowBundleProvider:
                 pointers_count=len(pointer_lines),
                 family_count=len(family_lines),
                 total_chars=len(text),
+                family_agent_id=family_scope,
             )
         )
         logger.info(
@@ -260,6 +277,7 @@ class WindowBundleProvider:
             pointers_count=stored.pointers_count,
             family_count=stored.family_count,
             sha256=stored.bundle_sha256,
+            revision=stored.revision,
         )
         return BundleResult(
             text=stored.bundle_text,
@@ -273,6 +291,51 @@ class WindowBundleProvider:
             total_chars=stored.total_chars,
             reused=False,
         )
+
+    async def standing_update(
+        self,
+        working_directory: Path,
+        user_id: int,
+        family_id: Optional[int] = None,
+    ) -> str:
+        """The always-binding facts (pinned + core, and the family's pinned)
+        as one block, for a backend whose thread cannot take a new system
+        prompt (Codex resume, dv-ef59). Sent once when the window's bundle
+        changed after the thread received it; it replaces the earlier list."""
+        from src.profiles.registry import (
+            agent_id_for_working_dir,
+            family_agent_id_for_agent,
+        )
+
+        agent_id = agent_id_for_working_dir(self._registry, working_directory, user_id)
+        snapshot = await self._memory_repo.facts_snapshot(
+            agent_id, general_cap=0, pointer_cap=0
+        )
+        pinned = [render_fact_line(f) for f in snapshot.pinned]
+        core = [render_fact_line(f) for f in snapshot.general if f.tier == "core"]
+        family: List[str] = []
+        if family_id is not None:
+            fam = await self._memory_repo.facts_snapshot(
+                family_agent_id_for_agent(agent_id, family_id),
+                general_cap=0,
+                pointer_cap=0,
+            )
+            family = [render_fact_line(f) for f in fam.pinned]
+
+        def block(title: str, lines: List[str]) -> str:
+            body = "\n".join(f"- {line}" for line in lines) or "- (none)"
+            return f"{title}:\n{body}"
+
+        parts = [
+            "Your saved standing facts changed during this conversation. "
+            "This list replaces the <constraints> and core facts you were "
+            "given earlier; follow it from this message on.",
+            block("Constraints", pinned),
+            block("Core facts", core),
+        ]
+        if family_id is not None:
+            parts.append(block("Family constraints", family))
+        return "<memory_update>\n" + "\n\n".join(parts) + "\n</memory_update>"
 
     @staticmethod
     def _family_lines(snapshot: FactsSnapshot) -> List[str]:
@@ -341,6 +404,8 @@ class WindowBundleProvider:
             cached = PromptComposer(
                 memory_path=profile.memory_dir,
                 agent_md_path=profile.persona,
+                extra_write_roots=profile.extra_dirs,
+                project_instructions_path=profile.project_instructions,
             )
             self._profile_composers[profile.slug] = cached
         return cached

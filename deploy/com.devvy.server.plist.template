@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- rendered by scripts/render_deploy.py; do not install this file directly -->
+<!-- macOS local mode (dv-fe4d): the headless server (CHANNEL=local, no
+     Telegram) the Pump TUI and agentctl talk to; launchd restarts it.
+     Install: cp to ~/Library/LaunchAgents/, then
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.devvy.server.plist -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.devvy.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@POETRY_BIN@</string>
+        <string>run</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>src.main</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>@DEVVY_ROOT@</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CHANNEL</key>
+        <string>local</string>
+        <key>PATH</key>
+        <string>@SERVICE_PATH@</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/server.log</string>
+</dict>
+</plist>

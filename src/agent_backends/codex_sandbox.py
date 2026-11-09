@@ -124,6 +124,21 @@ def filesystem_policy(
     policy[":slash_tmp"] = "write"
     policy[":tmpdir"] = "write"
     workspace = Path(cwd).resolve()
+    bus_root = Path("/run/user")
+    if not full_access and workspace == Path("/"):
+        raise ValueError("Codex workspace may not be filesystem root")
+    if (
+        workspace == bus_root
+        or bus_root in workspace.parents
+        or workspace in bus_root.parents
+    ):
+        raise ValueError("Codex workspace may not be under /run/user")
+    for extra in extra_dirs:
+        root = Path(extra).resolve()
+        if not full_access and root == Path("/"):
+            raise ValueError("Codex write root may not be filesystem root")
+        if root == bus_root or bus_root in root.parents or root in bus_root.parents:
+            raise ValueError("Codex write root conflicts with /run/user")
     for path in denied:
         # Never hide the turn's own workspace (or an ancestor of it): codex
         # would start in a directory it cannot read.
@@ -132,6 +147,7 @@ def filesystem_policy(
         ):
             continue
         policy[path] = "none"
+    policy[str(bus_root)] = "none"
     return policy
 
 
@@ -149,6 +165,7 @@ def sandbox_args(
     extra_dirs: Iterable[Path] = (),
     registry: Any = None,
     user_id: Optional[int] = None,
+    extra_denied: Iterable[str] = (),
 ) -> List[str]:
     """The ``codex exec`` sandbox options for one turn.
 
@@ -159,6 +176,7 @@ def sandbox_args(
     if unrestricted:
         return ["-s", "danger-full-access"]
     denied = denied_paths(full_access=full_access, registry=registry, user_id=user_id)
+    denied += list(extra_denied)
     policy = filesystem_policy(
         cwd=cwd, extra_dirs=extra_dirs, full_access=full_access, denied=denied
     )

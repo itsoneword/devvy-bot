@@ -29,11 +29,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .denylist import (
     DEFAULT_DENIED_PATTERNS,
+    SECRET_PATTERN_EXEMPT_NAMES,
     TENANT_DATA_PATTERNS,
     protected_path_error,
     protected_search_error,
 )
-from .destructive import _is_free_path, classify, exchange_tool_ask
+from .destructive import RUN_RM_ALONE, _is_free_path, classify, exchange_tool_ask
 from .read_scope import ReadScope, build_read_scope
 
 ALLOW = "allow"
@@ -121,6 +122,8 @@ def turn_policy_for(
 def is_secret_path(file_path: str) -> bool:
     """True when *file_path*'s basename matches a credential pattern."""
     name = Path(file_path).name
+    if name in SECRET_PATTERN_EXEMPT_NAMES:
+        return False
     return any(fnmatch.fnmatch(name, pat) for pat in DEFAULT_DENIED_PATTERNS)
 
 
@@ -265,6 +268,10 @@ def _decide_one(
     # cross-FS/network damage from bash.
     if turn.full_access:
         reason = classify(tool_name, tool_input, turn.working_directory, turn.free_root)
+        if reason == RUN_RM_ALONE:
+            # A job's in-tree rm chained after an interpreter: the agent
+            # reruns it alone in seconds, the owner is never asked (dv-3d18).
+            return Decision(DENY, reason)
         if reason:
             preview = (
                 tool_input.get("command")

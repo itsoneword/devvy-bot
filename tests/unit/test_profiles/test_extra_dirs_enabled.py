@@ -143,6 +143,28 @@ def test_extra_dirs_must_exist_and_be_writable(tmp_path):
     validate_registry_paths(reg)  # now fine
 
 
+def test_missing_project_instructions_source_fails_at_boot(tmp_path):
+    """A bad explicit source must fail at boot, not disappear from the bundle."""
+    for directory in ("repo", "ws/study", "notes"):
+        (tmp_path / directory).mkdir(parents=True)
+    (tmp_path / "repo/agent.md").write_text("devops")
+    (tmp_path / "ws/study/persona.md").write_text("study")
+    cfg = _cfg(
+        tmp_path,
+        """
+  - slug: study
+    name: Study
+    working_dir: {root}/ws/study
+    memory_dir: {root}/ws/study/memory
+    persona: {root}/ws/study/persona.md
+    extra_dirs: [{root}/notes]
+    project_instructions: {root}/notes/CLAUDE.md
+""",
+    )
+    with pytest.raises(ValueError, match="project_instructions"):
+        load_profile_registry(cfg, validate_paths=True, data_root=None)
+
+
 # --- enabled ----------------------------------------------------------------
 
 

@@ -24,9 +24,9 @@ if TYPE_CHECKING:
     from .harness import CLAUDE_ACCOUNT_ENV, HarnessVersions
     from .router import ModelRouter, complete_text, get_router, set_router
 
-# `router` pulls claude_agent_sdk -> mcp (1.4 s). scripts/taskpump only needs
+# `router` pulls claude_agent_sdk -> mcp (1.4 s). scripts/pump2 only needs
 # `quota`, and importing a submodule runs this file, so these load on first use
-# (dv-f6af: `taskpump status --json` was 2.3 s, 1.4 s of it this import).
+# (dv-f6af: `pump status --json` was 2.3 s, 1.4 s of it this import).
 _LAZY = {
     "CLAUDE_ACCOUNT_ENV": ".harness",
     "HarnessVersions": ".harness",

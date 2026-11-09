@@ -159,7 +159,7 @@ async def test_new_command_extracts_rolls_but_never_seeds(tmp_path):
     assert state.window_id == 2
     assert state.force_new_session is True
     assert state.pending_seed_window is None
-    assert context.user_data["force_new_session"] is True
+    assert "force_new_session" not in context.user_data  # row only (dv-3114)
     assert "pending_seed_window" not in context.user_data
 
     # The next turn starts clean: no seed preamble.

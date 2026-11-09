@@ -15,6 +15,9 @@ from tests.unit.test_tmpsweep import _age, _load, _stale_dir
 _SCRIPTS = Path(__file__).parents[2] / "scripts"
 
 
+ROUTE = '{"harness": "claude", "provider": "anthropic_sub", "model": "sonnet"}'
+
+
 @pytest.fixture
 def tmpsweep():
     return _load("tmpsweep_edges", _SCRIPTS / "tmpsweep")
@@ -105,7 +108,14 @@ def test_agent_job_removes_its_tmp_last(tmp_path, monkeypatch):
         stderr = ""
         stdout = ""
 
-    monkeypatch.setattr(bgjob.subprocess, "run", lambda cmd, **kw: R())
+    monkeypatch.setattr(
+        bgjob.subprocess,
+        "run",
+        # The route probe must answer: an empty answer aborts the launch (dv-a8e4).
+        lambda cmd, **kw: (
+            type("RR", (R,), {"stdout": ROUTE})() if "--print-route" in cmd else R()
+        ),
+    )
     monkeypatch.setattr(bgjob.subprocess, "Popen", lambda *a, **k: None)
     args = type(
         "A",

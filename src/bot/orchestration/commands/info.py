@@ -1,10 +1,10 @@
 """Info/status command handlers moved verbatim from src/bot/orchestrator.py."""
 
 import asyncio
-import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -12,6 +12,13 @@ from telegram.ext import ContextTypes
 
 from ....agent_backends.codex_usage import CodexUsageError, format_codex_limits
 from ....agent_backends.protocol import BackendSession
+from ....model_router.routes import (
+    PROVIDER_ANTHROPIC_SUB,
+    PROVIDER_OPENROUTER,
+    profiles_off_pick,
+    resolve_turn_route,
+    scheduled_turn_model,
+)
 from ....profiles.registry import family_agent_id_for_agent, guest_agent_id
 from ...utils.html_format import escape_html
 from ..agents_menu import build_agents_picker
@@ -19,10 +26,26 @@ from ..base import OrchestratorBase, policy_for
 from ..formatting import format_diag, format_sessions_summary, format_usage_table
 from ..windowing import apply_window_tokens, reset_window, window_conversation_text
 
+if TYPE_CHECKING:
+    from ....model_router.quota import Limit
+
 logger = structlog.get_logger()
 
 
 CODEX_MENU_MODELS = 3
+
+
+@dataclass(frozen=True)
+class ChatRoutes:
+    """What a chat turn and a scheduled turn run on, in words (dv-3881)."""
+
+    chat: str  # the /model pick, e.g. "Claude · opus"
+    others: List[str]  # "slug → OpenRouter · model", profiles off the pick
+    scheduled: str  # scheduled / webhook turns, always Claude
+
+
+def _provider_name(provider: str) -> str:
+    return "OpenRouter" if provider == PROVIDER_OPENROUTER else provider
 
 
 def _mark(label: str, current: bool) -> str:
@@ -77,7 +100,9 @@ class InfoCommandsMixin(OrchestratorBase):
         context.user_data["claude_session_id"] = None
         context.user_data["codex_session_id"] = None
         context.user_data["session_started"] = True
-        context.user_data["force_new_session"] = True
+        # Windowless bots only; with windows the row carries it (dv-3114).
+        if context.bot_data.get("window_repo") is None:
+            context.user_data["force_new_session"] = True
 
         # BPC: /new is a clean start — no continuity seed — but data care
         # still applies (dv-d9e2 path 3): final extraction over the window's
@@ -274,11 +299,9 @@ class InfoCommandsMixin(OrchestratorBase):
     async def agentic_limits(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Расход (dv-f6af): Claude's last seen usage (dv-55ad) and recorded
-        limit, paid spend today / 7 days, Codex limits if Codex was used this
-        week. No buttons, no LLM anywhere: it must work exactly when Claude's
-        subscription is out."""
-        text, markup = await limits_panel(context)
+        """Selected chat limits and paid spend, with no buttons or LLM call."""
+        user = getattr(update, "effective_user", None)
+        text, markup = await limits_panel(context, self, user.id if user else None)
         await update.message.reply_text(text, reply_markup=markup)
 
     def _stop_notice(self, error_type: Optional[str]) -> Optional[str]:
@@ -398,9 +421,18 @@ class InfoCommandsMixin(OrchestratorBase):
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Choose backend/model and start OpenAI Codex auth."""
-        backend = self._selected_backend(context)
         user = getattr(update, "effective_user", None)
-        user_id = user.id if user else None
+        text, keyboard = await self._chat_model_screen(
+            context, user.id if user else None
+        )
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+    async def _chat_model_screen(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int]
+    ) -> Tuple[str, InlineKeyboardMarkup]:
+        """/model's text and keyboard (HTML): the one builder for /model and
+        /menu → Модели › Чат (dv-3881), which only adds « Назад."""
+        backend = self._selected_backend(context)
         model = self._selected_model(context, user_id)
         codex_logged_in = (Path.home() / ".codex" / "auth.json").exists()
         on_claude = backend == "claude"
@@ -446,21 +478,59 @@ class InfoCommandsMixin(OrchestratorBase):
                 )
             ]
         )
-        keyboard = InlineKeyboardMarkup(rows)
         current = (
             f"Claude {model.capitalize()}"
             if on_claude
             else model.removeprefix("openai-codex/")
         )
-        await update.message.reply_text(
-            "<b>Model</b>\n\n"
-            f"Now: <b>{escape_html(current)}</b>\n"
+        lines = [
+            "<b>Model</b>",
+            "",
+            f"Now: <b>{escape_html(current)}</b>",
             "Row 1: Claude. Below: Codex (GPT)"
             + ("" if codex_logged_in else ", needs login")
             + ".",
-            parse_mode="HTML",
-            reply_markup=keyboard,
+        ]
+        routes = self.chat_routes(context, user_id)
+        if routes.others:
+            lines += ["", "Не по этому выбору (свой provider):"]
+            lines += [f"• {escape_html(o)}" for o in routes.others]
+        lines += ["", f"Расписание и вебхуки: {escape_html(routes.scheduled)}."]
+        return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+    def chat_routes(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int]
+    ) -> "ChatRoutes":
+        """What chat and scheduled turns run on, in words (dv-3881): the /model
+        pick, the enabled profiles that do not follow it (``provider:``,
+        ``routes.profiles_off_pick``) and the scheduled / webhook model
+        (``routes.scheduled_turn_model``, what ``AgentHandler`` runs). In
+        memory: no DB or subprocess call."""
+        backend = self._selected_backend(context)
+        model = self._selected_model(context, user_id)
+        on_claude = backend == "claude"
+        chat = (
+            f"Claude · {model}"
+            if on_claude
+            else f"Codex · {model.removeprefix('openai-codex/')}"
         )
+        registry = context.bot_data.get("profile_registry")
+        profiles: List[Any] = []
+        if registry is not None:
+            try:
+                profiles = list(registry.enabled_profiles())
+            except Exception as exc:
+                logger.warning("model screen: profile list failed", error=str(exc))
+        others = [
+            f"{getattr(p, 'slug', '?')} → {_provider_name(r.provider)} · "
+            f"{r.model or 'модель профиля'}"
+            for p, r in profiles_off_pick(profiles, model if on_claude else None)
+        ]
+        scheduled = scheduled_turn_model(
+            (context.user_data or {}).get("agent_model"),
+            getattr(self.settings, "agent_model", None),
+        ) or (getattr(self.settings, "claude_model", None) or "CLI default")
+        return ChatRoutes(chat, others, f"Claude · {scheduled}")
 
     async def agentic_memory(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1002,28 +1072,182 @@ class InfoCommandsMixin(OrchestratorBase):
 
 async def limits_panel(
     context: ContextTypes.DEFAULT_TYPE,
+    orchestrator: OrchestratorBase,
+    user_id: Optional[int] = None,
 ) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
-    """The /limits text; /menu → Расход shows the same (dv-f6af). Spend and
-    limits only: no buttons (freeze lives on the Pump screen, the chat switch
-    in /model, the jobs switch in Модели). Kept as a pair so callers add
-    their own « Назад."""
-    return await spend_text(context), None
+    """The /limits text; /menu → Лимиты shows the same (dv-f6af). Limits only:
+    no buttons (freeze lives on the Pump screen, the chat switch in /model,
+    the jobs switch in Модели). Kept as a pair so callers add their own
+    « Назад."""
+    return await spend_text(context, orchestrator, user_id), None
 
 
 _CODEX_HARNESS = "openai_codex"
 _CODEX_RECENT_DAYS = 7
+# Quota providers (dv-47f9's names: the Claude subscription is "anthropic").
+_ANTHROPIC = "anthropic"
+_OPENAI = "openai"
+_BUDGET_HEAD = "Бюджет (= /usage):"
 
 
-async def spend_text(context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Расход: the Claude subscription first (dv-55ad renderer), then real
-    money per paying provider today / 7 days, then the Codex limits only if
-    Codex was used in the last 7 days. No model call."""
+async def spend_text(
+    context: ContextTypes.DEFAULT_TYPE,
+    orchestrator: OrchestratorBase,
+    user_id: Optional[int] = None,
+) -> str:
+    """One block per provider (dv-3881): the selected chat's first, then the
+    other providers' limits, each with what it runs ("использует: …") and,
+    on a limit, what waits for the reset; then paid spend and last the /usage
+    budget block (``_usage_text``, called, not copied)."""
     storage = context.bot_data.get("storage")
     db = getattr(storage, "db_manager", None)
-    blocks = [_claude_limit_text(), await _paid_spend_text(db)]
-    if db is not None and await _codex_recently_used(db):
-        blocks.append(await _codex_limits_text(context))
+    # A few older direct-call fixtures do not construct an orchestrator.
+    resolved = isinstance(orchestrator, OrchestratorBase)
+    selected = orchestrator._selected_backend(context) if resolved else "claude"
+    available = selected in orchestrator._backends(context) if resolved else True
+    from ....model_router import quota
+
+    stages, switched = _stages_by_provider()
+    codex_limit = quota.active(provider=_OPENAI)
+    codex_shown = False
+    claude_subscription_selected = False
+    if not available:
+        blocks = [f"Активный чат: {selected} — бэкенд недоступен или неизвестен."]
+    elif selected == _CODEX_HARNESS:
+        model = orchestrator._selected_model(context, user_id)
+        blocks = [f"Активный чат: Codex · модель: {model}"]
+        blocks.append(
+            await _codex_block(context, codex_limit, stages.get(_OPENAI), switched)
+        )
+        codex_shown = True
+    elif selected == "claude":
+        profile = orchestrator._active_profile(context, user_id) if resolved else None
+        model = (
+            orchestrator._selected_model(context, user_id) if resolved else "неизвестна"
+        )
+        route = resolve_turn_route(profile, model)
+        if route.provider != PROVIDER_ANTHROPIC_SUB:
+            provider = (
+                "OpenRouter"
+                if route.provider == PROVIDER_OPENROUTER
+                else route.provider
+            )
+            blocks = [
+                f"Активный чат: {provider} · модель: " f"{route.model or 'неизвестна'}"
+            ]
+        else:
+            claude_subscription_selected = True
+            blocks = [
+                f"Активный чат: Claude · модель: {model}",
+                _claude_block(stages.get(_ANTHROPIC), switched),
+            ]
+    else:
+        blocks = [f"Активный чат: {selected} — лимиты неизвестны."]
+
+    blocks.append(await _paid_spend_text(db))
+    if not claude_subscription_selected:
+        blocks.append(
+            "Другой провайдер — отдельный лимит:\n"
+            + _claude_block(stages.get(_ANTHROPIC), switched)
+        )
+    # Codex's account query costs latency: only when Codex matters now — used
+    # this week, a stage runs on it, or its limit is recorded.
+    if not codex_shown and (
+        codex_limit is not None
+        or stages.get(_OPENAI)
+        or (db is not None and await _codex_recently_used(db))
+    ):
+        blocks.append(
+            "Другой провайдер — отдельный лимит:\n"
+            + await _codex_block(context, codex_limit, stages.get(_OPENAI), switched)
+        )
+    usage_text = getattr(orchestrator, "_usage_text", None)
+    if resolved and user_id is not None and usage_text is not None:
+        blocks.append(f"{_BUDGET_HEAD}\n{await usage_text(user_id, context)}")
     return "\n\n".join(b for b in blocks if b)
+
+
+def _stages_by_provider() -> Tuple[Dict[str, List[str]], bool]:
+    """Which stages / jobs run on each quota provider now (the jobs switch
+    applied, the route the Pump holds on), and whether the switch is on."""
+    from ....model_router import job_rows
+    from ....model_router.routes import process_call_routes
+
+    try:
+        routes = process_call_routes()
+    except Exception:
+        logger.warning("limits: call routes unreadable", exc_info=True)
+        return {}, False
+    out: Dict[str, List[str]] = {}
+    for job in job_rows.JOB_LABELS:
+        try:
+            provider = routes.resolve_job(job).provider
+        except ValueError:
+            continue
+        key = _ANTHROPIC if provider == PROVIDER_ANTHROPIC_SUB else provider
+        out.setdefault(key, []).append(job_rows.job_label(job))
+    return out, bool(routes.job_switch)
+
+
+def _uses_lines(
+    stages: Optional[List[str]], switched: bool, limited: bool
+) -> List[str]:
+    """ "использует: …" for a provider, or on a limit "ждут сброса: …"."""
+    from ....model_router import job_rows
+
+    if not stages:
+        return []
+    names = (
+        "все стадии Pump и фоновые задачи"
+        if len(stages) == len(job_rows.JOB_LABELS)
+        else "стадии " + ", ".join(stages)
+    )
+    if switched:
+        names += " (переключатель)"
+    return [f"  {'ждут сброса' if limited else 'использует'}: {names}"]
+
+
+def _claude_block(stages: Optional[List[str]], switched: bool) -> str:
+    """Claude's usage / limit (dv-55ad renderer), what runs on it and, on a
+    limit, the Pump freeze it causes."""
+    from ....model_router import quota
+
+    limited = quota.active() is not None
+    lines = [_claude_limit_text(), *_uses_lines(stages, switched, limited)]
+    frozen = _pump_frozen()
+    if limited and frozen is not None and frozen.get("by") == "quota":
+        lines.append("  Pump: заморожен до сброса (экран Pump)")
+    return "\n".join(lines)
+
+
+async def _codex_block(
+    context: ContextTypes.DEFAULT_TYPE,
+    limit: Optional["Limit"],
+    stages: Optional[List[str]],
+    switched: bool,
+) -> str:
+    """Codex: a recorded limit with its reset, what runs on it (or waits for
+    the reset), then the account's own limits. A Codex limit never freezes
+    Pump: only the stages on Codex wait (dv-47f9)."""
+    lines: List[str] = []
+    if limit is not None:
+        lines.append(f"⛔ Codex: лимит до {_hhmm(limit.until)} UTC")
+    lines += _uses_lines(stages, switched, limit is not None)
+    if limit is not None:
+        lines.append(
+            "  Pump не заморожен: ждут только стадии на Codex"
+            if stages
+            else "  Pump: не затронут (стадии не на Codex)"
+        )
+    lines.append(await _codex_limits_text(context))
+    return "\n".join(lines)
+
+
+def _hhmm(at: datetime) -> str:
+    """HH:MM UTC, with the date when it is not today."""
+    now = datetime.now(UTC)
+    at = at.astimezone(UTC)
+    return at.strftime("%H:%M" if at.date() == now.date() else "%d.%m %H:%M")
 
 
 async def _paid_spend_text(db: Any) -> str:
@@ -1061,15 +1285,14 @@ def _claude_limit_text() -> str:
 
 
 def _pump_frozen() -> Optional[Dict[str, Any]]:
-    """The Pump's `frozen` block from its state file, None when running."""
-    from ....utils.paths import data_layout
+    """Pump v2's `frozen` block (src/pump2/freeze.py, dv-44b1), None when
+    running. An unreadable state file freezes the pump (fail closed)."""
+    from ....pump2 import freeze
 
-    try:
-        state = json.loads(data_layout().taskpump_state.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    frozen = state.get("frozen") if isinstance(state, dict) else None
-    return frozen if isinstance(frozen, dict) else None
+    st = freeze.read()
+    if st.error:
+        return {"by": "state error", "reason": st.error}
+    return st.frozen
 
 
 async def _codex_limits_text(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -1106,9 +1329,14 @@ def jobs_switch_name() -> str:
     from ....model_router.quota import job_route_info
 
     info = job_route_info()
-    if info is None:
+    return jobs_switch_label(None if info is None else str(info["harness"]))
+
+
+def jobs_switch_label(harness: Optional[str]) -> str:
+    """A switch value (a harness, None = the table) in words."""
+    if harness is None:
         return _TABLE_LABEL
-    return _JOB_SWITCH_LABELS.get(str(info["harness"]), str(info["harness"]))
+    return _JOB_SWITCH_LABELS.get(harness, harness)
 
 
 def jobs_switch_screen(note: str = "") -> Tuple[str, InlineKeyboardMarkup]:

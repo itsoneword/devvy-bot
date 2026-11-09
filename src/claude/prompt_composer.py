@@ -1,7 +1,7 @@
 """Compose a structured system prompt from persona file + DB-backed facts."""
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import structlog
 
@@ -27,9 +27,13 @@ class PromptComposer:
         self,
         memory_path: Path,
         agent_md_path: Path,
+        extra_write_roots: Tuple[Path, ...] = (),
+        project_instructions_path: Optional[Path] = None,
     ) -> None:
         self._memory_path = memory_path
         self._agent_md_path = agent_md_path
+        self._extra_write_roots = extra_write_roots
+        self._project_instructions_path = project_instructions_path
 
     def compose(
         self,
@@ -66,9 +70,8 @@ class PromptComposer:
         explicit flag inside ``<user_facts>`` so the agent clarifies with the
         user instead of silently picking one.
 
-        Project instructions (CLAUDE.md) are NOT a layer here: the CLI loads
-        them itself from the "project" setting source. Adding them back would
-        put the file in context twice.
+        Only an explicitly configured external project guide is composed here.
+        Cwd project instructions remain the CLI's own setting source.
 
         Family facts (only present for users in a family) are shared by other
         family members and injected as a separate, clearly-labeled block so
@@ -89,9 +92,12 @@ class PromptComposer:
                 "Prefer the working directory for scratch/project files."
             )
         else:
+            roots = (working_directory, *self._extra_write_roots)
+            writable = ", ".join(str(root) for root in roots)
             sections.append(
-                f"All file operations must stay within {working_directory}. "
-                "Use relative paths."
+                f"Writes must stay within these writable directories: {writable}. "
+                "Reads outside them may be allowed by the security policy. "
+                "Use absolute paths for files outside the working directory."
             )
 
         if window_started:
@@ -109,6 +115,15 @@ class PromptComposer:
         if agent_content:
             sections.append(f"<agent_identity>\n{agent_content}\n</agent_identity>")
 
+        if self._project_instructions_path is not None:
+            project_content = self._project_instructions_path.read_text(
+                encoding="utf-8"
+            ).strip()
+            sections.append(
+                f'<project_instructions source="{self._project_instructions_path}">\n'
+                f"{project_content}\n</project_instructions>"
+            )
+
         shared = self._read_file(SHARED_CAPABILITIES_PATH)
         if shared:
             sections.append(f"<shared_capabilities>\n{shared}\n</shared_capabilities>")
@@ -117,12 +132,11 @@ class PromptComposer:
             body = "\n".join(f"- {f}" for f in pinned_facts)
             sections.append(
                 "<constraints>\n"
-                "Standing constraints — a snapshot taken when this window "
-                "started. Each line is dated [DD.MM.YY] = when it became "
+                "Standing constraints — a snapshot, refreshed whenever one is saved, "
+                "corrected or removed. Each line is dated [DD.MM.YY] = when it became "
                 "true. Things change: if the user tells you a constraint no "
                 "longer holds, the conversation wins — treat that line as "
-                "superseded from that moment (the snapshot refreshes at the "
-                "next window). Only the user's explicit statement relaxes a "
+                "superseded from that moment. Only the user's explicit statement relaxes a "
                 "health or safety constraint; never retire one by your own "
                 "inference.\n"
                 f"{body}\n</constraints>"

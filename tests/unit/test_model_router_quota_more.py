@@ -38,6 +38,10 @@ NOW = datetime(2026, 10, 26, 8, 15, tzinfo=UTC)
             "You've hit your usage limit. Upgrade to Pro or try again at 3:15 PM.",
             datetime(2026, 10, 26, 15, 15),
         ),
+        (
+            "You’ve hit your usage limit. Upgrade to Pro or try again at 3:15 PM.",
+            datetime(2026, 10, 26, 15, 15),
+        ),
         # Unreadable / unknown zone -> UTC; no time at all -> +1h.
         (
             "You've hit your weekly limit · resets 9am (Mars/Base)",

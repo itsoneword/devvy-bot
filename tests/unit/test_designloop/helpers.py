@@ -1,11 +1,11 @@
-"""A trimmed copy of the gymbro docs the design loop reads (dv-9133 phase 2).
+"""A trimmed copy of the app docs the design loop reads (dv-9133 phase 2).
 
-Never the live gymbro repo: the shapes below are cut from it
+Never the live app repo: the shapes below are cut from it
 (docs/features.yaml, docs/SCREENS.md, docs/UI_GUIDE.md, docs/screens/) so a
 test pins the format, not today's content.
 
 - features.yaml: ``screens: <screen_id>: {passport, source, features:
-  {<feature>: {action?, api?, scenarios}}}``, the YAML subset gymbro's
+  {<feature>: {action?, api?, scenarios}}}``, the YAML subset app's
   ``scripts/harness/feature_map.py`` reads (quoted test ids with ``[..]``).
 - SCREENS.md: ``## 1. Shared tokens`` + one ``###`` passport per screen; a
   screen's ``passport:`` is its heading up to `` (``.
@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 FEATURES_YAML = """\
-# GymBro feature map (gb-1a72): screen -> feature -> scenarios.
+# App feature map (dv-1a72): screen -> feature -> scenarios.
 # Written in a YAML subset (feature_map.loads): quote anything with braces, '*' or '#'.
 
 bug_rule_since: 2026-10-24
@@ -30,7 +30,7 @@ screens:
         scenarios:
           - id: feed.new_event_bell.wired
             test: tests/web/test_screen_invariants.py::test_new_event_alerts_screen_and_feed_bell_wired
-            from: [gb-1aa8]
+            from: [dv-1aa8]
       discover_list:
         api: ["GET /api/events/discover"]
         scenarios:
@@ -137,8 +137,8 @@ FEED_ACTIONS = ("Saved",)
 FEED_API = ("GET /api/events/discover",)
 
 
-def make_gymbro_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "gymbro"
+def make_app_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "app"
     docs = repo / "docs"
     docs.mkdir(parents=True)
     (docs / "features.yaml").write_text(FEATURES_YAML, encoding="utf-8")

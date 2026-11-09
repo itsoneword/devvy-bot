@@ -1019,6 +1019,14 @@ class CodexCliIntegration:
         for both backends. Any other failure -- including the fresh retry
         itself failing -- propagates unchanged.
         """
+        from src.model_router import quota
+
+        limit = quota.active(provider="openai")
+        if limit is not None:
+            raise RuntimeError(
+                f"OpenAI usage limit exhausted until "
+                f"{limit.until.strftime('%H:%M UTC')}: {limit.message}"
+            )
         try:
             return await self._exec_turn(
                 prompt=prompt,
@@ -1143,9 +1151,23 @@ class CodexCliIntegration:
         # 7-10k tokens to the saved transcript on every Telegram message.
         # Fresh threads (including resume-failed retries and window rolls)
         # still receive the full bundle exactly once.
+        # dv-ef59: the bundle sha the thread holds after this turn. A fresh
+        # thread gets the whole bundle; a resumed one gets the changed
+        # standing facts once when a pinned/core change re-froze the window.
+        bundle_sha: Optional[str] = None
         if resume_id is None:
             prompt = await self._with_persona(
                 working_directory, prompt, family_id, user_id
+            )
+            meta = (
+                self.bundle_provider.last_meta(user_id, working_directory)
+                if self.bundle_provider is not None
+                else None
+            )
+            bundle_sha = meta.sha256 if meta else None
+        else:
+            prompt, bundle_sha = await self._with_standing_update(
+                working_directory, prompt, resume_id, user_id, family_id
             )
 
         # Hard-forbid the real-money exchange scripts on every Codex turn
@@ -1316,7 +1338,7 @@ class CodexCliIntegration:
             pass
         answer = scrub(answer or (final_fallback or ""))
 
-        if proc.returncode != 0 and not answer and not stopped:
+        if proc.returncode != 0 and not stopped:
             # NOT `proc.stderr.read()`: the drainer above already consumed the
             # whole stream, so re-reading it here returns b"" and the operator
             # gets "exit 1: " with no reason. Report what was actually
@@ -1325,13 +1347,23 @@ class CodexCliIntegration:
             reason = " | ".join(dict.fromkeys(e for e in error_events if e))
             if not reason:
                 reason = scrub("\n".join(stderr_tail))
-            message = (
-                f"Codex CLI failed (exit {proc.returncode}): "
-                f"{(reason or '(no output)')[-500:]}"
-            )
-            if resume_id and is_resume_failure(resume_id, reason):
-                raise CodexResumeError(resume_id, message)
-            raise RuntimeError(message)
+            from src.model_router import quota
+
+            limit = quota.parse_limit(reason, provider="openai")
+            if limit is not None:
+                quota.record(limit, "codex-turn")
+                raise RuntimeError(
+                    f"OpenAI usage limit exhausted until "
+                    f"{limit.until.strftime('%H:%M UTC')}: {limit.message}"
+                )
+            if not answer:
+                message = (
+                    f"Codex CLI failed (exit {proc.returncode}): "
+                    f"{(reason or '(no output)')[-500:]}"
+                )
+                if resume_id and is_resume_failure(resume_id, reason):
+                    raise CodexResumeError(resume_id, message)
+                raise RuntimeError(message)
 
         # `turn.completed.usage` is the thread's running TOTAL, not this
         # turn's (see read_rollout_token_info). This turn's flow is the delta
@@ -1397,7 +1429,57 @@ class CodexCliIntegration:
                 thread_total_input=total_in,
                 thread_total_output=total_out,
             )
+            if bundle_sha:
+                await self.store.set_bundle_sha(thread_id, bundle_sha)
         return response
+
+    async def _with_standing_update(
+        self,
+        working_directory: Path,
+        prompt: str,
+        thread_id: str,
+        user_id: int,
+        family_id: Optional[int],
+    ) -> Tuple[str, Optional[str]]:
+        """(prompt, current bundle sha) for a resumed thread (dv-ef59).
+
+        A resumed thread never re-reads the bundle, so when a pinned/core
+        change re-froze this window after the thread received its copy, the
+        standing facts are prepended once; the recorded sha then matches and
+        later turns carry nothing extra. A thread with no recorded sha
+        (started before dv-ef59) is stamped with the current one, unsent.
+        """
+        if self.bundle_provider is None:
+            return prompt, None
+        try:
+            bundle = await self.bundle_provider.get_or_materialize(
+                working_directory,
+                user_id,
+                family_id=family_id,
+                full_access=self._full_access_for(Path(working_directory)),
+            )
+            if bundle is None:
+                return prompt, None
+            received = await self.store.bundle_sha_for(thread_id)
+            if received is None or received == bundle.sha256:
+                return prompt, bundle.sha256
+            update = await self.bundle_provider.standing_update(
+                working_directory, user_id, family_id
+            )
+        except Exception as e:  # never fail a turn over the refresh
+            logger.warning(
+                "Codex standing-facts update skipped",
+                thread_id=thread_id,
+                error=str(e),
+            )
+            return prompt, None
+        logger.info(
+            "codex_standing_update_sent",
+            thread_id=thread_id,
+            old_sha256=received,
+            sha256=bundle.sha256,
+        )
+        return f"{update}\n\n{prompt}", bundle.sha256
 
     async def _persist_session(
         self,
@@ -1479,7 +1561,8 @@ class CodexCliIntegration:
 
         Codex reads a project's own ``AGENTS.md`` from cwd as developer
         instructions, so the bot persona must NOT be written there: the root
-        ``AGENTS.md`` is human-authored, dev-only, and no agent may clobber it.
+        ``AGENTS.md`` is generated from the shared project source and the
+        backend must not clobber it.
         Codex has no system-prompt flag, so the bundle lives in the first user
         message and is retained by the saved thread.  Callers must not invoke
         this for resume turns: doing so duplicates the frozen bundle in the

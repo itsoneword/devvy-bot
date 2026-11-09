@@ -84,6 +84,8 @@ class SessionModel:
     thread_total_input: int = 0
     thread_total_output: int = 0
     cumulative_tokens: int = 0
+    # Window-bundle sha a Codex thread last received (dv-ef59).
+    bundle_sha256: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""

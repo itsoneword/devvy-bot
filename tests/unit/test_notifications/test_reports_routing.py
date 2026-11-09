@@ -75,7 +75,7 @@ async def deliver(svc: NotificationService, source: str, **kw: Any) -> None:
 
 async def test_unset_setting_routes_nothing(bot: AsyncMock) -> None:
     svc = make_service(bot, on=False)
-    await deliver(svc, "taskpump:status")
+    await deliver(svc, "pump2:status")
     kw = bot.send_message.call_args.kwargs
     assert kw["chat_id"] == OWNER
     assert "message_thread_id" not in kw
@@ -85,7 +85,7 @@ async def test_unset_setting_routes_nothing(bot: AsyncMock) -> None:
 @pytest.mark.parametrize(
     "source,topic",
     [
-        ("taskpump:status", "Pump"),
+        ("pump2:status", "Pump"),
         ("bgjob", "Jobs"),
         ("bgjob:digest", "Jobs"),
         ("server-monitor:host1", "Monitoring"),
@@ -125,8 +125,8 @@ async def test_answer_needed_and_unmapped_stay_in_dm(
     bot.create_forum_topic.assert_not_called()
 
 
-async def test_taskpump_ask_goes_to_pump_topic(bot: AsyncMock) -> None:
-    await deliver(make_service(bot), "taskpump:ask")
+async def test_pump2_ask_goes_to_pump_topic(bot: AsyncMock) -> None:
+    await deliver(make_service(bot), "pump2:ask")
     assert bot.send_message.call_args.kwargs["chat_id"] == REPORTS
     assert bot.create_forum_topic.call_args.kwargs["name"] == "Pump"
 
@@ -197,7 +197,7 @@ async def test_first_pump_pin_unpins_old_topic_pins_then_edits_in_place(
         return_value=SimpleNamespace(chat=SimpleNamespace(id=REPORTS), message_id=7)
     )
     svc = make_service(bot)
-    await deliver(svc, "taskpump:status", pin_as="pump")
+    await deliver(svc, "pump2:status", pin_as="pump")
 
     thread = bot.send_message.call_args.kwargs["message_thread_id"]
     bot.unpin_all_forum_topic_messages.assert_awaited_once()
@@ -209,7 +209,7 @@ async def test_first_pump_pin_unpins_old_topic_pins_then_edits_in_place(
     )
 
     # Next tick: same message edited in place, nothing re-posted or re-cleared.
-    await deliver(svc, "taskpump:status", pin_as="pump")
+    await deliver(svc, "pump2:status", pin_as="pump")
     assert bot.send_message.await_count == 1
     bot.edit_message_text.assert_awaited_once()
     assert bot.edit_message_text.call_args.kwargs["message_id"] == 7
@@ -224,10 +224,10 @@ async def test_transient_pin_edit_error_does_not_post_a_second_pin(
         return_value=SimpleNamespace(chat=SimpleNamespace(id=REPORTS), message_id=7)
     )
     svc = make_service(bot)
-    await deliver(svc, "taskpump:status", pin_as="pump")
+    await deliver(svc, "pump2:status", pin_as="pump")
     bot.edit_message_text = AsyncMock(side_effect=TelegramError("Bad Gateway"))
 
-    await deliver(svc, "taskpump:status", pin_as="pump")
+    await deliver(svc, "pump2:status", pin_as="pump")
 
     assert bot.send_message.await_count == 1
     assert bot.pin_chat_message.await_count == 1
@@ -240,7 +240,7 @@ async def test_transient_pin_edit_error_does_not_post_a_second_pin(
     bot.send_message = AsyncMock(
         return_value=SimpleNamespace(chat=SimpleNamespace(id=REPORTS), message_id=8)
     )
-    await deliver(svc, "taskpump:status", pin_as="pump")
+    await deliver(svc, "pump2:status", pin_as="pump")
     assert bot.send_message.await_count == 1
     assert svc._pinned_messages == {(REPORTS, "pump"): 8}
     unpinned = [

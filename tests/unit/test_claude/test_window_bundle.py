@@ -295,8 +295,10 @@ async def test_devops_bundle_injects_all_21_general_and_60_pointers(
 ):
     """Today's devops shape: 21 general user_facts, 71 conversation_results.
     At the 60/60 defaults every general fact and 60 pointers go in."""
-    monkeypatch.delenv("MEMORY_SNAPSHOT_GENERAL_CAP", raising=False)
-    monkeypatch.delenv("MEMORY_POINTER_CAP", raising=False)
+    # dv-32fe: the default general cap is now 100; this test pins the shape
+    # at an explicit 60/60.
+    monkeypatch.setenv("MEMORY_SNAPSHOT_GENERAL_CAP", "60")
+    monkeypatch.setenv("MEMORY_POINTER_CAP", "60")
     settings = _settings()
     assert settings.memory_snapshot_general_cap == 60
     assert settings.memory_pointer_cap == 60
@@ -367,8 +369,8 @@ async def test_valve_quiet_for_gymbro_sized_scope_at_60(
     """Gymbro on 26.10: 89 general, ~1.16k ch pinned; at 60 general the
     valve-counted chars are ~22.8k. The new 24k default budget must not fire
     the consolidation valve every window."""
-    monkeypatch.delenv("MEMORY_SNAPSHOT_GENERAL_CAP", raising=False)
-    monkeypatch.delenv("BUNDLE_FACTS_BUDGET_CHARS", raising=False)
+    monkeypatch.setenv("MEMORY_SNAPSHOT_GENERAL_CAP", "60")
+    monkeypatch.setenv("BUNDLE_FACTS_BUDGET_CHARS", "24000")
     settings = _settings()
     assert settings.bundle_facts_budget_chars == 24_000
 
@@ -390,4 +392,43 @@ async def test_valve_quiet_for_gymbro_sized_scope_at_60(
     bundle = await provider.get_or_materialize(tmp_path / "ws", user_id=1)
     assert bundle is not None
     assert bundle.facts_count == 3 + 60
+    assert calls == []
+
+
+async def test_100_general_facts_injected_and_valve_quiet_at_default_budget(
+    window_repo, bundle_repo, memory_repo, composer, tmp_path, monkeypatch
+):
+    """dv-32fe: gymbro-sized scope (107 general ~350 ch, 3 pinned) at the
+    default caps: 100 general injected, and the 40k default budget does not
+    fire the consolidation valve (34.6k measured > the old 24k)."""
+    for name in (
+        "MEMORY_SNAPSHOT_GENERAL_CAP",
+        "MEMORY_POINTER_CAP",
+        "BUNDLE_FACTS_BUDGET_CHARS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = _settings()
+    assert settings.memory_snapshot_general_cap == 100
+    assert settings.bundle_facts_budget_chars == 40_000
+
+    calls = []
+
+    class FakeConsolidation:
+        def request_run(self, scope, reason, snapshot_chars=None):
+            calls.append((scope, reason, snapshot_chars))
+
+    for i in range(3):
+        await memory_repo.add_fact("devops", "pinned", f"pin {i} " + "p" * 370)
+    for i in range(107):
+        await memory_repo.add_fact("devops", "general", f"g{i:03d} " + "x" * 340)
+
+    provider = _capped_provider(
+        window_repo, bundle_repo, memory_repo, composer, settings
+    )
+    provider.attach_consolidation(FakeConsolidation())
+    bundle = await provider.get_or_materialize(tmp_path / "ws", user_id=1)
+    assert bundle is not None
+    assert bundle.facts_count == 3 + 100
+    assert "g106 " in bundle.text and "g007 " in bundle.text
+    assert "g006 " not in bundle.text
     assert calls == []

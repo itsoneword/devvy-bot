@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import secrets
+import subprocess
 import sys
 import tempfile
 import time
@@ -40,7 +42,7 @@ from src.agent_backends.codex_cli import (
     map_codex_event,
     policy_hook_args,
 )
-from src.agent_backends.codex_sandbox import sandbox_args
+from src.agent_backends.codex_sandbox import PERMISSION_PROFILE, sandbox_args
 from src.agent_bridge.policy_gate import POLICY_PATH, POLICY_URL_ENV_VAR
 from src.security import policy
 from src.utils.agent_env import agent_child_env
@@ -75,6 +77,142 @@ _TIMEOUT_ENV = "DEVVY_POLICY_TIMEOUT_SECONDS"
 _POLICY_REQUEST_TIMEOUT = int(ASK_TIMEOUT_SECONDS) + 60
 # Codex reads AGENTS.md; this repo (and the pump worktrees) carry CLAUDE.md.
 PROJECT_DOC_ARGS = ["-c", 'project_doc_fallback_filenames=["CLAUDE.md"]']
+
+_PREFLIGHT_SCRIPT = r"""
+import os, pathlib, socket, subprocess, sys
+cwd, extra, outside, canary, auth = map(pathlib.Path, sys.argv[1:6])
+auth_present = sys.argv[6] == '1'
+extras = [extra, *(pathlib.Path(path) for path in sys.argv[7:])]
+def check(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+inside = cwd / '.codex-preflight-write'
+inside.write_text('ok')
+inside.unlink()
+for extra in extras:
+    if extra == cwd:
+        continue
+    marker = extra / '.codex-preflight-write'
+    marker.write_text('ok')
+    marker.unlink()
+try:
+    canary.read_text()
+except (OSError, PermissionError):
+    pass
+else:
+    raise RuntimeError('credential canary readable')
+if auth_present:
+    try:
+        auth.read_bytes()
+    except OSError:
+        pass
+    else:
+        raise RuntimeError('Codex credential file readable')
+try:
+    outside.write_text('escape')
+except (OSError, PermissionError):
+    pass
+else:
+    outside.unlink()
+    raise RuntimeError('outside write allowed')
+runtime = pathlib.Path('/run/user') / str(os.getuid())
+for relative in ('bus', 'systemd/private', 'systemd/io.systemd.Manager'):
+    sock = socket.socket(socket.AF_UNIX)
+    sock.settimeout(1)
+    try:
+        sock.connect(str(runtime / relative))
+    except OSError:
+        pass
+    else:
+        raise RuntimeError('user manager socket reachable: ' + relative)
+    finally:
+        sock.close()
+result = subprocess.run(['systemd-run', '--user', '--wait', '--quiet', '/bin/true'],
+                        capture_output=True, timeout=3)
+check(result.returncode != 0, 'user systemd unit started outside sandbox')
+cg = pathlib.Path('/sys/fs/cgroup')
+own = pathlib.Path('/proc/self/cgroup').read_text().strip().split(':')[-1]
+relative = pathlib.Path(own.lstrip('/'))
+for path in (cg / p / 'cgroup.procs' for p in relative.parents):
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CLOEXEC)
+    except OSError:
+        pass
+    else:
+        os.close(fd)
+        raise RuntimeError('cgroup migration path writable: ' + str(path))
+print('native Codex sandbox preflight ok')
+"""
+
+
+def preflight_codex_job(spec: JobSpec, program: str) -> None:
+    """Exercise the installed native sandbox before any model call."""
+    if spec.unrestricted or spec.full_access:
+        raise RuntimeError("native Codex preflight requires a confined profile")
+    if spec.session_file is None:
+        raise RuntimeError("native Codex preflight needs a disposable job directory")
+    job_dir = spec.session_file.parent.resolve()
+    with tempfile.TemporaryDirectory(prefix="codex-preflight-", dir=job_dir) as tmp:
+        probe = Path(tmp)
+        canary = probe / "credential-canary"
+        canary.write_text("secret", encoding="utf-8")
+        outside = probe / "outside-write"
+        extra = spec.extra_dirs[0] if spec.extra_dirs else spec.working_directory
+        auth = (
+            Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
+        )
+        args = sandbox_args(
+            unrestricted=False,
+            full_access=False,
+            cwd=spec.working_directory,
+            extra_dirs=spec.extra_dirs,
+            extra_denied=(str(canary),),
+        )
+        # `codex sandbox` takes the same profile table as `codex exec`.
+        argv = [
+            program,
+            "sandbox",
+            "-C",
+            str(spec.working_directory),
+            "-P",
+            PERMISSION_PROFILE,
+            *args[2:],
+            "--",
+            sys.executable,
+            "-c",
+            _PREFLIGHT_SCRIPT,
+            str(spec.working_directory),
+            str(extra),
+            str(outside),
+            str(canary),
+            str(auth),
+            "1" if auth.is_file() else "0",
+            *(str(root) for root in spec.extra_dirs[1:]),
+        ]
+        env = agent_child_env()
+        env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        env.pop("XDG_RUNTIME_DIR", None)
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env,
+                cwd=spec.working_directory,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"native Codex sandbox preflight: {exc}") from exc
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip().splitlines()[-1:]
+            raise RuntimeError(
+                "native Codex sandbox preflight failed: "
+                + (detail[0] if detail else f"exit {result.returncode}")
+            )
+        if "native Codex sandbox preflight ok" not in result.stdout.splitlines():
+            raise RuntimeError(
+                "native Codex sandbox preflight returned no success marker"
+            )
 
 
 class JobPolicyEndpoint:
@@ -359,6 +497,8 @@ async def run_codex_job(spec: JobSpec, link: BotLink, out: Any = None) -> int:
     try:
         await endpoint.start()
         env = agent_child_env(endpoint.child_env())
+        env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        env.pop("XDG_RUNTIME_DIR", None)
         prompt = spec.prompt
         nudges = _max_nudges()
         with tempfile.TemporaryDirectory(prefix="codex-job-") as tmp:
@@ -404,6 +544,14 @@ async def run_codex_job(spec: JobSpec, link: BotLink, out: Any = None) -> int:
         reason = error or _failure_reason(turn)
         print(f"agentjob failed: {reason}", file=sys.stderr, flush=True)
         outcome, code, error = "error", 1, reason[:500]
+        from .quota import QUOTA_EXIT, parse_limit, quota_line
+
+        limit = parse_limit(
+            reason, provider=(spec.route.provider if spec.route else "openai")
+        )
+        if limit is not None:
+            print(quota_line(limit), file=sys.stderr, flush=True)
+            code = QUOTA_EXIT
 
     in_tok, out_tok, cached = _usage_totals(usage)
     route = spec.route
@@ -452,6 +600,11 @@ def _failure_reason(turn: Optional[_Turn]) -> str:
     if turn is None:
         return "codex did not run"
     if turn.errors:
+        from .quota import parse_limit
+
+        for error in turn.errors:
+            if parse_limit(error, provider="openai") is not None:
+                return error
         return turn.errors[-1]
     tail = "\n".join(turn.stderr_tail[-5:]).strip()
     if turn.rc != 0:

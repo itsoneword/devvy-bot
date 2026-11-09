@@ -10,6 +10,9 @@ This runs the work OUTSIDE the turn instead: `systemd-run --user` starts a
 transient unit that is not a child of the bot, so it survives both the end of
 the turn and a bot restart (the user manager has Linger=yes). Completion pings
 Telegram via `scripts/agentctl notify`.
+Without systemd (macOS, WSL2; `DEVVY_LAUNCHER=process`) the job runs detached
+under src/platform/launcher.py's supervisor instead, and agent jobs are boxed
+by sandbox-exec where there is no bwrap (dv-fe4d).
 
 NOTE on output: `claude --output-format text` buffers the whole reply and only
 writes it when the run ends, so `output.md` stays 0 bytes while the job works
@@ -46,10 +49,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+from src.utils.job_scope import cwd_in_profile  # noqa: E402
+
 JOBS_ROOT = Path(os.environ.get("BGJOB_ROOT", REPO.parent / "jobs"))
 PROFILES_YAML = REPO / "config" / "profiles.yaml"
 AGENTCTL = REPO / "scripts" / "agentctl"
-TASKPUMP = REPO / "scripts" / "taskpump"
+HOME_TASKS = REPO / ".deviz" / "tasks"
 PREAMBLE = REPO / "templates" / "bgjob_preamble.md"
 
 SUMMARY_LINES = 15
@@ -59,7 +65,7 @@ _SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.DOTALL)
 # Conservative defaults for small hosts (this host had 3.8G when it once
 # OOM-rebooted from parallel claude processes; it has 11G now). Bigger hosts
 # raise them via BGJOB_MAX_CONCURRENT / BGJOB_MEMORY_MAX in the environment of
-# the bot and taskpump units.
+# the bot and pump2 units.
 MAX_CONCURRENT = int(os.environ.get("BGJOB_MAX_CONCURRENT", "2"))
 JOB_MEMORY_MAX = os.environ.get("BGJOB_MEMORY_MAX", "1G")
 # scripts/testrun's cap (unset = its 1500M); an agent job's unit holds both.
@@ -83,6 +89,25 @@ PRE_TIMEOUT_S = 3600
 PRE_KILL_AFTER_S = 120
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+
+
+def _src_module(rel: str, name: str):
+    """A stdlib-only module of src/ by file path: this script runs on the
+    system python, which has none of the package's dependencies."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, REPO / rel)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    # Registered before exec: a module declaring a dataclass (paths.py) is
+    # looked up in sys.modules while the class body runs.
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# systemd unit or detached supervised process (dv-fe4d); see the module.
+launcher = _src_module("src/platform/launcher.py", "_bgjob_launcher")
 
 
 def _env() -> dict:
@@ -133,14 +158,72 @@ def record_job_limit(job_id: str) -> None:
         quota.record(limit, source)
 
 
-def refuse_on_limit() -> None:
+def cmd_limit_notice(args: argparse.Namespace) -> int:
+    """run.sh, after `summarize`, for a job that exited QUOTA_EXIT: the one
+    concise notice of the limit in the chat of the agent whose job hit it
+    (dv-47f9), shared with the pump's notices (one per provider, reset and
+    chat). A quiet job (the pump's) is the pump's to tell; the Jobs ping
+    still says "stopped on usage limit" as before."""
+    quota = _quota()
+    meta = read_meta(args.id)
+    profile = meta.get("profile") or ""
+    if quota is None or meta.get("quiet") or not profile:
+        return 0
+    try:
+        err = (job_dir(args.id) / "stderr.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return 0
+    limit = quota.find_limit(err[-8000:], datetime.now(UTC))
+    if limit is None:
+        return 0
+    provider = quota.provider_of(limit.provider)
+    # The recorded limit: a later reset than this job's own wins (same key
+    # the pump uses).
+    limit = quota.active(provider=provider) or limit
+    who = f"{provider} (Codex)" if provider == "openai" else provider
+    text = (
+        f"⏸ лимит {who} кончился до {limit.until.astimezone(UTC):%H:%M} UTC: "
+        f"задачи на нём ждут сброса, остальные модели идут\n{limit.message[:80]}"
+    )
+
+    def deliver() -> bool:
+        cmd = [str(AGENTCTL), "notify", text, "--source", "bgjob"]
+        cmd += ["--profile", profile, "--deliver"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return r.returncode == 0
+
+    quota.notify_once(limit, profile, deliver)
+    return 0
+
+
+def refuse_on_limit(args: argparse.Namespace | None = None) -> None:
     """Exit if a usage limit is recorded and not reset yet: a model job
     started now would only hit it (dv-7ad9). --force skips this."""
     quota = _quota()
-    limit = quota.active() if quota is not None else None
+    provider = "anthropic"
+    if args is not None:
+        cmd = [_venv_python(), str(REPO / "scripts" / "agentjob"), "--print-route"]
+        if getattr(args, "route", None):
+            cmd += ["--route", args.route]
+        if getattr(args, "model", None):
+            cmd += ["--model", args.model]
+        try:
+            probe = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if probe.returncode == 0:
+                provider = json.loads(probe.stdout or "{}").get("provider") or provider
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+            pass
+    if provider == "anthropic_sub":
+        provider = "anthropic"
+    limit = quota.active(provider=provider) if quota is not None else None
     if limit is not None:
         sys.exit(
-            f"error: Claude usage limit exhausted until "
+            f"error: {provider} usage limit exhausted until "
             f"{limit.until.strftime('%H:%M UTC')} ({limit.message[:120]}); "
             f"--force to try anyway"
         )
@@ -164,6 +247,14 @@ def agent_unit_memory_max() -> str:
     return str(job + test)
 
 
+def tui_secret_file() -> Path:
+    """The local TUI's credential (dv-fe4d), which no job may read: it alone
+    answers an owner prompt, so a job holding it could approve its own ask.
+    (The job does read bot.env: that is where agentctl's bearer lives.)"""
+    paths = _src_module("src/utils/paths.py", "_bgjob_paths")
+    return paths.tui_secret_path()
+
+
 def job_box_prefix(bwrap_bin: str, write_paths: list[str]) -> str:
     """The bwrap argv an agent job runs in: / read-only, write_paths rw.
 
@@ -183,10 +274,51 @@ def job_box_prefix(bwrap_bin: str, write_paths: list[str]) -> str:
     )
 
 
+def bwrap_hide_args(hidden: list[str]) -> str:
+    """bwrap options that cover each existing *hidden* file with /dev/null.
+    Appended after job_box_prefix, so no bind before them exposes it again.
+    A file that does not exist yet needs no cover (and bwrap could not
+    create the mount point on the read-only /)."""
+    return "".join(
+        f" --ro-bind /dev/null {shlex.quote(h)}" for h in hidden if Path(h).is_file()
+    )
+
+
+def seatbelt_box_prefix(sandbox_exec: str, d: Path, write_paths: list[str]) -> str:
+    """The macOS job box (dv-fe4d): sandbox-exec with the job profile of
+    src/security/seatbelt.py, written to the job dir. Same contract as
+    job_box_prefix: reads everywhere, writes only write_paths, and no
+    launchd/LaunchServices/AppleEvents escape (the dv-5e2f analogue)."""
+    seatbelt = _src_module("src/security/seatbelt.py", "_bgjob_seatbelt")
+    profile = d / "box.sb"
+    profile.write_text(
+        seatbelt.job_profile(write_paths, hidden=[str(tui_secret_file())]),
+        encoding="utf-8",
+    )
+    return f"{shlex.quote(sandbox_exec)} -f {shlex.quote(str(profile))}"
+
+
+def job_box(d: Path, write_paths: list[str]) -> str:
+    """The run.sh prefix that boxes an agent job: bwrap where it exists,
+    else macOS sandbox-exec. Neither: refuse, never run unconfined."""
+    bwrap_bin = shutil.which("bwrap")
+    if bwrap_bin:
+        return job_box_prefix(bwrap_bin, write_paths) + bwrap_hide_args(
+            [str(tui_secret_file())]
+        )
+    sandbox_exec = shutil.which("sandbox-exec")
+    if sandbox_exec:
+        return seatbelt_box_prefix(sandbox_exec, d, write_paths)
+    sys.exit(
+        "error: no box tool (bwrap or sandbox-exec) found; "
+        "refusing to run a job unconfined"
+    )
+
+
 def pre_step_lines(d: Path, bwrap_prefix: str, pre: dict) -> str:
     """run.sh lines for an agent job's pre-agent command step (dv-2514).
 
-    taskpump runs a board's acceptance command this way: the agent's Bash
+    pump2 runs a board's acceptance command this way: the agent's Bash
     tool stops at 600 s, a full suite does not. The command runs in the same
     box as the agent (it is code the build wrote), output to pre["log"],
     under `timeout`, which signals its whole process group. A finished step,
@@ -269,11 +401,22 @@ _REGISTRY_DUMP = """
 import json, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
+from src.config.loader import load_config
 from src.profiles import load_profile_registry
-reg = load_profile_registry(Path(sys.argv[2]))
+# No loadable settings (a checkout without them: tests, CI) = the safe
+# defaults: sandboxed, the registry's own data root.
+try:
+    config = load_config(config_file=Path(sys.argv[1]) / '.env')
+    sandbox_default = config.sandbox_enabled
+    kw = {"data_root": config.devvy_data_root}
+except Exception:
+    sandbox_default, kw = True, {}
+reg = load_profile_registry(Path(sys.argv[2]), sandbox_default=sandbox_default, **kw)
 print(json.dumps({
     p.slug: {"working_dir": str(p.working_dir),
-             "extra_dirs": [str(d) for d in p.extra_dirs]}
+             "extra_dirs": [str(d) for d in p.extra_dirs],
+             "sandbox": p.sandbox if p.sandbox is not None else sandbox_default,
+             "unrestricted": p.unrestricted}
     for p in reg.profiles
 }))
 """
@@ -308,6 +451,12 @@ def load_extra_dirs(slug: str) -> list:
     """The profile's ``extra_dirs`` (owner-only, dv-3103). A job runs with the
     owner's authority, so it may write where the profile's turns may."""
     return list(_registry().get(slug, {}).get("extra_dirs", []))
+
+
+def confined_codex_profile(slug: str) -> bool:
+    """Only a sandboxed, restricted profile may use native Codex isolation."""
+    profile = _registry().get(slug, {})
+    return profile.get("sandbox", True) is True and not profile.get("unrestricted")
 
 
 def extract_summary(text: str) -> str:
@@ -377,9 +526,9 @@ def write_summary(job_id: str) -> str:
     if not summary:
         err = ""
         try:
-            err = "\n".join(
-                (d / "stderr.log").read_text(errors="replace").strip().splitlines()[-3:]
-            )
+            lines = (d / "stderr.log").read_text(errors="replace").strip().splitlines()
+            preflight = [line for line in lines if "agentjob preflight failed:" in line]
+            err = preflight[-1] if preflight else "\n".join(lines[-3:])
         except OSError:
             pass
         summary = "(no output)" + (f"\n{err}" if err else "")
@@ -396,6 +545,13 @@ def read_meta(job_id: str) -> dict:
         return json.loads((job_dir(job_id) / "meta.json").read_text())
     except Exception:
         return {}
+
+
+def job_active(jid: str, meta: dict) -> bool:
+    """Is this job still running, asked of the launcher that started it."""
+    if launcher.is_process(meta):
+        return launcher.active(job_dir(jid))
+    return bool(meta.get("unit")) and unit_active(meta["unit"])
 
 
 def unit_active(unit: str) -> bool:
@@ -469,8 +625,7 @@ def live_jobs() -> list:
     for jid in all_jobs():
         if (job_dir(jid) / "QUEUED").exists():
             continue
-        meta = read_meta(jid)
-        if meta.get("unit") and unit_active(meta["unit"]):
+        if job_active(jid, read_meta(jid)):
             out.append(jid)
     return out
 
@@ -658,13 +813,36 @@ def build_digest_prompt(unsent: list, running: list) -> str:
     return text + "]"
 
 
-def _agentctl_prompt(profile: str, text: str, name: str) -> bool:
+def _agentctl_prompt(
+    profile: str,
+    text: str,
+    name: str,
+    user_id: int = 0,
+    chat_id: int = 0,
+    cwd: str = "",
+) -> bool:
+    argv = [str(AGENTCTL), "prompt", text, "--profile", profile, "--name", name]
+    if user_id:
+        argv += ["--user-id", str(user_id)]
+    if chat_id:
+        argv += ["--chat-id", str(chat_id)]
+    if cwd:
+        argv += ["--cwd", cwd]
     r = subprocess.run(
-        [str(AGENTCTL), "prompt", text, "--profile", profile, "--name", name],
+        argv,
         capture_output=True,
         text=True,
     )
     return r.returncode == 0
+
+
+def _notification_chat_id(args: argparse.Namespace) -> int | None:
+    return getattr(args, "chat_id", None) or getattr(args, "user_id", None)
+
+
+def _notify_chat_flag(args: argparse.Namespace) -> str:
+    chat_id = _notification_chat_id(args)
+    return f"--chat-id {int(chat_id)} " if chat_id else ""
 
 
 def _spawn_watcher(batch: str) -> None:
@@ -672,6 +850,13 @@ def _spawn_watcher(batch: str) -> None:
     re-checks the batch until its digest is out. A Popen from run.sh would be
     killed with that job's cgroup."""
     unit = f"bgbatch-{batch}"
+    if launcher.kind() == launcher.PROCESS:
+        # No user manager: a new session outlives run.sh just the same. A
+        # second watcher is harmless (digest_batch is serialized by flock).
+        launcher.spawn_detached(
+            [sys.executable, str(Path(__file__).resolve()), "digest-watch", batch]
+        )
+        return
     if unit_active(unit):
         return
     subprocess.run(
@@ -690,6 +875,21 @@ def _spawn_watcher(batch: str) -> None:
         text=True,
         env=_env(),
     )
+
+
+def _digest_cwd(meta: dict) -> str:
+    """The job's cwd when the digest turn may run there: the profile root or
+    the launching owner's own workspace (what /internal/prompt accepts).
+    Anything else (a /repo project dir) gives "" -- the API then starts at the
+    profile root and wraps it into that owner's workspace, so the digest is
+    still delivered instead of failing with "invalid job workspace"."""
+    cwd, root = meta.get("cwd"), meta.get("profile_root")
+    if not cwd or not root:
+        return ""
+    resolved, base = Path(cwd).resolve(), Path(root).resolve()
+    if resolved not in (base, base / "users" / str(meta["user_id"])):
+        return ""
+    return str(cwd)
 
 
 def digest_batch(batch: str, now: float | None = None, spawn: bool = True) -> str:
@@ -723,10 +923,20 @@ def digest_batch(batch: str, now: float | None = None, spawn: bool = True) -> st
             first = now
         plan = plan_digest(finished, running, sent, first, now)
         if plan[0] == "send":
-            profile = read_meta(plan[1][0]).get("profile") or ""
+            meta = read_meta(plan[1][0])
+            profile = meta.get("profile") or ""
             text = build_digest_prompt(plan[1], plan[2])
+            audience = {}
+            if meta.get("user_id"):
+                audience = {
+                    "user_id": int(meta["user_id"]),
+                    "chat_id": int(meta.get("chat_id") or meta["user_id"]),
+                }
+                cwd = _digest_cwd(meta)
+                if cwd:
+                    audience["cwd"] = cwd
             if not profile or not _agentctl_prompt(
-                profile, text, f"job-finish:{batch}"
+                profile, text, f"job-finish:{batch}", **audience
             ):
                 result = "failed"
             else:
@@ -760,20 +970,20 @@ def cmd_digest_watch(args: argparse.Namespace) -> int:
 
 def job_harness(python_bin: str, agentjob: Path, args: argparse.Namespace) -> str:
     """The harness the job's route resolves to (`agentjob --print-route`,
-    dv-d63d), so the box can be built for it; "" when the probe fails (the
-    job then reports the route error itself)."""
+    dv-d63d), so the box can be built for it. An empty result stops launch."""
     cmd = [python_bin, str(agentjob), "--print-route"]
     if getattr(args, "route", None):
         cmd += ["--route", args.route]
     if getattr(args, "model", None):
         cmd += ["--model", args.model]
+    if getattr(args, "harness", None):
+        cmd += ["--harness", args.harness]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         route = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
     except (OSError, subprocess.SubprocessError, ValueError):
         route = {}
     if not isinstance(route, dict) or not route.get("harness"):
-        print("warning: job route probe failed; box built for Claude", file=sys.stderr)
         return ""
     return str(route["harness"])
 
@@ -781,6 +991,7 @@ def job_harness(python_bin: str, agentjob: Path, args: argparse.Namespace) -> st
 def cmd_run(args: argparse.Namespace) -> int:
     profiles = load_profiles()
     cwd = profiles.get(args.profile)
+    profile_root = cwd
     if not cwd:
         sys.exit(
             f"error: unknown profile '{args.profile}'. "
@@ -822,25 +1033,27 @@ def cmd_run(args: argparse.Namespace) -> int:
     if pre_cmd and command:
         # A --cmd job IS a command; the step exists to run one before a turn.
         sys.exit("error: --pre-cmd is for model-turn jobs only, not --cmd")
+    if getattr(args, "harness", None) and command:
+        # dv-a8e4: the override picks the model harness; a --cmd job has none.
+        sys.exit("error: --harness is for model-turn jobs only, not --cmd")
     if pre_cmd and not getattr(args, "pre_log", None):
         sys.exit("error: --pre-cmd needs --pre-log")
     task = getattr(args, "task", None)
     ticket = ""
     if task:
-        # One ticket reader: taskpump's. Unknown/ambiguous ids exit non-zero.
-        r = subprocess.run(
-            [str(TASKPUMP), "path", task], capture_output=True, text=True
-        )
-        ticket = r.stdout.strip()
-        if r.returncode != 0 or not ticket:
+        # The home board's card file: <repo>/.deviz/tasks/<id>.md.
+        board, _, bare = task.rpartition(":")
+        card = HOME_TASKS / f"{bare}.md"
+        found = board in ("", "devvy") and card.is_file()
+        ticket = str(card.resolve()) if found else ""
+        if not ticket:
             sys.exit(
                 f"error: unknown task {task}: task_id only knows this repo's "
                 f"(devvy) board, not other agents' boards. For any other "
-                f"ticket, name it in the prompt and omit task_id. "
-                f"{r.stderr.strip()[:200]}"
+                f"ticket, name it in the prompt and omit task_id."
             )
     if not command and not getattr(args, "force", False):
-        refuse_on_limit()
+        refuse_on_limit(args)
     if not quiet and not command and not getattr(args, "force", False):
         dup = find_duplicate(args.name, task)
         if dup:
@@ -874,17 +1087,24 @@ def cmd_run(args: argparse.Namespace) -> int:
     output.touch()
 
     unit = f"bgjob-{job_id}"
+    how = launcher.kind()
     meta = {
         "id": job_id,
         "name": args.name,
         "profile": args.profile,
         "cwd": cwd,
+        "profile_root": profile_root,
+        "user_id": getattr(args, "user_id", None),
+        "chat_id": getattr(args, "chat_id", None),
         "unit": unit,
         "created": datetime.now(UTC).isoformat(),
         "model": args.model,
         "route": getattr(args, "route", None),
+        "harness": getattr(args, "harness", None),
         "prompt": args.prompt[:2000],
     }
+    if how == launcher.PROCESS:
+        meta["launcher"] = how
     if command:
         meta["cmd"] = command[:2000]
     if pre_cmd:
@@ -919,33 +1139,44 @@ def cmd_run(args: argparse.Namespace) -> int:
     agentjob = REPO / "scripts" / "agentjob"
     python_bin = _venv_python()
 
-    # Filesystem confinement is enforced by bubblewrap, NOT by systemd.
+    # The outer box confines Claude and Codex pre-steps; confined Codex tool
+    # calls use its native permission profile after a host-side preflight.
+    # systemd provides the unit memory cap, not filesystem confinement.
     # systemd --user accepts ProtectSystem=strict / ReadWritePaths / ProtectHome
     # and reports Result=success, but silently does not enforce them (the user
     # manager lacks the privileges for the mount namespace) -- verified: a job
     # with those properties still wrote outside its workspace. bwrap does
     # enforce: everything is read-only except the paths bound rw below.
-    bwrap_bin = shutil.which("bwrap")
-    if not bwrap_bin:
-        sys.exit("error: bwrap not found; refusing to run a job unconfined")
-
+    # No bwrap (macOS): sandbox-exec with the Seatbelt job profile; neither
+    # tool = refuse (job_box).
     write_paths = [str(d), cwd, str(Path.home() / ".claude")]
     # dv-d63d: a Codex job writes its sessions/rollouts and refreshes its
     # login under ~/.codex; a Claude job keeps today's write set.
-    if job_harness(python_bin, agentjob, args) == "openai_codex":
+    harness = job_harness(python_bin, agentjob, args)
+    if not harness:
+        sys.exit("error: job route probe failed; no model job launched")
+    native_codex = harness == "openai_codex" and confined_codex_profile(args.profile)
+    if harness == "openai_codex":
         write_paths.append(str(Path.home() / ".codex"))
     allow_dirs = list(args.allow_dir or [])
-    if not getattr(args, "cwd", None):
-        # --cwd jobs (taskpump worktrees) keep their explicit write set.
+    if cwd_in_profile(Path(cwd), Path(profiles[args.profile])):
+        # Profile roots and owner workspaces keep their configured write dirs.
         allow_dirs += load_extra_dirs(args.profile)
+    effective_dirs = []
     for extra in allow_dirs:
         p = Path(extra).expanduser().resolve()
-        if not p.is_dir():
-            sys.exit(f"error: --allow-dir does not exist: {p}")
+        if not p.is_dir() or p == Path("/"):
+            sys.exit(f"error: invalid --allow-dir: {p}")
         write_paths.append(str(p))
+        effective_dirs.append(str(p))
 
-    bwrap_prefix = job_box_prefix(bwrap_bin, write_paths)
-    # Only an explicit --setting-sources reaches agentjob (taskpump: project);
+    bwrap_prefix = job_box(d, write_paths)
+    agent_prefix = "" if native_codex else bwrap_prefix + " "
+    native_flag = "--native-preflight " if native_codex else ""
+    extra_flags = "".join(
+        f"--allow-dir {shlex.quote(path)} " for path in dict.fromkeys(effective_dirs)
+    )
+    # Only an explicit --setting-sources reaches agentjob (pump2: project);
     # without it agentjob keeps its own default, user + project (dv-fe02).
     setting_sources = getattr(args, "setting_sources", None)
     sources_flag = (
@@ -953,10 +1184,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     # Everything after the claude call is reporting, and --quiet drops all of
-    # it: taskpump-launched jobs write a structured report their caller renders
+    # it: pump2-launched jobs write a structured report their caller renders
     # into one short message, and the raw-tail ping would be a second, worse
     # copy of the same news.
+    notify_chat_flag = _notify_chat_flag(args)
     notify_tail = (
+        # A usage limit: one notice in the agent's own chat too (dv-47f9).
+        f"if [ $rc -eq 4 ]; then {shlex.quote(python_bin)} "
+        f"{str(Path(__file__).resolve())!r} limit-notice {shlex.quote(job_id)} "
+        ">/dev/null 2>&1 || true; fi\n"
         "d=$(( $(date +%s) - t0 ))\n"
         'dur=$(printf "%dm%02ds" $((d/60)) $((d%60)))\n'
         'if [ $rc -eq 0 ]; then icon="✅"; s="finished"; '
@@ -967,7 +1203,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # agentjob exit 4 (dv-7ad9): the usage limit ran out. Not a failure of
         # the work; the reset comes from agentjob's quota line.
         f"elif [ $rc -eq 4 ]; then icon=\"⏸\"; "
-        "until_iso=$(sed -n 's/^agentjob quota: .* until \\([^ ]*\\)[[:space:]]*$/\\1/p' "
+        "until_iso=$(sed -n 's/^agentjob quota: .* until \\([^ ]*\\).*$/\\1/p' "
         f"{str(d / 'stderr.log')!r} 2>/dev/null | tail -n 1); "
         'at=$(date -u -d "$until_iso" "+%H:%M UTC" 2>/dev/null || echo "?"); '
         's="stopped on usage limit (resets $at)"; '
@@ -980,7 +1216,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # that way (26.10: a merge job stopped on the limit left MERGE_HEAD in
         # the live checkout). Only a warning: nothing aborts it by hand.
         f"jcwd={shlex.quote(cwd)}\n"
-        'if [ $rc -ne 0 ]; then\n'
+        "if [ $rc -ne 0 ]; then\n"
         "  for g in MERGE_HEAD:merge rebase-merge:rebase rebase-apply:rebase; do\n"
         '    gp=$(git -C "$jcwd" rev-parse --path-format=absolute '
         '--git-path "${g%%:*}" 2>/dev/null)\n'
@@ -1015,7 +1251,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # still discoverable instead of silently lost.
         f"sent=0\n"
         f"for i in $(seq 1 30); do\n"
-        f'  if {str(AGENTCTL)!r} notify --source bgjob --markdown --ref job:{job_id} --profile {args.profile} --images-from {str(d / "summary.md")!r} "$msg" >>{str(d / "notify.log")!r} 2>&1; then\n'
+        f'  if {str(AGENTCTL)!r} notify --source bgjob --markdown --ref job:{job_id} --profile {args.profile} {notify_chat_flag}--images-from {str(d / "summary.md")!r} "$msg" >>{str(d / "notify.log")!r} 2>&1; then\n'
         f"    sent=1; break\n"
         f"  fi\n"
         f"  sleep 10\n"
@@ -1042,11 +1278,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     # dv-d63d: the job route names the models.yaml `jobs:` row agentjob runs
     # on; no --model unless the caller gave one (it would beat the row).
     route = getattr(args, "route", None)
-    route_flags = (f"--route {shlex.quote(route)} " if route else "") + (
-        f"--model {shlex.quote(args.model)} " if args.model else ""
+    # dv-a8e4: an explicit --harness is repeated, never added by bgjob.
+    harness_flag = getattr(args, "harness", None)
+    route_flags = (
+        (f"--route {shlex.quote(route)} " if route else "")
+        + (f"--model {shlex.quote(args.model)} " if args.model else "")
+        + (f"--harness {shlex.quote(harness_flag)} " if harness_flag else "")
     )
 
-    # dv-781f: the task context for the ask explainer, verbatim from taskpump.
+    # dv-781f: the task context for the ask explainer, verbatim from pump2.
     ask_context = getattr(args, "ask_context", None)
     ask_flag = f"--ask-context {shlex.quote(ask_context)} " if ask_context else ""
 
@@ -1057,6 +1297,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     runner = d / "run.sh"
     runner.write_text(
         "#!/bin/bash\n"
+        # Transient systemd units inherit the user manager's minimal PATH,
+        # not the caller's. Codex is installed in ~/.npm-global/bin here.
+        'export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin:$PATH"\n'
         # Timestamps captured here, not at completion: the finish notification
         # has to say when the job STARTED and how long it ran, otherwise the
         # user cannot tell which request it belongs to.
@@ -1064,10 +1307,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         "started_h=$(date -u '+%H:%M UTC')\n"
         f"cd {cwd!r} || exit 1\n"
         + tmp_head
-        + cgroup_carveout(JOB_MEMORY_MAX, d / "stderr.log")
+        + (
+            # No unit, no delegated cgroup: the supervisor's soft cap holds.
+            "box_cg=''\n"
+            if how == launcher.PROCESS
+            else cgroup_carveout(JOB_MEMORY_MAX, d / "stderr.log")
+        )
         + pre_step
-        + f"{bwrap_prefix} {shlex.quote(python_bin)} {str(agentjob)!r} "
+        + f"{agent_prefix}{shlex.quote(python_bin)} {str(agentjob)!r} "
         f"--profile {shlex.quote(args.profile)} --cwd {cwd!r} "
+        f"{native_flag}{extra_flags}"
         f"--prompt-file {str(d / 'prompt.txt')!r} "
         f"{route_flags}--name {shlex.quote(args.name)} "
         f"{sources_flag}"
@@ -1077,6 +1326,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         # stdout is the answer; the runner's log lines go to their own file.
         f">> {str(output)!r} 2>> {str(d / 'stderr.log')!r}\n"
         "rc=$?\n"
+        + f"if [ $rc -ne 0 ] && [ ! -s {str(output)!r} ]; then\n"
+        + f"  tail -n 8 {str(d / 'stderr.log')!r} > {str(d / 'summary.md')!r}\n"
+        + "fi\n"
         + ("fi\n" if pre_cmd else "")
         + f'echo "$rc" > {str(d / "exit_code")!r}\n'
         f"{shlex.quote(python_bin)} {str(Path(__file__).resolve())!r} "
@@ -1117,11 +1369,12 @@ def _launch_cmd_job(
             + "sent=0\n"
             + "for i in $(seq 1 30); do\n"
             + f"  if {str(AGENTCTL)!r} notify --source bgjob --ref {ref} "
-            + f'--profile {shlex.quote(args.profile)} "$msg" '
+            + f"--profile {shlex.quote(args.profile)} "
+            + f'{_notify_chat_flag(args)}"$msg" '
             + f">>{str(d / 'notify.log')!r} 2>&1; then sent=1; break; fi\n"
             + "  sleep 10\n"
             + "done\n"
-            + f'if [ "$sent" != "1" ]; then echo "$msg" > '
+            + 'if [ "$sent" != "1" ]; then echo "$msg" > '
             + f"{str(d / 'PENDING_NOTIFY')!r}; fi\n"
             + f"{me} pin --exclude {job_id} >/dev/null 2>&1 || true\n"
         )
@@ -1169,6 +1422,14 @@ def _start_unit(
     box/agent and the test leaves out of it; see cgroup_carveout. --cmd jobs
     keep a plain unit: no box, the bus and testrun's scope stay usable."""
     mem = agent_unit_memory_max() if delegate else JOB_MEMORY_MAX
+    if launcher.is_process(read_meta(job_id)):
+        # dv-fe4d: no systemd here. The supervisor enforces the same cap,
+        # softly; the env is ours, so the test cap and route vars carry over.
+        try:
+            launcher.start(job_dir(job_id), runner, _size_bytes(mem))
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            sys.exit(f"error: job launcher failed: {exc}")
+        return _announce_start(args, job_id, unit, output, quiet, queued)
     cmd = [
         "systemd-run",
         "--user",
@@ -1186,9 +1447,17 @@ def _start_unit(
             if TEST_MEMORY_MAX
             else []
         ),
+        # The slot caps too: a job that launches jobs (the pump's merge job
+        # starting its conflict agent) otherwise falls back to bgjob's default
+        # cap of 2, counts itself, and is refused (gb-1ad9 merge, 04.11).
+        *(
+            f"--setenv={name}={os.environ[name]}"
+            for name in ("BGJOB_MAX_CONCURRENT", "PUMP_MAX_CONCURRENT")
+            if os.environ.get(name)
+        ),
         # dv-d63d: agentjob resolves the job's route from models.yaml; the
         # table's path and the legacy PUMP_*_MODEL stage models set for
-        # taskpump must reach it too.
+        # pump2 must reach it too.
         *(
             [
                 f"--setenv={name}={os.environ[name]}"
@@ -1204,6 +1473,18 @@ def _start_unit(
     r = subprocess.run(cmd, capture_output=True, text=True, env=_env())
     if r.returncode != 0:
         sys.exit(f"error: systemd-run failed: {r.stderr.strip()}")
+    return _announce_start(args, job_id, unit, output, quiet, queued)
+
+
+def _announce_start(
+    args: argparse.Namespace,
+    job_id: str,
+    unit: str,
+    output: Path,
+    quiet: bool,
+    queued: bool,
+) -> int:
+    """The start ping, the jobs pin and its watcher, the printed id."""
 
     # Announce the start HERE, not in the MCP wrapper. The finish ping already
     # lives in this script, and having the two on different layers meant a job
@@ -1225,6 +1506,11 @@ def _start_unit(
                 f"job:{job_id}",
                 "--profile",
                 args.profile,
+                *(
+                    ["--chat-id", str(_notification_chat_id(args))]
+                    if _notification_chat_id(args)
+                    else []
+                ),
                 f'🚀 {args.profile} · job "{args.name}" {verb}\n'
                 f"at {started_at}\nid: {job_id}",
             ],
@@ -1264,10 +1550,10 @@ def _start_unit(
 
 def _job_state(jid: str, meta: dict) -> str:
     unit = meta.get("unit", "")
-    if unit and unit_active(unit):
+    if job_active(jid, meta):
         if (job_dir(jid) / "QUEUED").exists():
             return "RUNNING (queued for a slot)"
-        prog = job_progress(unit)
+        prog = "" if launcher.is_process(meta) else job_progress(unit)
         return f"RUNNING ({prog})" if prog else "RUNNING"
     ec = job_dir(jid) / "exit_code"
     rc = ec.read_text().strip() if ec.exists() else "?"
@@ -1479,11 +1765,14 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     meta = read_meta(args.id)
     if not meta:
         sys.exit(f"error: no such job: {args.id}")
-    subprocess.run(
-        ["systemctl", "--user", "stop", meta["unit"]],
-        capture_output=True,
-        env=_env(),
-    )
+    if launcher.is_process(meta):
+        launcher.cancel(job_dir(args.id))
+    else:
+        subprocess.run(
+            ["systemctl", "--user", "stop", meta["unit"]],
+            capture_output=True,
+            env=_env(),
+        )
     print(f"cancelled {args.id}")
     return 0
 
@@ -1511,6 +1800,13 @@ def main() -> int:
         "route is not Claude on the subscription.",
     )
     p.add_argument(
+        "--harness",
+        default=None,
+        choices=["claude"],
+        help="run this one job on Claude over the owner's jobs switch "
+        "(dv-a8e4). Explicit only: a failed Codex job is never retried on it.",
+    )
+    p.add_argument(
         "--route",
         default=None,
         metavar="NAME",
@@ -1529,7 +1825,7 @@ def main() -> int:
         "--cwd",
         metavar="DIR",
         help="run in this directory instead of the profile's working_dir, and "
-        "make it the writable root. Used by taskpump to run a job in a git "
+        "make it the writable root. Used by pump2 to run a job in a git "
         "worktree so an unattended agent never edits the tree the live bot "
         "imports from.",
     )
@@ -1537,7 +1833,7 @@ def main() -> int:
         "--quiet",
         action="store_true",
         help="send no Telegram start/finish/pin messages and skip the digest "
-        "turn. For jobs whose caller does its own reporting (taskpump); a "
+        "turn. For jobs whose caller does its own reporting (pump2); a "
         "job that pings twice from two layers is worse than one that pings "
         "once from the layer that knows what the message should say.",
     )
@@ -1545,7 +1841,7 @@ def main() -> int:
         "--task",
         metavar="ID",
         help="board ticket id (dv-xxxx); the job is told to read it itself. "
-        "Resolved by `taskpump path`.",
+        "Read from this repo's .deviz/tasks.",
     )
     p.add_argument(
         "--force",
@@ -1560,12 +1856,14 @@ def main() -> int:
         help="batch id (job_start passes the agent turn id): jobs sharing it "
         "are reported in one digest in the agent's chat",
     )
+    p.add_argument("--user-id", type=int, default=None)
+    p.add_argument("--chat-id", type=int, default=None)
     p.add_argument(
         "--ask-context",
         metavar="JSON",
         default=None,
         help="model-turn jobs only: {task_id, task_title, stage} handed to "
-        "agentjob for the ask card's explainer (taskpump, dv-781f)",
+        "agentjob for the ask card's explainer (pump2, dv-781f)",
     )
     p.add_argument(
         "--queue",
@@ -1579,7 +1877,7 @@ def main() -> int:
         metavar="LIST",
         default=None,
         help="comma list of CLI setting sources for the model turn (default: "
-        "agentjob's user,project). taskpump passes 'project' so stages get "
+        "agentjob's user,project). pump2 passes 'project' so stages get "
         "no user plugins, skills or hooks (dv-fe02).",
     )
     p.add_argument(
@@ -1587,7 +1885,7 @@ def main() -> int:
         metavar="COMMAND",
         default=None,
         help="model-turn jobs only: run this shell command in the job's box "
-        "BEFORE the turn, to completion (no 600 s Bash cap). taskpump runs a "
+        "BEFORE the turn, to completion (no 600 s Bash cap). pump2 runs a "
         "board's acceptance command this way (dv-2514).",
     )
     p.add_argument(
@@ -1637,6 +1935,12 @@ def main() -> int:
     p.add_argument("--tail", type=int, default=0)
     p.add_argument("--full", action="store_true", help="whole output, not summary")
     p.set_defaults(fn=cmd_output)
+
+    p = sub.add_parser(
+        "limit-notice", help="tell the job's agent chat about its usage limit, once"
+    )
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_limit_notice)
 
     p = sub.add_parser("summarize", help="write summary.md for a finished job")
     p.add_argument("id")

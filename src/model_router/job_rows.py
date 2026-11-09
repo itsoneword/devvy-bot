@@ -41,7 +41,12 @@ from .routes import (
     load_call_routes,
     pricing_rule_for,
 )
-from .types import CLAUDE_HARNESS, CODEX_HARNESS, JOB_ROUTE_NAMES, OPENROUTER_HARNESS
+from .types import (
+    CLAUDE_HARNESS,
+    CODEX_HARNESS,
+    OPENROUTER_HARNESS,
+    is_job_route,
+)
 
 #: Russian names for the job routes (the owner reads these, not route names).
 JOB_LABELS: Dict[str, str] = {
@@ -51,6 +56,8 @@ JOB_LABELS: Dict[str, str] = {
     "pump_implement": "сборка",
     "pump_review": "ревью",
     "pump_acceptance": "приёмка",
+    "pump_merge": "слияние",
+    "pump_mergefix": "исправление слияния",
     "background_job": "фоновые задачи",
     "monitor": "монитор сервера",
     "design_generate": "дизайн-варианты",
@@ -142,7 +149,7 @@ def model_choices(harness: str, routes: CallRoutes) -> Tuple[str, ...]:
 def set_job_model(path: Path, job: str, model: str) -> Optional[Change]:
     """Set ``job``'s model for the row's current harness. None = already
     that model (nothing written). Raises :class:`RowError` on a refusal."""
-    if job not in JOB_ROUTE_NAMES:
+    if not is_job_route(job):
         raise RowError(f"нет такой строки jobs.{job}")
     routes = load(path)
     harness = row_harness(routes, job)

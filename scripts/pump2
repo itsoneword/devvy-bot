@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""pump2 — Pump v2 front: tick | status [board] | doctor [board] | merge <board>:<id> |
+freeze | thaw | urgent <board>:<id> (dv-44b1) | start | answer | run-stage.
+Spec: docs/pump.md. Thin wrapper over src/pump2/cli.py."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.pump2.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

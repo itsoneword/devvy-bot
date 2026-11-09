@@ -209,6 +209,7 @@
     "dump.sessions_codex_rows": [
       {
         "backend": "openai_codex",
+        "bundle_sha256": null,
         "created_at": "<ts>",
         "cumulative_tokens": 150,
         "deactivated_at": null,
@@ -227,6 +228,7 @@
       },
       {
         "backend": "openai_codex",
+        "bundle_sha256": null,
         "created_at": "<ts>",
         "cumulative_tokens": 15,
         "deactivated_at": null,
@@ -492,6 +494,7 @@
     ],
     "create_session": {
       "backend": null,
+      "bundle_sha256": null,
       "created_at": "<ts>",
       "cumulative_tokens": 0,
       "deactivated_at": null,
@@ -637,6 +640,7 @@
     "dump.sessions": [
       {
         "backend": null,
+        "bundle_sha256": null,
         "created_at": "<ts>",
         "cumulative_tokens": 0,
         "deactivated_at": null,
@@ -826,6 +830,7 @@
       ],
       "session": {
         "backend": null,
+        "bundle_sha256": null,
         "created_at": "<ts>",
         "cumulative_tokens": 0,
         "deactivated_at": null,
@@ -920,6 +925,7 @@
       "recent_sessions": [
         {
           "backend": null,
+          "bundle_sha256": null,
           "created_at": "<ts>",
           "cumulative_tokens": 0,
           "deactivated_at": null,
@@ -2369,6 +2375,7 @@
     "dump.sessions_sqlss": [
       {
         "backend": null,
+        "bundle_sha256": null,
         "created_at": "<ts>",
         "cumulative_tokens": 0,
         "deactivated_at": null,
@@ -2387,6 +2394,7 @@
       },
       {
         "backend": null,
+        "bundle_sha256": null,
         "created_at": "<ts>",
         "cumulative_tokens": 0,
         "deactivated_at": "<ts>",
@@ -3919,9 +3927,12 @@
       "bundle_text": "<system prompt text>",
       "created_at": "<ts>",
       "facts_count": 3,
+      "family_agent_id": null,
       "family_count": 2,
       "persona_chars": 100,
       "pointers_count": 1,
+      "revision": 0,
+      "stale_at": null,
       "total_chars": 120,
       "user_id": 906,
       "window_id": 1,
@@ -3933,9 +3944,12 @@
       "bundle_text": "<system prompt text>",
       "created_at": "<ts>",
       "facts_count": 3,
+      "family_agent_id": null,
       "family_count": 2,
       "persona_chars": 100,
       "pointers_count": 1,
+      "revision": 0,
+      "stale_at": null,
       "total_chars": 120,
       "user_id": 906,
       "window_id": 1,
@@ -3947,9 +3961,12 @@
       "bundle_text": "<system prompt text>",
       "created_at": "<ts>",
       "facts_count": 3,
+      "family_agent_id": null,
       "family_count": 2,
       "persona_chars": 100,
       "pointers_count": 1,
+      "revision": 0,
+      "stale_at": null,
       "total_chars": 120,
       "user_id": 906,
       "window_id": 1,

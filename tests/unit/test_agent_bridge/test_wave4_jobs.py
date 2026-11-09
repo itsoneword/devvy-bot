@@ -239,9 +239,13 @@ class TestOwnerPath:
         assert argv[0].endswith("/scripts/bgjob")
         # --batch carries the turn id (jobs of one turn share one digest)
         assert list(argv[1:4]) == ["run", "--profile", "coach"]
-        assert argv[4:6] == ("--name", "audit")
-        assert argv[6] == "--batch" and argv[7]
-        assert list(argv[8:]) == ["--", "audit the repo"]
+        # job scope (dv-5a35): the caller's workspace and the owner's id
+        assert argv[4:6] == ("--cwd", str(workspace))
+        assert argv[6:8] == ("--user-id", str(OWNER))
+        i = argv.index("--name")
+        assert argv[i : i + 2] == ("--name", "audit")
+        assert argv[i + 2] == "--batch" and argv[i + 3]
+        assert list(argv[i + 4 :]) == ["--", "audit the repo"]
 
     async def test_nothing_model_supplied_can_become_a_flag(
         self, bridge: AgentBridge, workspace: Path, spawned: List[Tuple[str, ...]]

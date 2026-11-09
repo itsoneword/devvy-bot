@@ -168,6 +168,24 @@ class TestDeniedPathsFalsePositives:
     @pytest.mark.parametrize(
         "command",
         [
+            "git add .env.example && git commit -m env",
+            "git diff --stat -- .env.example",
+            "cat .env.sample",
+        ],
+    )
+    def test_env_templates_allowed(self, command: str) -> None:
+        ok, err = check_bash_denied_paths(command, self.REPO, full_access=True)
+        assert ok is True, f"{command}: {err}"
+
+    def test_template_next_to_real_env_still_denied(self) -> None:
+        ok, _ = check_bash_denied_paths(
+            "cp .env .env.example", self.REPO, full_access=True
+        )
+        assert ok is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             "sqlite3 data/bot.db .tables",
             "python3 -c \"import sqlite3;c=sqlite3.connect('/home/x/data/bot.db')\"",
         ],

@@ -90,7 +90,7 @@ def main() -> None:
                           help="text is markdown; render it as Telegram HTML")
     p_notify.add_argument("--source", default=None,
                           help="who is speaking (e.g. server-monitor:host1, "
-                          "taskpump:status, bgjob); picks the reports topic")
+                          "pump2:status, bgjob); picks the reports topic")
     p_notify.add_argument("--ref", default=None,
                           help="tag the sent message so a reply maps back (job:<id>)")
     p_notify.add_argument("--profile", default=None,
@@ -101,6 +101,9 @@ def main() -> None:
                           help="image path to send after the text (repeatable)")
     p_notify.add_argument("--images-from", default=None,
                           help="file whose `image: <path>` lines are sent as --image")
+    p_notify.add_argument("--buttons-json", default=None,
+                          help="inline buttons: JSON rows of {text, callback_data}; "
+                          "only publish: callbacks are kept (dv-ca8b)")
     p_notify.add_argument("--pin-as", default=None,
                           help="maintain a single pinned status post under this key")
     p_notify.add_argument("--repin", action="store_true",
@@ -116,6 +119,8 @@ def main() -> None:
     p_prompt.add_argument("--profile", required=True)
     p_prompt.add_argument("--name", default="prompt")
     p_prompt.add_argument("--chat-id", type=int, default=None)
+    p_prompt.add_argument("--user-id", type=int, default=None)
+    p_prompt.add_argument("--cwd", default=None)
 
     p_sched = sub.add_parser("schedule", help="manage scheduled jobs")
     ssub = p_sched.add_subparsers(dest="subcmd", required=True)
@@ -166,7 +171,8 @@ def main() -> None:
             {"text": args.text, "chat_id": args.chat_id, "pin_as": args.pin_as, "repin": args.repin,
              "markdown": args.markdown, "source": args.source,
              "ref": args.ref, "profile": args.profile, "images": images[:10],
-             "deliver": args.deliver},
+             "deliver": args.deliver,
+             "buttons": json.loads(args.buttons_json) if args.buttons_json else []},
         )
     elif args.cmd == "prompt":
         out = _request(
@@ -177,6 +183,8 @@ def main() -> None:
                 "profile": args.profile,
                 "name": args.name,
                 "chat_id": args.chat_id,
+                "user_id": args.user_id,
+                "cwd": args.cwd,
             },
         )
     elif args.cmd == "schedule" and args.subcmd == "add":

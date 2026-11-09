@@ -41,6 +41,14 @@ def _ask(command: str, root: Path, free_root: Optional[Path] = None) -> Any:
         "rm -rf .pump/*",
         "rm tests/../.pump/a.jsonl",
         "rm .pump/a.jsonl && echo done",
+        # dv-3d18: only sudo / xargs / env on the rm withhold the free root
+        "timeout 5 rm .pump/a.jsonl",
+        "nohup rm .pump/a.jsonl",
+        "rm -f .pump/a.jsonl 2>/dev/null",
+        "rm -f .pump/a.jsonl 2> /dev/null",
+        # dv-3d18: a command after the deletion cannot change what it deletes
+        "rm .pump/a.jsonl; ln -s /etc .pump/a.jsonl",
+        "rm -rf .pump/d && python3 -m pytest -q",
     ],
 )
 def test_free_inside_the_worktree(command: str, root: Path) -> None:
@@ -60,8 +68,8 @@ def test_free_inside_the_worktree(command: str, root: Path) -> None:
         "rm `cat list`",
         "rm ./.git/index",
         "env rm .pump/a.jsonl",
-        "timeout 5 rm .pump/a.jsonl",
-        "nohup rm .pump/a.jsonl",
+        "sudo rm .pump/a.jsonl",
+        "xargs rm < .pump/list",
         "pushd /tmp && rm .pump/a.jsonl",
         "bash -c 'cd / && rm .pump/a.jsonl'",
         "rm -- -x",  # target hidden behind `--`: fail closed
@@ -102,7 +110,6 @@ def test_no_free_root_keeps_todays_rule(root: Path) -> None:
         'python3 -c \'import os; os.symlink("/etc", "x")\' && rm -rf x/y',
         "bash -c 'ln -s /etc x' && rm -rf x/y",
         "git checkout other && rm -rf .pump/d",
-        "rm .pump/a.jsonl; ln -s /etc .pump/a.jsonl",
     ],
 )
 def test_path_making_command_on_the_line_asks(command: str, root: Path) -> None:
@@ -119,13 +126,17 @@ def test_path_making_command_on_the_line_asks(command: str, root: Path) -> None:
         "mv ../x .pump/m && rm -rf .pump/m",
     ],
 )
-def test_path_making_command_asks_through_decide(command: str, root: Path) -> None:
+def test_path_making_command_is_denied_through_decide(command: str, root: Path) -> None:
+    """dv-3d18: the rm alone would be free, so the job is told to run it
+    alone at once instead of waiting on the owner."""
     from src.security import policy
 
     turn = policy.TurnPolicy(
         working_directory=root, full_access=True, unrestricted=True, free_root=root
     )
-    assert policy.decide("Bash", {"command": command}, turn).action == policy.ASK
+    decision = policy.decide("Bash", {"command": command}, turn)
+    assert decision.action == policy.DENY
+    assert "run rm alone" in decision.reason
 
 
 @pytest.mark.parametrize(

@@ -24,7 +24,7 @@ authority.
 
 | | Needed | Why | If missing |
 |---|---|---|---|
-| **Linux** | required | The systemd unit, the sudoers rule and the bubblewrap sandbox are Linux-only | No macOS or Windows path in v1 |
+| **Linux** | required | The systemd unit, the sudoers rule and the bubblewrap sandbox are Linux-only | macOS / WSL2: [local mode](#local-mode-beta) instead |
 | **systemd** | required | The bot runs as a service; background jobs use `systemd --user` | Use `--no-service` and run `poetry run python -m src.main` yourself |
 | **Python ≥ 3.11** | required | The project targets 3.11+ | `sudo apt-get install -y python3 python3-venv python3-pip` |
 | **git** | required | The bot updates itself from git | `sudo apt-get install -y git` |
@@ -113,7 +113,8 @@ pick any:
 
 ## Re-running and uninstalling
 
-`./install.sh` is idempotent. Re-run it after a `git pull`, or to add the systemd unit to
+`./install.sh` is idempotent. To upgrade, follow `docs/upgrading.md` (it re-runs
+the installer after the `git pull`). Re-run it also to add the systemd unit to
 an install you first made with `--no-service`. It re-uses the token already in `.env`,
 skips owner capture if `ALLOWED_USERS` is set, keeps existing profiles, and leaves
 `.env` alone apart from the values it is setting.
@@ -134,6 +135,7 @@ uses the `claude` CLI — `rm -rf ~/.claude`, which logs you out everywhere on t
 
 | Flag | |
 |---|---|
+| `--local` | [Local mode](#local-mode-beta) (beta): no Telegram, Pump TUI, launchd on macOS. Implied on macOS. |
 | `--token <token>` | Bot token. Also read from `$TELEGRAM_BOT_TOKEN`, or prompted for. |
 | `--owner-id <id>` | Skip interactive owner capture (headless installs). |
 | `--profiles <list>` | Which profiles to install. Default `devops,general`. |
@@ -143,6 +145,76 @@ uses the `claude` CLI — `rm -rf ~/.claude`, which logs you out everywhere on t
 | `--dry-run` | Print every action, change nothing. |
 | `--uninstall` | Remove the service. Deletes no data. |
 | `-y`, `--yes` | Answer yes to every confirmation. |
+
+## Local mode (beta)
+
+A laptop install for the task pump alone: your own `claude` login, no Telegram bot, no
+link to any server. macOS first; Linux works the same way; Windows only through WSL2.
+
+```bash
+./install.sh --local --dry-run    # see the plan first
+./install.sh --local              # on macOS, plain ./install.sh does the same
+```
+
+What is different from the Telegram install:
+
+- **No Telegram questions.** No token, no owner capture: the local install has one owner
+  (`ALLOWED_USERS=1`, the local channel's only address). The config gets `CHANNEL=local`
+  and `ENABLE_API_SERVER=true` (bound to `127.0.0.1`).
+- **The interface is the Pump TUI**, `scripts/devvy-tui` (Textual; the installer runs
+  `poetry run pip install textual`). It shows the pump pin, the questions waiting for
+  you, a job's risky-action asks (Approve / Deny), the jobs and their output, and a New
+  task form. Answers go through `pump2 answer`, word for word (`scripts/pump2 --help`).
+- **One pump job at a time.** The tick runs with `BGJOB_MAX_CONCURRENT=1`: a build
+  job peaks around 2 GB, which a laptop feels. Raise it in the tick's plist if yours has
+  room.
+- **The ask credential is not in the config.** The server writes its own TUI secret
+  (`data/model_auth/tui.secret` in a plain checkout, `secrets/tui.secret` under
+  `DEVVY_DATA_ROOT`; mode 600) on first boot. Jobs cannot read it, so a job cannot
+  approve its own ask. `LOCAL_TUI_SECRET` in a config file is refused at boot.
+
+### macOS
+
+Preflight checks Python, git, Poetry, Node, the `claude` CLI and `sandbox-exec`, and
+offers `brew install …` for what is missing (install [Homebrew](https://brew.sh) first).
+There is no systemd, sudo or bubblewrap step. The installer renders two launchd agents
+into `deploy/rendered/` and loads them with `launchctl bootstrap gui/$(id -u)`:
+
+| Agent | Runs |
+|---|---|
+| `com.devvy.server` | `poetry run python -m src.main` with `CHANNEL=local`, kept alive |
+| `com.devvy.pump2` | `scripts/pump2 tick` every 120 s |
+
+Logs are `logs/server.log` and `logs/pump2.log` in the checkout. Restart the server
+with `launchctl kickstart -k gui/$(id -u)/com.devvy.server`; `./install.sh --uninstall`
+boots both agents out and removes their plists (no data is deleted).
+
+Background jobs run under the process launcher (no systemd) and inside a Seatbelt box
+(`sandbox-exec`, profiles in `src/security/seatbelt.py`). No `sandbox-exec` means no
+background job, the same rule as bubblewrap on Linux. **Run this once on the Mac:**
+
+```bash
+scripts/seatbelt_probe
+```
+
+It tries each escape the box is meant to stop (writing to `~`, `launchctl submit`, a
+copied `launchctl`, `open -a`, `osascript`, reading `~/.ssh` from the chat box) and the
+work it must allow. Every line should say PASS. Until it does, treat the Mac job box as
+untested — that is the main reason local mode is beta.
+
+### Windows (WSL2)
+
+Native Windows is not supported. Inside a WSL2 distro, run `./install.sh --local`:
+
+- **With systemd** enabled in WSL2 (`[boot] systemd=true` in `/etc/wsl.conf`), the distro
+  is a normal Linux host: jobs run as systemd units in bubblewrap.
+- **Without systemd**, preflight marks systemd optional and jobs fall back to the process
+  launcher (still inside bubblewrap, which is required). There is no launchd, so run the
+  server yourself (`poetry run python -m src.main`) and the tick from cron:
+  `*/5 * * * * cd <checkout> && BGJOB_MAX_CONCURRENT=1 scripts/pump2 tick`.
+
+On plain Linux, `--local` configures the same way and also leaves the server and the tick
+to you (launchd agents are macOS-only); jobs run as systemd units when systemd is running.
 
 ## Troubleshooting
 

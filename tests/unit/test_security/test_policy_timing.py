@@ -46,8 +46,8 @@ CORPUS: List[str] = [
     "python3 -c \"import sqlite3; c=sqlite3.connect('file:data/db/bot.db?mode=ro',"
     " uri=True); print(c.execute('select count(*) from tool_calls').fetchone())\"",
     "sqlite3 'file:data/db/bot.db?mode=ro' 'select count(*) from model_calls'",
-    "scripts/taskpump status",
-    "scripts/taskpump pending",
+    "scripts/pump2 status",
+    "scripts/pump2 pending",
     "scripts/trace --last 5",
     "ps aux --sort=-%cpu | head -15",
     "top -bn1 | head -20",

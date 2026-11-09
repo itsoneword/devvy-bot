@@ -126,10 +126,12 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 # Reports-group routing (dv-e215): source prefix -> forum topic name. Only
 # consulted when REPORTS_CHAT_ID is set. Sources that need the owner's answer
-# (taskpump:ask, approvals, reminders, family) never route, whatever this says.
+# (pump2:ask, approvals, reminders, family) never route, whatever this says.
 DEFAULT_REPORTS_ROUTES = {
     "server-monitor": "Monitoring",
-    "taskpump": "Pump",
+    "pump2": "Pump",
+    # Owner feature-feedback survey (dv-a42c): its own topic, no profile.
+    "pump2:feedback": "Feedback",
     "bgjob": "Jobs",
     "schedule": "Reports",
     "schedule:crypto": "Markets",

@@ -205,7 +205,8 @@ def test_any_deletion_outside_temp_is_gated():
         "rm notes.txt",
         "rm -rf build",
         "sudo rm -f /etc/x",
-        "cd /tmp && rm x",  # relative to the turn's cwd, not to the `cd`
+        "cd ~/notes && rm x",  # the `cd` is followed: not a temp dir
+        "cd $D && rm x",  # a `cd` it cannot follow: relative paths ask
         "unlink a",
         "rmdir old",
         "timeout 5 rm x",
@@ -223,6 +224,7 @@ def test_deletion_inside_temp_is_free():
     assert _bash("rm -rf /tmp/foo") is None
     assert _bash("rm /tmp/a /tmp/b") is None
     assert _bash("rm /tmp/a ./keep") is not None
+    assert _bash("cd /tmp && rm x") is None  # dv-3d18: the `cd` is followed
 
 
 def test_deletion_inside_a_nested_shell_is_seen():

@@ -9,7 +9,7 @@ so the owner's controls must work without a single model call:
 * ``/limits`` shows the Claude state from the shared limit record
   (``quota.active()``, ``DataLayout.model_quota``) — "Claude: ... until HH:MM"
   — above the existing Codex limits block;
-* its inline buttons freeze / thaw the Pump (``scripts/taskpump freeze|thaw
+* its inline buttons freeze / thaw the Pump (``scripts/pump2 freeze|thaw
   --by owner`` as a subprocess, no agent turn) and switch this chat to Codex,
   after which the next message is answered by Codex;
 * a chat / scheduled Claude turn that ends on the limit text is an error
@@ -19,12 +19,11 @@ so the owner's controls must work without a single model call:
 Buttons are found by what they say, then pressed through the
 CallbackQueryHandler the orchestrator really registers (so a prefix missing
 from the handler pattern fails here). The Pump's freeze state is read from
-``DataLayout.taskpump_state`` under ``DEVVY_DATA_ROOT`` (a tmp dir here).
+``src/pump2/freeze.py`` (a tmp state file here).
 Subprocesses are faked: the test records argv, nothing real runs.
 """
 
 import asyncio
-import json
 import re
 import subprocess
 import tempfile
@@ -105,11 +104,11 @@ class _Spawned:
         self.run(argv)
         return "ok" if kw.get("text") or kw.get("encoding") else b"ok"
 
-    def taskpump(self, action: str) -> List[Tuple[str, ...]]:
+    def pump2(self, action: str) -> List[Tuple[str, ...]]:
         return [
             c
             for c in self.calls
-            if any(Path(a).name == "taskpump" for a in c) and action in c
+            if any(Path(a).name == "pump2" for a in c) and action in c
         ]
 
 
@@ -320,14 +319,10 @@ def _record_limit(minutes_ahead: int = 125) -> datetime:
 
 
 def _freeze_pump_state(by: str = "owner") -> None:
-    from src.utils.paths import data_layout
+    """Pump v2 frozen (dv-44b1), in the temp state of tests/conftest.py."""
+    from src.pump2 import freeze
 
-    path = data_layout().taskpump_state
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"frozen": {"at": "2026-10-26T08:20:00Z", "by": by}}),
-        encoding="utf-8",
-    )
+    freeze.freeze(by)
 
 
 async def _drain_tasks() -> None:
@@ -428,10 +423,10 @@ async def test_limits_still_shows_claude_when_codex_query_fails(
 # --- scenario 2: freeze / thaw buttons -----------------------------------------
 
 
-async def test_freeze_button_runs_taskpump_freeze_by_owner_and_thaw_button_thaws(
+async def test_freeze_button_runs_pump2_freeze_by_owner_and_thaw_button_thaws(
     tmp_path, spawned
 ):
-    """Scenario: a button freezes the Pump (`taskpump freeze --by owner`); the
+    """Scenario: a button freezes the Pump (`pump2 freeze --by owner`); the
     other button thaws it. Both run with Claude exhausted, no agent turn."""
     _record_limit()
     settings = _settings(tmp_path)
@@ -441,14 +436,14 @@ async def test_freeze_button_runs_taskpump_freeze_by_owner_and_thaw_button_thaws
 
     await _press(orch, context, "lim:freeze")
 
-    (call,) = spawned.taskpump("freeze")
+    (call,) = spawned.pump2("freeze")
     i = call.index("--by")
     assert call[i + 1] == "owner", call
-    assert not spawned.taskpump("thaw")
+    assert not spawned.pump2("thaw")
 
     await _press(orch, context, "lim:thaw")
 
-    (call,) = spawned.taskpump("thaw")
+    (call,) = spawned.pump2("thaw")
     assert "--by" in call and call[call.index("--by") + 1] == "owner", call
     for backend in backends.values():
         backend.run_command.assert_not_awaited()
@@ -464,7 +459,7 @@ async def test_guest_pressing_the_freeze_button_is_refused(tmp_path, spawned):
     guest_ctx = _context(settings, {"backends": backends}, role="guest")
     await _press(orch, guest_ctx, "lim:freeze")
 
-    assert spawned.taskpump("freeze") == []
+    assert spawned.pump2("freeze") == []
 
 
 # --- scenario 3: chat to Codex --------------------------------------------------

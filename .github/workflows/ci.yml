@@ -45,4 +45,8 @@ jobs:
           poetry run flake8 src tests
 
       - name: Test
+        # timing tests are wall-clock bounds tuned for the dev box; a shared
+        # GitHub runner fails them on load alone (1.6 CI, 2026-10-31).
+        env:
+          PYTEST_ADDOPTS: -m "not timing"
         run: make test

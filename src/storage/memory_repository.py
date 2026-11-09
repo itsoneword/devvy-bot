@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 # Defaults only (dv-cf07): the live caps are the settings
-# MEMORY_SNAPSHOT_GENERAL_CAP / MEMORY_POINTER_CAP (60/60), passed in by
+# MEMORY_SNAPSHOT_GENERAL_CAP / MEMORY_POINTER_CAP (100/100, dv-32fe), passed in by
 # src/main.py. These 20s remain for callers that pass nothing (tests,
 # scripts/compose_candidate_seed.py).
 GENERAL_INJECTION_CAP = 20
@@ -39,7 +39,8 @@ FAMILY_INJECTION_CAP = 5
 POINTER_CAP = 20
 # Cap on general user_facts in the window-bundle snapshot (dv-7517 step 4,
 # owner decision 2026-08-15: 20; raised to a 60 setting by dv-cf07 on
-# 2026-10-27, because at 20 most of devops' ~90 active rows were never seen).
+# 2026-10-27, because at 20 most of devops' ~90 active rows were never seen;
+# 100 since dv-32fe, 2026-10-31).
 # Injected facts are so the agent knows who it is speaking with, not a
 # history dump -- everything older is reachable via recall(). A backstop, not
 # a target: the consolidation valve in window_bundle still fires first for
@@ -121,15 +122,39 @@ def format_fact_date(dt: Optional[datetime]) -> str:
     return dt.strftime("%d.%m.%y") if dt else "??.??.??"
 
 
+# Prefix on a source_ref meaning "this project decision belongs in <ref>, and
+# <ref> does not hold it yet" (dv-32fe). Set by MemoryWriter on a repo agent's
+# unverified decision (kept a full user_fact), cleared by the consolidation
+# sweep once the repo has it. A prefix, not a column: 12 coach user_facts
+# already carry a plain source_ref, and labels are free grouping.
+MISSING_REF_PREFIX = "missing:"
+
+
+def split_ref(source_ref: Optional[str]) -> Tuple[Optional[str], bool]:
+    """``(ref, missing)``: ``source_ref`` without the ``missing:`` prefix, and
+    whether it carried one."""
+    if source_ref and source_ref.startswith(MISSING_REF_PREFIX):
+        return source_ref[len(MISSING_REF_PREFIX) :], True
+    return source_ref, False
+
+
 def render_fact_line(fact: MemoryFact) -> str:
     """The one shared renderer for injected user_fact lines (review R7/D2)."""
-    return f"[{format_fact_date(fact.valid_from)}] {fact.content}"
+    line = f"[{format_fact_date(fact.valid_from)}] {fact.content}"
+    ref, missing = split_ref(fact.source_ref)
+    if missing:
+        line += f" ⚑ not yet in {ref}, add it there"
+    return line
 
 
 def render_pointer_line(pointer: ResultPointer) -> str:
     """Dated one-line pointer to a conversation_result; never its content."""
     date = format_fact_date(pointer.recorded_at)
-    target = f" → {pointer.source_ref}" if pointer.source_ref else ""
+    ref, missing = split_ref(pointer.source_ref)
+    if missing:
+        target = f" ⚑ not yet in {ref}"
+    else:
+        target = f" → {ref}" if ref else ""
     return (
         f"[{date}] {pointer.summary}{target}"
         " — retrieve via recall()/Read before relying on it"
@@ -265,6 +290,39 @@ class MemoryRepository:
             )
             row = await cur.fetchone()
             return MemoryFact(*row) if row else None
+
+    async def flagged_decisions(self, agent_id: str) -> List[MemoryFact]:
+        """Active user_facts flagged ``missing:<ref>`` (dv-32fe): a repo
+        agent's decisions its repo does not hold yet."""
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(
+                f"SELECT {_fact_columns()} FROM memory_facts "
+                "WHERE agent_id=? AND invalid_at IS NULL AND kind='user_fact' "
+                "AND source_ref LIKE ? ORDER BY id",
+                (agent_id, MISSING_REF_PREFIX + "%"),
+            )
+            return [MemoryFact(*r) for r in await cur.fetchall()]
+
+    async def promote_flagged(self, agent_id: str, fact_ids: List[int]) -> int:
+        """Turn flagged decisions into pointers in one UPDATE: kind becomes
+        ``conversation_result`` and the ``missing:`` prefix is stripped.
+        Content, dates and status are untouched. Only rows still flagged and
+        active match. Returns the number of rows changed."""
+        if not fact_ids:
+            return 0
+        marks = ",".join("?" for _ in fact_ids)
+        now = datetime.now(UTC).isoformat()
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(
+                "UPDATE memory_facts SET kind='conversation_result', "
+                f"source_ref=substr(source_ref, {len(MISSING_REF_PREFIX) + 1}), "
+                "updated_at=? "
+                f"WHERE agent_id=? AND id IN ({marks}) AND invalid_at IS NULL "
+                "AND kind='user_fact' AND source_ref LIKE ?",
+                (now, agent_id, *fact_ids, MISSING_REF_PREFIX + "%"),
+            )
+            await conn.commit()
+            return cur.rowcount
 
     async def active_scopes(self) -> List[str]:
         """Every agent_id with at least one still-active fact (invalid_at IS
@@ -480,7 +538,7 @@ class MemoryRepository:
         self,
         agent_id: str,
         query: str,
-        limit: int,
+        limit: int = 10,
         include_invalid: bool = False,
     ) -> List[MemoryFact]:
         """FTS keyword match over ALL facts (any tier, any kind), no recency

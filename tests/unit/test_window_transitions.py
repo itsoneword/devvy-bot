@@ -25,6 +25,19 @@ async def _seed_parents(db, user_id=7, session_id="s"):
         await conn.commit()
 
 
+async def _armed(repo, seed, user_id=7, wd="/p"):
+    """Arm a seeded transition the way production does: in the window row
+    (dv-3114 dropped the shared user_data fallback). Rolls first when the
+    seed would otherwise name the live window (= backend-switch mode)."""
+    state = await repo.get_or_create(user_id, wd)
+    if state.window_id <= seed:
+        await repo.roll_window(user_id, wd, new_backend="claude")
+    await repo.set_pending_transition(
+        user_id, wd, seed_window=seed, force_new_session=True
+    )
+    return {}
+
+
 async def test_consume_pending_seed_builds_preamble(repo):
     from src.bot.orchestration.windowing import consume_pending_seed
 
@@ -35,7 +48,7 @@ async def test_consume_pending_seed_builds_preamble(repo):
             "VALUES ('s',7,'old-q','old-a',1)"
         )
         await conn.commit()
-    user_data = {"pending_seed_window": 1}
+    user_data = await _armed(repo, 1)
     prompt = await consume_pending_seed(
         repo,
         user_data,
@@ -75,7 +88,7 @@ async def test_seed_survives_evaluator_checkpoint_at_end_of_window(repo):
     await repo.mark_evaluator_run(7, "/p", max_message_id=last_id)
     old, _new = await repo.roll_window(7, "/p", new_backend="claude")
 
-    user_data = {"pending_seed_window": old}
+    user_data = await _armed(repo, old)
     prompt = await consume_pending_seed(
         repo,
         user_data,
@@ -104,7 +117,7 @@ async def test_seed_is_capped_to_recent_turns(repo):
         await conn.commit()
     prompt = await consume_pending_seed(
         repo,
-        {"pending_seed_window": 1},
+        await _armed(repo, 1),
         user_id=7,
         working_dir="/p",
         user_message="next",
@@ -174,8 +187,16 @@ def _snapshot_memory_repo():
             )
         ],
     )
+    empty = FactsSnapshot(pinned=[], general=[], conflicts=[], pointers=[])
+
+    async def _snap(agent_id, general_cap=20, pointer_cap=20):
+        # dv-b50f: the seed asks twice -- once with the bundle's caps (what
+        # the bundle renders: here nothing) and once uncapped.
+        return snapshot if general_cap > 10_000 else empty
+
     memory_repo = MagicMock()
-    memory_repo.facts_snapshot = AsyncMock(return_value=snapshot)
+    memory_repo.bundle_caps = (100, 100)
+    memory_repo.facts_snapshot = AsyncMock(side_effect=_snap)
     return memory_repo
 
 
@@ -194,7 +215,7 @@ async def test_seed_includes_session_notes_from_memory(repo):
     memory_repo = _snapshot_memory_repo()
     prompt = await consume_pending_seed(
         repo,
-        {"pending_seed_window": 1},
+        await _armed(repo, 1),
         user_id=7,
         working_dir="/p",
         user_message="continue",
@@ -204,8 +225,8 @@ async def test_seed_includes_session_notes_from_memory(repo):
     assert "<session_notes>" in prompt
     assert "- [04.08.26] User deploys on Fridays" in prompt
     assert "we deploy on fridays" in prompt  # raw tail still present
-    # Same snapshot contract as the bundle: one call, shared renderers.
-    memory_repo.facts_snapshot.assert_awaited_once_with("devops")
+    # Same snapshot contract as the bundle: its capped call, then uncapped.
+    assert memory_repo.facts_snapshot.await_count == 2
 
 
 async def test_seed_notes_taxonomy_facts_vs_own_conclusions(repo):
@@ -226,7 +247,7 @@ async def test_seed_notes_taxonomy_facts_vs_own_conclusions(repo):
 
     prompt = await consume_pending_seed(
         repo,
-        {"pending_seed_window": 1},
+        await _armed(repo, 1),
         user_id=7,
         working_dir="/p",
         user_message="continue",
@@ -264,7 +285,7 @@ async def test_seed_labels_shown_of_total_turns(repo):
         await conn.commit()
     prompt = await consume_pending_seed(
         repo,
-        {"pending_seed_window": 1},
+        await _armed(repo, 1),
         user_id=7,
         working_dir="/p",
         user_message="next",
@@ -318,7 +339,7 @@ async def test_seed_works_without_memory_repo(repo):
         await conn.commit()
     prompt = await consume_pending_seed(
         repo,
-        {"pending_seed_window": 1},
+        await _armed(repo, 1),
         user_id=7,
         working_dir="/p",
         user_message="continue",
@@ -366,8 +387,11 @@ async def test_refresh_window_estimates_seed_tokens(repo):
     assert state.window_id == 2
     # ~8000 chars of tail → ~2000 estimated tokens; loose bounds, not exact.
     assert 1500 < state.cumulative_tokens < 2500
-    assert user_data["pending_seed_window"] == 1
-    assert user_data["force_new_session"] is True
+    # Armed in the per-workspace row only; never in the shared user_data
+    # dict, which every profile's chat sees (dv-3114).
+    assert state.pending_seed_window == 1 and state.force_new_session is True
+    assert "pending_seed_window" not in user_data
+    assert "force_new_session" not in user_data
 
 
 async def test_transition_survives_a_restart(repo):
@@ -401,7 +425,7 @@ async def test_transition_survives_a_restart(repo):
         backend="claude",
         conversation_text="convo",
     )
-    assert user_data["force_new_session"] is True  # in-process path still set
+    assert "force_new_session" not in user_data  # row only (dv-3114)
 
     # --- restart: process state is gone, only the DB survives ---
     user_data.clear()
@@ -429,12 +453,12 @@ async def test_transition_survives_a_restart(repo):
 
 async def test_seed_notes_cap_pointers_at_15_with_raised_snapshot_caps(repo):
     """dv-cf07: the bundle now carries up to 60 pointers; the roll seed stays
-    compact -- at most 15 pointer lines (and 15 fact lines), not a second
-    copy of the bundle's pointer list."""
+    compact -- notes hold only what the bundle's caps leave out (dv-b50f)."""
     from src.bot.orchestration.windowing import _session_notes_for_seed
     from src.storage.memory_repository import MemoryRepository
 
     memory_repo = MemoryRepository(repo._db)
+    memory_repo.bundle_caps = (5, 10)  # the bundle renders only the newest
     for i in range(30):
         await memory_repo.add_fact("devops", "general", f"seed general fact {i}")
     for i in range(71):
@@ -451,7 +475,8 @@ async def test_seed_notes_cap_pointers_at_15_with_raised_snapshot_caps(repo):
     assert sep, notes
     pointer_lines = [ln for ln in pointer_block.splitlines() if ln.startswith("- ")]
     fact_lines = [ln for ln in head.splitlines() if ln.startswith("- ")]
-    assert 0 < len(pointer_lines) <= 15
-    assert 0 < len(fact_lines) <= 15
-    # The newest conclusion is the one that survives the cut.
-    assert "seed conclusion 70" in pointer_block
+    # Only what the bundle's caps leave out: 25 facts, 61 pointers.
+    assert len(fact_lines) == 25
+    assert len(pointer_lines) == 61
+    assert "seed conclusion 70" not in pointer_block  # newest is in the bundle
+    assert "seed conclusion 00" in pointer_block

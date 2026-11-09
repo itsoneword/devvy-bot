@@ -485,7 +485,7 @@ async def test_trace_model_call_id_shows_job_tree_without_message(
         storage,
         workdir,
         _single_tool_stream(
-            "sess-job", "Bash", {"command": "scripts/taskpump tick"}, "Pump done."
+            "sess-job", "Bash", {"command": "scripts/pump2 tick"}, "Pump done."
         ),
         purpose="background_job",
         prompt="pump: implement dv-0000",
@@ -498,7 +498,7 @@ async def test_trace_model_call_id_shows_job_tree_without_message(
 
     bash = _tool_line(text, "Bash")
     assert "✓" in bash
-    assert "taskpump tick" in text
+    assert "pump2 tick" in text
     # Not the chat turn (whose message id is a different number).
     assert "A chat question" not in text
     assert "Glob" not in text

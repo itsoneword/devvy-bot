@@ -48,13 +48,40 @@ Configuration is loaded in this order (later sources override earlier ones):
 ### Required Settings
 
 ```bash
-# Telegram Bot Configuration
+# Telegram Bot Configuration (required only with CHANNEL=telegram, the default)
 TELEGRAM_BOT_TOKEN=1234567890:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
 TELEGRAM_BOT_USERNAME=your_bot_name
 
 # Security
 APPROVED_DIRECTORY=/path/to/your/projects
 ```
+
+`CHANNEL` (dv-fe4d) picks the install's one message channel: `telegram`
+(default, the bot) or `local` (a laptop install without Telegram). With
+`local` the token and username may be unset and `NOTIFICATION_CHAT_IDS`
+defaults to `[1]`, the single local address. `python -m src.main` then runs
+headless: no Telegram Application and no `telegram` import. The API server,
+scheduler, evaluator and ConfirmationManager run as usual, and everything the
+bot would send (notify, pins, owner prompts) becomes a row in the
+`local_messages` table through `LocalTransport`
+(`src/notifications/transport.py`). The same NotificationService handles
+pins and the ledger as on Telegram. The TUI reads that inbox at
+`GET /internal/inbox?since=<id>` and taps a button at
+`POST /internal/callback {"data": "confirm:<token>:y|n"}`. Both endpoints
+exist only with `CHANNEL=local`. They take the bearer `LOCAL_TUI_SECRET`,
+never `WEBHOOK_API_SECRET`, which every job can read. When it is unset, the
+server creates `<root>/secrets/tui.secret` (0600) at boot. That file is not in
+`bot.env`: the bwrap job box covers it with `/dev/null`, and both Seatbelt
+profiles deny it.
+
+`DEVVY_LAUNCHER` (dv-fe4d, env only, read by `scripts/bgjob`): `systemd` (default when `systemd-run` exists) or
+`process` (default otherwise: macOS, WSL2 without systemd). `process` runs a
+job detached under the supervisor in `src/platform/launcher.py`: no cgroup,
+so `BGJOB_MEMORY_MAX` is a soft cap sampled every `BGJOB_SAMPLE_S` (5) s; a
+job over it is killed and reported as an OOM kill. Agent jobs are boxed by
+bwrap, or on macOS by `sandbox-exec` with the profiles of
+`src/security/seatbelt.py`; with neither, bgjob refuses to start a job.
+Run `scripts/seatbelt_probe` once on a Mac before trusting that box.
 
 ### Optional Settings
 
@@ -185,9 +212,9 @@ prompt-only JSON and only checks the root (built-in: `extraction` and
 `screen_extraction` on `claude`, as before).
 
 `ask_explain` (the 🔎 block on an ask card) also sees who asks: the profile,
-and for a pump job the task id + title and the stage, fixed by
-`scripts/taskpump` at launch (`bgjob run --ask-context` → `agentjob
---ask-context`). Never the task's description or the agent's reasoning. That
+and for a design-run job the task id + title and the stage, fixed by
+`scripts/pump2 design run` at launch (`agentjob --ask-context`; pump2 stage
+jobs pass none yet). Never the task's description or the agent's reasoning. That
 context is untrusted (a title may come from public intake): it sits in its own
 nonce-tagged block, single-lined, capped at 200 chars, tag-like text defanged.
 The verdict stays advisory; the explanation lands within 45 s
@@ -242,7 +269,9 @@ move jobs.
 | `background_job` | `bgjob run` / `job_start` without `--route` | sonnet (`jobs.default`) |
 | `monitor` | `agentjob --purpose monitor` | sonnet |
 | `pump_analyze`, `pump_testdesign`, `pump_implement` | Pump stages | opus |
-| `pump_architect`, `pump_review`, `pump_acceptance` | Pump stages | sonnet |
+| `pump_review` | Pump stage | sonnet |
+| `pump_mergefix` | Pump stage (failed merge) | opus |
+| `design_generate` | design-loop variant generator | sonnet |
 
 Job harnesses: `claude` (CLI on the subscription), `openrouter` (the same CLI
 pointed at OpenRouter: base URL, key-store key, every tier alias and the
@@ -264,7 +293,7 @@ not logged in, there is no OpenRouter key, or a job has no model for the
 harness. The switch is the `job_route` key of `model_quota.json`
 (`<root>/workspaces/devops/`, `src/model_router/quota.py`), above the rows
 and above an explicit `--model`. It never turns on by itself after a quota
-error. `taskpump status` and `show_config.py routes` show it while it is on.
+error. `show_config.py routes` shows it while it is on.
 
 #### Agent Tools Bridge (Codex)
 
@@ -359,18 +388,22 @@ MEMORY_SCREEN_FACT_SEND_MAX=40
 # fallback retriever) inject every pinned and core fact, the newest
 # MEMORY_SNAPSHOT_GENERAL_CAP general user_facts and the newest
 # MEMORY_POINTER_CAP conversation_result pointers; older rows stay reachable
-# via recall(). 60/60 costs 19-26k ch (~5.5-10k tokens) per scope (26.10.26).
+# via recall(). 100/100 since dv-32fe (31.10.26): 100 general ~31k ch
+# (~8k tokens) on the largest scope, 100 pointers ~3k tokens.
 # The roll seed still carries at most 15 facts and 15 pointers.
-MEMORY_SNAPSHOT_GENERAL_CAP=60
-MEMORY_POINTER_CAP=60
+MEMORY_SNAPSHOT_GENERAL_CAP=100
+MEMORY_POINTER_CAP=100
 # Pressure valve, not a cap (dv-5e2a): a bundle whose pinned + general +
 # conflict + family chars exceed this is still injected whole, and a
 # consolidation run is requested for the scope. Pointers are not counted.
-BUNDLE_FACTS_BUDGET_CHARS=24000
+# 40k with the 100 cap (gymbro at 100 general counts ~34.6k ch).
+BUNDLE_FACTS_BUDGET_CHARS=40000
 # A window rotation (roll or /new) runs the final extraction, then a
 # stale-fact sweep of the scope (dv-cf07): one haiku call proposes facts a
 # newer fact made stale, code validates and closes them softly (UNDO lines in
-# the consolidation report). The new window's first turn waits up to this
+# the consolidation report). Code never closes a fact whose paths, ENV
+# names, config files or hosts the newer one does not repeat, nor a fact by
+# a short merge/deploy status line (dv-32fe). The new window's first turn waits up to this
 # many seconds for it, then freezes its snapshot without it.
 MEMORY_SWEEP_WAIT_SECONDS=60
 
@@ -563,12 +596,12 @@ WATCHDOG_MAX_TOKENS_PER_HOUR=5000000
 # Check with scripts/agent_env_names.py (prints names only).
 # No state/ area (dv-ebde): Codex thread ids + token totals and pinned status
 # messages are bot.db tables, consolidation reports go to
-# <root>/workspaces/devops/reports/consolidation/, the taskpump counter and
-# outbox to <root>/workspaces/devops/taskpump/, and the taskpump tick lock
-# is $XDG_RUNTIME_DIR/devvy-taskpump.lock. data/codex_sessions.json is only
+# <root>/workspaces/devops/reports/consolidation/, the release front's state
+# and outbox to <root>/workspaces/devops/release/ (the old pump's
+# workspaces/devops/taskpump/ is read once, for carry-over). data/codex_sessions.json is only
 # read once at startup (import into bot.db `sessions`), never written.
 # Read from the environment or this .env by the bot, the llm_analytics and
-# channel_intel daemons and scripts/taskpump (src/utils/paths.py).
+# channel_intel daemons and scripts/release (src/utils/paths.py).
 # DEVVY_DATA_ROOT=~/Devvybot/data
 
 # Database URL (SQLite by default)
@@ -607,6 +640,7 @@ OPENAI_API_KEY=                      # Required when VOICE_PROVIDER=openai
 ELEVENLABS_API_KEY=                  # Required when VOICE_PROVIDER=elevenlabs
 VOICE_VOCABULARY_HINTS=Claude,Anthropic,Sonnet,Opus,Haiku  # CSV of domain terms to bias recognition
 VOICE_LANGUAGE=                      # ISO-639-1 code (e.g. en); empty = auto-detect
+VOICE_ECHO_TRANSCRIPT=true           # reply to a voice with its transcript in a collapsed quote
 VOICE_TRANSCRIPTION_MODEL=           # Default: voxtral-mini-latest (Mistral) or whisper-1 (OpenAI)
 VOICE_MAX_FILE_SIZE_MB=20            # Max Telegram voice file size to download (1-200MB)
 ```
@@ -640,12 +674,24 @@ REPORTS_CHAT_ID=-1001234567890   # forum supergroup; bot is admin with "Manage t
 # source prefix=Topic name, comma-separated (or a JSON object). A source
 # matches a key when equal to it or `key:...`; longest key wins. Setting this
 # REPLACES the defaults below.
-# REPORTS_ROUTES=server-monitor=Monitoring,taskpump=Pump,bgjob=Jobs,schedule=Reports,schedule:crypto=Markets,schedule:news=Markets,crypto=Markets,news=Markets
+# REPORTS_ROUTES=server-monitor=Monitoring,pump2=Pump,pump2:feedback=Feedback,bgjob=Jobs,schedule=Reports,schedule:crypto=Markets,schedule:news=Markets,crypto=Markets,news=Markets
 ```
 
 Alternatively, when `DEVVY_DATA_ROOT` is set, put only the numeric chat ID in
 `<data-root>/reports_chat_id`. `REPORTS_CHAT_ID` in the environment takes
 precedence. Restart the bot after changing either setting.
+
+**Owner feature survey (dv-a42c).** The pump2 tick asks the owner to rate
+finished features in the unbound `Feedback` topic (`docs/pump-v2.md` §5b).
+Read from the environment of the `pump2 tick` process (not Settings: the
+pump runs without the bot's config):
+
+```bash
+# FEEDBACK_ENABLED=true          # false/0/off = no questions
+# FEEDBACK_INTERVAL_MIN=45       # at most one question per this many minutes
+# FEEDBACK_MIN_AGE_HOURS=24      # ask only this long after a feature's last merge
+# FEEDBACK_LOOKBACK_DAYS=14      # and only when that merge is this recent
+```
 
 **Talking to agents in topics (inbound).** Bind topics to profiles; a message
 in a bound topic is one turn with that profile, in the same conversation as
@@ -653,13 +699,17 @@ the DM (your sticky active profile is untouched), and the reply lands in the
 topic. Bound topics are created on startup. Unbound topics stay ignored.
 
 ```bash
-# REPORTS_BINDINGS=Monitoring=devops,Coach=coach     # Topic=profile slug (or JSON)
+# REPORTS_BINDINGS=Monitoring=monitoring,Coach=coach # Topic=profile slug (or JSON)
 # REPORTS_INBOUND_POLICY=owner                       # owner (default) | allowed
 ```
 
 Or in `<data-root>/reports_bindings.json`:
 `{"policy": "owner", "bindings": {"Coach": "coach"}}` (env wins). Empty = the
 group stays read-only. Replying to a report in a topic puts it in context.
+For a separate Monitoring conversation, add the shipped `monitoring` profile
+with `python3 scripts/install_profiles.py --add monitoring` and set only the
+`Monitoring` binding to `monitoring`. The profile uses its own workspace,
+session, and memory; other topic bindings need no changes.
 
 **Reply-only topics** (`"reply_only": ["Jobs"]` in the same file;
 no env variable): the topic must also be in `bindings` (its profile is
@@ -676,7 +726,7 @@ output path and the first 15 lines of `output.md` (untrusted data).
 * Topics are created on first use and stored in `project_threads` (slug
   `reports:<topic>`). A deleted topic is recreated once; any other failure
   delivers the message to the DM.
-* `taskpump:ask` (pump question / blocked / failed cards) goes to the Pump
+* `pump2:ask` (pump question / blocked / failed cards) goes to the Pump
   topic with a `pump:<id>` ref since 2026-10-20; a reply there reaches the
   devops session with the ticket id (Pump must be in `bindings` + `reply_only`).
 * **Always DM**, whatever the map says: sources
@@ -691,7 +741,7 @@ output path and the first 15 lines of `output.md` (untrusted data).
 
 Sources (`AgentResponseEvent.source`): `schedule:<job name>`, `bgjob`
 (start/finish), `bgjob:status` (pinned jobs list), `bgjob:digest` (batch digest, delivered to the agent's own chat),
-`taskpump:status|ask`, `webhook:<provider>`, `health`, `reminder`, `item`,
+`pump2:status|ask` (also the release front's cards), `webhook:<provider>`, `health`, `reminder`, `item`,
 `family`, `agent` (the `notify` tool), `internal` (`/internal/notify` without
 a source). External callers pass one: `agentctl notify --source
 server-monitor:<host> "..."`.
@@ -786,7 +836,9 @@ Per-profile keys include `sandbox`, `max_turns`, `max_cost_per_request`,
 `provider` / `model` / `allowed_models` (OpenRouter on the Claude harness, dv-d2f6),
 `permission_policy.allowed_roles`, `family_memory`, `personal_memory`, `mcp`,
 `extra_dirs` (extra write roots for a sandboxed profile — a notes vault, another
-checkout — instead of `sandbox: false`), `sandbox_read_dirs` (read-only mounts in the
+checkout — instead of `sandbox: false`; a board profile must include its
+`pump-worktrees/<board>`, else a `git worktree prune` inside the box drops every
+pump worktree's registration, `docs/FINDINGS.md` 2026-11-05), `sandbox_read_dirs` (read-only mounts in the
 sandboxed bash box, e.g. shared tool checkouts; owner-only), `sandbox_allowed_domains`
 (egress allowlist — **not enforced**: the bash box shares the host network until
 an egress proxy exists; validated and kept; owner-only), `sandbox_keys` (key-store

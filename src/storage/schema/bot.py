@@ -303,6 +303,25 @@ pending_notes = Table(
     sqlite_autoincrement=True,
 )
 
+local_messages = Table(
+    "local_messages",
+    metadata,
+    Column("id", INTEGER, primary_key=True, nullable=True),
+    Column("chat_id", INTEGER, nullable=False),
+    Column("text", TEXT, nullable=False),
+    Column("parse_mode", TEXT),
+    Column("buttons_json", TEXT),
+    Column("pinned", INTEGER, nullable=False, server_default=text("0")),
+    Column("created_at", TIMESTAMP),
+    Column("edited_at", TIMESTAMP),
+    Column("read_at", TIMESTAMP),
+    # The inbox's change cursor: bumped on insert, edit and pin (dv-fe4d).
+    Column("seq", INTEGER, nullable=False, server_default=text("0")),
+    Index("idx_local_messages_pinned", "pinned", "chat_id"),
+    Index("idx_local_messages_seq", "seq"),
+    sqlite_autoincrement=True,
+)
+
 pinned_messages = Table(
     "pinned_messages",
     metadata,
@@ -369,6 +388,66 @@ sent_messages = Table(
     sqlite_autoincrement=True,
 )
 
+message_reactions = Table(
+    "message_reactions",
+    metadata,
+    Column("id", INTEGER, primary_key=True, nullable=True),
+    Column("telegram_chat_id", INTEGER, nullable=False),
+    Column("telegram_message_id", INTEGER, nullable=False),
+    Column("user_id", INTEGER, nullable=False),
+    # The turn (dv-e1a7); NULL for a feature_feedback row.
+    Column("messages_message_id", INTEGER),
+    Column("profile_slug", TEXT),
+    # turn_reaction: the emoji. feature_feedback: the tapped button ("7",
+    # "nt", "skip"), "" for a voice/text-only answer (dv-a42c).
+    Column("emoji", TEXT, nullable=False),
+    # turn_reaction: 👎 -1, 👍 +1, ❤ +1, 🔥 +2 (dv-e1a7). feature_feedback:
+    # 1-10, NULL = none given yet / skipped.
+    Column("score", INTEGER),
+    Column("reacted_at", TIMESTAMP, nullable=False),
+    # dv-a42c: the owner's after-testing rating of a feature chain.
+    Column("kind", TEXT, nullable=False, server_default=text("'turn_reaction'")),
+    Column("feature_id", TEXT),
+    Column("comment", TEXT),  # raw text / voice transcript; never exported
+    Column("has_bugs", INTEGER),
+    Column("bugs_text", TEXT),
+    Column("tested", INTEGER),  # 1 / 0 = "не тестил" / NULL
+    Column("pros", TEXT),
+    Column("cons", TEXT),
+    Column("aspects", TEXT),  # comma list: ui, function, speed, other
+    Column("score_source", TEXT),  # button | extracted
+    # dv-3b99: kind='stage_score', one row per criterion a pump2 review /
+    # custom stage scored (score 1-10); card_size / card_kind set by analyze.
+    Column("board", TEXT),
+    Column("card_id", TEXT),
+    Column("stage", TEXT),
+    Column("criterion", TEXT),
+    Column("card_size", TEXT),
+    Column("card_kind", TEXT),
+    UniqueConstraint("telegram_chat_id", "telegram_message_id", "user_id"),
+    Index("idx_message_reactions_profile", "profile_slug", "reacted_at"),
+    Index("idx_message_reactions_feature", "feature_id"),
+    sqlite_autoincrement=True,
+)
+
+# One row per card of a rated feature chain, with how it was done (dv-a42c).
+feedback_feature_cards = Table(
+    "feedback_feature_cards",
+    metadata,
+    Column("id", INTEGER, primary_key=True, nullable=True),
+    Column("feature_id", TEXT, nullable=False),
+    Column("board", TEXT, nullable=False),
+    Column("card_id", TEXT, nullable=False),
+    Column("title", TEXT),
+    Column("merge_sha", TEXT),
+    Column("merged_at", TEXT),
+    Column("exec_mode", TEXT, nullable=False),  # pump2 | job | chat
+    Column("stages", TEXT),  # comma list of the pump2 stages run
+    Column("returns", INTEGER),
+    UniqueConstraint("feature_id", "board", "card_id"),
+    sqlite_autoincrement=True,
+)
+
 session_tracking = Table(
     "session_tracking",
     metadata,
@@ -406,6 +485,7 @@ sessions = Table(
     Column("thread_total_input", INTEGER, nullable=False, server_default=text("0")),
     Column("thread_total_output", INTEGER, nullable=False, server_default=text("0")),
     Column("cumulative_tokens", INTEGER, nullable=False, server_default=text("0")),
+    Column("bundle_sha256", TEXT),
     ForeignKeyConstraint(["user_id"], ["users.user_id"]),
     Index("idx_sessions_project_path", "project_path"),
     Index("idx_sessions_user_id", "user_id"),
@@ -523,4 +603,7 @@ window_bundles = Table(
     Column("family_count", INTEGER, nullable=False),
     Column("total_chars", INTEGER, nullable=False),
     Column("created_at", TIMESTAMP, server_default=text("CURRENT_TIMESTAMP")),
+    Column("family_agent_id", TEXT),
+    Column("stale_at", TIMESTAMP),
+    Column("revision", INTEGER, nullable=False, server_default=text("0")),
 )

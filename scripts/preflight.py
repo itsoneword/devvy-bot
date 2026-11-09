@@ -10,6 +10,12 @@ kind of installer people refuse to run.
 Standard library only: this is the very first thing the installer does, before
 Poetry exists, let alone the project's virtualenv.
 
+The matrix follows the platform (dv-fe4d): Linux (systemd + bwrap + sudo, the
+Telegram service install), Darwin (the local-mode install: brew fixes,
+launchd, the Seatbelt box) and WSL without systemd (local mode under the
+process launcher). ``DEVVY_PLATFORM=Darwin|Linux|WSL`` overrides detection so
+each path can be tested on any host.
+
 Usage:
     preflight.py                # human table, exit 1 if a required dep is missing
     preflight.py --json         # machine-readable, same exit code
@@ -114,6 +120,31 @@ def fmt_version(v: Tuple[int, ...]) -> str:
 # --- the checks ---------------------------------------------------------
 
 
+PLATFORMS = ("Linux", "Darwin", "WSL")
+
+
+def detect_platform() -> str:
+    """Linux, Darwin or WSL; ``DEVVY_PLATFORM`` wins over detection.
+
+    WSL means WSL *without* systemd: a WSL2 distro with systemd enabled is a
+    plain Linux host for this installer, and gets the systemd matrix.
+    """
+    forced = os.environ.get("DEVVY_PLATFORM", "").strip()
+    if forced in PLATFORMS:
+        return forced
+    system = platform.system()
+    if system == "Darwin":
+        return "Darwin"
+    try:
+        with open("/proc/sys/kernel/osrelease", encoding="utf-8") as fh:
+            wsl = "microsoft" in fh.read().lower()
+    except OSError:
+        wsl = False
+    if wsl and not os.path.exists("/run/systemd/system"):
+        return "WSL"
+    return "Linux"
+
+
 def check_os(check: Check) -> Result:
     system = platform.system()
     found = f"{system} {platform.machine()}"
@@ -124,6 +155,15 @@ def check_os(check: Check) -> Result:
             found,
             "v1 targets Linux + systemd only; see the task notes for macOS.",
         )
+    return Result(check, True, found)
+
+
+def check_os_local(check: Check) -> Result:
+    """The local-mode install runs on macOS and on Linux/WSL."""
+    system = platform.system()
+    found = f"{system} {platform.machine()}"
+    if system not in ("Darwin", "Linux"):
+        return Result(check, False, found, "local mode runs on macOS or Linux/WSL2")
     return Result(check, True, found)
 
 
@@ -203,6 +243,20 @@ def check_visudo(check: Check) -> Result:
     return Result(check, True, path)
 
 
+def check_sandbox_exec(check: Check) -> Result:
+    path = shutil.which("sandbox-exec")
+    if not path:
+        return Result(check, False, "", "background jobs will not run without it")
+    return Result(check, True, path)
+
+
+def check_brew(check: Check) -> Result:
+    path = shutil.which("brew")
+    if not path:
+        return Result(check, False, "", "the fixes below install through Homebrew")
+    return Result(check, True, path)
+
+
 @dataclass
 class Spec:
     check: Check
@@ -210,7 +264,128 @@ class Spec:
 
 
 def build_specs() -> List[Spec]:
-    """Every dependency, in the order the table prints them."""
+    """Every dependency for this platform, in the order the table prints them."""
+    plat = detect_platform()
+    if plat == "Darwin":
+        return _darwin_specs()
+    if plat == "WSL":
+        return _wsl_specs()
+    return _linux_specs()
+
+
+def _linux_spec(key: str) -> Spec:
+    """A fresh copy of one Linux check, for a matrix that reuses it as is."""
+    return next(s for s in _linux_specs() if s.check.key == key)
+
+
+def _darwin_specs() -> List[Spec]:
+    """macOS = the local-mode install (dv-fe4d): launchd, Seatbelt, Homebrew.
+
+    No systemd, bwrap, sudo or visudo: launchd agents run as the user, and
+    sandbox-exec is the job box (no box tool = no job, as on Linux).
+    """
+
+    def brew(
+        label: str, key: str, why: str, formula: str, probe: Callable[[Check], Result]
+    ) -> Spec:
+        return Spec(
+            Check(
+                key,
+                label,
+                why,
+                f"brew install {formula}",
+                autofix=f"brew install {formula}",
+            ),
+            probe,
+        )
+
+    return [
+        Spec(
+            Check(
+                "os",
+                "macOS / Linux",
+                "local mode: launchd agents and the Seatbelt box on macOS",
+                "Local mode installs on macOS, Linux or Windows via WSL2.",
+            ),
+            check_os_local,
+        ),
+        Spec(
+            Check(
+                "brew",
+                "Homebrew",
+                "installs git, node and poetry below",
+                "see https://brew.sh",
+                required=False,
+            ),
+            check_brew,
+        ),
+        Spec(
+            Check(
+                "python",
+                f"Python >= {fmt_version(MIN_PYTHON)}",
+                "the project targets 3.11+",
+                "brew install python@3.12",
+                autofix="brew install python@3.12",
+            ),
+            check_python,
+        ),
+        brew("git", "git", "the bot updates itself from git", "git", check_git),
+        brew(
+            "Poetry",
+            "poetry",
+            "dependency install and the launchd agents' ProgramArguments",
+            "poetry",
+            check_poetry,
+        ),
+        brew(
+            f"Node >= {fmt_version(MIN_NODE)}",
+            "node",
+            "the claude CLI is a Node application",
+            "node",
+            check_node,
+        ),
+        _linux_spec("claude"),  # same curl installer as on Linux
+        Spec(
+            Check(
+                "sandbox-exec",
+                "sandbox-exec (Seatbelt)",
+                "scripts/bgjob boxes background jobs with it; no box = no job",
+                "sandbox-exec ships with macOS at /usr/bin/sandbox-exec;"
+                " restore it or use a stock macOS install",
+            ),
+            check_sandbox_exec,
+        ),
+    ]
+
+
+def _wsl_specs() -> List[Spec]:
+    """WSL2 without systemd: local mode under the process launcher.
+
+    systemd stays in the table as optional (enable it in /etc/wsl.conf to get
+    the full Linux install); sudo/visudo are dropped, there is no unit or
+    sudoers rule to install. bwrap is still the job box, hence required.
+    """
+    systemd = _linux_spec("systemd")
+    systemd.check.required = False
+    systemd.check.why = "optional on WSL2: jobs fall back to the process launcher"
+    systemd.check.fix = "add [boot] systemd=true to /etc/wsl.conf, then wsl --shutdown"
+    bwrap = _linux_spec("bwrap")
+    bwrap.check.required = True
+    os_spec = Spec(
+        Check(
+            "os",
+            "Linux (WSL2)",
+            "local mode under the process launcher",
+            "Run inside a WSL2 Linux distro.",
+        ),
+        check_os_local,
+    )
+    tools = [_linux_spec(k) for k in ("python", "git", "poetry", "node", "claude")]
+    return [os_spec, systemd, *tools, bwrap]
+
+
+def _linux_specs() -> List[Spec]:
+    """Linux + systemd: the Telegram service install (unchanged since v1)."""
     return [
         Spec(
             Check(

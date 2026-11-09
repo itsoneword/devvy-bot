@@ -60,7 +60,7 @@ def test_unparsable_file_is_by_hand_and_untouched(tmp_path: Path) -> None:
 
 def test_unknown_job_is_refused(tmp_path: Path) -> None:
     with pytest.raises(job_rows.RowError):
-        job_rows.set_job_model(tmp_path / "models.yaml", "pump_nope", "sonnet")
+        job_rows.set_job_model(tmp_path / "models.yaml", "nope_row", "sonnet")
     assert not (tmp_path / "models.yaml").exists()
 
 

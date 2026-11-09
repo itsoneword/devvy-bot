@@ -12,7 +12,14 @@ import json
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    Field,
+    SecretStr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from src.utils.constants import (
@@ -47,15 +54,34 @@ from src.utils.paths import DataLayout, sqlite_url
 # and the session state import it instead of repeating the literal.
 DEFAULT_WINDOW_REFRESH_THRESHOLD_TOKENS = 150_000
 
+# Settings that may come from the process environment but never from a config
+# or secrets file (dv-fe4d): every agent job can read those files, and these
+# values must stay out of a job's reach. The loader refuses a file that sets
+# one; scripts/gen_env_example.py leaves them out of the example file.
+PROCESS_ENV_ONLY = frozenset({"LOCAL_TUI_SECRET"})
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # Bot settings
-    telegram_bot_token: SecretStr = Field(
-        ..., description="Telegram bot token from BotFather"
+
+    # Channel (dv-fe4d): where messages, pins and asks go. "telegram" is the
+    # bot; "local" is a laptop install with no Telegram at all (one channel
+    # per install). Declared before the token so its validator can read it.
+    channel: Literal["telegram", "local"] = Field(
+        "telegram", description="Message channel: telegram (bot) or local (no bot)"
     )
-    telegram_bot_username: str = Field(..., description="Bot username without @")
+    # Token and username: required when channel=telegram, unused when local
+    # (telegram_fields_required_for_telegram below).
+    telegram_bot_token: Optional[SecretStr] = Field(
+        None,
+        validate_default=True,
+        description="Telegram bot token from BotFather",
+    )
+    telegram_bot_username: Optional[str] = Field(
+        None, validate_default=True, description="Bot username without @"
+    )
 
     # Security
     approved_directory: Optional[Path] = Field(
@@ -632,7 +658,7 @@ class Settings(BaseSettings):
         "today-state digest and the evening gap-ping",
     )
     # The task board (dv-1327). Markdown files, not a table: agents, the owner's
-    # kanban UI and the taskpump all work the same files. Relative paths resolve
+    # kanban UI and the pump all work the same files. Relative paths resolve
     # against the bot's working directory (the repo).
     deviz_tasks_dir: Path = Field(
         Path(".deviz/tasks"),
@@ -727,6 +753,13 @@ class Settings(BaseSettings):
             "None = auto-detect."
         ),
     )
+    voice_echo_transcript: bool = Field(
+        True,
+        description=(
+            "Reply to each voice message with its transcript in a collapsed "
+            "(expandable) quote before the agent answers."
+        ),
+    )
     enable_soul_memory: bool = Field(False, description="Enable soul and memory system")
     memory_path: Path = Field(
         Path(DEFAULT_MEMORY_PATH),
@@ -800,9 +833,11 @@ class Settings(BaseSettings):
     # rejection. Counts pinned + general + conflicts + family, not pointers.
     # 12k (2026-08-05 measurement) became 24k with the 60-fact cap (dv-cf07):
     # at 60 general the largest scope (gymbro, 26.10.26) counts ~22.9k ch,
-    # and 12k would have fired the valve every window.
+    # and 12k would have fired the valve every window. 24k became 40k with
+    # the 100-fact cap (dv-32fe): at 100 general gymbro counts ~34.6k ch
+    # (31.10.26), and 24k would have fired the valve every window.
     bundle_facts_budget_chars: int = Field(
-        24_000,
+        40_000,
         ge=1_000,
         description=(
             "Character budget for the facts snapshot inside a frozen window "
@@ -812,9 +847,12 @@ class Settings(BaseSettings):
     # Facts per window (dv-cf07, owner 27.10.26: 60/60). Measured on 26.10.26
     # the whole facts block at 60/60 is 19-26k ch (~5.5-10k tokens) per
     # scope; older rows stay reachable via recall(). Both the frozen bundle
-    # and the per-turn fallback retriever read these.
+    # and the per-turn fallback retriever read these. Raised to 100/100 by
+    # dv-32fe (owner 31.10.26): at 60 gymbro hid 47 of 107 general facts and
+    # devops 23 of 83 pointers; 100 general ~31k ch (~8k tokens), 100
+    # pointers ~3k tokens, well under the owner's ~150k context ceiling.
     memory_snapshot_general_cap: int = Field(
-        60,
+        100,
         ge=1,
         description=(
             "General-tier user facts injected per window (newest first); "
@@ -822,7 +860,7 @@ class Settings(BaseSettings):
         ),
     )
     memory_pointer_cap: int = Field(
-        60,
+        100,
         ge=0,
         description=(
             "Newest conversation_result pointers injected per window; older "
@@ -922,6 +960,14 @@ class Settings(BaseSettings):
     webhook_api_secret: Optional[str] = Field(
         None, description="Shared secret for generic webhook providers"
     )
+    # The local TUI's own bearer (dv-fe4d), channel=local only: it alone can
+    # read /internal/inbox and answer asks on /internal/callback. Never the
+    # webhook secret above, which every job can read. It lives in its own
+    # file (DataLayout.tui_secret_file, created at boot, hidden from every
+    # box). The env var is a process-env override only (PROCESS_ENV_ONLY).
+    local_tui_secret: Optional[str] = Field(
+        None, description="Bearer of the local TUI (channel=local)"
+    )
     # Bearer for the channel-intel MCP seam (config/mcp/channel-intel.json
     # names it by env var, ``auth_env``). Read here, never from os.environ:
     # the bot scrubs secrets from its env at startup (dv-2976).
@@ -965,7 +1011,7 @@ class Settings(BaseSettings):
     reports_bindings: Annotated[Dict[str, str], NoDecode] = Field(
         default_factory=dict,
         description=(
-            "Topic name -> profile slug ('Monitoring=devops,Coach=coach' or a "
+            "Topic name -> profile slug ('Monitoring=monitoring,Coach=coach' or a "
             "JSON object). Bound topics are created on startup."
         ),
     )
@@ -1038,6 +1084,18 @@ class Settings(BaseSettings):
         if isinstance(v, list):
             return [int(uid) for uid in v]
         return v  # type: ignore[no-any-return]
+
+    @field_validator("telegram_bot_token", "telegram_bot_username")
+    @classmethod
+    def telegram_fields_required_for_telegram(cls, v: Any, info: ValidationInfo) -> Any:
+        """Token and username stay required unless channel=local (dv-fe4d).
+
+        A field validator, not a model one, so the error keeps the field's
+        own loc and the same "Field required" text as before.
+        """
+        if v is None and info.data.get("channel", "telegram") == "telegram":
+            raise PydanticCustomError("missing", "Field required")
+        return v
 
     @field_validator("reports_routes", mode="before")
     @classmethod
@@ -1230,6 +1288,11 @@ class Settings(BaseSettings):
         if self.enable_mcp and not self.mcp_config_path:
             raise ValueError("mcp_config_path required when enable_mcp is True")
 
+        # A local install has one owner and no Telegram chat ids: its single
+        # address is 1, so code that notifies chat_ids[0] has a target.
+        if self.channel == "local" and not self.notification_chat_ids:
+            object.__setattr__(self, "notification_chat_ids", [1])
+
         return self
 
     @field_validator("devvy_data_root", mode="before")
@@ -1336,7 +1399,9 @@ class Settings(BaseSettings):
 
     @property
     def telegram_token_str(self) -> str:
-        """Get Telegram token as string."""
+        """Get Telegram token as string (none on a channel=local install)."""
+        if self.telegram_bot_token is None:
+            raise ValueError("no TELEGRAM_BOT_TOKEN: channel is not telegram")
         return self.telegram_bot_token.get_secret_value()
 
     @property

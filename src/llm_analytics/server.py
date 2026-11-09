@@ -27,6 +27,17 @@ logger = structlog.get_logger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
+# Web-project snapshots (dv-d7d3, «Веб-проекты» tab) are other projects' code
+# served on this origin. The sandbox gives each an opaque origin, so its
+# scripts can read neither the ops cookies nor /api/*; connect-src blocks
+# network calls outright. No allow-same-origin / allow-modals.
+WEB_PROJECTS_DIR = STATIC_DIR / "web-projects"
+WEB_PROJECT_CSP = (
+    "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; "
+    "style-src 'unsafe-inline'; img-src data:; connect-src 'none'; "
+    "form-action 'none'; base-uri 'none'"
+)
+
 # api/calls/{id}/raw whitelist — metadata only, never content text or tool
 # inputs. tool_use blocks are reduced to their name/id.
 _RAW_TOP_FIELDS = (
@@ -354,6 +365,9 @@ class _RevalidatingStatic(StaticFiles):
     def file_response(self, *args: Any, **kwargs: Any) -> Any:
         response = super().file_response(*args, **kwargs)
         response.headers["Cache-Control"] = "no-cache"
+        path = Path(args[0] if args else kwargs["full_path"]).resolve()
+        if path.suffix == ".html" and WEB_PROJECTS_DIR.resolve() in path.parents:
+            response.headers["Content-Security-Policy"] = WEB_PROJECT_CSP
         return response
 
 

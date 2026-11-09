@@ -168,7 +168,7 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 class TestExportScope:
     """Scenario: Grafana sees only model_calls/tool_calls; messages unreachable."""
 
-    def test_export_has_only_model_calls_and_tool_calls(
+    def test_export_has_only_the_allowlisted_tables(
         self, bot_db: Path, tmp_path: Path
     ) -> None:
         out = tmp_path / "grafana" / "devvy.db"
@@ -176,7 +176,12 @@ class TestExportScope:
         export_usage(bot_db, out)
         conn = _open_ro(out)
         try:
-            assert _tables(conn) == {"model_calls", "tool_calls"}
+            assert _tables(conn) == {
+                "model_calls",
+                "tool_calls",
+                "message_reactions",
+                "feedback_feature_cards",
+            }
             assert conn.execute("SELECT COUNT(*) FROM model_calls").fetchone()[0] == 2
             assert conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0] == 2
         finally:
@@ -351,7 +356,12 @@ class TestIndexerHook:
         assert out.exists()
         conn = _open_ro(out)
         try:
-            assert _tables(conn) == {"model_calls", "tool_calls"}
+            assert _tables(conn) == {
+                "model_calls",
+                "tool_calls",
+                "message_reactions",
+                "feedback_feature_cards",
+            }
         finally:
             conn.close()
 

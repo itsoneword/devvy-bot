@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Check the two macOS Seatbelt boxes on a real Mac (dv-fe4d). Run once.
+
+The profiles (src/security/seatbelt.py) are tested as text on Linux; whether
+macOS enforces them as intended is only known here. Each line runs one
+escape attempt inside a box and prints PASS when the box stopped it (or, for
+the allowed cases, when the work went through):
+
+  job box   write inside the job dir         allowed
+  job box   write to ~                       blocked
+  job box   launchctl submit                 blocked (the dv-5e2f escape)
+  job box   copied launchctl, then submit    blocked (exec deny is by path:
+                                             only launchd itself can stop it)
+  job box   open -a Terminal                 blocked
+  job box   osascript "do shell script"      blocked
+  chat box  read ~/.ssh (or ~/.zshrc)        blocked
+  chat box  write in the workspace           allowed
+  chat box  cd + pwd -P + realpath in a      allowed (stat of $HOME and the
+            granted dir under ~                       grant's ancestors)
+
+Exit 0 only when every line is PASS. Until then the Mac job box counts as
+untested (docs/installation.md). Usage: scripts/seatbelt_probe
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def _seatbelt():
+    spec = importlib.util.spec_from_file_location(
+        "_probe_seatbelt", REPO / "src" / "security" / "seatbelt.py"
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _run(sandbox_exec: str, profile: str, command: str) -> int:
+    r = subprocess.run(
+        [sandbox_exec, "-p", profile, "/bin/bash", "-c", command],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return r.returncode
+
+
+def main() -> int:
+    if sys.platform != "darwin":
+        print("seatbelt_probe: macOS only (this host has no sandbox-exec)")
+        return 2
+    sandbox_exec = shutil.which("sandbox-exec")
+    if not sandbox_exec:
+        print("FAIL sandbox-exec not found: jobs will be refused")
+        return 1
+    sb = _seatbelt()
+    home = Path.home()
+    work = Path(tempfile.mkdtemp(prefix="seatbelt-probe-"))
+    # A granted dir two levels under ~, as a real workspace is.
+    home_work = Path(tempfile.mkdtemp(prefix=".seatbelt-probe-", dir=home)) / "ws"
+    home_work.mkdir()
+    job = sb.job_profile([str(work)])
+    chat = sb.bash_profile(
+        write_dirs=[str(work), str(home_work)], read_dirs=[], home=str(home)
+    )
+    stray = home / f".seatbelt-probe-{uuid.uuid4().hex[:8]}"
+    label = f"devvy.seatbelt-probe.{uuid.uuid4().hex[:8]}"
+    secret = home / ".ssh" if (home / ".ssh").is_dir() else home / ".zshrc"
+    read_cmd = f"ls {str(secret)!r}" if secret.is_dir() else f"cat {str(secret)!r}"
+
+    checks = [
+        ("job box: write inside the job dir", job, f"touch {str(work / 'ok')!r}", True),
+        ("job box: write to ~", job, f"touch {str(stray)!r}", False),
+        (
+            "job box: launchctl submit",
+            job,
+            f"/bin/launchctl submit -l {label} -- /usr/bin/true",
+            False,
+        ),
+        (
+            "job box: copied launchctl, then submit",
+            job,
+            f"cp /bin/launchctl {str(work / 'lc')!r} && "
+            f"{str(work / 'lc')!r} submit -l {label}-copy -- /usr/bin/true",
+            False,
+        ),
+        ("job box: open -a Terminal", job, "/usr/bin/open -a Terminal", False),
+        (
+            "job box: osascript do shell script",
+            job,
+            "/usr/bin/osascript -e 'do shell script \"true\"'",
+            False,
+        ),
+        (f"chat box: read {secret}", chat, read_cmd, False),
+        ("chat box: write in the workspace", chat, f"touch {str(work / 'c')!r}", True),
+        (
+            "chat box: cd + pwd -P + realpath in a granted dir under ~",
+            chat,
+            f"cd {str(home_work)!r} && test \"$(pwd -P)\" = {str(home_work)!r} && "
+            "/usr/bin/python3 -c 'import os; assert os.path.realpath(\".\") == os.getcwd()'",
+            True,
+        ),
+    ]
+    failed = 0
+    for name, profile, command, allowed in checks:
+        ok = (_run(sandbox_exec, profile, command) == 0) == allowed
+        failed += not ok
+        print(f"{'PASS' if ok else 'FAIL'} {name}")
+    # Clean up anything an escape managed to create.
+    for lbl in (label, f"{label}-copy"):
+        subprocess.run(["/bin/launchctl", "remove", lbl], capture_output=True)
+    shutil.rmtree(home_work.parent, ignore_errors=True)
+    stray.unlink(missing_ok=True)
+    shutil.rmtree(work, ignore_errors=True)
+    print("all PASS" if not failed else f"{failed} FAIL: the Mac box is not safe")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

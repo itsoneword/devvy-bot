@@ -7,7 +7,7 @@ Description=Check /tmp every 15 minutes; sweep when over 70% or once a day
 # The 15-min tick is cheap: tmpsweep exits at once unless /tmp is over 70%
 # or the last sweep is >=23h old (state in ~/.local/state/devvy/).
 OnBootSec=10min
-# Same reason as taskpump.timer: OnBootSec alone never arms when the user
+# Same reason as pump2.timer: OnBootSec alone never arms when the user
 # manager starts after boot.
 OnStartupSec=10min
 OnUnitActiveSec=15min

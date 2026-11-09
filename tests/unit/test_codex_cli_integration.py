@@ -1,5 +1,6 @@
 import json
 import stat
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -9,6 +10,10 @@ import pytest
 from src.agent_backends.codex_cli import CodexCliIntegration, InMemoryCodexSessionStore
 from src.claude.prompt_composer import PromptComposer
 from src.config.settings import Settings
+from src.profiles.registry import load_profile_registry
+from src.security import denylist
+from src.security.denylist import ProtectedDirs
+from tests.unit.test_model_router import db  # noqa: F401  (fixture)
 
 
 @dataclass
@@ -141,6 +146,77 @@ async def test_run_command_resumes_from_store(tmp_path, settings):
     assert captured["argv"][-1].endswith("\n\nagain")
     assert "<current_time>" in captured["argv"][-1]
     assert "large frozen persona" not in captured["argv"][-1]
+
+
+async def test_resumed_profile_keeps_one_bundle_and_existing_sandbox_grants(
+    tmp_path, settings, monkeypatch
+):
+    """A saved Codex thread carries the first bundle; resume only adds the request."""
+    workspace = tmp_path / "gymbro-workspace"
+    repo = tmp_path / "gymbro-repo"
+    devops = tmp_path / "devops"
+    secrets = tmp_path / "secrets"
+    for path in (workspace, repo, devops, secrets):
+        path.mkdir()
+    (workspace / "persona.md").write_text("GymBro persona")
+    (devops / "persona.md").write_text("Devops persona")
+    (repo / "CLAUDE.md").write_text(
+        "GYMBRO_PROJECT_GUIDE: create draft cards in the repo board."
+    )
+    config = tmp_path / "profiles.yaml"
+    config.write_text(
+        "profiles:\n"
+        f"  - slug: devops\n    name: Devops\n    working_dir: {devops}\n"
+        f"    memory_dir: {devops}/memory\n    persona: {devops}/persona.md\n"
+        "    default: true\n    sandbox: false\n"
+        f"  - slug: gymbro\n    name: GymBro\n    working_dir: {workspace}\n"
+        f"    memory_dir: {workspace}/memory\n    persona: {workspace}/persona.md\n"
+        f"    extra_dirs: [{repo}]\n"
+        f"    project_instructions: {repo}/CLAUDE.md\n"
+    )
+    monkeypatch.setattr(
+        denylist,
+        "protected_dirs",
+        lambda: ProtectedDirs(everyone=(secrets.resolve(),), tenant=()),
+    )
+    registry = load_profile_registry(config, data_root=None)
+    store = InMemoryCodexSessionStore()
+    integ = CodexCliIntegration(
+        config=settings,
+        codex_bin=str(_fake_codex(tmp_path)),
+        session_store=store,
+        profile_registry=registry,
+    )
+    argvs = []
+    original = integ._build_argv
+
+    def capture_argv(**kwargs):
+        argv = original(**kwargs)
+        argvs.append(argv)
+        return argv
+
+    integ._build_argv = capture_argv  # type: ignore[method-assign]
+    await integ.run_command(
+        prompt="first request", working_directory=workspace, user_id=7, force_new=True
+    )
+    await integ.run_command(
+        prompt="second request", working_directory=workspace, user_id=7
+    )
+
+    fresh, resumed = argvs
+    assert fresh[-1].count("GYMBRO_PROJECT_GUIDE") == 1
+    assert "GYMBRO_PROJECT_GUIDE" not in resumed[-1]
+    assert "resume" in resumed
+    assert resumed[-1].endswith("second request")
+    from src.agent_backends.codex_sandbox import PERMISSION_PROFILE
+
+    prefix = f"permissions.{PERMISSION_PROFILE}.filesystem="
+    for argv in (fresh, resumed):
+        raw = next(arg[len(prefix) :] for arg in argv if arg.startswith(prefix))
+        policy = tomllib.loads("t = " + raw)["t"]
+        assert policy[str(workspace.resolve())] == "write"
+        assert policy[str(repo.resolve())] == "write"
+        assert policy[str(secrets.resolve())] == "none"
 
 
 def _m_flag(argv):
@@ -327,6 +403,52 @@ async def test_failed_turn_reports_the_reason_from_stdout(tmp_path, settings):
     assert "exit 1" in message
     assert "invalid_request_error" in message
     assert message.count("invalid_request_error") == 1  # turn.failed dedup
+
+
+async def test_codex_chat_and_scheduled_quota_stops_are_recorded(
+    tmp_path, settings, db, monkeypatch
+):
+    from datetime import UTC, datetime
+
+    from src.model_router import quota
+    from tests.unit.test_model_router import _router, _rows
+
+    monkeypatch.setenv("DEVVY_DATA_ROOT", str(tmp_path / "data"))
+    script = _failing_codex(tmp_path)
+    observed = (
+        "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+        "visit https://chatgpt.com/codex/settings/usage to purchase more credits "
+        "or try again at 10:24 PM."
+    )
+    script.write_text(script.read_text().replace("400 invalid_request_error", observed))
+    integ = CodexCliIntegration(
+        config=settings,
+        codex_bin=str(script),
+        session_store=InMemoryCodexSessionStore(),
+    )
+    router = _router(db)
+
+    for purpose, attended in (("chat", True), ("scheduled", False)):
+        with pytest.raises(Exception) as exc:
+            await router.run_turn(
+                integ,
+                purpose=purpose,
+                attended=attended,
+                prompt="hi",
+                working_directory=tmp_path,
+                user_id=1,
+                force_new=True,
+            )
+        assert any(name in str(exc.value).lower() for name in ("openai", "codex"))
+        assert "limit" in str(exc.value).lower()
+
+    rows = await _rows(db)
+    assert [(r["purpose"], r["outcome"], r["provider"]) for r in rows] == [
+        ("chat", "error", "openai"),
+        ("scheduled", "error", "openai"),
+    ]
+    assert all("limit" in (r["error"] or "").lower() for r in rows)
+    assert quota.active(datetime.now(UTC), provider="openai") is not None
 
 
 class TestCurrentTimezone:

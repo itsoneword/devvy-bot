@@ -8,8 +8,6 @@ Classifies file modifications into tiers:
 
 from __future__ import annotations
 
-import asyncio
-import subprocess
 from pathlib import Path
 
 import structlog
@@ -95,17 +93,3 @@ class SelfModificationGuard:
     def needs_restart(self, file_path: str) -> bool:
         """Whether modifying this file requires a bot restart to take effect."""
         return self.get_tier(file_path) == 2
-
-    async def trigger_restart(self, delay_seconds: float = 1.0) -> None:
-        """Restart the bot service via systemctl.
-
-        The delay allows the calling code to send a Telegram message before
-        the process dies.
-        """
-        logger.info("Self-restart triggered", delay=delay_seconds)
-        await asyncio.sleep(delay_seconds)
-        subprocess.Popen(
-            ["sudo", "systemctl", "restart", "claude-bot"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )

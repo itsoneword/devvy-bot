@@ -84,6 +84,10 @@ class AgentServices:
     # main.py's closure over the process's TurnLocks and
     # ``commands.system.request_restart``. None -> restart_bot not mounted.
     request_restart: Optional[Callable[[str, "TurnContext"], Awaitable[str]]] = None
+    # Reports forum group (Settings.reports_chat_id; None = routing off). A job
+    # started in one of its topics reports to the owner's chat instead, so the
+    # ReportsRouter still picks the profile topic / Jobs (dv-5a35).
+    reports_chat_id: Optional[int] = None
 
 
 @dataclass(frozen=True)

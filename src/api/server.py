@@ -8,6 +8,7 @@ that agents call via scripts/agentctl to send messages, schedule jobs,
 and manage the shared task board.
 """
 
+import json
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,8 +16,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import structlog
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from ..bot.card_buttons import clean_buttons
 from ..config.settings import Settings
 from ..events.bus import EventBus
 from ..events.types import AgentResponseEvent, ScheduledEvent, WebhookEvent
@@ -42,7 +45,7 @@ class NotifyRequest(BaseModel):
     repin: bool = False  # daily re-send + re-pin of the pin_as post (dv-6646)
     # True: text is model markdown, converted to Telegram HTML on delivery.
     markdown: bool = False
-    # Who is speaking (dv-e215): "server-monitor:<host>", "taskpump:status",
+    # Who is speaking (dv-e215): "server-monitor:<host>", "pump2:status",
     # "bgjob", ... Picks the reports-group topic; unmapped/absent = DM.
     source: Optional[str] = None
     # Ledger tag + owning profile for replies (dv-c41e): "job:<id>", "devops".
@@ -54,6 +57,9 @@ class NotifyRequest(BaseModel):
     # True: deliver to `profile`'s own chat (its bound topic, else the DM),
     # the job digest's route (dv-a9b0). Unknown profile = routed by source.
     deliver: bool = False
+    # Inline buttons (dv-ca8b): rows of {text, callback_data}.
+    # Untrusted shape; only card callbacks (``CARD_PREFIXES``) are kept.
+    buttons: List[Any] = []
 
 
 class PromptRequest(BaseModel):
@@ -69,6 +75,8 @@ class PromptRequest(BaseModel):
     profile: str
     name: str = "prompt"
     chat_id: Optional[int] = None
+    user_id: Optional[int] = None
+    cwd: Optional[Path] = None
 
 
 class PolicyAskRequest(BaseModel):
@@ -81,6 +89,18 @@ class PolicyAskRequest(BaseModel):
     # Untrusted (the job's agent runs beside it): unknown keys are dropped,
     # values capped (AskContext.from_mapping).
     context: Optional[Dict[str, Any]] = None
+
+
+class CallbackRequest(BaseModel):
+    """A button tap from the local TUI: the button's callback data, the same
+    string a Telegram inline button carries (``confirm:<token>:y|n``)."""
+
+    data: str
+
+
+class ChatRequest(BaseModel):
+    profile: str
+    text: str
 
 
 class ModelCallRequest(BaseModel):
@@ -148,6 +168,7 @@ def create_api_app(
     confirmation_manager: Optional[Any] = None,
     model_calls: Optional[Any] = None,
     tool_calls: Optional[Any] = None,
+    chat_turn_service: Optional[Any] = None,
 ) -> FastAPI:
     """Create the FastAPI application.
 
@@ -342,6 +363,7 @@ def create_api_app(
             ledger_ref=body.ref,
             ledger_profile_slug=body.profile,
             deliver_profile=deliver_profile,
+            buttons=clean_buttons(body.buttons),
         )
         await event_bus.publish(event)
         logger.info(
@@ -361,12 +383,20 @@ def create_api_app(
         working_dir = _resolve_working_dir(body.profile)
         if working_dir is None:
             raise HTTPException(status_code=400, detail="profile is required")
+        if body.cwd is not None:
+            root = working_dir.resolve()
+            candidate = body.cwd.resolve()
+            owner_workspace = root / "users" / str(body.user_id)
+            if body.user_id is None or candidate not in (root, owner_workspace):
+                raise HTTPException(status_code=400, detail="invalid job workspace")
+            working_dir = candidate
         event = ScheduledEvent(
             job_id=f"prompt-{uuid.uuid4().hex[:8]}",
             job_name=body.name,
             prompt=body.prompt,
             working_directory=working_dir,
             target_chat_ids=[body.chat_id] if body.chat_id else [],
+            created_by=body.user_id or 0,
         )
         await event_bus.publish(event)
         logger.info("Internal prompt published", profile=body.profile, name=body.name)
@@ -393,6 +423,105 @@ def create_api_app(
             context=AskContext.from_mapping(body.context),
         )
         return {"approved": bool(approved)}
+
+    # --- local channel (dv-fe4d): the TUI's inbox and its button taps ------
+    # Mounted only on a channel=local install, and authenticated with the
+    # TUI's own secret, never WEBHOOK_API_SECRET: every job can read that one,
+    # and an ask's buttons sit in the inbox, so a job holding it could read
+    # its own ask's token and approve it. On a Telegram install the owner's
+    # tap reaches ConfirmationManager only through Telegram.
+    if getattr(settings, "channel", "telegram") == "local":
+        from ..claude.confirmation import CALLBACK_PREFIX
+        from ..notifications.transport import close_buttons, inbox_cursor, inbox_since
+
+        def _require_tui_auth(authorization: Optional[str]) -> None:
+            secret = settings.local_tui_secret
+            if not secret or secret == settings.webhook_api_secret:
+                raise HTTPException(
+                    status_code=503, detail="LOCAL_TUI_SECRET not configured"
+                )
+            if not verify_shared_secret(authorization, secret):
+                raise HTTPException(status_code=401, detail="Invalid authorization")
+
+        @app.get("/internal/inbox")
+        async def internal_inbox(
+            since: int = 0,
+            authorization: Optional[str] = Header(None),
+        ) -> Dict[str, Any]:
+            """Messages created or changed after the cursor ``since`` (a
+            row's ``seq``) plus every live pin; ``cursor`` is the next
+            ``since``."""
+            _require_tui_auth(authorization)
+            if db_manager is None:
+                raise HTTPException(status_code=503, detail="Database not available")
+            messages = await inbox_since(db_manager, since)
+            return {"messages": messages, "cursor": inbox_cursor(messages, since)}
+
+        @app.post("/internal/chat")
+        async def internal_chat(
+            body: ChatRequest,
+            authorization: Optional[str] = Header(None),
+        ) -> StreamingResponse:
+            _require_tui_auth(authorization)
+            if not body.text.strip() or not body.profile.strip():
+                raise HTTPException(
+                    status_code=400, detail="Empty chat message or profile"
+                )
+            if chat_turn_service is None:
+                raise HTTPException(status_code=503, detail="Chat service unavailable")
+            if profile_registry and not profile_registry.get_enabled_by_slug(
+                body.profile
+            ):
+                raise HTTPException(status_code=404, detail="Unknown profile")
+
+            async def events() -> Any:
+                user_id = (getattr(settings, "allowed_users", None) or [1])[0]
+                async for event in chat_turn_service.stream(
+                    user_id=user_id, profile=body.profile, text=body.text
+                ):
+                    yield json.dumps(event, ensure_ascii=False) + "\n"
+
+            return StreamingResponse(events(), media_type="application/x-ndjson")
+
+        @app.get("/internal/agents")
+        async def internal_agents(
+            authorization: Optional[str] = Header(None),
+        ) -> Dict[str, List[str]]:
+            _require_tui_auth(authorization)
+            if profile_registry is None:
+                return {"agents": ["devops"]}
+            return {"agents": [p.slug for p in profile_registry.enabled_profiles]}
+
+        @app.post("/internal/callback")
+        async def internal_callback(
+            body: CallbackRequest,
+            authorization: Optional[str] = Header(None),
+        ) -> Dict[str, bool]:
+            """Resolve an owner prompt, as the Telegram button callback does
+            (commands/admin.py ``_confirmation_callback``)."""
+            _require_tui_auth(authorization)
+            parts = body.data.split(":")
+            if (
+                len(parts) != 3
+                or parts[0] != CALLBACK_PREFIX
+                or parts[2]
+                not in (
+                    "y",
+                    "n",
+                )
+            ):
+                raise HTTPException(status_code=400, detail="Unknown callback")
+            approved = parts[2] == "y"
+            matched = (
+                confirmation_manager.resolve(parts[1], approved)
+                if confirmation_manager is not None
+                else False
+            )
+            if matched and db_manager is not None:
+                verdict = "✅ Approved" if approved else "⛔ Denied"
+                await close_buttons(db_manager, body.data, verdict)
+            logger.info("Local callback", approved=approved, matched=matched)
+            return {"matched": bool(matched)}
 
     @app.post("/internal/model_calls")
     async def internal_model_call(
@@ -611,6 +740,7 @@ async def run_api_server(
     confirmation_manager: Optional[Any] = None,
     model_calls: Optional[Any] = None,
     tool_calls: Optional[Any] = None,
+    chat_turn_service: Optional[Any] = None,
 ) -> None:
     """Run the FastAPI server using uvicorn."""
     import uvicorn
@@ -626,6 +756,7 @@ async def run_api_server(
         confirmation_manager=confirmation_manager,
         model_calls=model_calls,
         tool_calls=tool_calls,
+        chat_turn_service=chat_turn_service,
     )
 
     config = uvicorn.Config(

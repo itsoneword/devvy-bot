@@ -61,6 +61,8 @@ def composer_for(
         cached = PromptComposer(
             memory_path=profile.memory_dir,
             agent_md_path=profile.persona,
+            extra_write_roots=profile.extra_dirs,
+            project_instructions_path=profile.project_instructions,
         )
         cache[profile.slug] = cached
     return cached
@@ -87,8 +89,17 @@ def resolve_turn_context(
     from ..profiles.registry import agent_id_for_working_dir, family_agent_id_for_agent
 
     memory_agent_id = agent_id_for_working_dir(registry, working_directory, user_id)
+    profile_slug = agent_id_for_working_dir(registry, working_directory)
+    if registry and role == "owner" and user_id is not None:
+        profile, workspace_user = registry.resolve_working_dir(working_directory)
+        if (
+            profile is not None
+            and workspace_user == user_id
+            and working_directory.resolve().parent.name == "users"
+        ):
+            profile_slug = profile.slug
     return TurnContext(
-        profile_slug=agent_id_for_working_dir(registry, working_directory),
+        profile_slug=profile_slug,
         working_dir=working_directory,
         requester_chat_id=requester_chat_id,
         memory_agent_id=memory_agent_id,

@@ -218,3 +218,80 @@ async def test_backend_switch_roll_writes_codex_columns(storage, settings, tmp_p
     assert rows["claude-1"] == (None, 0, 0, 0, 0)
     store = CodexSessionStore(storage.db_manager)
     assert await store.thread_for(USER_ID, workdir) == resp.session_id
+
+
+def _capturing_codex(tmp_path: Path, log: Path) -> Path:
+    """Stand-in `codex` that logs its final argv element (the prompt)."""
+    script = tmp_path / "codex_cap"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        'outfile=""\n'
+        'args=("$@")\n'
+        "for ((i=0; i<${#args[@]}; i++)); do\n"
+        '  if [[ "${args[$i]}" == "-o" ]]; then outfile="${args[$((i+1))]}"; fi\n'
+        "done\n"
+        f'printf "%s\\n=====TURN=====\\n" "${{args[-1]}}" >> {log}\n'
+        'echo \'{"type":"thread.started","thread_id":"th-fixed"}\'\n'
+        'echo \'{"type":"item.completed","item":{"type":"agent_message",'
+        '"text":"reply"}}\'\n'
+        'echo \'{"type":"turn.completed","usage":{"input_tokens":10,'
+        '"output_tokens":5}}\'\n'
+        'if [[ -n "$outfile" ]]; then echo -n "reply" > "$outfile"; fi\n'
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
+    return script
+
+
+async def test_resumed_thread_gets_changed_constraints_exactly_once(
+    storage, settings, tmp_path
+):
+    """dv-ef59: a resumed Codex thread never re-reads the bundle, so when a
+    pinned fact changes the bundle, the next prompt carries it once."""
+    from src.evaluator.writer import MemoryWriter
+
+    workdir = tmp_path / "ws"
+    workdir.mkdir()
+    persona = tmp_path / "agent.md"
+    persona.write_text("You are the coach.", encoding="utf-8")
+    log = tmp_path / "prompts.log"
+
+    window_repo = WindowRepository(storage.db_manager)
+    bundle_repo = WindowBundleRepository(storage.db_manager)
+    memory_repo = MemoryRepository(storage.db_manager)
+    provider = WindowBundleProvider(
+        window_repo=window_repo,
+        bundle_repo=bundle_repo,
+        memory_repo=memory_repo,
+        profile_registry=None,
+        default_composer=PromptComposer(memory_path=tmp_path, agent_md_path=persona),
+    )
+    integ = CodexCliIntegration(
+        config=settings,
+        codex_bin=str(_capturing_codex(tmp_path, log)),
+        session_store=CodexSessionStore(storage.db_manager),
+        bundle_provider=provider,
+        session_manager=SessionManager(
+            settings, SQLiteSessionStorage(storage.db_manager)
+        ),
+    )
+    writer = MemoryWriter(memory_repo, source="agent_tool", bundle_repo=bundle_repo)
+
+    async def turn(text, **kw):
+        await integ.run_command(
+            prompt=text, working_directory=workdir, user_id=USER_ID, **kw
+        )
+        return log.read_text().split("=====TURN=====\n")[-2]
+
+    await turn("hello", force_new=True)
+    resumed = await turn("second")
+    assert "ZEBRA-RULE" not in resumed
+
+    await writer.apply_ops(
+        "devops",
+        [{"op": "add", "tier": "pinned", "content": "ZEBRA-RULE never say anxious"}],
+    )
+    changed = await turn("third")
+    assert changed.count("ZEBRA-RULE") == 1
+
+    after = await turn("fourth")
+    assert "ZEBRA-RULE" not in after

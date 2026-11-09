@@ -191,6 +191,57 @@ def test_expired_record_and_cmd_jobs_are_not_refused(
     assert _started(calls)
 
 
+def test_codex_limit_refuses_codex_job_but_allows_claude_job(
+    bgjob, root, tmp_path, monkeypatch
+):
+    from src.model_router import quota
+
+    table = tmp_path / "models.yaml"
+    table.write_text(
+        "jobs:\n  background_job: {harness: openai_codex}\n"
+        "  pump_review: {harness: claude}\n"
+    )
+    monkeypatch.setenv("MODEL_ROUTES_PATH", str(table))
+    until = datetime.now(UTC).replace(microsecond=0) + timedelta(hours=2)
+    quota.record(
+        quota.Limit(
+            kind="usage limit",
+            until=until,
+            message="You’ve hit your usage limit. Try again in 2 hours.",
+            provider="openai",
+        ),
+        "bgjob:codex",
+    )
+    jobs = tmp_path / "jobs"
+    calls = _patch_run(bgjob, jobs, tmp_path, monkeypatch)
+
+    class ProbeResult:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, stdout=""):
+            self.stdout = stdout
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if "--print-route" in cmd:
+            provider = "anthropic" if "pump_review" in cmd else "openai"
+            harness = "claude" if provider == "anthropic" else "openai_codex"
+            return ProbeResult(json.dumps({"harness": harness, "provider": provider}))
+        return ProbeResult()
+
+    monkeypatch.setattr(bgjob.subprocess, "run", run)
+
+    with pytest.raises(SystemExit) as exc:
+        bgjob.cmd_run(_args(name="codex-again", route="background_job"))
+    assert "openai" in str(exc.value.code).lower()
+    assert not _started(calls)
+    assert not list(jobs.glob("*/run.sh"))
+
+    assert bgjob.cmd_run(_args(name="claude-ok", route="pump_review")) == 0
+    assert _started(calls)
+
+
 # --------------------------------------------------------------------------
 # Scenario: a merge job dying on the limit pings "stopped on limit, mid-merge"
 # --------------------------------------------------------------------------

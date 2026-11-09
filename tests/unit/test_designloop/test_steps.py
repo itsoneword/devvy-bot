@@ -1,6 +1,6 @@
 """The design loop's real steps on a board repo (dv-9133 phase 3).
 
-A real git repo (the trimmed gymbro docs), a real ``run_loop``; only the
+A real git repo (the trimmed app docs), a real ``run_loop``; only the
 processes the steps start are faked: the agentjob generator, the board's
 render and gate argv, and the collage python. The critic is a fake coroutine.
 """
@@ -23,7 +23,7 @@ from src.designloop.steps import (
     tradeoff_of,
 )
 
-CARD = "gb-d001"
+CARD = "dv-d001"
 AGENTJOB = Path("/fake/agentjob")
 TEMPLATE = (
     Path(__file__).resolve().parents[3] / "config" / "taskpump" / "design_generate.md"
@@ -42,7 +42,7 @@ def _git(repo: Path, *args: str) -> str:
 
 
 @pytest.fixture
-def repo(gymbro_repo: Path) -> Path:
+def repo(app_repo: Path) -> Path:
     for args in (
         ["init", "-q", "-b", "main"],
         ["config", "user.email", "t@t"],
@@ -50,8 +50,8 @@ def repo(gymbro_repo: Path) -> Path:
         ["add", "-A"],
         ["commit", "-qm", "init"],
     ):
-        _git(gymbro_repo, *args)
-    return gymbro_repo
+        _git(app_repo, *args)
+    return app_repo
 
 
 class Runner:
@@ -102,10 +102,10 @@ def steps(repo: Path, tmp_path: Path, runner: Runner) -> BoardSteps:
         repo=repo,
         card=CARD,
         screen="feed",
-        worktrees=tmp_path / "wt" / "gymbro",
+        worktrees=tmp_path / "wt" / "app",
         out=repo / ".screens" / "design" / CARD,
         config=CONFIG,
-        profile="gymbro",
+        profile="app",
         agentjob=AGENTJOB,
         template=TEMPLATE,
         run=runner,
@@ -143,8 +143,8 @@ async def test_a_ready_run_commits_three_real_app_variants_and_offers_them(
     for n, job in enumerate(runner.jobs, 1):
         cmd = job["cmd"]
         assert cmd[cmd.index("--route") + 1] == JOB_ROUTE
-        assert cmd[cmd.index("--profile") + 1] == "gymbro"
-        assert job["cwd"] == tmp_path / "wt" / "gymbro" / f"{CARD}-v{n}"
+        assert cmd[cmd.index("--profile") + 1] == "app"
+        assert job["cwd"] == tmp_path / "wt" / "app" / f"{CARD}-v{n}"
         assert "Too many filters on top" in job["prompt"]
         # Each branch carries one commit on the real app.
         branch = f"design/{CARD}/v{n}"
@@ -159,7 +159,7 @@ async def test_a_ready_run_commits_three_real_app_variants_and_offers_them(
     assert images == [outcome.collage]
     assert "v2 groups the filters" in text
     # The board gate got the variant's renders and the current refs.
-    assert runner.gates[0][2] == str(repo / "docs" / "screens" / "feed")
+    assert runner.gates[0][2] == str(repo / ".screens" / "design" / CARD / "current")
 
 
 async def test_a_variant_with_no_commit_fails_the_gate_and_goes_back(repo, tmp_path):
@@ -211,7 +211,7 @@ async def test_a_gate_that_prints_no_json_stops_the_run(repo, tmp_path):
     s = steps(repo, tmp_path, Runner(gate_out="Traceback ..."))
     await s.generate(build_brief(repo, "feed", "x"), {})
     renders = await s.render(f"design/{CARD}/v1")
-    with pytest.raises(RuntimeError, match="gate of design/gb-d001/v1"):
+    with pytest.raises(RuntimeError, match="gate of design/dv-d001/v1"):
         await s.gate(f"design/{CARD}/v1", renders)
 
 

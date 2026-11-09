@@ -107,6 +107,15 @@ class TestDenylistValidator:
             result, _ = self.validator.is_path_allowed(path)
             assert result is False, path
 
+    def test_env_templates_allowed(self) -> None:
+        """Committed templates are not secrets (owner, 2026-10-31)."""
+        for path in ("/p/.env.example", "/p/.env.sample", "/p/.env.template"):
+            result, err = self.validator.is_path_allowed(path)
+            assert result is True, f"{path}: {err}"
+        for path in ("/p/.env.example.bak", "/p/.env.examples", "/p/.env.example-prod"):
+            result, _ = self.validator.is_path_allowed(path)
+            assert result is False, path
+
     def test_multi_tenant_stores_not_in_global_denylist(self) -> None:
         """bot.db is denied per-profile, not globally.
 

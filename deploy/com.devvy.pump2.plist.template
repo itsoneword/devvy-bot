@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- rendered by scripts/render_deploy.py; do not install this file directly -->
+<!-- macOS local mode (dv-fe4d): the pump2 2-minute tick, the launchd twin
+     of deploy/pump2.timer. Jobs run under the process launcher (no
+     systemd here). Install: cp to ~/Library/LaunchAgents/, then
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.devvy.pump2.plist -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.devvy.pump2</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@DEVVY_ROOT@/scripts/pump2</string>
+        <string>tick</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>@DEVVY_ROOT@</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>@SERVICE_PATH@</string>
+        <key>BGJOB_MAX_CONCURRENT</key>
+        <string>@PUMP_MAX_CONCURRENT@</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/pump2.log</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/pump2.log</string>
+</dict>
+</plist>

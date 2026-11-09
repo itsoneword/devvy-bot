@@ -56,7 +56,7 @@ FALLBACK = timedelta(hours=1)
 MAX_PAUSE = timedelta(days=8)
 
 _LIMIT_RE = re.compile(
-    r"\b(?:you'?ve|you have)\s+(?:hit|reached)\s+your\s+"
+    r"\b(?:you['’]?ve|you have)\s+(?:hit|reached)\s+your\s+"
     r"(?P<kind>[^·.\n]{0,40}?\b(?:limit|budget))\b",
     re.IGNORECASE,
 )
@@ -97,7 +97,10 @@ _CLOCK_RE = re.compile(
 )
 _TZ_RE = re.compile(r"\(([^()]+)\)")
 _FAILED_PREFIX = "agentjob failed: "
-_QUOTA_LINE_RE = re.compile(r"^agentjob quota: (?P<msg>.*) · until (?P<until>\S+)\s*$")
+_QUOTA_LINE_RE = re.compile(
+    r"^agentjob quota: (?P<msg>.*) · until (?P<until>\S+)"
+    r"(?: · provider (?P<provider>[\w-]+))?\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -105,9 +108,12 @@ class Limit:
     kind: str  # "weekly limit", "session limit", "usage limit", ...
     until: datetime  # aware UTC: when to try again
     message: str  # the limit text as the harness wrote it
+    provider: str = "anthropic"
 
 
-def parse_limit(text: str, now: Optional[datetime] = None) -> Optional[Limit]:
+def parse_limit(
+    text: str, now: Optional[datetime] = None, provider: str = "anthropic"
+) -> Optional[Limit]:
     """The usage limit `text` reports, or None when it is some other error."""
     match = _LIMIT_RE.search(text or "")
     if not match:
@@ -121,13 +127,16 @@ def parse_limit(text: str, now: Optional[datetime] = None) -> Optional[Limit]:
         kind=" ".join(match.group("kind").split()).lower(),
         until=until,
         message=line[:300],
+        provider=provider,
     )
 
 
 def quota_line(limit: Limit) -> str:
     """The stderr line agentjob prints on a limit hit."""
     until = limit.until.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return f"agentjob quota: {limit.message} · until {until}"
+    return (
+        f"agentjob quota: {limit.message} · until {until} · provider {limit.provider}"
+    )
 
 
 def parse_quota_line(text: str) -> Optional[Limit]:
@@ -147,6 +156,7 @@ def parse_quota_line(text: str) -> Optional[Limit]:
         kind=" ".join(kind.group("kind").split()).lower() if kind else "limit",
         until=until.astimezone(UTC),
         message=msg,
+        provider=match.group("provider") or "anthropic",
     )
 
 
@@ -172,9 +182,7 @@ def record(limit: Limit, source: str) -> None:
     """Record a limit hit for every later job. A hit with an earlier reset
     never shortens a record that is still active (a session limit inside a
     weekly one). Best effort: an unwritable data root records nothing."""
-    current = active(datetime.now(UTC))
-    if current is not None and current.until >= limit.until:
-        return
+    provider = "anthropic" if limit.provider == "anthropic_sub" else limit.provider
     body = {
         "kind": limit.kind,
         "until": limit.until.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -182,22 +190,100 @@ def record(limit: Limit, source: str) -> None:
         "source": source,
         "recorded": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+
+    def change(rec: Dict[str, Any]) -> None:
+        if provider == "anthropic":
+            existing = _limit_from_body(rec, datetime.now(UTC), "anthropic")
+            if existing is None or existing.until < limit.until:
+                rec.update(body)
+        else:
+            providers = rec.setdefault("providers", {})
+            if not isinstance(providers, dict):
+                providers = rec["providers"] = {}
+            existing = _limit_from_body(
+                providers.get(provider), datetime.now(UTC), provider
+            )
+            if existing is None or existing.until < limit.until:
+                providers[provider] = body
+
     try:
-        update_record(lambda rec: rec.update(body))
+        update_record(change)
     except OSError:
         pass
 
 
-def active(now: Optional[datetime] = None) -> Optional[Limit]:
+def active(
+    now: Optional[datetime] = None, provider: str = "anthropic"
+) -> Optional[Limit]:
     """The recorded limit if its reset is still ahead of `now`, else None.
     No record, an expired one or an unreadable one: None (never blocks)."""
     from src.utils.paths import data_layout
 
     now = (now or datetime.now(UTC)).astimezone(UTC)
+    if provider == "anthropic_sub":
+        provider = "anthropic"
     try:
         body = json.loads(data_layout().model_quota.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if provider != "anthropic":
+        providers = body.get("providers") if isinstance(body, dict) else None
+        body = providers.get(provider) if isinstance(providers, dict) else None
+    return _limit_from_body(body, now, provider)
+
+
+def provider_of(provider: str) -> str:
+    """The record's name for a route provider: the Claude subscription route
+    (``anthropic_sub``) is the provider-less top-level record."""
+    return "anthropic" if provider in ("anthropic_sub", "") else provider
+
+
+# --- one agent-chat notice per limit (dv-47f9) ---
+
+NOTICES_KEY = "limit_notices"
+
+
+def notify_once(limit: Limit, profile: str, deliver: Callable[[], bool]) -> bool:
+    """Tell ``profile``'s chat about ``limit`` once per provider and reset,
+    whoever sees it first (the pump tick or ``bgjob summarize``). The claim is
+    checked, ``deliver``-ed and written under the record's lock, so two
+    senders at once send one notice; a ``deliver`` that returns False claims
+    nothing and the next hit retries. True when this call delivered."""
+    until = _stamp(limit.until)
+    key = f"{provider_of(limit.provider)}|{until}|{profile}"
+    sent = False
+
+    def change(body: Dict[str, Any]) -> None:
+        nonlocal sent
+        notices = body.get(NOTICES_KEY)
+        if not isinstance(notices, dict):
+            notices = {}
+        # A claim past its reset only blocks nothing: drop it.
+        now = datetime.now(UTC)
+        for old, at in list(notices.items()):
+            stamp = _from_stamp(at)
+            if stamp is None or stamp <= now - timedelta(days=1):
+                notices.pop(old)
+        if key in notices or not deliver():
+            body[NOTICES_KEY] = notices
+            return
+        notices[key] = until
+        body[NOTICES_KEY] = notices
+        sent = True
+
+    try:
+        update_record(change)
+    except OSError:
+        logger.warning("limit notice not claimed", key=key, exc_info=True)
+    return sent
+
+
+def _limit_from_body(body: Any, now: datetime, provider: str) -> Optional[Limit]:
+    if not isinstance(body, dict):
+        return None
+    try:
         until = datetime.fromisoformat(str(body["until"]).replace("Z", "+00:00"))
-    except (OSError, ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError):
         return None
     if until.tzinfo is None:
         until = until.replace(tzinfo=UTC)
@@ -208,6 +294,7 @@ def active(now: Optional[datetime] = None) -> Optional[Limit]:
         kind=str(body.get("kind") or "limit"),
         until=until,
         message=str(body.get("message") or ""),
+        provider=provider,
     )
 
 
@@ -613,6 +700,9 @@ __all__ = [
     "find_limit",
     "parse_limit",
     "parse_quota_line",
+    "provider_of",
+    "notify_once",
+    "NOTICES_KEY",
     "quota_line",
     "record",
     "JOB_ROUTE_KEY",

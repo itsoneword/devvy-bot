@@ -8,17 +8,18 @@ captured_tools, event_bus, scheduler, services = (
     base.scheduler,
     base.services,
 )
+_boards_file = base._boards_file
 
 
 async def test_bare_id_is_pinned_to_the_callers_board(
     services, captured_tools, monkeypatch
 ):
     spawned = base._fake(monkeypatch)
-    tools = base._tools(services, captured_tools, "gymbro")
-    r = await tools["pump_answer"].handler({"task_id": "gb-1a2b", "text": "go"})
+    tools = base._tools(services, captured_tools, "app")
+    r = await tools["pump_answer"].handler({"task_id": "dv-1a2b", "text": "go"})
     assert r.get("isError") is not True, r
     (argv,) = base._calls(spawned, "answer")
-    assert list(argv[-3:]) == ["gymbro:gb-1a2b", "--", "go"]
+    assert list(argv[-3:]) == ["app:dv-1a2b", "--", "go"]
 
 
 async def test_profile_without_a_board_gets_the_no_board_error(
@@ -34,7 +35,7 @@ async def test_profile_without_a_board_gets_the_no_board_error(
 
 async def test_empty_answer_is_refused(services, captured_tools, monkeypatch):
     spawned = base._fake(monkeypatch)
-    tools = base._tools(services, captured_tools, "pl")
+    tools = base._tools(services, captured_tools, "site")
     r = await tools["pump_answer"].handler({"task_id": "dv-0a1b", "text": "  "})
     assert r.get("isError") is True
     assert base._calls(spawned, "answer") == []

@@ -106,21 +106,18 @@ async def test_owner_menu_is_the_settled_short_list_in_order(tmp_dir, deps):
     names = [c.command for c in await orchestrator.get_bot_commands()]
 
     # /agents needs a profile registry; without one the rest must still hold.
-    # dv-6104: /menu listed second; /tasks unlisted (the /menu Pump screen
-    # replaces it, owner 26.10.26) so the menu stays at 12.
+    # dv-3881: model + limits after new; stop/resume/restart stay (owner
+    # 02.11.26); status, usage, auth leave the menu (still in /help).
     assert names == [
         "start",
         "menu",
         "new",
+        "model",
+        "limits",
         "stop",
         "resume",
         "restart",
-        "auth",
         "help",
-        "status",
-        "usage",
-        "limits",
-        "model",
     ]
 
 
@@ -172,9 +169,11 @@ def test_callback_pattern_covers_every_prefix(agentic_settings, deps):
         "vset:off",
         "confirm:yes",
         "watchdog:hold",
+        "restart:force",
         "qi:ab12cd34",
         "lim:freeze",
         "lim:codex",
+        "publish:go:devvy",
     ]
     for data in samples:
         assert any(p.match(data) for p in patterns), f"no handler routes {data!r}"
@@ -225,9 +224,10 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
     # 4 message handlers (text, document, photo, voice)
     assert len(msg_handlers) == 4
-    # 4 callback handlers (cd:/model:/agent: selection + confirm: gate +
-    # watchdog: hold/dismiss gate + menu: hub, dv-6104)
-    assert len(cb_handlers) == 4
+    # 6 callback handlers (cd:/model:/agent: selection + confirm: gate +
+    # watchdog: hold/dismiss gate + menu: hub, dv-6104 + restart:force, dv-86f4
+    # + fb: feature-feedback scores, dv-a42c)
+    assert len(cb_handlers) == 6
 
 
 def test_agentic_message_handlers_reject_edited_messages(agentic_settings, deps):
@@ -362,7 +362,13 @@ async def test_restart_command_sends_sigterm(deps):
     context = MagicMock()
     context.bot_data = {"audit_logger": None}
 
-    with patch("src.bot.orchestration.commands.system.os.kill") as mock_kill:
+    with (
+        patch("src.bot.orchestration.commands.system.os.kill") as mock_kill,
+        patch(
+            "src.bot.orchestration.commands.system.preflight",
+            AsyncMock(return_value=None),
+        ),
+    ):
         await restart_command(update, context)
 
     import os
@@ -750,7 +756,7 @@ class TestPerUserTurnLock:
         voice_handler.process_voice_message.assert_awaited_once()
         orchestrator._run_agentic_media_turn.assert_awaited_once()
         # The user saw an immediate "queued" ack while waiting.
-        ack_text = update.message.reply_text.call_args.args[0]
+        ack_text = update.message.reply_text.call_args_list[0].args[0]
         assert "Queued" in ack_text
 
     async def test_callback_query_does_not_take_the_lock(self, agentic_settings, deps):
@@ -915,6 +921,59 @@ async def test_agentic_voice_calls_claude(agentic_settings, deps):
     )
     claude_integration.run_command.assert_awaited_once()
     assert context.user_data["claude_session_id"] == "voice-session-123"
+
+
+async def test_agentic_voice_echoes_transcript_in_collapsed_quote(
+    agentic_settings, deps
+):
+    """The voice gets its transcript back as an expandable quote (HTML-escaped)
+    before the turn, and the turn runs on a fresh "Working..." message."""
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+
+    mock_response = MagicMock()
+    mock_response.session_id = "voice-session-echo"
+    mock_response.content = "ok"
+    mock_response.tools_used = []
+    claude_integration = AsyncMock()
+    claude_integration.run_command = AsyncMock(return_value=mock_response)
+
+    processed_voice = MagicMock()
+    processed_voice.prompt = "Voice prompt text"
+    processed_voice.transcription = "Сделай <b>так</b> & потом"
+    voice_handler = MagicMock()
+    voice_handler.process_voice_message = AsyncMock(return_value=processed_voice)
+    features = MagicMock()
+    features.get_voice_handler.return_value = voice_handler
+
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.voice = MagicMock()
+    update.message.caption = None
+    update.message.message_id = 1
+    update.message.chat.send_action = AsyncMock()
+    first_msg = AsyncMock()
+    working_msg = AsyncMock()
+    update.message.reply_text = AsyncMock(side_effect=[first_msg, working_msg])
+
+    context = MagicMock()
+    context.user_data = {}
+    context.bot_data = {
+        "settings": agentic_settings,
+        "features": features,
+        "claude_integration": claude_integration,
+    }
+
+    await orchestrator.agentic_voice(update, context)
+
+    echo = first_msg.edit_text.await_args_list[-1]
+    assert echo.args[0] == (
+        "🎙 <blockquote expandable>Сделай &lt;b&gt;так&lt;/b&gt; &amp; "
+        "потом</blockquote>"
+    )
+    assert echo.kwargs["parse_mode"] == "HTML"
+    first_msg.delete.assert_not_awaited()
+    assert update.message.reply_text.await_args_list[1].args[0] == "Working..."
+    claude_integration.run_command.assert_awaited_once()
 
 
 async def test_agentic_voice_missing_handler_is_provider_aware(tmp_path, deps):
@@ -1476,7 +1535,13 @@ async def test_restart_command_is_immediate_even_while_a_turn_runs(deps):
         context = MagicMock()
         context.bot_data = {"audit_logger": None, "turn_locks": turn_locks}
 
-        with patch("src.bot.orchestration.commands.system.os.kill") as mock_kill:
+        with (
+            patch("src.bot.orchestration.commands.system.os.kill") as mock_kill,
+            patch(
+                "src.bot.orchestration.commands.system.preflight",
+                AsyncMock(return_value=None),
+            ),
+        ):
             await restart_command(update, context)
 
         mock_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)

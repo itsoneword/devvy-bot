@@ -12,7 +12,16 @@ import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
+from typing import (
+    TYPE_CHECKING,
+    AbstractSet,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+)
 
 import structlog
 
@@ -116,8 +125,12 @@ class EvaluatorService:
         episodic_guard_enabled: bool = True,
         jev_gate: Optional[JevGateConfig] = None,
         screen: Optional[ScreenConfig] = None,
+        repo_agents: AbstractSet[str] = frozenset(),
     ) -> None:
         self._repo = memory_repo
+        # Profiles with their own repo (dv-32fe): their extraction prompt
+        # routes per-task decisions to pointers. Empty = every prompt as before.
+        self._repo_agents = frozenset(repo_agents)
         self._writer = writer
         self._token_tracker = token_tracker
         self._db = db
@@ -238,6 +251,8 @@ class EvaluatorService:
             conversation_text=conversation_text,
             current_facts=format_current_facts(facts),
             family_facts=family_facts_text,
+            agent_id=agent_id,
+            repo_agents=self._repo_agents,
         )
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
 
@@ -612,6 +627,8 @@ class EvaluatorService:
                 if family_scope_id is not None
                 else None
             ),
+            agent_id=agent_id,
+            repo_agents=self._repo_agents,
         )
         record["prompt_chars"] = len(prompt)
         try:

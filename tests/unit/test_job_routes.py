@@ -27,8 +27,8 @@ from structlog.testing import capture_logs
 REPO = Path(__file__).resolve().parents[2]
 SLUG = "z-ai/glm-5.3"
 
-# What every job ran on before dv-d63d: taskpump's ANALYZE/IMPLEMENT/... model
-# constants (scripts/taskpump ~202-218), bgjob's and agentjob's --model
+# What every job ran on before dv-d63d: the old pump's ANALYZE/IMPLEMENT/... model
+# constants, bgjob's and agentjob's --model
 # default `sonnet` for bgjob jobs and the server monitor.
 TODAY = {
     "background_job": "sonnet",

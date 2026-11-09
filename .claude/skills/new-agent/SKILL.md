@@ -32,7 +32,7 @@ Collect, in this order, skipping anything already given:
 Rules you enforce, and say so if the user asks for the opposite:
 
 - **Never `sandbox: false` for a new agent.** Full access is what `devops` is
-  for. A folder it needs to write goes in `extra_dirs` (dv-3103).
+  for. A folder it needs to write goes in `extra_dirs`.
 - `extra_dirs` is **owner-only**: if guests may use it, it gets no extra dirs.
 - `extra_dirs` must already exist, cannot be `/` or `~`, and cannot overlap
   another profile's `working_dir`/`memory_dir` (this repo included). Check with
@@ -75,12 +75,12 @@ data/templates/local/<slug>/persona.md     # the persona
   # user_data_tools: [logs]       # only for tracking profiles
 ```
 
-`persona.md` — follow the standard shape (dv-8cde): **role → goal → tool
+`persona.md` — follow the standard shape: **role → goal → tool
 pointers → per-turn rules → safety block → 2–3 worked examples.** Instruction
 prose in English; state the reply language explicitly. Name every extra dir
 and what goes where (e.g. "Research notes go to `~/notes/study/<topic>.md`
 as Obsidian markdown: frontmatter `tags:`, wikilinks for related notes"). Keep
-it under ~4k chars; the persona is injected on every turn.
+it under ~4k chars (shared-capabilities 10 KB, CLAUDE.md 10 KB); the persona is injected on every turn.
 
 Then, in this order — stop and report at the first failure:
 
@@ -92,6 +92,21 @@ poetry run python scripts/check_install.py --skip-db      # real loader: creates
 `check_install.py` is the gate: if it fails, fix the template/YAML and re-run
 it. **Never leave `config/profiles.yaml` in a state that fails this check** —
 the bot will not boot.
+
+**Own topic in the reports group.** If `<data-root>/reports_bindings.json`
+exists (the owner's agents each have a topic there), add
+`"<Name>": "<slug>"` to its `bindings` and validate the JSON. The topic is
+created at the next start (`ensure_bound_topics`); without this line the agent
+works only in the DM.
+
+**Repo + board when it will produce code or tasks.** If the purpose involves
+building anything (prototype, app, scripts) or background work, do not defer
+it to "later": create the repo (`git init -b main`, `.deviz/config.json` +
+`.deviz/tasks/`, a short `CLAUDE.md`), add it to the profile's `extra_dirs`,
+register it in `config/taskpump/boards.json` (`name`, `repo`, `profile`,
+`"pump2": true` so pump2 serves it, optional `test`), and give the persona a Board section (where the board is,
+and that `job_start(task_id)` starts a card). Without a board the agent cannot
+use `job_start(task_id)` or the Pump.
 
 ## 3. Hand over
 

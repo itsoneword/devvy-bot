@@ -93,3 +93,8 @@ class AgentResponseEvent(Event):
     # bound topic, else the DM. Used by the batch job digest, which must not
     # land in Jobs (the log).
     deliver_profile: Optional[str] = None
+    # Inline buttons under the message (dv-ca8b): rows of {text,
+    # callback_data}. Only ``publish:`` callbacks (the publish
+    # card) ever get here; /internal/notify drops the rest
+    # (``card_buttons.clean_buttons``).
+    buttons: List[List[Dict[str, str]]] = field(default_factory=list)

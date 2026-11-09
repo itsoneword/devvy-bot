@@ -41,17 +41,17 @@ def test_same_fixes_twice_repeat_new_ones_do_not():
     assert not repeated(clean, clean)
 
 
-def test_images_put_renders_first_and_never_send_a_path_twice(gymbro_repo):
-    brief = build_brief(gymbro_repo, "feed", "calmer")
-    renders = state_refs(gymbro_repo, "feed", "main")
+def test_images_put_renders_first_and_never_send_a_path_twice(app_repo):
+    brief = build_brief(app_repo, "feed", "calmer")
+    renders = state_refs(app_repo, "feed", "main")
     images, legend = _images(renders, brief.refs, ())
     assert len(images) == len(set(images)) == len(brief.refs)
     assert legend[0].endswith("under review: feed/main-dark.png")
     assert all("current screen" in line for line in legend[len(renders) :])
 
 
-def test_feature_parser_reads_inline_lists_and_ignores_scenarios(gymbro_repo):
-    screens = load_features(gymbro_repo / "docs" / "features.yaml")
+def test_feature_parser_reads_inline_lists_and_ignores_scenarios(app_repo):
+    screens = load_features(app_repo / "docs" / "features.yaml")
     join = {f.name: f for f in screens["event_page"].features}["join_leave"]
     assert join.action == "I'm going"
     assert join.api == ("POST /api/events/{id}/join", "POST /api/events/{id}/leave")
@@ -59,14 +59,14 @@ def test_feature_parser_reads_inline_lists_and_ignores_scenarios(gymbro_repo):
     assert "id" not in {f.name for f in screens["feed"].features}
 
 
-def test_unknown_passport_is_an_error(gymbro_repo):
-    passports = gymbro_repo / "docs" / "SCREENS.md"
+def test_unknown_passport_is_an_error(app_repo):
+    passports = app_repo / "docs" / "SCREENS.md"
     passports.write_text(
         passports.read_text().replace("### TAB Feed", "### TAB Other"),
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="TAB Feed"):
-        build_brief(gymbro_repo, "feed", "calmer")
+        build_brief(app_repo, "feed", "calmer")
 
 
 def test_calibration_script_help_runs():

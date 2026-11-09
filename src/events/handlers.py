@@ -20,10 +20,10 @@ from typing import (
 
 import structlog
 
-from ..agent_backends.protocol import CLAUDE_BACKEND, policy_for
 from ..claude.facade import ClaudeIntegration
 from ..items.loop_guard import automated_turn
 from ..model_router import get_router
+from ..model_router.routes import scheduled_turn_model
 from .bus import Event, EventBus
 from .health_export import build_health_export_prompt, summarize_health_export
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
@@ -391,9 +391,10 @@ class AgentHandler:
                 prefs = await self.storage.preferences.get(user_id)
             except Exception as e:
                 logger.warning("model pref lookup failed", error=str(e))
-        configured = (prefs or {}).get("agent_model") or self.default_agent_model
-        # The one Claude tier gate (agent_backends/protocol.py), not a copy.
-        return policy_for(CLAUDE_BACKEND).resolve_model(configured)
+        # One resolution with /menu → Модели's "Расписание" line (dv-3881).
+        return scheduled_turn_model(
+            (prefs or {}).get("agent_model"), self.default_agent_model
+        )
 
     async def handle_scheduled(self, event: Event) -> None:
         """Process a scheduled event through Claude."""

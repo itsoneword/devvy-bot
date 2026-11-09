@@ -1,7 +1,7 @@
-"""The design loop (dv-9133 phase 3): variants, mechanical gate, critic
+"""The design loop (phase 3): variants, mechanical gate, critic
 rounds, one collage to the owner.
 
-Every step is injected, so ``taskpump design run`` wires the real ones
+Every step is injected, so ``pump2 design run`` wires the real ones
 (:mod:`src.designloop.steps`) and tests wire fakes:
 
 - ``generate(brief, feedback) -> branches``: the variants
@@ -14,9 +14,12 @@ Every step is injected, so ``taskpump design run`` wires the real ones
 - ``collage(variants) -> Path``; ``deliver(text, images)``.
 
 Stop: every variant ``ready``, :data:`MAX_ROUNDS` rounds, or the same fixes
-as last round. Owner 26.10 22:31: only ``ready`` reaches the owner as a
-choice; a loop that stops without one sends a short "design failed: reasons"
-note, no images and no pick.
+as last round. The ``ready`` variants reach the owner as a choice; a loop
+that stops on rounds / repeated without one still offers every critiqued
+variant (dv-2d00), with its open remarks. Either way the offer is sorted by
+critic score, best first (= recommended). Only a loop where no variant got
+past the gate sends a short "design failed: reasons" note, no images and no
+pick.
 """
 
 from __future__ import annotations
@@ -135,6 +138,9 @@ async def run_loop(
         feedback = {v.branch: list(v.notes) for v in revising}
 
     offered = [v for v in variants if v.ready]
+    if not offered and stop in ("rounds", "repeated"):
+        offered = [v for v in variants if v.critique is not None]
+    offered.sort(key=lambda v: v.critique.score if v.critique else 0, reverse=True)
     outcome = Outcome(stop=stop, rounds=rounds, variants=variants, offered=offered)
     if offered:
         if describe:
@@ -186,21 +192,45 @@ STOP_WHY = {
 }
 
 
+# The Telegram message is cut past its limit: keep the remarks short so the
+# pick line survives. The full notes stay in the card body.
+REMARKS_SHOWN = 2
+REMARK_CHARS = 160
+
+
 def offer_text(title: str, outcome: Outcome) -> str:
     """The owner's choice: one line per offered variant, reply a number."""
     n = len(outcome.offered)
-    lines = [f"🎨 {title}: {n} design variant{'s' if n > 1 else ''}, critic: ready"]
+    plural = "s" if n > 1 else ""
+    ready = all(v.ready for v in outcome.offered)
+    if ready:
+        lines = [f"🎨 {title}: {n} design variant{plural}, critic: ready"]
+    else:
+        lines = [
+            f"🎨 {title}: {n} design variant{plural}; the critic called none ready "
+            f"after {outcome.rounds} critic round{'s' if outcome.rounds != 1 else ''}"
+            " — best score first, 1 is recommended"
+        ]
     for i, variant in enumerate(outcome.offered, 1):
         score = variant.critique.score if variant.critique else 0
         line = f"{i}. {variant.tradeoff or variant.branch} ({score}/10)"
+        if not ready and i == 1:
+            line += " — recommended"
         lines.append(line)
+        if not variant.ready:
+            for note in variant.notes[:REMARKS_SHOWN]:
+                if len(note) > REMARK_CHARS:
+                    note = note[: REMARK_CHARS - 1] + "…"
+                lines.append(f"   · {note}")
+            if len(variant.notes) > REMARKS_SHOWN:
+                lines.append(f"   · +{len(variant.notes) - REMARKS_SHOWN} more")
     choices = ", ".join(str(i) for i in range(1, n + 1))
     lines.append(f"↩ reply with the number of the one to build: {choices}")
     return "\n".join(lines)
 
 
 def failed_text(title: str, outcome: Outcome) -> str:
-    """Owner 26.10 22:31: a short note with the reasons, no choice."""
+    """The owner's rule: a short note with the reasons, no choice."""
     lines = [f"🎨 design failed: {title} — {STOP_WHY.get(outcome.stop, outcome.stop)}"]
     for variant in outcome.variants:
         if variant.notes:

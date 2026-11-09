@@ -1,24 +1,26 @@
-"""Notification service for delivering proactive agent responses to Telegram.
+"""Notification service for delivering proactive agent responses.
 
 Subscribes to AgentResponseEvent on the event bus and delivers messages
-through the Telegram bot API with rate limiting (1 msg/sec per chat).
+through a transport (``transport.py``): the Telegram bot API with rate
+limiting (1 msg/sec per chat), or a local install's inbox (dv-fe4d). Routing,
+pins and the ledger live here, once, for both.
 """
 
 import asyncio
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import structlog
-from telegram import Bot
-from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
 
 from ..bot.utils.html_format import markdown_to_telegram_html
 from ..events.bus import Event, EventBus
 from ..events.types import AgentResponseEvent
-from .routing import ReportsRouter
+from .transport import Buttons, TelegramTransport, Transport
+
+if TYPE_CHECKING:
+    from .routing import ReportsRouter
 
 logger = structlog.get_logger()
 
@@ -39,6 +41,28 @@ MARKDOWN_MODE = "markdown"
 _MD_CHUNK = 3400
 
 
+def button_pairs(rows: List[List[Dict[str, str]]]) -> List[List[Tuple[str, str]]]:
+    """An event's button rows (``{"text", "callback_data"}``) as transport
+    button rows of ``(label, callback_data)`` (dv-ca8b)."""
+    return [[(b["text"], b["callback_data"]) for b in row] for row in rows]
+
+
+def button_markup(rows: List[List[Dict[str, str]]]) -> Any:
+    """An event's button rows as Telegram's inline keyboard (dv-ca8b).
+    ``telegram`` is imported on use: a local install never loads it."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(b["text"], callback_data=b["callback_data"])
+                for b in row
+            ]
+            for row in rows
+        ]
+    )
+
+
 def _sanitize_text(text: str) -> str:
     """Replace lone surrogates with U+FFFD so the text is always sendable."""
     return _LONE_SURROGATE.sub("\ufffd", text)
@@ -54,18 +78,27 @@ _PIN_GONE_MARKERS = (
 
 
 class NotificationService:
-    """Delivers agent responses to Telegram chats with rate limiting."""
+    """Delivers agent responses through a transport with rate limiting."""
 
     def __init__(
         self,
         event_bus: EventBus,
-        bot: Bot,
+        bot: Optional[Any] = None,
         default_chat_ids: Optional[List[int]] = None,
         pin_store: Optional[Any] = None,
         sent_messages: Optional[Any] = None,
-        reports_router: Optional[ReportsRouter] = None,
+        reports_router: Optional["ReportsRouter"] = None,
+        transport: Optional[Transport] = None,
     ) -> None:
         self.event_bus = event_bus
+        # ``bot`` (telegram.Bot) = the Telegram transport; a local install
+        # passes ``transport=LocalTransport(...)`` and no bot (dv-fe4d).
+        if transport is None:
+            if bot is None:
+                raise ValueError("NotificationService needs a bot or a transport")
+            transport = TelegramTransport(bot)
+        self.transport: Transport = transport
+        # The raw bot, for the reports router's topic calls (Telegram only).
         self.bot = bot
         self.default_chat_ids = default_chat_ids or []
         # sent_messages ledger repo: events carrying ledger_kind (verbatim
@@ -90,6 +123,8 @@ class NotificationService:
         self._pin_dates: dict[tuple[int, str], str] = {}
         self._running = False
         self._sender_task: Optional[asyncio.Task[None]] = None
+        # True when start() had to start the bus itself (see start()).
+        self._owns_bus = False
 
     async def _load_pins(self) -> None:
         if self._pin_store is None:
@@ -127,6 +162,12 @@ class NotificationService:
         await self._load_pins()
         self._running = True
         self._sender_task = asyncio.create_task(self._process_send_queue())
+        # Nothing reaches the queue unless the bus dispatches. main starts the
+        # bus first; a caller that wires only this service (a headless local
+        # server, its tests) gets it started here, and stopped in stop().
+        if not self.event_bus.running:
+            await self.event_bus.start()
+            self._owns_bus = True
         logger.info("Notification service started")
 
     async def stop(self) -> None:
@@ -140,6 +181,9 @@ class NotificationService:
                 await self._sender_task
             except asyncio.CancelledError:
                 pass
+        if self._owns_bus:
+            await self.event_bus.stop()
+            self._owns_bus = False
         logger.info("Notification service stopped")
 
     async def handle_response(self, event: Event) -> None:
@@ -181,18 +225,21 @@ class NotificationService:
             return
         reports_chat = router.chat_id
         assert reports_chat is not None
+        # Reports topics are Telegram forum topics: a router implies a bot.
+        bot = self.bot
+        assert bot is not None
         try:
-            thread_id = await router.thread_id(self.bot, topic)
+            thread_id = await router.thread_id(bot, topic)
             try:
                 await self._rate_limited_send(
                     reports_chat, event, thread_id=thread_id, reraise=True
                 )
                 return
-            except TelegramError as e:
+            except self.transport.Error as e:
                 if not router.is_thread_gone(e):
                     raise
                 logger.warning("Reports topic gone, recreating", topic=topic)
-                thread_id = await router.thread_id(self.bot, topic, recreate=True)
+                thread_id = await router.thread_id(bot, topic, recreate=True)
                 await self._rate_limited_send(
                     reports_chat, event, thread_id=thread_id, reraise=True
                 )
@@ -227,7 +274,9 @@ class NotificationService:
         loop = asyncio.get_event_loop()
         now = loop.time()
         last_send = self._last_send_per_chat.get(chat_id, 0.0)
-        wait_time = SEND_INTERVAL_SECONDS - (now - last_send)
+        # Telegram's per-chat limit; the local inbox has none (interval 0).
+        interval = getattr(self.transport, "send_interval", SEND_INTERVAL_SECONDS)
+        wait_time = interval - (now - last_send)
 
         if wait_time > 0:
             await asyncio.sleep(wait_time)
@@ -235,9 +284,6 @@ class NotificationService:
         if event.pin_as:
             await self._send_or_edit_pinned(chat_id, event, thread_id, reraise)
             return
-        topic_kw: dict[str, Any] = (
-            {"message_thread_id": thread_id} if thread_id is not None else {}
-        )
 
         try:
             # Split long messages (Telegram limit: 4096 chars)
@@ -252,17 +298,24 @@ class NotificationService:
             # empty message and the error would skip the images.
             chunks = [c for c in chunks if c.strip()]
 
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
+                # Buttons (dv-ca8b) sit under the last chunk: the card's end.
+                buttons = (
+                    button_pairs(event.buttons)
+                    if event.buttons and i == len(chunks) - 1
+                    else None
+                )
                 if is_md:
-                    sent = await self._send_markdown_chunk(chat_id, chunk, **topic_kw)
+                    sent_id = await self._send_markdown_chunk(
+                        chat_id, chunk, thread_id=thread_id, buttons=buttons
+                    )
                 else:
-                    sent = await self.bot.send_message(
-                        chat_id=chat_id,
-                        text=chunk,
-                        parse_mode=(
-                            ParseMode.HTML if event.parse_mode == "HTML" else None
-                        ),
-                        **topic_kw,
+                    sent_id = await self.transport.send(
+                        chat_id,
+                        chunk,
+                        parse_mode="HTML" if event.parse_mode == "HTML" else None,
+                        thread_id=thread_id,
+                        buttons=buttons,
                     )
                 self._last_send_per_chat[chat_id] = asyncio.get_event_loop().time()
                 # Reports sent into a topic are ledgered too (as "report"),
@@ -273,8 +326,8 @@ class NotificationService:
                 if ledger_kind and self.sent_messages is not None:
                     # Every chunk is ledgered — a reply can target any of them.
                     await self.sent_messages.record(
-                        telegram_chat_id=sent.chat.id,
-                        telegram_message_id=sent.message_id,
+                        telegram_chat_id=chat_id,
+                        telegram_message_id=sent_id,
                         kind=ledger_kind,
                         messages_message_id=event.ledger_messages_message_id,
                         profile_slug=event.ledger_profile_slug,
@@ -286,7 +339,7 @@ class NotificationService:
                     await asyncio.sleep(SEND_INTERVAL_SECONDS)
 
             if event.image_paths:
-                await self._send_images(chat_id, event.image_paths, topic_kw)
+                await self._send_images(chat_id, event.image_paths, thread_id)
 
             logger.info(
                 "Notification sent",
@@ -295,7 +348,7 @@ class NotificationService:
                 chunks=len(chunks),
                 originating_event=event.originating_event_id,
             )
-        except TelegramError as e:
+        except self.transport.Error as e:
             if reraise:
                 raise
             logger.error(
@@ -306,56 +359,43 @@ class NotificationService:
             )
 
     async def _send_images(
-        self, chat_id: int, paths: List[str], topic_kw: dict[str, Any]
+        self, chat_id: int, paths: List[str], thread_id: Optional[int]
     ) -> None:
         """Send already-validated files after the text (dv-f90c): raster
         photos as one album, everything else as documents. Best-effort: a
         failed image never loses the text that was already delivered."""
-        from telegram import InputMediaPhoto
-
         from ..bot.utils.image_extractor import should_send_as_photo
 
         photos = [Path(p) for p in paths if should_send_as_photo(Path(p))]
         docs = [Path(p) for p in paths if not should_send_as_photo(Path(p))]
         try:
-            if len(photos) == 1:
-                with open(photos[0], "rb") as f:
-                    await self.bot.send_photo(chat_id=chat_id, photo=f, **topic_kw)
-            elif photos:
-                handles = [open(p, "rb") for p in photos[:10]]  # noqa: SIM115
-                try:
-                    await self.bot.send_media_group(
-                        chat_id=chat_id,
-                        media=[InputMediaPhoto(media=h) for h in handles],
-                        **topic_kw,
-                    )
-                finally:
-                    for h in handles:
-                        h.close()
-            for doc in docs:
-                with open(doc, "rb") as f:
-                    await self.bot.send_document(
-                        chat_id=chat_id, document=f, filename=doc.name, **topic_kw
-                    )
+            await self.transport.send_files(chat_id, photos, docs, thread_id)
         except Exception as e:  # noqa: BLE001
             logger.warning("Notification images failed", chat_id=chat_id, error=str(e))
 
     async def _send_markdown_chunk(
-        self, chat_id: int, chunk: str, **kwargs: Any
-    ) -> Any:
+        self,
+        chat_id: int,
+        chunk: str,
+        thread_id: Optional[int] = None,
+        buttons: Optional[Buttons] = None,
+    ) -> int:
         """Send one markdown chunk as HTML; on a parse error send it plain."""
         try:
-            return await self.bot.send_message(
-                chat_id=chat_id,
-                text=markdown_to_telegram_html(chunk),
-                parse_mode=ParseMode.HTML,
-                **kwargs,
+            return await self.transport.send(
+                chat_id,
+                markdown_to_telegram_html(chunk),
+                parse_mode="HTML",
+                thread_id=thread_id,
+                buttons=buttons,
             )
-        except BadRequest as e:
+        except self.transport.BadRequest as e:
             if "parse" not in str(e).lower() and "entit" not in str(e).lower():
                 raise
             logger.warning("markdown html rejected, sending plain", error=str(e))
-            return await self.bot.send_message(chat_id=chat_id, text=chunk, **kwargs)
+            return await self.transport.send(
+                chat_id, chunk, thread_id=thread_id, buttons=buttons
+            )
 
     def _split_markdown(self, text: str, max_length: int) -> List[str]:
         """Split markdown without leaving a ``` fence open across chunks."""
@@ -391,14 +431,12 @@ class NotificationService:
         if not text:
             if existing:
                 try:
-                    await self.bot.unpin_chat_message(
-                        chat_id=chat_id, message_id=existing
-                    )
-                except TelegramError:
+                    await self.transport.unpin(chat_id, existing)
+                except self.transport.Error:
                     pass
                 try:
-                    await self.bot.delete_message(chat_id=chat_id, message_id=existing)
-                except TelegramError:
+                    await self.transport.delete(chat_id, existing)
+                except self.transport.Error:
                     pass
                 self._pinned_messages.pop(key, None)
                 await self._save_pin(key)
@@ -414,11 +452,9 @@ class NotificationService:
 
         if existing:
             try:
-                await self.bot.edit_message_text(
-                    chat_id=chat_id, message_id=existing, text=text
-                )
+                await self.transport.edit(chat_id, existing, text)
                 return
-            except TelegramError as e:
+            except self.transport.Error as e:
                 # Re-create only when the message is really gone (user deleted
                 # it). Anything else (timeout, 429, Bad Gateway) waits for the
                 # next push: re-posting then would leave the old pin orphaned
@@ -432,27 +468,22 @@ class NotificationService:
                     )
                     return
                 try:
-                    await self.bot.unpin_chat_message(
-                        chat_id=chat_id, message_id=existing
-                    )
-                except TelegramError:
+                    await self.transport.unpin(chat_id, existing)
+                except self.transport.Error:
                     pass
                 self._pinned_messages.pop(key, None)
                 await self._save_pin(key)
 
         try:
-            topic_kw: dict[str, Any] = (
-                {"message_thread_id": thread_id} if thread_id is not None else {}
-            )
-            msg = await self.bot.send_message(chat_id=chat_id, text=text, **topic_kw)
-            self._remember_pin(key, msg.message_id)
+            message_id = await self.transport.send(chat_id, text, thread_id=thread_id)
+            self._remember_pin(key, message_id)
             await self._save_pin(key)
-        except TelegramError as e:
+        except self.transport.Error as e:
             if reraise and thread_id is not None:
                 raise
             logger.warning("pinned status update failed", chat_id=chat_id, error=str(e))
             return
-        await self._pin_new(chat_id, msg.message_id, thread_id)
+        await self._pin_new(chat_id, message_id, thread_id)
 
     def _remember_pin(self, key: tuple[int, str], message_id: int) -> None:
         self._pinned_messages[key] = message_id
@@ -469,20 +500,17 @@ class NotificationService:
         the bottom, gets pinned, the old one is unpinned. True = done; False =
         the send failed and the old pin stays (caller edits it in place)."""
         chat_id = key[0]
-        topic_kw: dict[str, Any] = (
-            {"message_thread_id": thread_id} if thread_id is not None else {}
-        )
         try:
-            msg = await self.bot.send_message(chat_id=chat_id, text=text, **topic_kw)
-        except TelegramError as e:
+            message_id = await self.transport.send(chat_id, text, thread_id=thread_id)
+        except self.transport.Error as e:
             logger.warning("status repin failed, keeping old pin", error=str(e))
             return False
-        self._remember_pin(key, msg.message_id)
+        self._remember_pin(key, message_id)
         await self._save_pin(key)
-        await self._pin_new(chat_id, msg.message_id, thread_id)
+        await self._pin_new(chat_id, message_id, thread_id)
         try:
-            await self.bot.unpin_chat_message(chat_id=chat_id, message_id=old_id)
-        except TelegramError:
+            await self.transport.unpin(chat_id, old_id)
+        except self.transport.Error:
             pass
         return True
 
@@ -494,18 +522,12 @@ class NotificationService:
             # pinned there (e.g. the stray 15.10 pin in Pump), so the topic
             # shows exactly one status. Best-effort.
             try:
-                await self.bot.unpin_all_forum_topic_messages(
-                    chat_id=chat_id, message_thread_id=thread_id
-                )
-            except TelegramError as e:
+                await self.transport.unpin_all(chat_id, thread_id)
+            except self.transport.Error as e:
                 logger.warning("topic unpin-all failed", chat_id=chat_id, error=str(e))
         try:
-            await self.bot.pin_chat_message(
-                chat_id=chat_id,
-                message_id=message_id,
-                disable_notification=True,
-            )
-        except TelegramError as e:
+            await self.transport.pin(chat_id, message_id)
+        except self.transport.Error as e:
             # Posted fine; only the pin failed (e.g. no "Pin messages" right).
             logger.warning("pinned status update failed", chat_id=chat_id, error=str(e))
 

@@ -94,7 +94,7 @@ class TestInternalNotifyDeliver:
             "/internal/notify",
             json={
                 "text": "q?",
-                "source": "taskpump:ask",
+                "source": "pump2:ask",
                 "ref": "pump:app:dv-1",
                 "profile": "app",
                 "deliver": True,

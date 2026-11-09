@@ -1,4 +1,4 @@
-"""Critic calibration on 3 current gymbro screens (dv-9133 phase 2 step 5).
+"""Critic calibration on 3 current app screens (dv-9133 phase 2 step 5).
 
 Contract: ``src.designloop.calibrate.calibrate(repo, report)`` (sync or
 async; ``scripts/designloop_calibrate`` wraps it) critiques the current refs
@@ -53,7 +53,7 @@ def _screen_of(request: CallRequest) -> str:
 
 
 async def test_calibration_report_holds_raw_critic_output_for_the_three_screens(
-    gymbro_repo, tmp_path, db
+    app_repo, tmp_path, db
 ):
     from src.designloop.calibrate import calibrate
 
@@ -76,7 +76,7 @@ async def test_calibration_report_holds_raw_critic_output_for_the_three_screens(
     )
     report = tmp_path / "calibration.md"
 
-    result: Any = calibrate(gymbro_repo, report)
+    result: Any = calibrate(app_repo, report)
     if inspect.isawaitable(result):
         await result
 
@@ -87,7 +87,7 @@ async def test_calibration_report_holds_raw_critic_output_for_the_three_screens(
         state = dict(SCREENS)[screen]
         images = {str(Path(p).resolve()) for p in request.images}
         for theme in ("dark", "light"):
-            assert str(ref(gymbro_repo, screen, state, theme).resolve()) in images
+            assert str(ref(app_repo, screen, state, theme).resolve()) in images
         assert request.purpose == "design_critic"
 
     # Industry references stand in for the owner's favourites.

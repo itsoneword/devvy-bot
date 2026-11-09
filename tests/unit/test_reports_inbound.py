@@ -31,7 +31,7 @@ def _router(policy: str = "owner") -> ReportsRouter:
         {"server-monitor": "Monitoring"},
         repo,
         [OWNER],
-        bindings={"Coach": "coach", "Monitoring": "devops"},
+        bindings={"Coach": "coach", "Monitoring": "monitoring"},
         inbound_policy=policy,
     )
 
@@ -39,7 +39,7 @@ def _router(policy: str = "owner") -> ReportsRouter:
 async def test_profile_for_thread_bound_unbound_and_wrong_chat() -> None:
     r = _router()
     assert await r.profile_for_thread(GROUP, 21) == "coach"
-    assert await r.profile_for_thread(GROUP, 22) == "devops"
+    assert await r.profile_for_thread(GROUP, 22) == "monitoring"
     assert await r.profile_for_thread(GROUP, 99) is None  # Pump etc.: unbound
     assert await r.profile_for_thread(GROUP, None) is None  # General
     assert await r.profile_for_thread(555, 21) is None
@@ -341,7 +341,7 @@ async def test_voice_in_bound_topic_reroutes_one_turn(tmp_path, monkeypatch):
     await orch.agentic_voice(update, context)
     # "Transcribing..." notice + typing go into the topic
     assert update.message.chat.send_action.call_args.kwargs["message_thread_id"] == 21
-    assert update.message.reply_text.await_args.args == ("Transcribing...",)
+    assert update.message.reply_text.await_args_list[0].args == ("Transcribing...",)
     voice_handler.process_voice_message.assert_awaited_once()
 
     request = orch._run_turn.call_args.args[0]

@@ -1,6 +1,6 @@
 [project]
 name = "devvy"
-version = "1.5.0"
+version = "1.7.0"
 description = "Devvy -- a self-hosted Telegram front-end for the Claude Code and OpenAI Codex CLIs"
 readme = "README.md"
 license = "MIT"
@@ -66,9 +66,11 @@ alembic = "^1.16"
 psycopg = {version = "^3.2", extras = ["binary"]}
 # Bot screens drawn at phone width for the Pump UI gate (dv-4cd8).
 pillow = "^13.0.0"
+textual = {version = "^8.2.8", optional = true}
 
 [tool.poetry.extras]
 voice = ["mistralai", "openai"]
+tui = ["textual"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.3"

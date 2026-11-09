@@ -2503,7 +2503,7 @@ class ClaudeSDKManager:
             # text is the CLI's limit line and 0 tokens; it used to log as an
             # ok turn. Checked once on the final result, never per event.
             limit = (
-                quota.parse_limit(result_content or "")
+                quota.parse_limit(result_content or "", provider="anthropic")
                 if result_is_error or not output_tokens
                 else None
             )

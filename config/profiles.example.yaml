@@ -114,6 +114,21 @@
 #       - ~/notes                       # Obsidian vault
 #       - ${DEVVY_ROOT}/../my-project   # another checkout on this host
 #
+# A profile that owns a task-pump board (config/taskpump/boards.json) must
+# also list the board's pump worktrees, `${DEVVY_ROOT}/pump-worktrees/<board>`:
+# they are git worktrees of the board's repo, and a `git worktree prune` (or
+# `worktree add`) run in the repo from inside the box treats every worktree
+# it cannot see as gone and drops its registration (docs/FINDINGS.md 2026-11-05).
+#
+# Optional `project_instructions:` names one readable project guide outside
+# the workspace. Its contents join the shared first-turn/window bundle for
+# both backends. Select it explicitly for a primary repo in `extra_dirs`;
+# do not use it for the cwd CLAUDE.md, which the CLI already loads, or infer
+# one from every extra directory (some are data or deployment checkouts).
+# A missing or unreadable source fails profile path validation at boot.
+#
+#     project_instructions: ${DEVVY_ROOT}/../my-project/CLAUDE.md
+#
 # Optional per-profile `sandbox_read_dirs:` (dv-98f2) lists directories a
 # SANDBOXED profile's bash may READ but not write (shared tool checkouts). Bash
 # runs in a bwrap box that contains only: the system (read-only), the

@@ -212,22 +212,19 @@ grep or version them by hand.
 
 ### Task pump (opt-in)
 
-`scripts/taskpump` works the board unattended: a task you move to `in_progress`
-is analysed, you get a short plan and up to three questions in Telegram, your
-answer arrives as an ordinary chat message, then it designs tests and implements
-on a `pump/<id>` branch in a git worktree. Separate **architect** (checks the plan),
-**review** (can send a build back once) and **acceptance** (runs the product) jobs
-bracket the build, and small tasks skip what they do not need. `deps:` and `start_at:`
-in a task's frontmatter hold its launch, and a pinned status post shows what runs, what
-needs you and what waits. Several builds run in parallel; the owner `/menu` Pump screen
-lists what waits for you and can freeze, thaw or prioritise. Each stage's model comes from
+`scripts/pump2` works the board unattended: a card you move to `in_progress` goes
+**analyze → tests → build → review → merge**, each stage one job in the card's own git
+worktree. Only analyze asks you, in Telegram, and your answer arrives as an ordinary
+chat message. `deps:` and `start_at:` in a card's frontmatter hold its launch, a pinned
+summary in the board's chat shows what runs and what needs you, and the owner `/menu`
+Pump screen can freeze, thaw or prioritise. Each stage's model comes from
 `config/models.yaml` (`jobs:`). UI work can use the **design loop**: label a card
-`designloop` and run `taskpump design run <board:id>` — Claude variants at phone width, a
-render/checks gate and critic rounds, then you pick one. Merging stays yours. It is off until
-you enable the timer (`deploy/taskpump.timer.template`, rendered by
+`designloop` and run `scripts/pump2 design run <board:id>` — Claude variants at phone
+width, a render/checks gate and critic rounds, then you pick one. It is off until you
+enable the timer (`deploy/pump2.timer.template`, rendered by
 `scripts/render_deploy.py`); other repos' boards are listed in your own
-`config/taskpump/boards.json` (see `boards.example.json`). Details:
-`docs/taskpump.md`.
+`config/taskpump/boards.json` (see `boards.example.json` and `docs/pump.md`); `scripts/pump2 doctor <board>`
+checks a new board before you enable the timer. Commands: `scripts/pump2 --help`.
 
 ### deviz
 
@@ -358,6 +355,27 @@ Full detail — prerequisites, what the installer touches, uninstall, troublesho
 each preflight failure — is in [docs/installation.md](docs/installation.md).
 
 > Installed **from source only**. Devvy is not on PyPI and there is no `pip install` route.
+
+### Local mode (beta) — the Pump on your laptop, no Telegram
+
+A second install for a Mac (or Linux / Windows via WSL2) that only wants the task pump: your
+own `claude` login, no bot token, no VPS. The server runs headless (`CHANNEL=local`) and a
+terminal UI is the interface: the pump's status pin, the questions it asks you, Approve/Deny
+for a job's risky action, running jobs and their output, and a "new task" form.
+
+```bash
+git clone https://github.com/itsoneword/devvy-bot.git
+cd devvy-bot
+./install.sh --local        # on macOS --local is implied
+scripts/devvy-tui           # the Pump TUI
+scripts/seatbelt_probe      # macOS, once: checks the job sandbox on your Mac
+```
+
+On macOS it installs two launchd agents (the server and a 5-minute pump tick), boxes every
+background job with `sandbox-exec` (Seatbelt), and runs one job at a time
+(`PUMP_MAX_CONCURRENT=1`, about 2 GB per job). **This is beta**: the Seatbelt profiles are
+tested as text on Linux and are only proven on your Mac once `seatbelt_probe` prints all
+PASS. Chat with the agents is not in local mode yet. Details: [docs/installation.md](docs/installation.md#local-mode-beta).
 
 ### Giving the bot an LLM login
 

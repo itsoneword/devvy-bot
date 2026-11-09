@@ -264,10 +264,10 @@ def test_pump_envelope_names_task_and_answer_command():
     assert pump_task_from_ref("job:x") is None
     env = pump_envelope("name:dv-1")
     # dv-a9b0: the card may sit in any board agent's chat, and sandboxed
-    # agents cannot run the script -> name the tools, not scripts/taskpump.
+    # agents cannot run the script -> name the tools, not scripts/pump2.
     assert "pump_pending" in env and "pump_answer" in env
     assert "name:dv-1" in env and "verbatim" in env
-    assert "scripts/taskpump" not in env and "in Pump" not in env
+    assert "scripts/pump2" not in env and "in Pump" not in env
 
 
 async def test_reply_context_uses_pump_envelope():
@@ -351,7 +351,7 @@ async def test_reply_to_gymbro_card_runs_on_gymbro_with_pump_tools():
     assert user_text == "1 default, 2 да"
     assert "pump_pending" in prompt and "pump_answer" in prompt
     assert "gymbro:dv-1" in prompt
-    assert "scripts/taskpump" not in prompt
+    assert "scripts/pump2" not in prompt
     assert prompt.endswith("1 default, 2 да")
 
 

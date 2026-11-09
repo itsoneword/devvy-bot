@@ -1,66 +1,19 @@
 {
   "_comment": [
-    "Other repos' deviz boards the pump serves (dv-57ba). Edited by hand only.",
-    "Each entry: name (short, lowercase; tasks show as <name>:dv-xxxx) and repo",
-    "(the repo top level, which must have .deviz/tasks/). Listing a board also",
-    "allows its repo for worktrees, branches and commits, like a repos line.",
-    "Optional intake: list = argv printing a JSON array of open items, each with",
-    "an id; close = argv run per filed item, {id} substituted; what = the noun",
-    "used in titles and messages. Both run with cwd = the board's repo.",
-    "Optional profile (dv-a438): the bot profile every job of this board runs",
-    "under (tool policy, cost attribution), and the profile whose job_start(task_id)",
-    "starts this board's tasks; default devops. Optional test: the repo's test",
-    "command, given to every job instead of 'find it in the repo's docs'.",
-    "Optional stages (dv-a438): extra pipeline stages for this board, any of",
-    "[\"architect\", \"review\", \"acceptance\"]: architect checks each plan against the repo's",
-    "docs/REQUIREMENTS.md (and docs/features.yaml if present, dv-224f) before the",
-    "owner sees it, review reads every build step;",
-    "each may return the work once; acceptance runs `acceptance.command` (argv,",
-    "cwd = the task's worktree) after review and judges the architect's criteria,",
-    "and runs only on a board with that block. Default none.",
-    "Optional acceptance.light_args (dv-7a10): argv appended to the command for a",
-    "task the architect (or the owner's answer) set to `light`; without it light runs full.",
-    "Optional acceptance.full_paths (dv-87b4): globs (fnmatch, `*` crosses `/`) of",
-    "schema/migration/DB/test-infra files; a branch diff touching one raises the task",
-    "to full, and so do a `pytest.` criterion tag and a perf/db/migration/load/scale",
-    "label; otherwise the architect's level (none = light where light_args exist).",
-    "Optional acceptance.max_minutes (dv-2514, default 60): the pump runs the command",
-    "itself before the acceptance agent starts; past this it is killed as a hang",
-    "(a mechanical stop, one auto-retry, then the owner), never a FAIL.",
-    "On a board with acceptance, build/review/test design run changed-area tests only.",
-    "This repo's own board takes them from PUMP_OWN_STAGES (default architect,review).",
-    "Optional deploy (dv-2263): where the board's prod says what it runs, so a",
-    "merged card can be marked live (pump_live, status done). Either log = an",
-    "absolute path to a deploy.py-style journal (`<ts> <old> -> <new> build=<b> ok`;",
-    "`rolled-back` lines put the old sha back), or started = argv printing when prod",
-    "last started (ISO or systemd @unix): live once it started after the merge.",
-    "Without it merges are tracked but never called live, and the pin never warns.",
-    "This repo's own board uses claude-bot's systemd start time.",
-    "This repo's own board is always served and needs no entry."
+    "Boards the pump serves; copy to boards.json and edit by hand.",
+    "Each board needs name, repo (the repo top level, with .deviz/tasks/),",
+    "\"pump2\": true (boards without it are skipped) and a test command",
+    "(pump2_test, or test): merge and pump2 doctor refuse a board without one.",
+    "Every other key is optional; the full table is in docs/pump.md."
   ],
   "boards": [
     {
-      "name": "other",
-      "repo": "/abs/path/to/another/repo",
-      "intake": {
-        "what": "report",
-        "list": [
-          "python3",
-          "tools/dump_reports.py",
-          "--json",
-          "--status",
-          "open"
-        ],
-        "close": [
-          "python3",
-          "tools/dump_reports.py",
-          "--mark-handled",
-          "{id}"
-        ]
-      },
-      "deploy": {
-        "log": "/abs/path/to/prod/logs/deploy.log"
-      }
+      "name": "myapp",
+      "repo": "/abs/path/to/repo",
+      "pump2": true,
+      "profile": "devops",
+      "pump2_test": "/abs/path/to/repo/.venv/bin/pytest -q",
+      "pump2_branch": "main"
     }
   ]
 }

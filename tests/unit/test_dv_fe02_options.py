@@ -19,8 +19,7 @@ Owner answers 3.1 and 3.2 (2026-10-25, "as proposed"):
      (default ``("user", "project")``) -> ``job_options``; plumbed through
      ``scripts/agentjob --setting-sources a,b`` and
      ``scripts/bgjob run --setting-sources`` (argparse dest
-     ``setting_sources``); taskpump passes ``project`` (tested in
-     ``tests/unit/test_scripts/test_dv_fe02_phase3.py``).
+     ``setting_sources``); pump2 passes ``project``.
 
 The effective ``--settings`` value is read the way the SDK builds it for the
 CLI (``SubprocessCLITransport._build_settings_value``, which merges the chat's
@@ -241,14 +240,18 @@ def _load_agentjob() -> Any:
 
 
 def _agentjob_spec(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *extra: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *extra: str,
+    override_cwd: Path | None = None,
+    extra_dirs: tuple[Path, ...] = (),
 ) -> JobSpec:
     """Run scripts/agentjob's main() with fakes; return the JobSpec it built."""
     agentjob = _load_agentjob()
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("do it")
     cwd = tmp_path / "wt"
-    cwd.mkdir()
+    cwd.mkdir(exist_ok=True)
     profile = type(
         "P",
         (),
@@ -257,6 +260,7 @@ def _agentjob_spec(
             "sandbox": False,
             "unrestricted": False,
             "working_dir": cwd,
+            "extra_dirs": extra_dirs,
         },
     )()
     registry = type("R", (), {"get_by_slug": lambda self, slug: profile})()
@@ -290,13 +294,36 @@ def _agentjob_spec(
             "--prompt-file",
             str(prompt),
             "--cwd",
-            str(cwd),
+            str(override_cwd or cwd),
             *extra,
         ],
     )
     assert agentjob.main() == 0
     assert len(seen) == 1
     return seen[0]
+
+
+def test_agentjob_codex_owner_cwd_keeps_configured_extra_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cwd = tmp_path / "wt" / "users" / "1001"
+    cwd.mkdir(parents=True)
+    extra = tmp_path / "obsidian"
+    extra.mkdir()
+    spec = _agentjob_spec(monkeypatch, tmp_path, override_cwd=cwd, extra_dirs=(extra,))
+    assert spec.working_directory == cwd
+    assert extra in spec.extra_dirs
+
+
+def test_agentjob_pump_cwd_does_not_inherit_profile_extra_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pump = tmp_path / "pump-worktrees" / "dv-5a35"
+    pump.mkdir(parents=True)
+    extra = tmp_path / "obsidian"
+    extra.mkdir()
+    spec = _agentjob_spec(monkeypatch, tmp_path, override_cwd=pump, extra_dirs=(extra,))
+    assert spec.extra_dirs == ()
 
 
 def test_agentjob_setting_sources_flag_reaches_the_job_spec(
@@ -323,9 +350,18 @@ def _run_sh(bgjob: Any, tmp_path: Path, monkeypatch: Any, **extra: Any) -> str:
     class R:
         returncode = 0
         stderr = ""
-        stdout = ""
 
-    monkeypatch.setattr(bgjob.subprocess, "run", lambda cmd, **kw: R())
+        def __init__(self, stdout: str = "") -> None:
+            self.stdout = stdout
+
+    # The route probe must answer: an empty answer aborts the launch (dv-a8e4).
+    route = '{"harness": "claude", "provider": "anthropic_sub", "model": "sonnet"}'
+
+    monkeypatch.setattr(
+        bgjob.subprocess,
+        "run",
+        lambda cmd, **kw: R(route if "--print-route" in cmd else ""),
+    )
     fields = {
         "prompt": "do it",
         "profile": "general",

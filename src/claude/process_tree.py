@@ -25,9 +25,32 @@ logger = structlog.get_logger()
 _PROC = "/proc"
 
 
+def _ps_parent_map() -> Dict[int, int]:
+    """pid -> ppid from ``ps``, for hosts without ``/proc`` (macOS, dv-fe4d)."""
+    import subprocess
+
+    parents: Dict[int, int] = {}
+    try:
+        out = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return parents
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            parents[int(parts[0])] = int(parts[1])
+    return parents
+
+
 def _parent_map() -> Dict[int, int]:
     """pid -> ppid for every process we can read."""
     parents: Dict[int, int] = {}
+    if not os.path.isdir(_PROC):
+        return _ps_parent_map()
     try:
         names = os.listdir(_PROC)
     except OSError:
@@ -71,6 +94,14 @@ def _signal(pid: int, sig: int) -> None:
 
 
 def _alive(pid: int) -> bool:
+    if not os.path.isdir(_PROC):  # macOS: no zombie check without /proc
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
     try:
         with open(f"{_PROC}/{pid}/stat", "rb") as fh:
             state = fh.read().decode("utf-8", "replace").rsplit(")", 1)[-1].split()[0]

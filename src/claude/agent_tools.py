@@ -20,6 +20,8 @@ import asyncio
 import json
 import os
 import re
+import shlex
+import sys
 from datetime import UTC, datetime
 from datetime import tzinfo as _tzinfo
 from pathlib import Path
@@ -29,8 +31,13 @@ import structlog
 from claude_agent_sdk import create_sdk_mcp_server
 
 from ..evaluator.validator import MAX_CONTENT_LENGTH, VALID_TIERS
+from ..evaluator.writer import effective_from
 from ..events.types import AgentResponseEvent
+from ..model_router.routes import JOB_HARNESS_OVERRIDES
+from ..pump2.design import DESIGN_AWAITING, DESIGN_RUNNING, _fm_str, is_designloop
+from ..pump2.state import HOME_REPO, find_card, load_boards
 from ..storage import board_policy
+from ..utils import boards as boards_mod
 from .exchange_tools import EXCHANGE_SPECS, ONCHAIN_SPECS
 from .hireli_tools import HIRELI_SPECS
 from .image_tools import IMAGE_SPECS
@@ -56,6 +63,8 @@ logger = structlog.get_logger()
 # limit for both write paths, so a fact the tool accepts is one the batch job
 # would also have accepted.
 MAX_FACT_CHARS = MAX_CONTENT_LENGTH
+# remember(source_ref=...): a repo path or card id, never a document (dv-32fe).
+MAX_SOURCE_REF_CHARS = 200
 
 # `recall` (facts): explicit retrieval has no per-turn injection cap to lean
 # on, so it needs its own ceiling on how much a single call can return.
@@ -281,7 +290,7 @@ def _resolve_working_dir(
 @_spec(
     "notify",
     "Send the user a Telegram message right now. Owners may set source to "
-    "server-monitor, taskpump:status, crypto, or news to route a report to "
+    "server-monitor, crypto, or news to route a report to "
     "the matching reports topic. Omit source for a direct message.",
     tool_schema({"text": str, "source": str}, "text"),
 )
@@ -293,8 +302,7 @@ async def notify(
         return _err("text is required")
     source = (args.get("source") or "").strip()
     if source and (
-        ctx.role != "owner"
-        or source not in {"server-monitor", "taskpump:status", "crypto", "news"}
+        ctx.role != "owner" or source not in {"server-monitor", "crypto", "news"}
     ):
         return _err("source is restricted to owner report routes")
     # Requester chat comes from server context only; a model-supplied
@@ -348,8 +356,9 @@ def _restart_available(services: AgentServices, ctx: TurnContext) -> bool:
     "restart_bot",
     "Restart the bot process to apply code or config changes. The restart "
     "runs AFTER this turn's reply is sent and saved and every other agent's "
-    "turn in flight has ended (at most 10 min). Call it, then finish your "
-    "reply normally. Never run `systemctl restart claude-bot` yourself: it "
+    "turn in flight has ended (at most 10 min). A boot check of the code and "
+    "config runs first; if it fails, nothing restarts and the result says why. "
+    "Call it, then finish your reply normally. Never run `systemctl restart claude-bot` yourself: it "
     "kills this turn before it is saved and the next turn will not know it "
     "happened.",
     tool_schema({"reason": str}),
@@ -368,6 +377,16 @@ async def restart_bot(
         user_id=ctx.user_id,
         status=status,
     )
+    if status.startswith("refused"):
+        # dv-86f4: the boot check failed; the bot keeps running as it is.
+        return _text(
+            {
+                "status": "refused",
+                "why": status.partition(":")[2].strip(),
+                "next": "tell the owner why; fix it and call restart_bot "
+                "again, or the owner sends /restart force",
+            }
+        )
     return _text(
         {
             "status": status,
@@ -438,9 +457,7 @@ async def schedule_add(
             return _err(f"could not parse 'at' datetime: {at_raw!r}")
         if run_at <= datetime.now(UTC):
             return _err("'at' is in the past")
-    target = _resolve_working_dir(
-        services, ctx, args.get("profile") or ctx.profile_slug
-    )
+    target = _resolve_working_dir(services, ctx, args.get("profile"))
     try:
         job_id = await services.scheduler.add_job(
             job_name=name,
@@ -731,7 +748,7 @@ async def _bgjob(
 
 
 async def _run_script(ctx: TurnContext, name: str, *argv: str) -> Dict[str, Any]:
-    """Run scripts/<name> (bgjob, taskpump) out-of-sandbox, owner only."""
+    """Run scripts/<name> (bgjob, pump2) out-of-sandbox, owner only."""
     # Invocation-time role gate (dv-a900), independent of the mount-time
     # filter below: even if a job tool ever ends up mounted in a
     # non-owner session (mis-wire, stale tool reference), the call still
@@ -775,19 +792,31 @@ async def run_repo_script(name: str, *argv: str) -> "tuple[int, str]":
     return (rc if isinstance(rc, int) else 0), text
 
 
+# --- Pump v2 is the only pump (dv-81a7) ------------------------------------
+PUMP2_NOT_V1 = "not in pump2 v1"
+
+
+def pump_card_route(task_id: str, board: str = "") -> "tuple[str, str]":
+    """("pump2", `board:id`) for one card. pump2 names every card `board:id`;
+    a bare id belongs to `board` (the caller's), else to the home board."""
+    named, _, bare = task_id.rpartition(":")
+    return "pump2", f"{named or board or boards_mod.HOME_BOARD}:{bare}"
+
+
 async def _caller_board(ctx: TurnContext) -> "tuple[str, Dict[str, Any] | None]":
     """(board, None) for the caller's profile, or ("", error). The caller's
-    profile picks the board — two boards can both mint `dv-` ids — and taskpump
-    is the one reader of the boards file. Never a tool parameter."""
-    found = await _run_script(ctx, "taskpump", "board-of", ctx.profile_slug)
-    if found.get("isError") and ctx.role != "owner":
-        return "", found  # _run_script's role refusal, passed through as is
-    if found.get("isError"):
+    profile picks the board (two boards can both mint `dv-` ids), resolved by
+    `boards.board_of_profile`. Never a tool parameter."""
+    # Invocation-time owner gate, as _run_script's (job tools are owner only).
+    if ctx.role != "owner":
+        return "", _err("background jobs are not available in this session")
+    board = boards_mod.board_of_profile(ctx.profile_slug)
+    if board is None:
         return "", _err(
             f"this agent ({ctx.profile_slug}) has no board in the task pipeline; "
             "use job_start without task_id for one-off work"
         )
-    return found["content"][0]["text"].strip().splitlines()[-1].strip(), None
+    return board, None
 
 
 def _on_board(board: str, task_id: str) -> "tuple[str, Dict[str, Any] | None]":
@@ -798,16 +827,96 @@ def _on_board(board: str, task_id: str) -> "tuple[str, Dict[str, Any] | None]":
     return f"{board}:{bare}", None
 
 
-async def _start_board_task(ctx: TurnContext, task_id: str) -> Dict[str, Any]:
+async def _start_board_task(
+    services: AgentServices, ctx: TurnContext, task_id: str
+) -> Dict[str, Any]:
     """job_start(task_id) (dv-a438): put the ticket into the board pipeline
-    (`taskpump start`) instead of running it as one job."""
+    (`pump2 start`) instead of running it as one job."""
     board, err = await _caller_board(ctx)
     if err:
         return err
     full, err = _on_board(board, task_id)
     if err:
         return err
-    return await _run_script(ctx, "taskpump", "start", full, "--by", ctx.profile_slug)
+    design, err = _designloop_card(full)
+    if err:
+        return err
+    if design:
+        return await _start_design_run(services, ctx, full)
+    return await _run_script(ctx, "pump2", "start", full, "--by", ctx.profile_slug)
+
+
+def _designloop_card(full: str) -> "tuple[bool, Dict[str, Any] | None]":
+    """(is a designloop card, error) for `board:id` (dv-06e6), by the same
+    lookup as `pump2 start`; a board it does not serve is left to it."""
+    name, _, cid = full.partition(":")
+    try:
+        board = load_boards(boards_mod.BOARDS_FILE_DEFAULT, guard=True).get(name)
+    except (OSError, ValueError) as exc:
+        logger.warning("job_start: boards file unreadable", error=str(exc))
+        return False, None
+    if board is None:  # not served by pump2: `pump2 start` refuses it
+        return False, None
+    try:
+        card = find_card(board, cid)
+    except (OSError, ValueError) as exc:
+        return False, _err(f"{full}: {exc}")
+    if not is_designloop(card):
+        return False, None
+    state = _fm_str(card, "design_state")
+    if card.fm.get("status") == "done" or state in (
+        DESIGN_RUNNING,
+        DESIGN_AWAITING,
+        "picked",
+    ):
+        return True, _err(
+            f"{full}: no new design run (design_state={state or 'none'}, "
+            f"status={card.fm.get('status')})"
+        )
+    return True, None
+
+
+async def _start_design_run(
+    services: AgentServices, ctx: TurnContext, full: str
+) -> Dict[str, Any]:
+    """`pump2 design run <board:id>` as a detached bgjob, run by the bot
+    outside the caller's bash box (as the tick runs pump2): a sandboxed board
+    agent cannot reach scripts/pump2 from its box (dv-06e6). `full` is a
+    validated id on the caller's own board."""
+    # The bot's own venv python, as pump2.timer runs `poetry run python`:
+    # the design path imports src.model_router (structlog), which the
+    # script's `#!/usr/bin/env python3` system python lacks.
+    pump2 = str(HOME_REPO / "scripts" / "pump2")
+    cmd = shlex.join([sys.executable, pump2, "design", "run", full])
+    return await _bgjob(
+        services,
+        ctx,
+        "run",
+        "--profile",
+        ctx.profile_slug,
+        *_job_scope(services, ctx, HOME_REPO),
+        "--name",
+        f"design-{full.partition(':')[2]}",
+        "--queue",
+        "--cmd",
+        cmd,
+    )
+
+
+def _job_scope(services: AgentServices, ctx: TurnContext, cwd: Any) -> List[str]:
+    """bgjob's --cwd / --user-id / --chat-id for a job started by this turn."""
+    scope = ["--cwd", str(cwd)]
+    if ctx.user_id is not None:
+        scope += ["--user-id", str(ctx.user_id)]
+    # The reports group is never a bare destination: sent there without a
+    # thread id, the digest and pings would land in General. Without
+    # --chat-id bgjob targets the owner's own chat (user_id), which the
+    # ReportsRouter routes to the profile's topic / Jobs (dv-5a35).
+    if ctx.requester_chat_id is not None and (
+        ctx.requester_chat_id != services.reports_chat_id
+    ):
+        scope += ["--chat-id", str(ctx.requester_chat_id)]
+    return scope
 
 
 async def _refresh_jobs_pin(services: AgentServices, ctx: TurnContext) -> None:
@@ -842,12 +951,17 @@ async def _refresh_jobs_pin(services: AgentServices, ctx: TurnContext) -> None:
         logger.warning("jobs pin refresh failed", error=str(exc))
 
 
-_TASK_ID_RE = re.compile(r"^([a-z]+:)?dv-[0-9a-f]{4,}$")
+# A board card id: `dv-xxxx`, `gb-xxxx` (hex), optionally `board:` first.
+_TASK_ID_RE = re.compile(r"^([a-z][a-z0-9-]{0,15}:)?[a-z]{2,8}-[0-9a-f]{4,}$")
 
 
 def valid_task_id(task_id: str) -> bool:
-    """A board ticket id (`dv-xxxx`, optionally `board:dv-xxxx`)."""
+    """A board card id (`dv-xxxx`, `gb-xxxx`, optionally `board:<id>`)."""
     return bool(_TASK_ID_RE.match(task_id))
+
+
+# `pump2` as a command word: at the start, after a separator or as a path tail
+_PUMP2_CMD = re.compile(r"(?:^|[;&|(])\s*(?:\S*/)?pump2(?=\s|$|[;&|)])")
 
 
 def _command_job_argv(
@@ -877,6 +991,13 @@ def _command_job_argv(
         )
     if turn.full_access:
         return command, ""
+    if _PUMP2_CMD.search(command):
+        # dv-92ee: pump2 is not reachable from the bash box (exit 127)
+        return "", (
+            "pump2 does not run in this profile's job box; use "
+            "job_start(task_id=<board:id>) instead: it starts a designloop "
+            "card's design run or puts the card into the pipeline"
+        )
     profile = registry.get_by_working_dir(ctx.working_dir) if registry else None
     box = BashBox.for_profile(profile, Path(ctx.working_dir))
     try:
@@ -894,10 +1015,12 @@ def _command_job_argv(
     "user when it finishes. The job runs in YOUR profile's workspace and "
     "can only write there. Give it a self-contained prompt: it starts "
     "fresh with no memory of this conversation. For a board ticket pass "
-    "task_id (dv-xxxx) instead: that starts no job here but puts the "
-    "ticket of YOUR board into the task pipeline (analysis -> owner "
+    "task_id (dv-xxxx, gb-xxxx) instead: that starts no job here but puts "
+    "the ticket of YOUR board into the task pipeline (analysis -> owner "
     "questions -> build -> owner review, each step a separate job, hours "
-    "not minutes); creating a task does not start it, this does. You do "
+    "not minutes); creating a task does not start it, this does; on a STOPPED card it "
+    "restarts it at the stage it stopped in; on a designloop card it starts "
+    "its design run. You do "
     "not execute board tasks yourself, and prompt is then optional. A profile with no board "
     "gets an error. Standing job rules and the <summary> contract are added "
     "automatically; do not restate them. Tell the user it is running and "
@@ -912,7 +1035,10 @@ def _command_job_argv(
     "force=true only for an intentional re-run. Jobs you start in the same "
     "turn are reported back together in ONE digest in this chat when all "
     "have finished (or 30 min after the first), so start related jobs in "
-    "one turn.",
+    'one turn. harness="claude" runs ONE prompt job on Claude even '
+    "while the owner's jobs switch routes jobs to Codex (an explicit retry "
+    "of a failed Codex job); omit it otherwise. A failed Codex job is never "
+    "retried on Claude by itself.",
     tool_schema(
         {
             "prompt": str,
@@ -920,6 +1046,7 @@ def _command_job_argv(
             "name": str,
             "task_id": str,
             "force": bool,
+            "harness": str,
         }
     ),
     available=_jobs_available,
@@ -930,13 +1057,24 @@ async def job_start(
     prompt = (args.get("prompt") or "").strip()
     command = (args.get("command") or "").strip()
     task_id = (args.get("task_id") or "").strip()
+    harness = args.get("harness") or None
     if command and task_id:
         return _err("task_id is for prompt jobs, not command jobs")
+    if harness is not None:
+        # dv-a8e4: a one-job override of the jobs switch, for prompt jobs only
+        # (a command job has no model; a board task runs the pump's routes).
+        if harness not in JOB_HARNESS_OVERRIDES:
+            return _err(
+                f"harness must be one of {sorted(JOB_HARNESS_OVERRIDES)}, "
+                f"not {harness!r}"
+            )
+        if command or task_id:
+            return _err("harness is for prompt jobs, not command or task_id jobs")
     if task_id:
         if not valid_task_id(task_id):
-            return _err("task_id must look like dv-xxxx")
+            return _err("task_id must look like dv-xxxx, gb-xxxx or board:<id>")
         logger.info("agent tool job_start", profile=ctx.profile_slug, task=task_id)
-        return await _start_board_task(ctx, task_id)
+        return await _start_board_task(services, ctx, task_id)
     if bool(prompt) == bool(command):
         return _err("give exactly one of prompt or command")
     # --name takes a VALUE, and argparse rejects a value that looks like an
@@ -944,6 +1082,7 @@ async def job_start(
     # than passed through. bgjob slugifies the rest itself.
     name = (args.get("name") or "job").strip().lstrip("-") or "job"
     logger.info("agent tool job_start", profile=ctx.profile_slug, name=name)
+    job_scope = _job_scope(services, ctx, ctx.working_dir)
     if command:
         run_cmd, err = _command_job_argv(services, ctx, command)
         if err:
@@ -954,6 +1093,7 @@ async def job_start(
             "run",
             "--profile",
             ctx.profile_slug,
+            *job_scope,
             "--name",
             name,
             # Command jobs (release check, full suite) wait for a slot when
@@ -983,9 +1123,11 @@ async def job_start(
         "run",
         "--profile",
         ctx.profile_slug,
+        *job_scope,
         "--name",
         name,
         *(["--force"] if args.get("force") else []),
+        *(["--harness", harness] if harness else []),
         # Jobs started in this turn are digested together in the agent's chat.
         "--batch",
         ctx.turn_id,
@@ -995,7 +1137,7 @@ async def job_start(
 
 
 # Pump tools (dv-a9b0): a sandboxed board agent (e.g. `app`) cannot run
-# scripts/taskpump in its bash box, so status / pending / answer are tools,
+# scripts/pump2 in its bash box, so status / pending / answer are tools,
 # pinned like job_start(task_id) to the caller's own board.
 _PUMP_ID_RE = re.compile(r"^([a-z][a-z0-9-]{0,15}:)?[a-z]{2,8}-[0-9a-z]{4,}$")
 
@@ -1013,7 +1155,7 @@ async def pump_status(
     board, err = await _caller_board(ctx)
     if err:
         return err
-    return await _run_script(ctx, "taskpump", "status", "--board", board)
+    return await _run_script(ctx, "pump2", "status", board)
 
 
 @_spec(
@@ -1030,7 +1172,7 @@ async def pump_pending(
     board, err = await _caller_board(ctx)
     if err:
         return err
-    return await _run_script(ctx, "taskpump", "pending", "--board", board)
+    return await _run_script(ctx, "pump2", "pending", board)
 
 
 @_spec(
@@ -1060,7 +1202,7 @@ async def pump_answer(
         return err
     logger.info("agent tool pump_answer", profile=ctx.profile_slug, task=full)
     # The owner's words after `--`: no reply text can be read as an option.
-    return await _run_script(ctx, "taskpump", "answer", full, "--", text)
+    return await _run_script(ctx, "pump2", "answer", full, "--", text)
 
 
 _PUMP_ACTIONS = ("freeze", "thaw", "urgent")
@@ -1068,14 +1210,15 @@ _PUMP_ACTIONS = ("freeze", "thaw", "urgent")
 
 @_spec(
     "pump_control",
-    "Pause / resume the task pipeline on EVERY board (dv-b17e). "
-    "action=freeze: no new launches anywhere, running pump jobs stop, every "
-    "task keeps its status, branch and committed phases. action=urgent + "
-    "task_id (any board, `board:dv-xxxx`): freeze, then run that one task "
-    "alone past caps and deps; the owner is told when it reaches review. "
-    "action=thaw: every stopped stage reruns as a fresh job. Only on the "
-    "owner's explicit 'freeze/stop the pump' or 'do X first' — never on a "
-    "casual 'pause' or to tidy up, since it stops every board's work.",
+    "Pause / resume the task pipeline (Pump v2) on EVERY board (dv-44b1). "
+    "action=freeze: no new stage launches anywhere; running jobs and merges "
+    "already launched finish and are reaped as usual (nothing is stopped or "
+    "rerun), the next stage then waits. action=urgent + task_id "
+    "(`board:dv-xxxx`, bare = home board): freeze, but that one card keeps "
+    "launching; the urgent mark clears when it reaches done or stopped (the "
+    "freeze stays). action=thaw: launches resume on the next tick. Only on "
+    "the owner's explicit 'freeze/stop the pump' or 'do X first' — never on "
+    "a casual 'pause' or to tidy up, since it holds every board's work.",
     tool_schema({"action": str, "task_id": str}, "action"),
     available=_jobs_available,
 )
@@ -1091,11 +1234,12 @@ async def pump_control(
         if not _PUMP_ID_RE.match(task_id):
             return _err("urgent needs task_id like dv-xxxx or board:dv-xxxx")
         # Global, not _caller_board: freeze/urgent span every board.
-        argv += ["--", task_id]
+        named, _, bare = task_id.rpartition(":")
+        argv += ["--", f"{named or boards_mod.HOME_BOARD}:{bare}"]
     logger.info(
         "agent tool pump_control", profile=ctx.profile_slug, action=action, task=task_id
     )
-    return await _run_script(ctx, "taskpump", *argv)
+    return await _run_script(ctx, "pump2", *argv)
 
 
 @_spec(
@@ -1154,6 +1298,17 @@ async def job_output(
     return await _bgjob(services, ctx, *argv)
 
 
+# dv-ef59: what each ``effective`` value means, appended to the memory tools'
+# result detail.
+_EFFECTIVE_DETAIL = {
+    "next_turn": "binds from your next message in this conversation",
+    "next_window": (
+        "your prompt picks it up at the next window, not in this "
+        "conversation — until then only this conversation carries it"
+    ),
+}
+
+
 @_spec(
     "remember",
     "Save one durable fact about the user to long-term memory RIGHT NOW, "
@@ -1177,17 +1332,28 @@ async def job_output(
     "via recall. Not for task/ticket status ('dv-xxxx merged', 'started X', "
     "'raised Y to 5', 'implemented in <sha>'): it goes stale and contradicts "
     "the next status; status lives on the board (task_comment on that card). "
-    "Pinned and core facts enter EVERY future turn, so use them for what "
-    "matters and nothing else. scope: 'private' (default, only this user) or 'family' "
+    "Pinned and core facts enter EVERY future turn, starting with your next "
+    "message in this conversation, so use them for what matters and nothing "
+    "else. A general fact is stored at once but enters your prompt only at "
+    "the next window; until then it lives only in this conversation. The "
+    "result's 'effective' says which ('next_turn' / 'next_window'): tell "
+    "the user that, not that it already applies. scope: 'private' (default, only this user) or 'family' "
     "(shared with the user's household; silently downgraded to private if "
     "they have no family). You may NOT choose whose memory this lands in: "
     "it is always the current session's own. Saying 'I'll remember that' "
     "without calling this tool is a lie — a separate batch process may "
-    "catch the fact hours later, or may not.",
+    "catch the fact hours later, or may not. "
+    "source_ref (optional): where a per-task project decision is recorded "
+    "in your repo ('docs/DECISIONS.md' or a card id like 'gb-1ab3'); the "
+    "full text is kept and only a one-line pointer is injected. status "
+    "'saved_not_in_repo' = the repo does not hold it yet: add it there.",
     # Only 'fact' is required. 'tier' especially must stay optional: it
     # decides whether the fact becomes a standing constraint injected into
     # every future turn, and a forced choice is a guessed one.
-    tool_schema({"fact": str, "tier": str, "scope": str, "label": str}, "fact"),
+    tool_schema(
+        {"fact": str, "tier": str, "scope": str, "label": str, "source_ref": str},
+        "fact",
+    ),
     available=_memory_write_available,
 )
 async def remember(
@@ -1210,6 +1376,14 @@ async def remember(
     if tier not in VALID_TIERS:
         return _err(f"tier must be one of {sorted(VALID_TIERS)}")
     label = _str_arg(args, "label") or None
+    # dv-32fe: a repo-relative path or card id. The writer checks it against
+    # the agent's repo (pointer when verified, flagged full fact when not).
+    source_ref = _str_arg(args, "source_ref") or None
+    if source_ref is not None:
+        if len(source_ref) > MAX_SOURCE_REF_CHARS:
+            return _err(f"source_ref must be at most {MAX_SOURCE_REF_CHARS} characters")
+        if source_ref.startswith(("/", "~")) or ".." in source_ref.split("/"):
+            return _err("source_ref must be a path inside your repo or a card id")
 
     # `scope` is a SELECTOR between two server-derived scopes, never a
     # scope identifier. Anything that isn't the literal "family" -- an
@@ -1225,21 +1399,23 @@ async def remember(
     )
 
     writer = services.memory_writer
+    op: Dict[str, Any] = {
+        "op": "add",
+        # In-session captures are user facts by definition;
+        # conversation results reach memory via the evaluator.
+        "kind": "user_fact",
+        "tier": tier,
+        "content": fact,
+        "label": label,
+        "scope": "family" if target != ctx.memory_agent_id else "private",
+    }
+    if source_ref is not None:
+        # A recorded decision: offered as a pointer, the writer decides.
+        op.update(kind="conversation_result", source_ref=source_ref)
     try:
         applied = await writer.apply_ops(
             ctx.memory_agent_id,
-            [
-                {
-                    "op": "add",
-                    # In-session captures are user facts by definition;
-                    # conversation results reach memory via the evaluator.
-                    "kind": "user_fact",
-                    "tier": tier,
-                    "content": fact,
-                    "label": label,
-                    "scope": "family" if target != ctx.memory_agent_id else "private",
-                }
-            ],
+            [op],
             family_agent_id=ctx.family_agent_id,
         )
     except Exception as exc:
@@ -1256,6 +1432,8 @@ async def remember(
         if applied.added
         else ("duplicate" if applied.dropped_duplicate else "failed")
     )
+    if status == "saved" and applied.not_in_repo:
+        status = "saved_not_in_repo"
     # One line per call, whatever the outcome. tool_calls already records
     # that the call happened; this records what it did, so "the model
     # called remember and nothing landed" is visible instead of silent.
@@ -1269,18 +1447,27 @@ async def remember(
     )
     if status == "failed":
         return _err("the fact could not be saved; do not tell the user it was")
-    return _text(
-        {
-            "status": status,
-            "scope": "family" if target != ctx.memory_agent_id else "private",
-            "tier": tier,
-            "detail": (
-                "already known, nothing written"
-                if status == "duplicate"
+    payload: Dict[str, Any] = {
+        "status": status,
+        "scope": "family" if target != ctx.memory_agent_id else "private",
+        "tier": tier,
+        "detail": (
+            "already known, nothing written"
+            if status == "duplicate"
+            else (
+                f"saved as a fact, flagged: not found in {source_ref}; add "
+                "it there and remember again with source_ref"
+                if status == "saved_not_in_repo"
                 else "stored in long-term memory"
-            ),
-        }
-    )
+            )
+        ),
+    }
+    if status != "duplicate":
+        # dv-ef59: say when it binds, so "got it, done" is never claimed
+        # for a fact that only reaches the prompt at the next window.
+        payload["effective"] = effective_from(tier)
+        payload["detail"] += "; " + _EFFECTIVE_DETAIL[payload["effective"]]
+    return _text(payload)
 
 
 @_spec(
@@ -1572,13 +1759,16 @@ async def memory_forget(
         return _err(
             "the fact could not be closed; do not tell the user it was " "forgotten"
         )
+    effective = effective_from(fact.tier)
     return _text(
         {
             "status": "forgotten",
             "id": fact.id,
             "content": fact.content,
             "scope": scope,
-            "detail": "closed, not deleted — history is preserved",
+            "effective": effective,
+            "detail": "closed, not deleted — history is preserved; "
+            + _EFFECTIVE_DETAIL[effective],
         }
     )
 
@@ -1673,7 +1863,9 @@ async def memory_correct(
             "old_content": fact.content,
             "new_content": new_fact,
             "scope": scope,
-            "detail": "old fact closed and linked; new fact saved verbatim",
+            "effective": effective_from(fact.tier),
+            "detail": "old fact closed and linked; new fact saved verbatim; "
+            + _EFFECTIVE_DETAIL[effective_from(fact.tier)],
         }
     )
 

@@ -13,7 +13,7 @@ from src.utils.agent_env import is_secret_name, scrub_process_env
 from src.utils.paths import data_layout
 
 from .environments import DevelopmentConfig, ProductionConfig, TestingConfig
-from .settings import Settings
+from .settings import PROCESS_ENV_ONLY, Settings
 
 logger = structlog.get_logger()
 
@@ -65,6 +65,8 @@ def load_config(
             approved_directory=os.getenv("APPROVED_DIRECTORY"),
             debug_mode=os.getenv("DEBUG"),
         )
+
+        _refuse_process_env_only_keys(env_files)
 
         # Load base settings from environment variables
         # pydantic-settings will automatically read from environment variables
@@ -146,6 +148,26 @@ def scrub_secrets_from_environ(
     removed = scrub_process_env(secret_env_names(settings, env_file))
     logger.info("Scrubbed secrets from process env", names=removed)
     return removed
+
+
+def _refuse_process_env_only_keys(env_files: tuple) -> None:
+    """A config or secrets file must not set a ``PROCESS_ENV_ONLY`` key.
+
+    Every agent job reads those files (bot.env carries agentctl's bearer), so
+    e.g. a LOCAL_TUI_SECRET there would let a job approve its own ask
+    (dv-fe4d). Refuse to boot rather than quietly use or ignore it."""
+    for path in env_files:
+        if not Path(path).exists():
+            continue
+        found = sorted(
+            k for k in dotenv_values(path) if k and k.upper() in PROCESS_ENV_ONLY
+        )
+        if found:
+            raise InvalidConfigError(
+                f"{', '.join(found)} must not be set in {path}: every agent job "
+                "can read that file. Delete the line; the server keeps the "
+                "local TUI credential in its own file (secrets/tui.secret)."
+            )
 
 
 def _export_config_env(env_file: Path) -> None:

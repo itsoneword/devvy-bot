@@ -75,6 +75,10 @@ class EventBus:
         )
         await self._queue.put(event)
 
+    @property
+    def running(self) -> bool:
+        return self._running
+
     async def start(self) -> None:
         """Start processing events from the queue."""
         if self._running:

@@ -56,10 +56,10 @@ def test_job_row_with_a_fallback_is_rejected(tmp_path: Path) -> None:
 
 
 def test_unknown_job_route_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="pump_nope"):
-        _routes(tmp_path, "jobs:\n  pump_nope: {}\n")
+    with pytest.raises(ValueError, match="nope_row"):
+        _routes(tmp_path, "jobs:\n  nope_row: {}\n")  # pump_<x> is a custom stage
     with pytest.raises(ValueError, match="unknown job route"):
-        CallRoutes().resolve_job("pump_nope")
+        CallRoutes().resolve_job("nope_row")
 
 
 def test_openrouter_job_without_a_model_is_rejected(tmp_path: Path) -> None:
@@ -116,17 +116,25 @@ def _spec(tmp_path: Path, route: Route) -> JobSpec:
     )
 
 
-async def test_a_codex_job_route_fails_loud_without_running(
+async def test_a_codex_job_route_runs_on_codex_never_on_claude(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Codex jobs come in phase 3: until then a codex route never runs the
-    job on Claude instead."""
+    """Codex jobs exist since dv-d63d: a codex route goes to the Codex runner
+    (stubbed here) and never runs the job on Claude instead."""
     monkeypatch.setattr(
         "src.model_router.job.ClaudeSDKClient",
         lambda *a, **k: pytest.fail("no client may be built"),
     )
+    seen: list = []
+
+    async def fake_codex(spec: JobSpec, link: BotLink, out: object = None) -> int:
+        seen.append(spec.route.harness)
+        return 7
+
+    monkeypatch.setattr("src.model_router.job_codex.run_codex_job", fake_codex)
     route = Route("openai_codex", "openai", "openai-codex/gpt-6-sol")
-    assert await run_job(_spec(tmp_path, route), BotLink("http://x:1", None)) == 2
+    assert await run_job(_spec(tmp_path, route), BotLink("http://x:1", None)) == 7
+    assert seen == ["openai_codex"]
 
 
 async def test_an_openrouter_job_with_no_key_fails_cleanly(

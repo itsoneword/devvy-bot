@@ -128,7 +128,8 @@ async def test_switch_arms_full_rebuild_without_roll(storage, tmp_path):
     # Durable intent: fresh session, seeded from the CURRENT window.
     assert after.force_new_session is True
     assert after.pending_seed_window == after.window_id
-    assert context.user_data["force_new_session"] is True
+    # Row only, never the per-user dict every profile shares (dv-3114).
+    assert "force_new_session" not in context.user_data
 
 
 async def test_switch_transition_survives_a_restart(storage, tmp_path):
@@ -406,3 +407,58 @@ def test_tools_line_format():
 
     assert tools_line([]) == ""
     assert tools_line(["a", "b", "a", "a"]) == "[tools: a×3, b]"
+
+
+async def test_roll_in_another_profile_does_not_reset_this_session(tmp_path):
+    """dv-3114 regression (live 02.11.26): PTB ``user_data`` is per Telegram
+    user, shared by every profile's chat. A window roll in the gymbro chat
+    (21:24) left ``force_new_session`` in it; the owner's next devops message
+    (21:40, while the gymbro turn was still running) opened a fresh, unseeded
+    devops session. Only this workspace's window row may force a new session.
+    """
+    from src.bot.orchestration.windowing import refresh_window
+
+    settings = create_test_config(approved_directory=str(tmp_path), agentic_mode=True)
+    db = DatabaseManager(tempfile.mktemp(suffix=".db"))
+    await db.initialize()
+    repo = WindowRepository(
+        db, eval_interval_tokens=0, refresh_threshold_tokens=150_000
+    )
+    wd = Path(tmp_path)
+    other = wd / "other-profile"
+    await repo.get_or_create(123, wd)
+    await _seed_turns(db, wd, 1, [("devops-q", "devops-a")], user_id=123)
+
+    calls = []
+
+    async def run_command(**kw):
+        calls.append(kw)
+        return _mock_response("devops-live", context_tokens=90_000)
+
+    orch = MessageOrchestrator(settings, {"claude_integration": MagicMock()})
+    update, context = _turn_harness(settings, repo, AsyncMock(side_effect=run_command))
+    await orch.agentic_text(update, context)  # establishes the devops session
+
+    # Another profile's chat rolls its window with the SAME user_data dict.
+    await refresh_window(
+        repo,
+        None,
+        context.user_data,
+        user_id=123,
+        working_dir=other,
+        backend="claude",
+        conversation_text="",
+    )
+    # And a stale flag as an older build (or a mid-turn peer) would leave it.
+    context.user_data["force_new_session"] = True
+    context.user_data["pending_seed_window"] = 1
+
+    await orch.agentic_text(update, context)
+    second = calls[1]
+    assert second["force_new"] is False
+    assert second["session_id"] == "devops-live"
+    assert "<conversation_context>" not in second["prompt"]
+
+    # The other profile's own transition is still armed for its next turn.
+    other_state = await repo.get_or_create(123, other)
+    assert other_state.force_new_session is True

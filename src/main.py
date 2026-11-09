@@ -6,14 +6,12 @@ import logging
 import signal
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional
 
 import structlog
 
 from src import __version__
 from src.agent_backends import AgentBackend, CodexCliIntegration, CodexSessionStore
-from src.bot.core import ClaudeCodeBot
-from src.bot.features.self_modify import SelfModificationGuard
 from src.claude import (
     ClaudeIntegration,
     SessionManager,
@@ -25,8 +23,8 @@ from src.events.bus import EventBus
 from src.events.handlers import AgentHandler
 from src.events.middleware import EventSecurityMiddleware
 from src.exceptions import ConfigurationError
-from src.notifications.routing import ReportsRouter
 from src.notifications.service import NotificationService
+from src.notifications.transport import LocalTransport, TelegramTransport, Transport
 from src.scheduler.scheduler import JobScheduler
 from src.security.audit import AuditLogger, InMemoryAuditStorage
 from src.security.auth import (
@@ -42,7 +40,14 @@ from src.storage.hold_repository import HoldStore
 from src.storage.model_calls import ModelCallRepository
 from src.storage.session_storage import SQLiteSessionStorage
 from src.utils.log_redaction import install_secret_redaction
+from src.utils.paths import DataLayout
 from src.utils.turn_locks import report_dropped_messages
+
+if TYPE_CHECKING:
+    # The Telegram side is imported only when channel=telegram: a local
+    # install (dv-fe4d) never loads the telegram package.
+    from src.bot.core import ClaudeCodeBot
+    from src.notifications.routing import ReportsRouter
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -255,14 +260,27 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # feature, so it no longer rides the file-oriented soul_memory flag).
     refresh_service = None
 
+    from src.evaluator.decision_refs import DecisionRefChecker
     from src.evaluator.jev_gate import JevGateConfig
     from src.evaluator.screen import ScreenConfig
     from src.evaluator.service import EvaluatorService
     from src.evaluator.writer import MemoryWriter
     from src.token.tracker import TokenTracker
+    from src.utils.boards import agent_repos
 
     token_tracker = TokenTracker(db=storage.db_manager)
-    memory_writer = MemoryWriter(storage.memory_repository)
+    # dv-32fe: agents with their own repo (boards.json profiles + devops)
+    # store per-task decisions as pointers, checked against that repo.
+    decision_refs = DecisionRefChecker(agent_repos())
+    from src.storage.window_bundle_repository import WindowBundleRepository
+
+    # dv-ef59: every writer marks the window bundle stale on a pinned/core
+    # change, so the rule binds from the next turn, not the next roll.
+    memory_writer = MemoryWriter(
+        storage.memory_repository,
+        decision_refs=decision_refs,
+        bundle_repo=WindowBundleRepository(storage.db_manager),
+    )
     evaluator_service = EvaluatorService(
         memory_repo=storage.memory_repository,
         writer=memory_writer,
@@ -287,12 +305,17 @@ async def create_application(config: Settings) -> Dict[str, Any]:
             fact_send_min=config.memory_screen_fact_send_min,
             fact_send_max=config.memory_screen_fact_send_max,
         ),
+        repo_agents=decision_refs.agents,
     )
 
     # DB-backed agent memory retriever (always on; replaces file memory).
     # Selects pinned + FTS-matched general facts per agent_id each turn.
     from src.storage.memory_repository import MemoryRetriever
 
+    storage.memory_repository.bundle_caps = (
+        config.memory_snapshot_general_cap,
+        config.memory_pointer_cap,
+    )
     memory_retriever = MemoryRetriever(
         storage.memory_repository,
         general_cap=config.memory_snapshot_general_cap,
@@ -300,13 +323,22 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     )
 
     # Profile registry (multi-persona routing). Unset = single-profile mode.
+    # Safe mode (dv-86f4): after a crash loop deploy/crashwatch.sh sets
+    # <data root>/lkg/USE and this boot loads profiles/models from the
+    # last-known-good snapshot instead of the live files.
+    from src.boot import safemode
+
+    profiles_path, models_path = safemode.config_paths(
+        config.data_layout, config.profiles_config_path, config.model_routes_path
+    )
+    safe_mode_alert: Optional[str] = None
     profile_registry = None
-    if config.profiles_config_path:
+    if profiles_path:
         from src.boot.profiles import bootstrap_profiles
         from src.profiles import load_profile_registry, validate_registry_paths
 
         profile_registry = load_profile_registry(
-            config.profiles_config_path,
+            profiles_path,
             sandbox_default=config.sandbox_enabled,
             data_root=config.devvy_data_root,
         )
@@ -318,8 +350,25 @@ async def create_application(config: Settings) -> Dict[str, Any]:
             Path(__file__).parent.parent / "data" / "templates",
         )
         # A missing persona or unwritable working_dir must fail here, naming
-        # the profile, rather than at the first turn that uses it.
-        validate_registry_paths(profile_registry)
+        # the profile, rather than at the first turn that uses it. Only the
+        # default profile is fatal (dv-86f4): any other bad profile is off for
+        # this run and the owner is told once the bot is up (run_application).
+        for slug, reason in validate_registry_paths(
+            profile_registry, degrade=True
+        ).items():
+            logger.warning("Profile disabled for this run", profile=slug, reason=reason)
+        if safemode.is_active(config.data_layout):
+            # Only the default profile, owner-only: the snapshot may carry
+            # grants revoked since. After validation, so /agents shows "safe
+            # mode" as the reason for every agent it turns off.
+            safe_mode_alert = safemode.apply(
+                profile_registry,
+                config.data_layout,
+                config.profiles_config_path,
+                models_from_snapshot=models_path != config.model_routes_path,
+                sandbox_default=config.sandbox_enabled,
+                data_root=config.devvy_data_root,
+            )
         logger.info("Profile registry loaded", count=len(profile_registry.profiles))
 
     # Lifecycle observability — records resume/fresh/memory events per profile.
@@ -344,7 +393,6 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # byte-identical until the next roll or /new. Injected into both backends
     # so a codex turn cannot un-freeze the prompt.
     from src.claude.window_bundle import WindowBundleProvider
-    from src.storage.window_bundle_repository import WindowBundleRepository
 
     bundle_provider = WindowBundleProvider(
         window_repo=window_repo,
@@ -469,11 +517,6 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     )
     agent_handler.register()
 
-    # Self-modification guard for native service mode
-    self_modification_guard = SelfModificationGuard(
-        bot_root=Path(__file__).resolve().parent.parent,
-    )
-
     # Backend registry (dv-5368): user_data["agent_backend"] is the key the
     # orchestrator looks up; each value satisfies AgentBackend
     # (src/agent_backends/protocol.py). A third backend registers its
@@ -507,7 +550,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # settings < models.yaml. A bad file never stops the boot; the owner is
     # told once the bot can send (run_application).
     call_routes, model_routes_alert = boot_call_routes(
-        config.model_routes_path, legacy=legacy_route_models(config)
+        models_path, legacy=legacy_route_models(config)
     )
     model_router = ModelRouter(
         backends=backends,
@@ -549,7 +592,6 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "event_bus": event_bus,
         "prompt_composer": prompt_composer,
         "token_tracker": token_tracker,
-        "self_modification_guard": self_modification_guard,
         "profile_registry": profile_registry,
         "lifecycle_logger": lifecycle_logger,
         "window_repo": window_repo,
@@ -559,16 +601,27 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "hold_store": hold_store,
     }
 
-    bot = ClaudeCodeBot(config, dependencies)
+    # The channel (dv-fe4d). Telegram: the bot, whose Telegram Bot instance
+    # exists only after bot.initialize(), so the notification service and the
+    # owner prompts are wired in run_application(). Local: no bot at all; the
+    # same services deliver into the local inbox.
+    bot: Optional["ClaudeCodeBot"] = None
+    if config.channel == "telegram":
+        from src.bot.core import ClaudeCodeBot
+        from src.bot.features.self_modify import SelfModificationGuard
 
-    # Notification service and scheduler need the bot's Telegram Bot instance,
-    # which is only available after bot.initialize(). We store placeholders
-    # and wire them up in run_application() after initialization.
+        # Self-modification guard for native service mode
+        dependencies["self_modification_guard"] = SelfModificationGuard(
+            bot_root=Path(__file__).resolve().parent.parent,
+        )
+        bot = ClaudeCodeBot(config, dependencies)
 
     logger.info("Application components created successfully")
 
     return {
         "bot": bot,
+        # bot.deps on a Telegram install; the same dict when there is no bot.
+        "deps": dependencies,
         "backends": backends,
         "claude_integration": claude_integration,
         "storage": storage,
@@ -582,24 +635,77 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "refresh_service": refresh_service,
         "bundle_provider": bundle_provider,
         "model_routes_alert": model_routes_alert,
+        "safe_mode_alert": safe_mode_alert,
         # Separate writer instance for the in-session `remember` tool: same
         # repo and the same duplicate suppression, but stamped
         # source="agent_tool" and counted separately from the batch evaluator.
         "agent_memory_writer": MemoryWriter(
-            storage.memory_repository, source="agent_tool"
+            storage.memory_repository,
+            source="agent_tool",
+            decision_refs=decision_refs,
+            bundle_repo=WindowBundleRepository(storage.db_manager),
         ),
+        "decision_refs": decision_refs,
         # And a third for the audit tools (dv-a9e1): forget/correct close rows
         # on the user's explicit ask, so invalidated_by must say so.
         "audit_memory_writer": MemoryWriter(
-            storage.memory_repository, source="user_request"
+            storage.memory_repository,
+            source="user_request",
+            bundle_repo=WindowBundleRepository(storage.db_manager),
         ),
     }
+
+
+def crashwatch_recovery(layout: DataLayout) -> Optional[str]:
+    """The «снова работает» message after a crash-loop alert, or None (dv-86f4).
+
+    ``deploy/crashwatch.sh`` (ExecStopPost) counts crashes in
+    ``<data root>/crashwatch/fails`` and stamps ``alerted`` when it told the
+    owner. A boot that gets this far after such an alert clears both, so the
+    next loop alerts afresh, and says how many crashes it took.
+    """
+    base = layout.root if layout.root is not None else layout.legacy_dir
+    state = Path(base) / "crashwatch"
+    alerted = state / "alerted"
+    try:
+        stamp = alerted.read_text(encoding="utf-8").split()
+    except OSError:
+        return None
+    crashes = stamp[1] if len(stamp) > 1 and stamp[1].isdigit() else "?"
+    for name in ("alerted", "fails"):
+        try:
+            (state / name).unlink()
+        except OSError:
+            pass
+    return f"✅ Бот снова работает после {crashes} падений подряд."
+
+
+# How long a boot must stay up before it counts as the end of a crash loop.
+CRASHWATCH_GRACE_S = 60.0
+
+
+async def crashwatch_recovery_after(
+    layout: DataLayout,
+    notify: Callable[[str], Awaitable[None]],
+    grace: float = CRASHWATCH_GRACE_S,
+) -> None:
+    """After ``grace`` s up, send the «снова работает» message if there is one.
+
+    The grace keeps a loop that dies late in startup from getting an alert /
+    «снова работает» pair per few restarts.
+    """
+    await asyncio.sleep(grace)
+    recovered = crashwatch_recovery(layout)
+    if recovered:
+        structlog.get_logger().info("Crash loop over", message=recovered)
+        await notify(recovered)
 
 
 async def run_application(app: Dict[str, Any]) -> None:
     """Run the application with graceful shutdown handling."""
     logger = structlog.get_logger()
-    bot: ClaudeCodeBot = app["bot"]
+    bot: Optional["ClaudeCodeBot"] = app["bot"]
+    deps: Dict[str, Any] = app["deps"]
     claude_integration: ClaudeIntegration = app["claude_integration"]
     storage: Storage = app["storage"]
     config: Settings = app["config"]
@@ -608,6 +714,8 @@ async def run_application(app: Dict[str, Any]) -> None:
 
     notification_service: Optional[NotificationService] = None
     scheduler: Optional[JobScheduler] = None
+    recovery_task: Optional[asyncio.Task[None]] = None
+    snapshot_task: Optional[asyncio.Task[bool]] = None
     agent_bridge: Optional[Any] = None
 
     # Set up signal handlers for graceful shutdown
@@ -621,14 +729,33 @@ async def run_application(app: Dict[str, Any]) -> None:
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        logger.info("Starting Claude Code Telegram Bot")
+        logger.info("Starting Claude Code Telegram Bot", channel=config.channel)
 
-        # Initialize the bot first (creates the Telegram Application)
-        await bot.initialize()
+        # Where notifications and owner prompts go (dv-fe4d).
+        transport: Transport
+        telegram_bot: Optional[Any] = None
+        if bot is not None:
+            # Initialize the bot first (creates the Telegram Application)
+            await bot.initialize()
+            assert bot.app is not None
 
-        # Now wire up components that need the Telegram Bot instance
-        telegram_bot = bot.app.bot
-        app["agent_handler"].bot = telegram_bot
+            # Now wire up components that need the Telegram Bot instance
+            telegram_bot = bot.app.bot
+            app["agent_handler"].bot = telegram_bot
+            transport = TelegramTransport(telegram_bot)
+        else:
+            # Local channel: the inbox the TUI reads, behind its own secret
+            # (created on first boot, never in bot.env: jobs read that file,
+            # and the loader refuses LOCAL_TUI_SECRET there). Only a
+            # process-env override (tests) takes the place of the file.
+            transport = LocalTransport(storage.db_manager, desktop_notify=True)
+            if not config.local_tui_secret:
+                from src.utils.paths import ensure_tui_secret, tui_secret_path
+
+                config.local_tui_secret = ensure_tui_secret(
+                    tui_secret_path(config.data_layout)
+                )
+            logger.info("Local channel: no Telegram, inbox at /internal/inbox")
 
         # Wire notification callbacks for evaluator/refresh services.
         #
@@ -638,8 +765,8 @@ async def run_application(app: Dict[str, Any]) -> None:
         # agent never wrote" (dv-7783), and (b) persisted as a messages row
         # in the profile's current session/window so the agent can see that
         # the user was told — previously the text existed nowhere.
-        _notify_registry = bot.deps.get("profile_registry")
-        _notify_window_repo = bot.deps.get("window_repo")
+        _notify_registry = deps.get("profile_registry")
+        _notify_window_repo = deps.get("window_repo")
 
         async def _persist_notification(
             user_id: int, message: str, agent_id: str
@@ -664,14 +791,14 @@ async def run_application(app: Dict[str, Any]) -> None:
             user_id: int, message: str, agent_id: Optional[str] = None
         ) -> None:
             try:
-                sent = await telegram_bot.send_message(chat_id=user_id, text=message)
+                message_id = await transport.send(user_id, message)
             except Exception as e:
                 logger.warning("Notification failed", user_id=user_id, error=str(e))
                 return
             try:
                 await storage.sent_messages.record(
-                    telegram_chat_id=sent.chat.id,
-                    telegram_message_id=sent.message_id,
+                    telegram_chat_id=user_id,
+                    telegram_message_id=message_id,
                     kind="system_notify",
                     profile_slug=agent_id,
                 )
@@ -700,13 +827,30 @@ async def run_application(app: Dict[str, Any]) -> None:
             for chat_id in config.notification_chat_ids or []:
                 await _notify_user(chat_id, app["model_routes_alert"])
 
+        # Safe-mode boot (dv-86f4): one 🛟 message names every agent it turned
+        # off, instead of one «выключен» per profile.
+        if app.get("safe_mode_alert"):
+            for chat_id in config.notification_chat_ids or []:
+                await _notify_user(chat_id, app["safe_mode_alert"])
+        # A profile the boot switched off over bad paths (dv-86f4): one message
+        # per profile, so the owner learns now rather than from its silence.
+        elif _notify_registry is not None:
+            for slug, reason in _notify_registry.boot_disabled.items():
+                for chat_id in config.notification_chat_ids or []:
+                    await _notify_user(
+                        chat_id,
+                        f"⚠️ Профиль {slug} выключен до рестарта: {reason}",
+                    )
+
         # Start event bus
         await event_bus.start()
 
         # Notification service
-        reports_router: Optional[ReportsRouter] = None
-        if config.reports_chat_id:
-            reports_router = ReportsRouter(
+        reports_router: Optional["ReportsRouter"] = None
+        if config.reports_chat_id and telegram_bot is not None:
+            from src.notifications import routing
+
+            reports_router = routing.ReportsRouter(
                 chat_id=config.reports_chat_id,
                 routes=config.reports_routes,
                 repository=storage.project_threads,
@@ -716,7 +860,7 @@ async def run_application(app: Dict[str, Any]) -> None:
                 reply_only=config.reports_reply_only,
                 ledger=storage.sent_messages,
             )
-            bot.deps["reports_router"] = reports_router
+            deps["reports_router"] = reports_router
             await reports_router.ensure_bound_topics(telegram_bot)
             logger.info(
                 "Reports routing on",
@@ -726,6 +870,7 @@ async def run_application(app: Dict[str, Any]) -> None:
         notification_service = NotificationService(
             event_bus=event_bus,
             bot=telegram_bot,
+            transport=transport,
             default_chat_ids=config.notification_chat_ids or [],
             pin_store=storage.pinned_messages,
             sent_messages=storage.sent_messages,
@@ -735,11 +880,12 @@ async def run_application(app: Dict[str, Any]) -> None:
         await notification_service.start()
 
         # Collect concurrent tasks
-        tasks = []
+        tasks: list[asyncio.Task[Any]] = []
 
         # Bot task — use start() which handles its own initialization check
-        bot_task = asyncio.create_task(bot.start())
-        tasks.append(bot_task)
+        if bot is not None:
+            bot_task = asyncio.create_task(bot.start())
+            tasks.append(bot_task)
 
         # Stale-fact sweep (dv-cf07; was the dv-4c6f report-only pass). Not
         # scheduler-bound: window rotations (refresh_window / /new, via
@@ -757,9 +903,10 @@ async def run_application(app: Dict[str, Any]) -> None:
             notify_callback=_notify_owner,
             board=storage.tasks,
             report_dir=config.data_layout.consolidation_dir,
+            decision_refs=app.get("decision_refs"),
         )
         app["consolidation_service"] = consolidation_service
-        bot.deps["consolidation_service"] = consolidation_service
+        deps["consolidation_service"] = consolidation_service
 
         # Bundle (dv-5e2a): a facts snapshot over budget requests a sweep
         # instead of being truncated, and a new window's snapshot waits for
@@ -837,7 +984,7 @@ async def run_application(app: Dict[str, Any]) -> None:
                 event_bus=event_bus,
                 task_repo=storage.tasks,
                 scheduler=scheduler,
-                profile_registry=bot.deps.get("profile_registry"),
+                profile_registry=deps.get("profile_registry"),
                 default_chat_ids=config.notification_chat_ids or [],
                 memory_writer=app.get("agent_memory_writer"),
                 memory_repo=storage.memory_repository,
@@ -847,17 +994,22 @@ async def run_application(app: Dict[str, Any]) -> None:
                 user_timezone=config.user_timezone,
                 storage=storage,
                 window_repo=_notify_window_repo,
+                reports_chat_id=config.reports_chat_id,
             )
 
             # restart_bot (dv-da50): drain on the one process-wide TurnLocks
             # the orchestrator and AgentHandler both hold, then SIGTERM.
-            from src.bot.orchestration.commands.system import request_restart
-
             _restart_locks = app["agent_handler"].turn_locks
 
             async def _request_restart(reason: str, ctx: Any) -> str:
+                # Imported on use: the module is a Telegram command module.
+                from src.bot.orchestration.commands.system import request_restart
+
                 return await request_restart(
-                    _restart_locks, reason=reason, user_id=ctx.user_id
+                    _restart_locks,
+                    reason=reason,
+                    user_id=ctx.user_id,
+                    notify=_notify_owner,
                 )
 
             agent_services.request_restart = _request_restart
@@ -891,16 +1043,16 @@ async def run_application(app: Dict[str, Any]) -> None:
                 from src.items.repository import ItemRepository
                 from src.items.service import ItemService
 
-                _user_store = bot.deps.get("user_store")
+                _user_store = deps.get("user_store")
                 item_service = ItemService(
                     ItemRepository(storage.db_manager),
                     scheduler=scheduler,
-                    profile_registry=bot.deps.get("profile_registry"),
+                    profile_registry=deps.get("profile_registry"),
                     default_tz=config.user_timezone,
                     role_lookup=(_user_store.get_role_cached if _user_store else None),
                 )
                 agent_services.items = item_service
-                bot.deps["item_service"] = item_service
+                deps["item_service"] = item_service
                 app["agent_handler"].items = item_service
                 for backend in app.get("backends", {}).values():
                     backend.items_service = item_service
@@ -942,61 +1094,41 @@ async def run_application(app: Dict[str, Any]) -> None:
                         error=str(e),
                     )
 
-        # Destructive-op confirmation gate (full-access profiles). Needs the
-        # Telegram bot, so it's wired here. Prompts go to the owner chat(s).
+        # Destructive-op confirmation gate (full-access profiles). Prompts go
+        # to the owner chat(s) through the channel's transport: Telegram
+        # buttons, or an inbox card the TUI answers on /internal/callback.
         try:
-            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
             from src.claude.confirmation import CALLBACK_PREFIX, ConfirmationManager
             from src.security import ask_explain
 
-            def _confirm_keyboard(token: str) -> InlineKeyboardMarkup:
-                return InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "✅ Approve",
-                                callback_data=f"{CALLBACK_PREFIX}:{token}:y",
-                            ),
-                            InlineKeyboardButton(
-                                "⛔ Deny",
-                                callback_data=f"{CALLBACK_PREFIX}:{token}:n",
-                            ),
-                        ]
-                    ]
-                )
+            def _confirm_buttons(token: str) -> list[tuple[str, str]]:
+                return [
+                    ("✅ Approve", f"{CALLBACK_PREFIX}:{token}:y"),
+                    ("⛔ Deny", f"{CALLBACK_PREFIX}:{token}:n"),
+                ]
 
             async def _send_confirm_prompt(chat_id: int, text: str, token: str) -> int:
-                message = await telegram_bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode="HTML",
-                    reply_markup=_confirm_keyboard(token),
+                return await transport.send(
+                    chat_id, text, parse_mode="HTML", buttons=_confirm_buttons(token)
                 )
-                return message.message_id
 
             # dv-af70: the explanation is edited into a still-pending card,
             # so the same buttons go back on with it.
             async def _update_confirm_prompt(
                 chat_id: int, message_id: int, text: str, token: str
             ) -> None:
-                await telegram_bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text,
+                await transport.edit(
+                    chat_id,
+                    message_id,
+                    text,
                     parse_mode="HTML",
-                    reply_markup=_confirm_keyboard(token),
+                    buttons=_confirm_buttons(token),
                 )
 
             async def _edit_confirm_prompt(
                 chat_id: int, message_id: int, text: str
             ) -> None:
-                await telegram_bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text,
-                    parse_mode="HTML",
-                )
+                await transport.edit(chat_id, message_id, text, parse_mode="HTML")
 
             confirmation_manager = ConfirmationManager(
                 send_prompt=_send_confirm_prompt,
@@ -1009,7 +1141,7 @@ async def run_application(app: Dict[str, Any]) -> None:
             claude_integration.sdk_manager.attach_confirmation_manager(
                 confirmation_manager
             )
-            bot.deps["confirmation_manager"] = confirmation_manager
+            deps["confirmation_manager"] = confirmation_manager
         except Exception as e:  # pragma: no cover - defensive wiring guard
             logger.warning("Failed to attach confirmation manager", error=str(e))
 
@@ -1020,7 +1152,7 @@ async def run_application(app: Dict[str, Any]) -> None:
         if agent_bridge is not None:
             from src.security.policy import turn_policy_for
 
-            policy_registry = bot.deps.get("profile_registry")
+            policy_registry = deps.get("profile_registry")
             agent_bridge.attach_policy(
                 lambda ctx: turn_policy_for(
                     policy_registry,
@@ -1029,59 +1161,39 @@ async def run_application(app: Dict[str, Any]) -> None:
                     user_id=ctx.user_id,
                     role=ctx.role,
                 ),
-                bot.deps.get("confirmation_manager"),
+                deps.get("confirmation_manager"),
             )
 
-        # Session watchdog alert (dv-8bb5). Same reasons as the confirmation
-        # gate above for wiring here: needs the Telegram bot instance, and
+        # Session watchdog alert (dv-8bb5). Wired here for the same reason as
+        # the confirmation gate above: needs the channel's transport, and
         # prompts go to the owner chat(s).
         try:
             from src.security.session_watchdog import CALLBACK_PREFIX as WATCHDOG_PREFIX
             from src.security.session_watchdog import WatchdogManager
 
             async def _send_watchdog_alert(chat_id: int, text: str, token: str) -> int:
-                keyboard = InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "⏸️ Hold 10 min",
-                                callback_data=f"{WATCHDOG_PREFIX}:{token}:10m",
-                            ),
-                            InlineKeyboardButton(
-                                "⏸️ Hold 1 day",
-                                callback_data=f"{WATCHDOG_PREFIX}:{token}:1d",
-                            ),
-                            InlineKeyboardButton(
-                                "✅ Dismiss",
-                                callback_data=f"{WATCHDOG_PREFIX}:{token}:ack",
-                            ),
-                        ]
-                    ]
-                )
-                message = await telegram_bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
+                return await transport.send(
+                    chat_id,
+                    text,
                     parse_mode="HTML",
-                    reply_markup=keyboard,
+                    buttons=[
+                        ("⏸️ Hold 10 min", f"{WATCHDOG_PREFIX}:{token}:10m"),
+                        ("⏸️ Hold 1 day", f"{WATCHDOG_PREFIX}:{token}:1d"),
+                        ("✅ Dismiss", f"{WATCHDOG_PREFIX}:{token}:ack"),
+                    ],
                 )
-                return message.message_id
 
             async def _edit_watchdog_alert(
                 chat_id: int, message_id: int, text: str
             ) -> None:
-                await telegram_bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text,
-                    parse_mode="HTML",
-                )
+                await transport.edit(chat_id, message_id, text, parse_mode="HTML")
 
             watchdog_manager = WatchdogManager(
                 send_alert=_send_watchdog_alert,
                 chat_ids=config.notification_chat_ids or [],
                 edit_alert=_edit_watchdog_alert,
             )
-            bot.deps["watchdog_manager"] = watchdog_manager
+            deps["watchdog_manager"] = watchdog_manager
         except Exception as e:  # pragma: no cover - defensive wiring guard
             logger.warning("Failed to attach watchdog manager", error=str(e))
 
@@ -1089,16 +1201,23 @@ async def run_application(app: Dict[str, Any]) -> None:
         if features.api_server_enabled:
             from src.api.server import run_api_server
 
+            chat_turn_service = None
+            if config.channel == "local":
+                from src.chat.local_turns import LocalChatTurns
+
+                chat_turn_service = LocalChatTurns(config, deps)
+
             api_task = asyncio.create_task(
                 run_api_server(
                     event_bus,
                     config,
                     storage.db_manager,
                     scheduler=scheduler,
-                    profile_registry=bot.deps.get("profile_registry"),
-                    confirmation_manager=bot.deps.get("confirmation_manager"),
+                    profile_registry=deps.get("profile_registry"),
+                    confirmation_manager=deps.get("confirmation_manager"),
                     model_calls=ModelCallRepository(storage.db_manager),
                     tool_calls=storage.tool_calls,
+                    chat_turn_service=chat_turn_service,
                 )
             )
             tasks.append(api_task)
@@ -1106,6 +1225,34 @@ async def run_application(app: Dict[str, Any]) -> None:
                 "API server enabled",
                 host=config.api_server_host,
                 port=config.api_server_port,
+            )
+
+        # Back after a crash-loop alert (dv-86f4, deploy/crashwatch.sh): only
+        # once polling and every service above have run CRASHWATCH_GRACE_S, so
+        # a loop that dies late in startup is not reported as over. Not in
+        # `tasks`: its end must not end the run.
+        recovery_task = asyncio.create_task(
+            crashwatch_recovery_after(config.data_layout, _notify_owner)
+        )
+        # Last-known-good config for safe mode (dv-86f4): this boot's live
+        # profiles/models, once it has run SNAPSHOT_DELAY_S with polling up and
+        # the restart preflight passes. Not from a safe-mode boot: that one
+        # runs on the snapshot already. Not in `tasks`, like recovery.
+        if config.profiles_config_path and not app.get("safe_mode_alert"):
+            from src.boot import safemode
+            from src.bot.orchestration.commands.system import preflight
+
+            models_live = config.model_routes_path
+            if models_live is not None and not models_live.is_absolute():
+                models_live = Path(__file__).parent.parent / models_live
+            snapshot_task = asyncio.create_task(
+                safemode.snapshot_after(
+                    config.data_layout,
+                    profiles_path=Path(config.profiles_config_path).absolute(),
+                    models_path=models_live,
+                    check=preflight,
+                    sha=safemode.head_sha(),
+                )
             )
 
         # Shutdown task
@@ -1140,12 +1287,16 @@ async def run_application(app: Dict[str, Any]) -> None:
         logger.error("Application error", error=str(e))
         raise
     finally:
+        if recovery_task is not None:
+            recovery_task.cancel()
+        if snapshot_task is not None:
+            snapshot_task.cancel()
         # Ordered shutdown: scheduler -> bridge -> API -> notification -> bot
         # -> claude -> storage
         logger.info("Shutting down application")
 
         try:
-            if bot.app is not None:
+            if bot is not None and bot.app is not None:
                 await report_dropped_messages(
                     app["agent_handler"].turn_locks, bot.app.bot
                 )
@@ -1156,7 +1307,8 @@ async def run_application(app: Dict[str, Any]) -> None:
             if notification_service:
                 await notification_service.stop()
             await event_bus.stop()
-            await bot.stop()
+            if bot is not None:
+                await bot.stop()
             await claude_integration.shutdown()
             await storage.close()
         except Exception as e:
@@ -1195,7 +1347,7 @@ async def main() -> None:
         # Initialize bot and Claude integration
         app = await create_application(config)
         # The config file /voice persists its choice into (dv-6b6c).
-        app["bot"].deps["env_file"] = args.config_file or Path(".env")
+        app["deps"]["env_file"] = args.config_file or Path(".env")
         await run_application(app)
 
     except ConfigurationError as e:

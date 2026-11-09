@@ -65,6 +65,13 @@ def _denylist_env(monkeypatch):
     monkeypatch.delenv("APPROVED_DIRECTORY", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _boot_check_passes(monkeypatch):
+    """The restart preflight (dv-86f4) is a subprocess; here it passes.
+    tests/unit/test_restart_preflight.py covers it failing."""
+    monkeypatch.setattr(system, "preflight", AsyncMock(return_value=None))
+
+
 @pytest.fixture
 def fast_restart(monkeypatch):
     """Shrink the drain timings so a test runs in well under a second."""

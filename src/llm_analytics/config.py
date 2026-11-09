@@ -43,7 +43,7 @@ class AnalyticsConfig:
         )
         scan_interval = float(os.getenv("LLM_ANALYTICS_SCAN_INTERVAL", "30"))
         # Same env vars and defaults as the bot (PROFILES_CONFIG_PATH),
-        # scripts/bgjob (BGJOB_ROOT) and scripts/taskpump (PUMP_WORKTREES).
+        # scripts/bgjob (BGJOB_ROOT) and scripts/pump2 (PUMP_WORKTREES).
         profiles_env = os.getenv("PROFILES_CONFIG_PATH")
         profiles_path = Path(profiles_env).expanduser() if profiles_env else None
         jobs_dir = Path(os.getenv("BGJOB_ROOT") or str(REPO_ROOT.parent / "jobs"))

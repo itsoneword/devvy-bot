@@ -13,13 +13,16 @@ topic store).
 
 import asyncio
 import time
-from typing import Any, Dict, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional
 
 import structlog
-from telegram import Bot
-from telegram.error import TelegramError
 
 from ..events.types import AgentResponseEvent
+
+if TYPE_CHECKING:
+    # Type-only: a local-channel install (dv-fe4d) imports this module through
+    # NotificationService and must never load the telegram package.
+    from telegram import Bot
 
 # Ledger refs whose reply is inbound in a reply-only topic (dv-c41e jobs,
 # 2026-10-20 pump questions).
@@ -39,7 +42,7 @@ _TOPIC_UNUSABLE_MARKERS = (
 )
 
 
-def is_topic_unusable_error(error: TelegramError) -> bool:
+def is_topic_unusable_error(error: Exception) -> bool:
     """True when the topic no longer exists or the thread id is invalid."""
     text = str(error).lower()
     return any(marker in text for marker in _TOPIC_UNUSABLE_MARKERS)
@@ -49,7 +52,7 @@ SLUG_PREFIX = "reports:"
 
 # Sources that are DM-only no matter what the routing map says: the owner has
 # to see them on the device they answer from: reminders / item jobs, family
-# notices and the routing's own errors. "taskpump:ask" (the pump's
+# notices and the routing's own errors. "pump2:ask" (the pump's
 # question/blocked/failed card) left this list on 2026-10-20: it goes to the
 # Pump topic with a "pump:<id>" ref, so a reply reaches the devops session.
 # Interactive prompts (tool-call approvals, watchdog) are sent directly by the
@@ -122,7 +125,7 @@ class ReportsRouter:
             return role is not None
         return role == "owner"
 
-    async def ensure_bound_topics(self, bot: Bot) -> None:
+    async def ensure_bound_topics(self, bot: "Bot") -> None:
         """Create the bound topics that do not exist yet (startup, best effort)."""
         for topic in self.bindings:
             try:
@@ -148,6 +151,32 @@ class ReportsRouter:
             if known == thread_id:
                 return topic
         return None
+
+    def route_topic(self, source: str) -> Optional[str]:
+        """The topic ``source`` is routed to (longest matching key), or None."""
+        best = ""
+        for key in self.routes:
+            if source_matches(source.lower(), key) and len(key) > len(best):
+                best = key
+        return self.routes[best] if best else None
+
+    async def is_route_topic(self, message: Any, source: str) -> bool:
+        """True when ``message`` is in the reports chat's topic of ``source``
+        (dv-a42c: the unbound Feedback topic). Never creates the topic."""
+        topic = self.route_topic(source)
+        thread = message.message_thread_id if message.is_topic_message else None
+        if topic is None or not thread or message.chat_id != self.chat_id:
+            return False
+        known = self._threads.get(topic)
+        if known is None:
+            row = await self.repository.get_by_chat_project(
+                self.chat_id, SLUG_PREFIX + topic.lower()
+            )
+            if not (row and row.is_active):
+                return False
+            known = int(row.message_thread_id)
+            self._threads[topic] = known
+        return bool(known == thread)
 
     async def profile_for_thread(
         self, chat_id: Optional[int], thread_id: Optional[int]
@@ -245,7 +274,7 @@ class ReportsRouter:
                 best = key
         return self.routes[best] if best else None
 
-    async def thread_id(self, bot: Bot, topic: str, recreate: bool = False) -> int:
+    async def thread_id(self, bot: "Bot", topic: str, recreate: bool = False) -> int:
         """Thread id for ``topic``; creates (and persists) it when missing."""
         assert self.chat_id is not None
         slug = SLUG_PREFIX + topic.lower()
@@ -279,4 +308,6 @@ class ReportsRouter:
 
     @staticmethod
     def is_thread_gone(error: Exception) -> bool:
+        from telegram.error import TelegramError
+
         return isinstance(error, TelegramError) and (is_topic_unusable_error(error))

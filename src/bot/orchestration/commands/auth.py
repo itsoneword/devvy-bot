@@ -6,7 +6,8 @@ never routes through ``agentic_text``.
 
 The in-flight login lives in ``bot_data`` keyed by chat, not in ``user_data``,
 because the reply carrying a Claude code is an ordinary text message and the
-text handler has to find it from the chat alone.
+text handler has to find it from the chat alone (``next_input``'s first
+consumer, dv-3881).
 """
 
 import asyncio
@@ -143,7 +144,7 @@ async def consume_login_code(
     """If this chat has a login waiting on a code, spend the message on it.
 
     Returns True when the message was consumed and must not reach the agent.
-    Called from the top of ``agentic_text``.
+    Called through ``next_input.consume`` (text only), before the turn lock.
     """
     pending = context.bot_data.get(PENDING_KEY)
     # Nothing has ever started a login in this process unless the key holds a

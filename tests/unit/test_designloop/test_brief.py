@@ -24,11 +24,11 @@ CHANGE = "Too many controls above the first card; make the feed calmer."
 
 
 def test_feed_brief_lists_every_feed_action_and_its_dark_and_light_refs(
-    gymbro_repo: Path,
+    app_repo: Path,
 ):
     from src.designloop.brief import build_brief
 
-    brief = build_brief(gymbro_repo, "feed", CHANGE)
+    brief = build_brief(app_repo, "feed", CHANGE)
 
     text = brief.text
     for feature in FEED_FEATURES:
@@ -43,7 +43,7 @@ def test_feed_brief_lists_every_feed_action_and_its_dark_and_light_refs(
 
     refs = {Path(p).resolve() for p in brief.refs}
     expected = {
-        ref(gymbro_repo, "feed", state, theme).resolve()
+        ref(app_repo, "feed", state, theme).resolve()
         for state in REFS["feed"]
         for theme in ("dark", "light")
     }
@@ -58,14 +58,14 @@ def test_feed_brief_lists_every_feed_action_and_its_dark_and_light_refs(
 
 
 def test_brief_has_a_value_and_space_paragraph_and_states_the_problem(
-    gymbro_repo: Path,
+    app_repo: Path,
 ):
     """Owner 27.10 (designer audit): the brief states the problem, never
     prescribes variants, and always carries a "value and space" paragraph
     (who needs the feature, how often, how much screen it deserves)."""
     from src.designloop.brief import build_brief
 
-    text = build_brief(gymbro_repo, "profile_tab", CHANGE).text
+    text = build_brief(app_repo, "profile_tab", CHANGE).text
 
     assert "value and space" in text.lower()
     assert CHANGE in text
@@ -73,10 +73,10 @@ def test_brief_has_a_value_and_space_paragraph_and_states_the_problem(
         assert feature in text, feature
 
 
-def test_unknown_screen_is_an_error_not_an_empty_brief(gymbro_repo: Path):
+def test_unknown_screen_is_an_error_not_an_empty_brief(app_repo: Path):
     import pytest
 
     from src.designloop.brief import build_brief
 
     with pytest.raises((KeyError, ValueError)):
-        build_brief(gymbro_repo, "no_such_screen", CHANGE)
+        build_brief(app_repo, "no_such_screen", CHANGE)

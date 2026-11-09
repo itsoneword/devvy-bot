@@ -3,6 +3,7 @@
 import os
 import shutil
 import tempfile
+from typing import Iterator
 
 import pytest
 
@@ -38,6 +39,9 @@ CORE_TESTS = (
     # dv-5432: no exported test reads a path the export withholds
     "tests/unit/test_scripts/test_export_public.py::"
     "test_no_exported_test_reads_a_withheld_path",
+    # 31.10.26: and none imports a withheld module
+    "tests/unit/test_scripts/test_export_public.py::"
+    "test_no_exported_test_imports_a_withheld_module",
     "tests/unit/test_scripts/test_export_public.py::"
     "test_withheld_ref_scan_flags_a_root_chain_into_docs_research",
 )
@@ -118,6 +122,44 @@ def _legacy_data_root(monkeypatch: pytest.MonkeyPatch) -> None:
     Empty = unset; tests that exercise the root override it themselves.
     """
     monkeypatch.setenv("DEVVY_DATA_ROOT", "")
+
+
+@pytest.fixture(autouse=True)
+def _pump2_freeze_to_tmp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Pump v2 freeze state (dv-44b1) in a temp file, never the checkout's
+    ``data/pump2/freeze.json``: a live freeze must not hold unit ticks or
+    flip the Pump screen."""
+    from src.pump2 import freeze
+
+    p = tmp_path_factory.mktemp("pump2_freeze") / "freeze.json"
+    monkeypatch.setattr(freeze, "default_path", lambda: p)
+
+
+@pytest.fixture(autouse=True)
+def _pump2_scores_to_tmp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Pump v2 stage scores (dv-3b99) go to a temp path, never the live
+    bot.db: a unit tick's review / custom report must not add rows there."""
+    from src.pump2 import criteria
+
+    p = tmp_path_factory.mktemp("pump2_scores") / "bot.db"
+    monkeypatch.setattr(criteria, "scores_db", lambda: p)
+
+
+@pytest.fixture(autouse=True)
+def _restore_channel() -> Iterator[None]:
+    """Undo a CHANNEL that ``load_config`` exported from a test's .env file
+    (dv-fe4d): it writes os.environ behind monkeypatch's back, and a leaked
+    ``CHANNEL=local`` makes every later Settings() skip the token check."""
+    before = os.environ.get("CHANNEL")
+    yield
+    if before is None:
+        os.environ.pop("CHANNEL", None)
+    else:
+        os.environ["CHANNEL"] = before
 
 
 @pytest.fixture(autouse=True)

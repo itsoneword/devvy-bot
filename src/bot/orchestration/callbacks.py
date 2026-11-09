@@ -214,7 +214,10 @@ class CallbacksMixin(OrchestratorBase):
             )
             return
         if data == "model:codex_login":
-            await self._start_codex_login(query, context)
+            # /auth's login flow, the one implementation (dv-3881).
+            from .commands import auth
+
+            await auth._start_login(query, context, "codex")
             return
         if data == "model:codex_logout":
             proc = await asyncio.create_subprocess_exec(
@@ -278,7 +281,7 @@ class CallbacksMixin(OrchestratorBase):
         """lim:* — freeze/thaw on the /menu Pump screen, and taps on an old
         /limits message (that panel had buttons until dv-f6af). No agent
         turn: with Claude out of quota the agent cannot answer pump_control,
-        so these run taskpump directly. Owner-only, like /limits itself — a
+        so these run scripts/pump2 directly (dv-44b1: the old pump is off). Owner-only, like /limits itself — a
         button bypasses the command gate (dv-6b6c). ``markup``: what the
         freeze/thaw result keeps (the /menu Pump screen's « Назад, dv-6104)."""
         if self._resolve_role(query.from_user.id, context) != "owner":
@@ -288,11 +291,11 @@ class CallbacksMixin(OrchestratorBase):
         if action in ("freeze", "thaw"):
             from ...claude.agent_tools import run_repo_script
 
-            rc, out = await run_repo_script("taskpump", action, "--by", "owner")
+            rc, out = await run_repo_script("pump2", action, "--by", "owner")
             head = (
                 ("⏸ Pump заморожен." if action == "freeze" else "▶ Pump разморожен.")
                 if rc == 0
-                else f"taskpump {action} failed (exit {rc})."
+                else f"pump2 {action} failed (exit {rc})."
             )
             await self._drop_buttons(query, f"{head}\n{out[-800:]}".strip(), markup)
             return
@@ -317,7 +320,13 @@ class CallbacksMixin(OrchestratorBase):
         registry = context.bot_data.get("profile_registry")
         profile = registry.get_enabled_by_slug(slug) if registry else None
         if not profile:
-            await query.edit_message_text(f"Unknown profile: {slug}")
+            # Off this run over bad paths (dv-86f4): say why, not "unknown".
+            why = getattr(registry, "boot_disabled", {}).get(slug)
+            await query.edit_message_text(
+                f"⚠ The '{slug}' agent is off this run: {why}"
+                if why
+                else f"Unknown profile: {slug}"
+            )
             return
         user_id = query.from_user.id if query.from_user else None
         role = self._resolve_role(user_id, context)
@@ -602,6 +611,16 @@ class CallbacksMixin(OrchestratorBase):
             except Exception:
                 pass
 
+    async def _handle_publish_callback(
+        self, query: Any, context: ContextTypes.DEFAULT_TYPE, data: str
+    ) -> None:
+        """A tap on the «ready to publish» card (dv-b05e)."""
+        from .publish_taps import handle_publish_callback
+
+        await handle_publish_callback(
+            query, data, self._resolve_role(query.from_user.id, context) == "owner"
+        )
+
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -611,6 +630,10 @@ class CallbacksMixin(OrchestratorBase):
         if data.startswith(INTERRUPT_PREFIX):
             # Answers the query itself (a refusal is an alert popup).
             await self._handle_interrupt_callback(query, context, data)
+            return
+        if data.startswith("publish:"):
+            # The publish card (dv-b05e): same owner gate, popup refusal.
+            await self._handle_publish_callback(query, context, data)
             return
         await query.answer()
 

@@ -10,12 +10,15 @@ Usage:
            [--route pump_review] [--name NAME] [--purpose background_job|monitor]
            [--session-file PATH]
            [--ask-context '{"task_id": ..., "task_title": ..., "stage": ...}']
-  agentjob --print-route [--route NAME] [--model M]   # resolved route as JSON
+  agentjob --print-route [--route NAME] [--model M] [--harness claude]
+                                                    # resolved route as JSON
 
 The job's harness, provider and model come from the `jobs:` rows of
 config/models.yaml (dv-d63d; read here, so an edit applies to the next job).
 `--route` names the row (default: background_job, or monitor for
 --purpose monitor); `--model` beats it only on the Claude subscription.
+`--harness claude` runs this one job on Claude over the owner's jobs switch
+(dv-a8e4); it is never chosen implicitly, so a failed Codex job stays failed.
 
 The answer goes to stdout; the exit code is 0 on success, 3 when work the job
 started was still running at its end (dv-b6dd). Needs the bot's
@@ -81,6 +84,7 @@ from src.model_router.job import (  # noqa: E402
     run_job,
 )
 from src.model_router.routes import process_call_routes  # noqa: E402
+from src.utils.job_scope import cwd_in_profile  # noqa: E402
 
 
 def main() -> int:
@@ -88,10 +92,17 @@ def main() -> int:
     ap.add_argument("--profile", help="profile slug (policy flags)")
     ap.add_argument("--prompt-file", type=Path)
     ap.add_argument("--cwd", type=Path, default=None, help="default: the profile's")
+    ap.add_argument("--allow-dir", type=Path, action="append", default=[])
+    ap.add_argument("--native-preflight", action="store_true")
     ap.add_argument(
         "--model",
         default=None,
         help="explicit Claude model; default: the job route's (models.yaml jobs:)",
+    )
+    ap.add_argument(
+        "--harness",
+        default=None,
+        help="explicit one-job harness over the jobs switch; only 'claude'",
     )
     ap.add_argument(
         "--route",
@@ -105,11 +116,13 @@ def main() -> int:
         help="print the resolved route as JSON and exit",
     )
     ap.add_argument("--name", default="job")
-    ap.add_argument("--purpose", default="background_job", choices=["background_job", "monitor"])
+    ap.add_argument(
+        "--purpose", default="background_job", choices=["background_job", "monitor"]
+    )
     ap.add_argument(
         "--setting-sources",
         default="user,project",
-        help="comma list of CLI setting sources; taskpump stages pass 'project'",
+        help="comma list of CLI setting sources; pump stages pass 'project'",
     )
     ap.add_argument(
         "--ask-context",
@@ -131,7 +144,7 @@ def main() -> int:
 
     try:
         route = process_call_routes().resolve_job(
-            args.route or args.purpose, model=args.model
+            args.route or args.purpose, model=args.model, harness=args.harness
         )
     except ValueError as exc:
         sys.exit(f"error: {exc}")
@@ -159,12 +172,12 @@ def main() -> int:
     # ends (exit QUOTA_EXIT plus the quota line), without a model call.
     from src.model_router import quota
 
-    # Only a Claude-subscription route is stopped by Claude's limit; a job
-    # moved to Codex/OpenRouter (dv-d63d) goes ahead.
-    on_claude = route.harness == "claude"
-    limit = None if args.ignore_quota or not on_claude else quota.active()
+    provider = "anthropic" if route.provider == "anthropic_sub" else route.provider
+    limit = None if args.ignore_quota else quota.active(provider=provider)
     if limit is not None:
-        print(f"agentjob failed: {limit.message} (recorded, not retried)", file=sys.stderr)
+        print(
+            f"agentjob failed: {limit.message} (recorded, not retried)", file=sys.stderr
+        )
         print(quota.quota_line(limit), file=sys.stderr)
         return quota.QUOTA_EXIT
 
@@ -186,6 +199,17 @@ def main() -> int:
     cwd = (args.cwd or profile.working_dir).expanduser().resolve()
     if not cwd.is_dir():
         sys.exit(f"error: working dir does not exist: {cwd}")
+    extra_dirs = []
+    requested_dirs = list(args.allow_dir)
+    if cwd_in_profile(cwd, profile.working_dir):
+        # Profile roots and owner workspaces keep their configured write dirs;
+        # --cwd jobs elsewhere (pump worktrees) keep their explicit set only.
+        requested_dirs.extend(profile.extra_dirs)
+    for requested in requested_dirs:
+        root = Path(requested).expanduser().resolve()
+        if not root.is_dir() or root == Path("/"):
+            sys.exit(f"error: invalid --allow-dir: {root}")
+        extra_dirs.append(root)
     # dv-58db: a pump worktree is disposable; deleting inside it needs no ask.
     free_root = pump_worktree_root(cwd)
     print(f"agentjob: free_root={free_root}", file=sys.stderr)
@@ -212,8 +236,22 @@ def main() -> int:
         session_file=args.session_file,
         # A confined Codex job writes these too (dv-d63d); --cwd jobs (pump
         # worktrees) keep their explicit write set, as in the bgjob box.
-        extra_dirs=() if args.cwd else tuple(profile.extra_dirs or ()),
+        extra_dirs=tuple(dict.fromkeys(extra_dirs)),
     )
+    if args.native_preflight:
+        if route.harness != "openai_codex" or spec.unrestricted or spec.full_access:
+            sys.exit("error: native Codex preflight requested for an unconfined route")
+        from src.model_router.job_codex import preflight_codex_job
+        from src.model_router.harness import codex_program
+
+        program = codex_program()
+        if not program:
+            sys.exit("agentjob preflight failed: codex not found on PATH")
+        try:
+            preflight_codex_job(spec, program)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"agentjob preflight failed: {exc}", file=sys.stderr)
+            return 1
     return asyncio.run(run_job(spec, bot_link_from_env(REPO)))
 
 

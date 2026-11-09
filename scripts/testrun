@@ -106,7 +106,7 @@ def journal(unit: str) -> str:
 
 def outcome(unit: str, wait: bool) -> tuple[str, str]:
     """(systemd result, memory peak) from the finished scope's journal; ("",
-    "") unknown. Same parse as taskpump's unit_outcome. A scope logs its result
+    "") unknown. Parsed from the journal like a bgjob unit's result. A scope logs its result
     ('oom-kill') but, unlike a service, no "memory peak" line: that one comes
     from `Peak` below."""
     deadline = time.monotonic() + (JOURNAL_WAIT_SECONDS if wait else 0)

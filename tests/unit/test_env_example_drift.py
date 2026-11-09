@@ -63,15 +63,23 @@ class TestGeneratedFileIsCurrent:
 
 class TestEveryFieldIsDocumented:
     def test_all_settings_fields_present(self):
-        from src.config.settings import Settings
+        from src.config.settings import PROCESS_ENV_ONLY, Settings
 
         documented = _documented(ENV_EXAMPLE.read_text(encoding="utf-8"))
         missing = [
             name.upper()
             for name in Settings.model_fields
-            if name.upper() not in documented
+            if name.upper() not in documented and name.upper() not in PROCESS_ENV_ONLY
         ]
         assert not missing, f"undocumented settings: {missing}"
+
+    def test_process_env_only_settings_are_left_out(self):
+        # The loader refuses them in an env file (dv-fe4d): offering them in
+        # the example would invite the line that stops the boot.
+        from src.config.settings import PROCESS_ENV_ONLY
+
+        documented = _documented(ENV_EXAMPLE.read_text(encoding="utf-8"))
+        assert not PROCESS_ENV_ONLY & set(documented)
 
 
 class TestInstallerContract:

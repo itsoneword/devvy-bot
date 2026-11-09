@@ -155,9 +155,8 @@ data/coach/*
 *.db
 *.db-journal
 
-# Codex CLI backend: generated persona + per-turn output file (written into
-# each profile's working_dir, which for the devops profile is this repo).
-/AGENTS.md
+# Codex CLI backend: per-turn output file. Root AGENTS.md is generated from
+# docs/project-instructions.md and tracked with CLAUDE.md.
 .codex_last_message.txt
 *.log
 .DS_Store
@@ -188,7 +187,7 @@ tg_image_*
 # Archived/retired tooling and superseded docs (preserved on disk, out of git)
 .archive/
 
-# taskpump job reports — per-worktree scratch, never committed
+# pump job reports — per-worktree scratch, never committed
 .pump/
 
 # Per-user uploads (dv-9ebe). devops' working_dir is this repo, so inbound
@@ -224,3 +223,9 @@ deploy/rendered/
 
 # dv-5e4f Phase 0.1: prod-derived golden-replay snapshots (never commit real data)
 data/golden/
+
+# launchd agents' logs, macOS local mode (scripts/render_deploy.py LOG_DIR)
+/logs/
+
+# Pump v2 per-card worktrees live inside the repo
+.pump-worktrees/

@@ -67,6 +67,25 @@ _KILL_IN_SQL_HEREDOC = (
     "EOF"
 )
 
+_DOC_EDIT_HEREDOC = (
+    "python3 - <<'PY'\n"
+    "p = 'docs/systemd-operations.md'\n"
+    "t = open(p).read()\n"
+    "t += 'Run sudo systemctl restart claude-bot, then docker rm -f c;'\n"
+    "t += ' cleanup with rm -rf build and kill 1.\\n'\n"
+    "open(p, 'w').write(t)\n"
+    "PY"
+)
+_NC_HEREDOC = (
+    "python3 - <<'PY'\n"
+    "import sqlite3\n"
+    "nc = 1\n"
+    "x = (nc + 1)\n"
+    "c = sqlite3.connect('file:data/db/bot.db?mode=ro', uri=True)\n"
+    "print(x, c.execute('select 1').fetchall())\n"
+    "PY"
+)
+
 
 # dv-275f: a real protected dir of this install (secrets/), not a guess.
 # Placeholder resolved at run time by _live(): the suite pins DEVVY_DATA_ROOT
@@ -105,6 +124,25 @@ CASES: List[Tuple[str, Tuple[str, Dict[str, Any]], bool, str]] = [
     ("download", _bash("curl -s https://example.com/file"), True, ALLOW),
     ("remote copy", _bash("scp report.pdf host:/srv/"), True, ASK),
     ("git push", _bash("git push origin main"), True, ASK),
+    # dv-b05e: publishing to the public repo is the owner's button, never a turn's.
+    ("release publish", _bash("scripts/release publish devvy"), True, ASK),
+    (
+        "release_public publish",
+        _bash("poetry run python scripts/release_public.py publish"),
+        True,
+        ASK,
+    ),
+    (
+        "gh release create",
+        _bash("gh release create v1.7.0 --notes-file notes.md"),
+        True,
+        ASK,
+    ),
+    ("gh release delete", _bash("gh release delete v1.7.0 --yes"), True, ASK),
+    ("release check pushes nothing", _bash("scripts/release check devvy"), True, ALLOW),
+    ("release later pushes nothing", _bash("scripts/release later devvy"), True, ALLOW),
+    ("quoted publish mention", _bash('git commit -m "release publish"'), True, ALLOW),
+    ("gh release list is a read", _bash("gh release list"), True, ALLOW),
     (
         "money script",
         _bash(
@@ -309,6 +347,47 @@ CASES: List[Tuple[str, Tuple[str, Dict[str, Any]], bool, str]] = [
     (
         "read-only name on another server asks",
         ("mcp__other__exchange_report", {}),
+        True,
+        ASK,
+    ),
+    # dv-3d18 phase 1: risky verbs match where a shell runs them, not in data.
+    (
+        "heredoc editing docs that mention systemctl restart",
+        _bash(_DOC_EDIT_HEREDOC),
+        True,
+        ALLOW,
+    ),
+    (
+        "python heredoc with (nc + 1) sqlite analysis",
+        _bash(_NC_HEREDOC),
+        True,
+        ALLOW,
+    ),
+    (
+        "grep for docker rm -f text",
+        _bash('grep -rn "docker rm -f" docs'),
+        True,
+        ALLOW,
+    ),
+    (
+        "git merge-base is not a merge",
+        _bash("git merge-base pump/dv-ab12 main"),
+        True,
+        ALLOW,
+    ),
+    ("ssh with a quoted rm asks", _bash("ssh h 'rm -rf x'"), True, ASK),
+    ("sudo systemctl asks", _bash("sudo systemctl restart claude-bot"), True, ASK),
+    ("bash heredoc kill asks", _bash("bash <<EOF\nkill 1\nEOF"), True, ASK),
+    (
+        "heredoc piped into bash asks",
+        _bash("cat <<EOF | bash\nsystemctl restart nginx\nEOF"),
+        True,
+        ASK,
+    ),
+    ("literal piped into sh asks", _bash("echo 'kill 1' | sh"), True, ASK),
+    (
+        "python -c os.system rm -rf / asks",
+        _bash("python3 -c \"import os; os.system('rm -rf /')\""),
         True,
         ASK,
     ),

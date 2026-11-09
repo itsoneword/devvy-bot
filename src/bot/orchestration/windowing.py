@@ -173,43 +173,48 @@ async def account_turn_and_maybe_eval(
     return state
 
 
-SEED_NOTES_FACT_LIMIT = 15
-# The bundle now carries up to MEMORY_POINTER_CAP (60) pointers (dv-cf07);
-# the seed keeps only the newest few so it stays a compact reminder, not a
-# second copy of the bundle's pointer list.
-SEED_NOTES_POINTER_LIMIT = 15
+# Caps of the window bundle (MEMORY_SNAPSHOT_GENERAL_CAP / MEMORY_POINTER_CAP
+# defaults). main.py sets ``memory_repo.bundle_caps`` from the live settings so
+# the seed excludes exactly what the bundle renders (dv-b50f).
+DEFAULT_BUNDLE_CAPS = (100, 100)
 
 
 async def _session_notes_for_seed(memory_repo: Any, agent_id: str) -> str:
-    """Two labeled sub-blocks for the seed's session-notes: dated user-fact
-    lines and dated conversation_result pointers, rendered via the same
-    helpers as the window bundle so the dv-8254 taxonomy cannot drift between
-    the two surfaces (plan decision 8). The fact lines deliberately duplicate
-    the bundle's snapshot — belt-and-braces at the highest-risk moment (owner
-    default D8, revisit with dv-e574's measurement). conversation_result
-    content never appears; pointers only.
+    """Facts/pointers the window bundle will NOT render, as labeled sub-blocks.
 
-    The roll's final evaluator run lands its facts just before the next turn
-    consumes the seed, so 'freshest' is exactly 'what the outgoing window was
-    about'."""
+    The bundle (``<constraints>``, ``<user_facts>``, ``<memory_pointers>``)
+    already carries its capped snapshot, so repeating those lines only costs
+    tokens and overweights them (dv-b50f supersedes the D8 belt-and-braces
+    duplication). We take the uncapped snapshot and keep only rows outside the
+    bundle's selection (e.g. beyond its caps, or landed after it). Same
+    render helpers as the bundle; conflict-pair members are excluded;
+    conversation_result content never appears, pointers only. Returns "" when
+    nothing remains, so the caller omits the block."""
     if not memory_repo or not agent_id:
         return ""
     from src.storage.memory_repository import render_fact_line, render_pointer_line
 
+    general_cap, pointer_cap = getattr(memory_repo, "bundle_caps", DEFAULT_BUNDLE_CAPS)
     try:
-        snapshot = await memory_repo.facts_snapshot(agent_id)
+        bundle = await memory_repo.facts_snapshot(
+            agent_id, general_cap=general_cap, pointer_cap=pointer_cap
+        )
+        full = await memory_repo.facts_snapshot(
+            agent_id, general_cap=1_000_000, pointer_cap=1_000_000
+        )
     except Exception as e:
         logger.warning("Seed session notes unavailable", error=str(e))
         return ""
-    # Conflict-pair members are excluded: the bundle renders them adjacently
-    # under an explicit warning; repeating one side here without that flag
-    # would present an unresolved conflict as settled truth.
-    conflict_ids = {fact.id for pair in snapshot.conflicts for fact in pair}
-    facts = [f for f in snapshot.pinned + snapshot.general if f.id not in conflict_ids]
-    fact_lines = [f"- {render_fact_line(f)}" for f in facts[:SEED_NOTES_FACT_LIMIT]]
+    in_bundle = {f.id for f in bundle.pinned + bundle.general}
+    pointer_ids = {p.id for p in bundle.pointers}
+    conflict_ids = {fact.id for pair in full.conflicts for fact in pair}
+    fact_lines = [
+        f"- {render_fact_line(f)}"
+        for f in full.pinned + full.general
+        if f.id not in conflict_ids and f.id not in in_bundle
+    ]
     pointer_lines = [
-        f"- {render_pointer_line(p)}"
-        for p in snapshot.pointers[:SEED_NOTES_POINTER_LIMIT]
+        f"- {render_pointer_line(p)}" for p in full.pointers if p.id not in pointer_ids
     ]
     sections: list[str] = []
     if fact_lines:
@@ -258,7 +263,9 @@ async def consume_pending_seed(
     # read as a fallback for a transition armed by an older build still in
     # flight when this shipped.
     state = await window_repo.get_or_create(user_id, working_dir)
-    old_window = state.pending_seed_window or user_data.pop("pending_seed_window", None)
+    # Row only: user_data is shared by every profile's chat, so a fallback
+    # read could seed this agent from another agent's window id (dv-3114).
+    old_window = state.pending_seed_window
     user_data.pop("pending_seed_window", None)
     if not old_window:
         return user_message
@@ -290,6 +297,13 @@ async def consume_pending_seed(
             total_turns = await counter(user_id, working_dir, window_id=old_window)
         except Exception as e:
             logger.warning("Seed turn count unavailable", error=str(e))
+    # A retry/duplicate: the last stored turn is the very request now being
+    # sent. The trailing user message already carries it, so drop that turn
+    # rather than print it twice (dv-b50f).
+    if rows and rows[-1][0].strip() == user_message.strip():
+        rows = rows[:-1]
+        if total_turns:
+            total_turns -= 1
     tail = select_tail(rows, total_turns=total_turns)
     notes = await _session_notes_for_seed(memory_repo, agent_id)
     return build_seed_preamble(
@@ -356,8 +370,7 @@ async def arm_backend_switch(
     await window_repo.set_pending_transition(
         user_id, working_dir, seed_window=state.window_id, force_new_session=True
     )
-    user_data["pending_seed_window"] = state.window_id
-    user_data["force_new_session"] = True
+    # No user_data mirror: it is shared across profiles (dv-3114).
 
 
 def _hand_off_final_eval(
@@ -435,8 +448,7 @@ async def refresh_window(
     await window_repo.set_pending_transition(
         user_id, working_dir, seed_window=old, force_new_session=True
     )
-    user_data["pending_seed_window"] = old
-    user_data["force_new_session"] = True
+    # No user_data mirror: it is shared across profiles (dv-3114).
 
 
 async def window_conversation_text(
@@ -513,7 +525,6 @@ async def reset_window(
         user_id, working_dir, seed_window=None, force_new_session=True
     )
     user_data.pop("pending_seed_window", None)
-    user_data["force_new_session"] = True
 
 
 def apply_window_tokens(

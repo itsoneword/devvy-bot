@@ -43,6 +43,8 @@ jobs:
           poetry run flake8 src tests
 
       - name: Test
+        env:
+          PYTEST_ADDOPTS: -m "not timing"
         run: make test
 
   release:

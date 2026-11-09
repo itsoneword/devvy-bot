@@ -165,9 +165,7 @@ def test_truncated_screen_png_carries_the_red_flag(no_network):
 # --- scenario 3: deterministic, no real Telegram --------------------------
 
 
-@pytest.mark.parametrize(
-    "name", ["model_7fca8f0.json", "menu_6104_settings.json", "menu_6104_pump.json"]
-)
+@pytest.mark.parametrize("name", ["model_7fca8f0.json", "menu_6104_pump.json"])
 def test_same_input_twice_gives_byte_identical_pngs(name, no_network):
     pytest.importorskip("PIL")
     from src.bot.screens import render

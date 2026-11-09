@@ -76,3 +76,41 @@ def test_later_hit_moves_until_and_an_unreadable_record_is_no_limit(root) -> Non
 
     data_layout().model_quota.write_text("{not json")
     assert quota.active(T0) is None
+
+
+def test_claude_and_codex_records_expire_independently_and_legacy_is_claude(
+    root,
+) -> None:
+    import json
+
+    from src.model_router import quota
+    from src.utils.paths import data_layout
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    claude_reset = now + timedelta(hours=1)
+    codex_reset = now + timedelta(hours=2)
+    # A pre-migration top-level record has no provider.
+    data_layout().model_quota.parent.mkdir(parents=True, exist_ok=True)
+    data_layout().model_quota.write_text(
+        json.dumps(
+            {
+                "kind": "weekly limit",
+                "until": claude_reset.isoformat(),
+                "message": "You have hit your weekly limit",
+            }
+        )
+    )
+    assert quota.active(now, provider="anthropic") is not None
+    assert quota.active(now, provider="openai") is None
+
+    quota.record(
+        quota.Limit(
+            "usage limit", codex_reset, "You’ve hit your usage limit", provider="openai"
+        ),
+        "codex-job",
+    )
+    assert quota.active(now, provider="anthropic").until == claude_reset
+    assert quota.active(now, provider="openai").until == codex_reset
+    assert quota.active(claude_reset, provider="anthropic") is None
+    assert quota.active(claude_reset, provider="openai") is not None
+    assert quota.active(codex_reset, provider="openai") is None

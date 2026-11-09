@@ -23,6 +23,10 @@ ALLOWED_PREFIXES = (
     # Standalone writer of the separate Postgres observability DB (psycopg,
     # obs_writer role); not the bot's SQLite, same class as llm_analytics.
     "src/observability/host_metrics.py",
+    # dv-fe4d: the local inbox (``local_messages``) opens its own short
+    # connection per call (not the pool, which is tied to one event loop); the
+    # one table and its SQL live together in this module.
+    "src/notifications/transport.py",
 )
 
 _PATTERN = re.compile(r"\bget_connection\(|\.execute\(|\.executescript\(")

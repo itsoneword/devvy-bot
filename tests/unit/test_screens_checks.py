@@ -133,15 +133,10 @@ async def test_current_model_keyboard_passes_every_check(
     assert _codes(screen) == []
 
 
-@pytest.mark.parametrize(
-    "name, marker",
-    [("menu_6104_settings.json", "➖ "), ("menu_6104_pump.json", "⚡ ")],
-    ids=["settings", "pump"],
-)
-def test_dv6104_menu_screens_fail_on_truncated_labels(name, marker):
-    screen = _fixture(name)
+def test_dv6104_menu_pump_screen_fails_on_truncated_labels():
+    screen = _fixture("menu_6104_pump.json")
     flat = [label for row in _labels(screen) for label in row]
-    assert any(label.startswith(marker) for label in flat), flat
+    assert any(label.startswith("⚡ ") for label in flat), flat
     assert "truncated" in _codes(screen)
 
 

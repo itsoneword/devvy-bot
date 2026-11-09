@@ -60,7 +60,7 @@ class TestPromptComposer:
 
         # Verify order: directory constraint < agent_identity < constraints
         #               < user_facts
-        idx_dir = result.index("All file operations")
+        idx_dir = result.index(str(tmp_path))
         idx_agent = result.index("<agent_identity>")
         idx_pinned = result.index("<constraints>")
         idx_general = result.index("<user_facts>")
@@ -94,7 +94,7 @@ class TestPromptComposer:
         agent = tmp_path / "nonexistent_agent.md"
         c = PromptComposer(memory_path=mem, agent_md_path=agent)
         result = c.compose(working_directory=tmp_path)
-        assert "All file operations" in result
+        assert str(tmp_path) in result
         assert "<agent_identity>" not in result
         assert "<constraints>" not in result
         assert "<user_facts>" not in result
@@ -112,7 +112,9 @@ class TestPromptComposer:
         self, composer: PromptComposer
     ) -> None:
         result = composer.compose(working_directory=Path("/some/dir"))
-        assert "All file operations must stay within /some/dir" in result
+        assert "/some/dir" in result
+        assert "write" in result.lower()
+        assert "All file operations must stay within /some/dir" not in result
 
 
 class TestComposeFacts:
