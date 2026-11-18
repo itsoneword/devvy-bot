@@ -116,7 +116,7 @@ def test_review_capped_diff_without_files_read_is_rejected(
     _big_commit(wt)
     (wt / ".pump/review.md").write_text("## Verdict\npass\n## Remarks\n")
     f.tick(b, tmp_path)
-    assert st(b)["stage"] == "stopped"
+    assert st(b)["stage"] == "resolve"
     assert "did not read the code" in find_card(b, "dv-0001").body
 
 
@@ -143,7 +143,7 @@ def test_review_rejects(repo: Path, tmp_path: Path, text: str) -> None:
     if text:
         (wt / ".pump/review.md").write_text(text)
     f.tick(b, tmp_path)
-    assert st(b)["stage"] == "stopped"
+    assert st(b)["stage"] == "resolve"
     assert "review" in find_card(b, "dv-0001").body
 
 
@@ -168,7 +168,7 @@ def test_review_return_build_remarks_rereview_second_return(
     assert (wt / ".pump/review.prev.md").exists()
     verdict(wt, "return", "1. src/b.py: still wrong")
     f.tick(b, tmp_path)
-    assert st(b)["stage"] == "stopped"
+    assert st(b)["stage"] == "resolve"
     assert "two returns, stopped for the owner" in find_card(b, "dv-0001").body
 
 

@@ -46,6 +46,7 @@ purposes:
   screen_extraction: {harness: backend, json: {claude: validate}}
   reconcile:         {models: {claude: haiku}}
   consolidation:     {models: {claude: haiku}}
+  consolidation_cards: {models: {claude: sonnet}}  # sweep: done card holds it?
   fact_quality:      {models: {claude: haiku}}
   onboarding:        {}                          # = default (sonnet)
   ask_explain:       {models: {claude: sonnet}}
@@ -56,16 +57,40 @@ purposes:
     harness: openrouter
     models: {openrouter: null, claude: opus}     # null = live best Qwen pick
   screen:            {models: {claude: haiku}}   # decide's LLM leg (off today)
-  design_critic:                                 # dv-9133: judges Claude's mockups,
-    harness: openai_codex                        # so another family; takes images
-    fallback: null                               # never Claude (only Codex sees -i)
+  design_critic:                                 # dv-a5aa: judges the mockups on
+    harness: claude                              # opus (owner 13.11), images as
+    models: {claude: opus}                       # blocks on the Claude plain path;
+    fallback: null                               # no fallback
+  devlog_style:                                  # dv-fc9d: owner's speech patterns,
+    harness: claude                              # his transcripts: Claude only
+    models: {claude: sonnet}
+    fallback: null
+  post_image:                                    # dv-fc9d: devlog channel picture,
+    harness: openrouter                          # image out; only OpenRouter draws
+    models: {openrouter: google/gemini-nano-banana-2.1}
+    fallback: null
+  design_mockup:                                 # dv-75f1: design step 0, free
+    harness: flux                                # FLUX (key-store service flux);
+    models: {flux: flux3-klein}
+    fallback: null                               # owner 13.11: no paid fallback
+  design_mockup_paid:                            # card label paidmockup only
+    harness: openrouter
+    models: {openrouter: google/gemini-nano-banana-2.1}
+    fallback: null
+  design_mockup_prompt: {models: {claude: sonnet}}  # mockup subjects from the brief
+  design_spec:                                   # a board's style spec drafted
+    harness: claude                              # from its images (opus, images)
+    models: {claude: opus}
+    fallback: null
 
 # --- Background jobs (dv-d63d) -------------------------------------------
 #
 # bgjob / job_start (background_job), the server monitor (monitor) and each
 # Pump stage (pump_<stage>) run on the row named here. Same row keys as
 # purposes, except fallback: a job never falls back to another harness, a
-# failed job is reported (owner 2026-10-26). jobs.default is the jobs' own
+# failed job is reported (owner 2026-10-26). One exception, limit_fallback:
+# <claude model>: a job that hits that model's usage limit reruns once on
+# this model (owner 2026-11-17). jobs.default is the jobs' own
 # default row; the top-level default above is for plain calls only.
 #
 # Read by each job when it starts: an edit applies to the next job, no
@@ -96,7 +121,7 @@ jobs:
   pump_implement:  {models: {claude: opus}}
   pump_review:     {models: {claude: sonnet}}
   pump_merge:      {models: {claude: opus}}  # dv-ca8b owner-started merge job
-  pump_mergefix:   {models: {claude: opus}}  # dv-2c5c pump2: a merge that did not land
+  pump_resolve:    {models: {claude: opus}}  # dv-b8bb pump2: every stop goes here first
   design_generate: {models: {claude: sonnet}}  # dv-9133 design variants; not opus
   # pump_copy:     {models: {claude: sonnet}}  # a board's custom stage `copy` (docs/pump.md)
 

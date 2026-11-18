@@ -1,8 +1,9 @@
 """ANALYZE: card + repo -> ``.pump/plan.md`` (goal, Cn criteria, touches,
 size, kind, assumptions, jobs, questions; format in ``..criteria``).
 
-``.pump/`` is state, never committed. Questions park the card in
-``waiting_user``; the owner's verbatim answer (``pump2 answer``) reruns this
+``.pump/`` is state, never committed. Questions go to resolve first
+(dv-f707): the board's agent answers the reversible ones on the card and
+passes the rest to the owner (``waiting_user``); the answers rerun this
 stage once. A second round of questions stops the card. A plan that breaks
 the format reruns once with the error (``format_retry``), then stops.
 """
@@ -12,7 +13,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from .. import criteria as cr
-from ..state import Board, Card, Outcome, card_digest
+from ..state import QUESTION_STOP, Board, Card, Outcome, card_digest
+from .common import read_tests_json
 
 SECTIONS = (
     "Goal",
@@ -38,11 +40,22 @@ def prompt(board: Board, card: Card, wt: Path) -> str:
     again = ""
     if prev.exists():
         again = (
-            "\nThis is a SECOND pass. Your earlier plan is below; the owner's "
-            "answer is the last `### @owner` section of the card. Produce the "
-            "final plan with that answer applied. Ask nothing the owner has "
-            "already answered.\n\n=== earlier plan.md ===\n"
+            "\nThis is a SECOND pass. Your earlier plan is below; the answers "
+            "are the card's last `### @<install>/owner` (older: `### @owner`) "
+            "section and the board agent's `decided for you` comment: apply "
+            "both like owner answers. Produce the final plan with them applied. "
+            "Ask nothing already answered.\n\n=== earlier plan.md ===\n"
             f"{prev.read_text()}\n=== end earlier plan ===\n"
+        )
+    if card.pump2.get("rethink"):
+        # dv-b8bb: resolve sent the card back (`rerun analyze`) to rethink it
+        kept, _ = read_tests_json(wt)
+        listing = "\n".join(f"- {f}" for f in kept) or "(none)"
+        again += (
+            "\nThe resolve step sent this card BACK to rethink the task (its "
+            "note is below). Rewrite the requirements. The current tests are "
+            "the previous test version: keep them unless the new criteria "
+            f"contradict them:\n{listing}\n"
         )
     cur = pump / "plan.md"
     if card.pump2.get("format_retry") and cur.exists():
@@ -100,9 +113,14 @@ rejected.
 Anything the next stages need (files, risks).
 
 Rules for questions: do not ask about things you can decide yourself (temp
-files, which file to edit, naming, formatting). Ask only about product, scope,
-money, production or deletion decisions. When in doubt, decide and record the
-choice in Assumptions.
+files, which file to edit, naming, formatting). Decide anything easy to change
+later (labels, defaults, layout, wording, which variant first, scope splits
+into follow-up cards) and record it in Assumptions with `reversible: yes`. Ask
+only about money, keys, prod (an action on the prod server or prod data:
+deploy, restart, migration, deletion; not a look or behaviour change shipped by
+the normal deploy and easy to flip back), deletion outside the job tree, or
+product choices that are hard to undo. The result lands on staging for the
+owner to try first.
 """
 
 
@@ -189,6 +207,8 @@ def finish(board: Board, card: Card, wt: Path) -> Outcome:
     if not keep:
         # docs only: no tests stage, but build still writes the docs
         nxt = "tests" if set(touches) & {"code", "db", "ui"} else "build"
+        if nxt != "tests":  # the tests stage reads (and clears) it
+            state["rethink"] = None
         return Outcome(nxt, head, state)
     q = "\n".join(f"{i}. {x}" for i, x in enumerate(keep, 1))
     rnd = int(card.pump2.get("round") or 0)
@@ -197,9 +217,7 @@ def finish(board: Board, card: Card, wt: Path) -> Outcome:
             "stopped",
             f"analyze: asked twice, stopped for the owner\n{head}\nQuestions:\n{q}",
         )
+    # dv-f707: the board's agent (resolve) triages them before the owner
     return Outcome(
-        "waiting_user",
-        f"analyze: questions for the owner (answer with "
-        f'`pump2 answer {board.name}:{card.id} "<text>"`)\n{q}\n\n{head}',
-        dict(state, round=rnd + 1),
+        "stopped", f"{QUESTION_STOP}\n{q}\n\n{head}", dict(state, round=rnd + 1)
     )

@@ -107,7 +107,7 @@ async def test_timed_out_ask_comes_back_to_a_cursor_past_it(db, monkeypatch) -> 
 
     # Nothing changed yet: the cursor past the ask returns nothing.
     assert _poll(client, cursor)["messages"] == []
-    assert await asyncio.wait_for(task, 5) == {"approved": False}
+    assert await asyncio.wait_for(task, 5) == {"approved": False, "timed_out": True}
 
     # Same cursor after the timeout: the edited card, buttons gone.
     again = _poll(client, cursor)
@@ -127,7 +127,7 @@ async def test_answered_ask_comes_back_without_buttons(db) -> None:  # type: ign
     data = next(b[1] for b in first[0]["buttons"] if b[1].endswith(":y"))
     r = client.post("/internal/callback", json={"data": data}, headers=TUI_AUTH)
     assert r.json() == {"matched": True}
-    assert await asyncio.wait_for(task, 5) == {"approved": True}
+    assert await asyncio.wait_for(task, 5) == {"approved": True, "timed_out": False}
     rows = _poll(client, cursor)["messages"]
     assert [m["id"] for m in rows] == [first[0]["id"]]
     assert not rows[0]["buttons"] and "Approved" in rows[0]["text"]

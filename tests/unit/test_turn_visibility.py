@@ -62,3 +62,37 @@ async def test_busy_notice_sent_and_removed():
         assert "job x" in h.bot.send_message.call_args.kwargs["text"]
         sent.delete.assert_not_called()
     sent.delete.assert_awaited_once()
+
+
+async def test_busy_notice_goes_to_profile_topic_not_dm():
+    """A gymbro background turn locks only gymbro: its notice belongs in the
+    GymBro topic, not the DM (which is devops) - 17.11.26."""
+    h = AgentHandler(
+        event_bus=MagicMock(),
+        claude_integration=MagicMock(),
+        default_working_directory=".",
+        default_user_id=1,
+    )
+    sent = MagicMock()
+    sent.delete = AsyncMock()
+    h.bot = MagicMock()
+    h.bot.send_message = AsyncMock(return_value=sent)
+    router = MagicMock()
+    router.chat_id = -100
+    router.profile_topic = lambda slug: "GymBro" if slug == "gymbro" else None
+    router.thread_id = AsyncMock(return_value=42)
+    h.reports_router = router
+    async with h._busy_notice(1, "x", "gymbro"):
+        kw = h.bot.send_message.call_args.kwargs
+        assert (kw["chat_id"], kw["message_thread_id"]) == (-100, 42)
+    async with h._busy_notice(1, "x", "devops"):
+        kw = h.bot.send_message.call_args.kwargs
+        assert kw["chat_id"] == 1 and "message_thread_id" not in kw
+
+
+def test_job_finish_label_is_readable():
+    from src.events.handlers import _job_label
+
+    assert _job_label("job-finish:79994f734795") == "reading a finished job's result"
+    assert _job_label("crypto") == "job crypto"
+    assert _job_label(None) == "scheduled job"

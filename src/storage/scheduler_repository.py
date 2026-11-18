@@ -53,6 +53,7 @@ class SchedulerRepository:
         item_id: Any,
         timezone: Any,
         ends_at_iso: Any,
+        profile_slug: Any = None,
     ) -> None:
         """Insert (or replace) a job definition, active by default. Callers
         own formatting ``target_chat_ids`` to a CSV string and ``ends_at`` to
@@ -62,8 +63,8 @@ class SchedulerRepository:
                 "INSERT OR REPLACE INTO scheduled_jobs "
                 "(job_id, job_name, cron_expression, prompt, target_chat_ids, "
                 "working_directory, skill_name, created_by, is_active, "
-                "delivery, item_id, timezone, ends_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+                "delivery, item_id, timezone, ends_at, profile_slug) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
                 (
                     job_id,
                     job_name,
@@ -77,6 +78,7 @@ class SchedulerRepository:
                     item_id,
                     timezone,
                     ends_at_iso,
+                    profile_slug,
                 ),
             )
             await conn.commit()

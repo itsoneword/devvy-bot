@@ -71,7 +71,13 @@ def test_codex_preset_moves_every_purpose_but_the_scorer(tmp_path):
             "  screen_extraction: {harness: openai_codex}\n",
         )
     )
-    for purpose in PLAIN_PURPOSES - {"scorer"}:
+    # post_image (dv-fc9d) is pinned to OpenRouter (only it draws),
+    # devlog_style to Claude (the owner's own transcripts), design_critic to
+    # Claude opus (dv-a5aa).
+    pinned = {"scorer", "post_image", "devlog_style", "design_critic"}
+    # dv-75f1: mockups on FLUX / OpenRouter (image out), the spec on opus.
+    pinned |= {"design_mockup", "design_mockup_paid", "design_spec"}
+    for purpose in PLAIN_PURPOSES - pinned:
         route = routes.resolve(purpose, backend="claude")
         assert (route.harness, route.model) == (CODEX_HARNESS, CODEX_MODEL), purpose
 
@@ -85,8 +91,11 @@ def test_openrouter_preset_moves_every_purpose(tmp_path):
             "  screen_extraction: {harness: openrouter}\n",
         )
     )
-    # scorer and design_critic (dv-9133) are pinned to a harness of their own.
-    for purpose in PLAIN_PURPOSES - {"scorer", "design_critic"}:
+    # scorer, design_critic (dv-a5aa), post_image and devlog_style (dv-fc9d)
+    # are pinned to a route of their own.
+    pinned = {"scorer", "design_critic", "post_image", "devlog_style"}
+    pinned |= {"design_mockup", "design_mockup_paid", "design_spec"}
+    for purpose in PLAIN_PURPOSES - pinned:
         for hint in ("claude", "openai_codex"):
             route = routes.resolve(purpose, backend=hint)
             assert (route.harness, route.model, route.provider) == (

@@ -104,7 +104,7 @@ def test_comment_is_appended(repo: Path) -> None:
     before = p.read_text()
     add_comment(p, "hello")
     after = p.read_text()
-    assert after.startswith(before) and "### @pump2 — " in after
+    assert after.startswith(before) and "/pump2 — " in after
     assert after.rstrip().endswith("hello")
 
 
@@ -150,12 +150,12 @@ def test_merge_green_fast_forwards(repo: Path, tmp_path: Path) -> None:
     assert ".pump-worktrees/" in (repo / ".gitignore").read_text()
 
 
-def test_merge_green_but_dirty_live_checkout_goes_to_mergefix(
+def test_merge_green_but_dirty_live_checkout_goes_to_resolve(
     repo: Path, tmp_path: Path
 ) -> None:
     """Tests green, but the live checkout holds someone's uncommitted edit the
     fast-forward would overwrite (gb-1ac7, gb-1ae0 05.11). dv-2c5c: no longer
-    held; the card goes to the mergefix stage, the file is never touched."""
+    held; dv-b8bb: the card goes to resolve, the file is never touched."""
     branch_with(repo, "pump2/x", "b.txt", "b\n")
     (repo / "b.txt").write_text("someone's uncommitted work\n")
     p = repo / TASKS / "dv-0001.md"
@@ -163,9 +163,9 @@ def test_merge_green_but_dirty_live_checkout_goes_to_mergefix(
     runs = tmp_path / "runs"
     b = board(repo, f"echo x >> {runs}")
     res = merge(b, find_card(b, "dv-0001"), locks=tmp_path / "l")
-    assert res.outcome == "mergefix"
+    assert res.outcome == "conflict"
     c = find_card(b, "dv-0001")
-    assert c.pump2["stage"] == "mergefix"
+    assert c.pump2["stage"] == "resolve"
     assert (repo / "b.txt").read_text() == "someone's uncommitted work\n"
     assert dirty_overlap(b, "pump2/x") == ["b.txt"]
     assert runs.read_text().count("x") == 1
@@ -204,7 +204,8 @@ def test_merge_dirty_file_the_branch_does_not_touch_merges(
     assert (repo / "notes.txt").exists()
 
 
-def test_merge_red_goes_to_build_then_stops(repo: Path, tmp_path: Path) -> None:
+def test_merge_red_goes_to_resolve(repo: Path, tmp_path: Path) -> None:
+    """dv-b8bb: no blind back-to-build; every merge RED goes to resolve."""
     branch_with(repo, "pump2/x", "b.txt", "b\n")
     p = repo / TASKS / "dv-0001.md"
     set_pump2(p, stage="merge", branch="pump2/x")
@@ -213,12 +214,11 @@ def test_merge_red_goes_to_build_then_stops(repo: Path, tmp_path: Path) -> None:
     res = merge(b, find_card(b, "dv-0001"), locks=tmp_path / "l")
     assert res.outcome == "red"
     c = find_card(b, "dv-0001")
-    assert c.pump2["stage"] == "build" and c.pump2["attempt"] == 1
+    assert c.pump2["stage"] == "resolve" and c.pump2["resolve_from"] == "merge"
     assert "tests/x.py::test_boom" in c.body and "exit code: 1" in c.body
     assert git(repo, "rev-parse", "main") == head
-    set_pump2(p, stage="merge")
-    merge(b, find_card(b, "dv-0001"), locks=tmp_path / "l")
-    assert find_card(b, "dv-0001").pump2["stage"] == "stopped"
+    stop_md = repo / ".pump-worktrees/dv-0001/.pump/stop.md"
+    assert "tests/x.py::test_boom" in stop_md.read_text()
 
 
 def test_merge_conflict_stops_loud(repo: Path, tmp_path: Path) -> None:
@@ -228,10 +228,10 @@ def test_merge_conflict_stops_loud(repo: Path, tmp_path: Path) -> None:
     set_pump2(repo / TASKS / "dv-0001.md", stage="merge", branch="pump2/x")
     b = board(repo, "true")
     res = merge(b, find_card(b, "dv-0001"), locks=tmp_path / "l")
-    # dv-2c5c: a CONFLICT no longer stops the card; it hands off to mergefix.
-    assert res.outcome == "mergefix"
+    # dv-b8bb: a CONFLICT goes to resolve, the merge left in progress.
+    assert res.outcome == "conflict"
     c = find_card(b, "dv-0001")
-    assert c.pump2["stage"] == "mergefix" and "CONFLICT" in c.body
+    assert c.pump2["stage"] == "resolve" and "CONFLICT" in c.body
     assert "merge-facts.md" in c.body  # the git output now lives in the facts file
 
 
@@ -516,8 +516,17 @@ def test_bad_plan_stops_loud(repo: Path, tmp_path: Path) -> None:
     plan(repo, touches="")
     f.tick(b, tmp_path)
     c = find_card(b, "dv-0001")
-    assert c.pump2["stage"] == "stopped"
+    assert c.pump2["stage"] == "resolve"
     assert "Touches is empty" in c.body and "## Goal" in c.body
+
+
+def pass_to_owner(b: Board, f: "Fake", repo: Path, tmp: Path) -> None:
+    """dv-f707: the board's agent (resolve) passes the question to the owner."""
+    f.tick(b, tmp)  # launches resolve
+    (repo / ".pump-worktrees/dv-0001/.pump/resolve.md").write_text(
+        "## Verdict\nowner\n\n## Reasoning\nr\n\n## Owner reason\ndeletion outside\n"
+    )
+    f.tick(b, tmp)
 
 
 def test_question_round_trip_and_second_round_stop(repo: Path, tmp_path: Path) -> None:
@@ -526,6 +535,8 @@ def test_question_round_trip_and_second_round_stop(repo: Path, tmp_path: Path) -
     f.tick(b, tmp_path)
     plan(repo, "code", Q_DELETE)
     f.tick(b, tmp_path)
+    assert find_card(b, "dv-0001").pump2["stage"] == "resolve"  # dv-f707
+    pass_to_owner(b, f, repo, tmp_path)
     c = find_card(b, "dv-0001")
     assert c.fm["status"] == "waiting_user" and c.pump2["stage"] == "analyze"
     assert c.pump2["round"] == 1 and "1. Q: Delete the old table?" in c.body
@@ -536,16 +547,16 @@ def test_question_round_trip_and_second_round_stop(repo: Path, tmp_path: Path) -
     assert cli_main(["--boards", str(bf), "answer", "t:dv-0001", "Yes, delete."]) == 0
     c = find_card(b, "dv-0001")
     assert c.fm["status"] == "in_progress"
-    assert c.body.rstrip().endswith("Yes, delete.") and "### @owner — " in c.body
+    assert c.body.rstrip().endswith("Yes, delete.") and "/owner — " in c.body
     assert cli_main(["--boards", str(bf), "answer", "t:dv-0001", "again"]) == 2
     f.tick(b, tmp_path)  # relaunch, with the earlier plan and the answer
-    assert len(f.launched) == 2
-    p2 = f.launched[1][3]
+    assert len(f.launched) == 3  # analyze, resolve, analyze
+    p2 = f.launched[2][3]
     assert "Q: Delete the old table?" in p2 and "Yes, delete." in p2
     plan(repo, "code", "Q: And the backups? | default: keep | matters: m | found: f")
     f.tick(b, tmp_path)
     c = find_card(b, "dv-0001")
-    assert c.pump2["stage"] == "stopped" and "asked twice" in c.body
+    assert c.pump2["stage"] == "resolve" and "asked twice" in c.body
     assert "1. Q: And the backups?" in c.body
 
 
@@ -555,6 +566,7 @@ def test_second_pass_without_questions_proceeds(repo: Path, tmp_path: Path) -> N
     f.tick(b, tmp_path)
     plan(repo, "code", "Q: q? | default: d | matters: m | found: f")
     f.tick(b, tmp_path)
+    pass_to_owner(b, f, repo, tmp_path)
     bf = repo / "boards.json"
     bf.write_text(f'{{"boards":[{{"name":"t","repo":"{repo}"}}]}}')
     cli_main(["--boards", str(bf), "answer", "t:dv-0001", "ok"])
@@ -581,7 +593,7 @@ def test_model_job_rc_nonzero_reruns_once_then_stops(
     assert len(f.launched) == 2
     f.tick(b, tmp_path)
     c = find_card(b, "dv-0001")
-    assert c.pump2["stage"] == "stopped" and "stopped for the owner" in c.body
+    assert c.pump2["stage"] == "resolve" and "to resolve (1 of 2)" in c.body
 
 
 def test_launch_oserror_stops_only_that_card(repo: Path, tmp_path: Path) -> None:
@@ -596,7 +608,7 @@ def test_launch_oserror_stops_only_that_card(repo: Path, tmp_path: Path) -> None
     (line,) = f.tick(b, tmp_path)
     assert "launch failed" in line
     c = find_card(b, "dv-0001")
-    assert c.pump2["stage"] == "stopped" and "Argument list too long" in c.body
+    assert c.pump2["stage"] == "resolve" and "Argument list too long" in c.body
 
 
 def test_big_prompt_goes_through_a_file(
@@ -615,10 +627,10 @@ def test_big_prompt_goes_through_a_file(
     c = find_card(b, "dv-0001")
     wt = tmp_path / "wt"
     big = "x" * (runner.PROMPT_ARG_MAX + 1)
-    assert runner.bgjob_launch_stage(b, c, "mergefix", wt, big) == "job-9"
+    assert runner.bgjob_launch_stage(b, c, "resolve", wt, big) == "job-9"
     arg = seen[0][-1]
-    assert len(arg) < 1000 and "prompt-mergefix.md" in arg
-    assert (wt / ".pump" / "prompt-mergefix.md").read_text() == big
+    assert len(arg) < 1000 and "prompt-resolve.md" in arg
+    assert (wt / ".pump" / "prompt-resolve.md").read_text() == big
     seen.clear()
     runner.bgjob_launch_stage(b, c, "build", wt, "small")
     assert seen[0][-1] == "small"
@@ -640,4 +652,4 @@ def test_merge_killed_tests_retry_merge_then_stop(repo: Path, tmp_path: Path) ->
         assert f"retry {k}/2" in c.body and "back to build" not in c.body
     merge(b, find_card(b, "dv-0001"), locks=tmp_path / "l")
     c = find_card(b, "dv-0001")
-    assert c.pump2["stage"] == "stopped" and "killed" not in c.pump2
+    assert c.pump2["stage"] == "resolve" and "killed" not in c.pump2

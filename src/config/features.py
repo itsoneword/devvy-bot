@@ -73,6 +73,11 @@ class FeatureFlags:
         """Check if streaming drafts via sendMessageDraft is enabled."""
         return self.settings.enable_stream_drafts
 
+    @property
+    def rich_messages_enabled(self) -> bool:
+        """Check if replies go out as Telegram Rich Messages (dv-1c98)."""
+        return self.settings.enable_rich_messages
+
     def is_feature_enabled(self, feature_name: str) -> bool:
         """Generic feature check by name."""
         feature_map = {
@@ -87,6 +92,7 @@ class FeatureFlags:
             "voice_messages": self.voice_messages_enabled,
             "soul_memory": self.soul_memory_enabled,
             "stream_drafts": self.stream_drafts_enabled,
+            "rich_messages": self.rich_messages_enabled,
         }
         return feature_map.get(feature_name, False)
 
@@ -115,4 +121,6 @@ class FeatureFlags:
             features.append("soul_memory")
         if self.stream_drafts_enabled:
             features.append("stream_drafts")
+        if self.rich_messages_enabled:
+            features.append("rich_messages")
         return features

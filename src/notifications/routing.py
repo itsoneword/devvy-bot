@@ -154,10 +154,7 @@ class ReportsRouter:
 
     def route_topic(self, source: str) -> Optional[str]:
         """The topic ``source`` is routed to (longest matching key), or None."""
-        best = ""
-        for key in self.routes:
-            if source_matches(source.lower(), key) and len(key) > len(best):
-                best = key
+        best = self._best_route_key(source.lower())
         return self.routes[best] if best else None
 
     async def is_route_topic(self, message: Any, source: str) -> bool:
@@ -253,12 +250,18 @@ class ReportsRouter:
         if not self.enabled or target_chat_id == self.chat_id:
             return None
         if event.deliver_profile:
+            if target_chat_id not in self.owner_chat_ids:
+                return None
+            # A scheduled job with a named route of its own
+            # (``schedule:crypto`` -> Markets) keeps it; the bare ``schedule``
+            # catch-all yields to the creating profile (dv-f6c4).
+            source = (event.source or "").lower()
+            if source.startswith("schedule:"):
+                key = self._best_route_key(source)
+                if len(key) > len("schedule"):
+                    return self.routes[key]
             # The profile's own chat (its bound topic), else the DM.
-            return (
-                self.profile_topic(event.deliver_profile)
-                if target_chat_id in self.owner_chat_ids
-                else None
-            )
+            return self.profile_topic(event.deliver_profile)
         if event.ledger_kind:  # reminders: replies must be attributable in DM
             return None
         # Only the owner's notification chats (NOTIFICATION_CHAT_IDS) have reports;
@@ -268,11 +271,16 @@ class ReportsRouter:
         source = (event.source or "").lower()
         if any(source_matches(source, k) for k in ALWAYS_DM_SOURCES):
             return None
+        best = self._best_route_key(source)
+        return self.routes[best] if best else None
+
+    def _best_route_key(self, source: str) -> str:
+        """The longest route key matching ``source`` (lowercased), or ""."""
         best = ""
         for key in self.routes:
             if source_matches(source, key) and len(key) > len(best):
                 best = key
-        return self.routes[best] if best else None
+        return best
 
     async def thread_id(self, bot: "Bot", topic: str, recreate: bool = False) -> int:
         """Thread id for ``topic``; creates (and persists) it when missing."""

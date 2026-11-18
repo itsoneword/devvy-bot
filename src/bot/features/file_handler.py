@@ -19,6 +19,7 @@ from typing import Dict, List
 
 from telegram import Document
 
+from src.bot.telegram_retry import fetch_media_bytes
 from src.config import Settings
 from src.security.validators import SecurityValidator
 
@@ -158,15 +159,9 @@ class FileHandler:
 
     async def _download_file(self, document: Document) -> Path:
         """Download file from Telegram"""
-        # Get file
-        file = await document.get_file()
-
-        # Create temp file path
         file_name = document.file_name or f"file_{uuid.uuid4()}"
         file_path = self.temp_dir / file_name
-
-        # Download to path
-        await file.download_to_drive(str(file_path))
+        file_path.write_bytes(await fetch_media_bytes(document))
 
         return file_path
 

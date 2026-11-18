@@ -308,6 +308,43 @@ CASES: List[Tuple[str, Tuple[str, Dict[str, Any]], bool, str]] = [
         False,
         ASK,
     ),
+    # webform_* tools (dv-5a25): fill is free, submit asks on every profile.
+    (
+        "webform fill is allowed",
+        ("mcp__agent__webform_fill", {"form": "william_russell_claim", "data": {}}),
+        True,
+        ALLOW,
+    ),
+    (
+        "webform fill is allowed on a sandboxed profile",
+        ("mcp__agent__webform_fill", {"form": "william_russell_claim", "data": {}}),
+        False,
+        ALLOW,
+    ),
+    (
+        "webform submit asks",
+        (
+            "mcp__agent__webform_submit",
+            {
+                "form": "william_russell_claim",
+                "data": {"name": "Test Person", "bills": [{"amount": "10"}]},
+            },
+        ),
+        True,
+        ASK,
+    ),
+    (
+        "webform submit asks on a sandboxed profile too",
+        (
+            "mcp__agent__webform_submit",
+            {
+                "form": "william_russell_claim",
+                "data": {"name": "Test Person", "bills": [{"amount": "10"}]},
+            },
+        ),
+        False,
+        ASK,
+    ),
     # dv-275f: images are looked at only through view_image. Read of any
     # raster file is denied by suffix (pure, no stat), on every profile.
     ("Read a png", ("Read", {"file_path": _RENDER}), True, DENY),

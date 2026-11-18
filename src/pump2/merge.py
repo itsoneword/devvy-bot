@@ -4,6 +4,7 @@ Only this module writes to the integration branch (docs/pump.md)."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -12,15 +13,19 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import criteria, slots
+from . import cards, criteria, slots
 from .state import (
     WORKTREES,
     Board,
     Card,
+    _split,
     add_comment,
+    list_cards,
+    parse_frontmatter,
     read_card,
     set_pump2,
     set_status,
+    stop,
     tail,
     worktree_path,
 )
@@ -55,7 +60,7 @@ def run_tests(
 
 @dataclass
 class Result:
-    outcome: str  # merged | red | conflict | busy | error | mergefix
+    outcome: str  # merged | red | conflict | busy | error
     detail: str = ""
 
 
@@ -164,14 +169,25 @@ def ensure_worktree(board: Board, card_id: str, branch: str) -> Path:
 
 
 def _stop(
-    card: Card, stage: str, title: str, cmd: str, rc: int, out: str, **kw: object
+    board: Board,
+    card: Card,
+    title: str,
+    cmd: list[str],
+    rc: int,
+    out: str,
+    stage: str = "stopped",
+    direct: bool = False,
+    **kw: object,
 ) -> None:
-    kw.setdefault("mergefix", None)  # the next merge attempt gets its own
+    """``stage`` "stopped" goes through state.stop (resolve first)."""
     kw.setdefault("stray", None)
+    text = f"{title}\ncommand: {shlex.join(cmd)}\nexit code: {rc}\n"
+    text += f"```\n{tail(out)}\n```"
+    if stage == "stopped":
+        stop(board, card.path, text, direct, **kw)
+        return
     set_pump2(card.path, stage=stage, job=None, **kw)
-    add_comment(
-        card.path, f"{title}\ncommand: {cmd}\nexit code: {rc}\n```\n{tail(out)}\n```"
-    )
+    add_comment(card.path, text)
 
 
 def _integration_checkout(board: Board, log: Path) -> Path:
@@ -222,14 +238,65 @@ def is_card(path: str) -> bool:
     return path.startswith(CARDS)
 
 
-def resolve_card_conflicts(wt: Path, log: Path | None = None) -> list[str]:
+def _title(text: str) -> str:
+    try:
+        lines, _ = _split(text)
+        return str(parse_frontmatter(lines).get("title") or "").strip()
+    except ValueError:
+        return ""
+
+
+def _show(wt: Path, spec: str) -> str | None:
+    p = subprocess.run(["git", "show", spec], cwd=wt, capture_output=True, text=True)
+    return p.stdout if p.returncode == 0 else None
+
+
+def _refile(board: Board, card: Card, wt: Path, f: str, text: str, why: str) -> None:
+    """The branch added card file ``f`` whose id names a different card
+    (``why``): file the branch's card under a fresh id in the live tree and
+    say so on the card, with the branch files that still name the old id."""
+    old = Path(f).stem
+    made = cards.refile(board, text)
+    _, changed = sh(["git", "diff", "--name-only", f"{board.branch}...HEAD"], wt)
+    mention = []
+    for g in sorted(set(changed.split())):
+        if g == f:
+            continue
+        try:
+            if old in (wt / g).read_text(errors="replace"):
+                mention.append(g)
+        except OSError:
+            continue
+    add_comment(
+        card.path,
+        f"merge: the branch added card {old} ({_title(text)!r}) but {old} is "
+        f"already {why}; the branch's card is kept as {made.id} ({made.path}), "
+        f"the other side's {old} is unchanged.\nbranch files that still name "
+        f"{old}: " + (", ".join(mention) or "(none)"),
+    )
+
+
+def resolve_card_conflicts(
+    wt: Path,
+    log: Path | None = None,
+    board: Board | None = None,
+    card: Card | None = None,
+) -> list[str]:
     """Resolve the in-progress merge's conflicts in card files by taking the
-    integration branch's side (theirs). Returns the other conflicted files."""
+    integration branch's side (theirs). A card file added on both sides with
+    different titles is two cards: the branch's is re-filed under a fresh id
+    before theirs is taken. Returns the other conflicted files."""
     rest = []
     for f in unmerged(wt):
         if not is_card(f):
             rest.append(f)
             continue
+        if board is not None and card is not None and _show(wt, f":1:{f}") is None:
+            ours, theirs = _show(wt, f":2:{f}"), _show(wt, f":3:{f}")
+            if ours is not None and theirs is not None:
+                if _title(ours) != _title(theirs):
+                    why = f"{_title(theirs)!r} on {board.branch}"
+                    _refile(board, card, wt, f, ours, why)
         rc, _ = sh(["git", "checkout", "--theirs", "--", f], wt, log)
         if rc == 0:
             sh(["git", "add", "--", f], wt, log)
@@ -238,11 +305,39 @@ def resolve_card_conflicts(wt: Path, log: Path | None = None) -> list[str]:
     return rest
 
 
-def align_cards(board: Board, wt: Path, log: Path | None = None) -> bool:
+def _to_moved(board: Board, wt: Path, f: str, card: Card | None) -> None:
+    """A pre-move branch's card file ``f`` on a moved board: the
+    cards live in the boards repo, so the branch copy is dropped. A card the
+    moved dir lacks (a follow-up the branch added) is created there under its
+    id; one whose id holds another title there is re-filed."""
+    mine = _show(wt, f"HEAD:{f}")
+    if mine is None:
+        return
+    live = board.tasks / f[len(CARDS) :]
+    if live.exists():
+        theirs = live.read_text(errors="replace")
+        if card is not None and _title(mine) != _title(theirs):
+            _refile(board, card, wt, f, mine, f"{_title(theirs)!r} in the cards dir")
+        return
+    live.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(live, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(mine)
+    cards.commit_cards(board.tasks, f"{board.name}: {live.stem} from {f}")
+
+
+def align_cards(
+    board: Board, wt: Path, log: Path | None = None, card: Card | None = None
+) -> bool:
     """Set the card branch's card files back to the integration branch's
     committed version, so the fast-forward never touches pump2's live card
     writes. A branch-only card file the live tree does not have (a follow-up
-    card) is kept. Card files only: no test run needed. True = committed."""
+    card) is kept; one whose path the live tree holds with another title is
+    re-filed under a fresh id. Card files only: no test run
+    needed. True = committed."""
     _, d = sh(["git", "diff", "--name-only", board.branch, "HEAD"], wt)
     todo = []
     for f in sorted(set(d.split())):
@@ -251,7 +346,14 @@ def align_cards(board: Board, wt: Path, log: Path | None = None) -> bool:
         rc, _ = sh(["git", "cat-file", "-e", f"{board.branch}:{f}"], wt)
         if rc == 0:
             sh(["git", "checkout", board.branch, "--", f], wt, log)
+        elif board.moved:
+            _to_moved(board, wt, f, card)
+            sh(["git", "rm", "-q", "--", f], wt, log)
         elif (board.repo / f).exists():
+            mine = _show(wt, f"HEAD:{f}")
+            live = (board.repo / f).read_text(errors="replace")
+            if card is not None and mine is not None and _title(mine) != _title(live):
+                _refile(board, card, wt, f, mine, f"{_title(live)!r} in the live tree")
             sh(["git", "rm", "-q", "--", f], wt, log)
         else:
             continue
@@ -261,6 +363,50 @@ def align_cards(board: Board, wt: Path, log: Path | None = None) -> bool:
     msg = CARDS_MSG.format(board.branch)
     rc, _ = sh(["git", "commit", "-q", "-m", msg, "--", *todo], wt, log)
     return rc == 0
+
+
+FOLLOWUPS = "followups.json"
+
+
+def file_followups(board: Board, card: Card, wt: Path) -> list[str]:
+    """After the fast-forward: file the build's ``.pump/followups.json`` cards
+    in the live tree (todo, parent = the card) and comment their ids. An item
+    whose title a child of the card already has is not filed again."""
+    p = wt / ".pump" / FOLLOWUPS
+    if not p.exists():
+        return []
+    try:
+        items = json.loads(p.read_text())
+    except ValueError as e:
+        add_comment(card.path, f"merge: {p} is not JSON ({e}); no follow-ups filed")
+        return []
+    if not isinstance(items, list):
+        items = []
+    have = {
+        str(c.fm.get("title") or "").strip()
+        for c in list_cards(board)[0]
+        if str(c.fm.get("parent") or "") == card.id
+    }
+    made = []
+    for it in items:
+        if not isinstance(it, dict) or not str(it.get("title") or "").strip():
+            continue
+        title = " ".join(str(it["title"]).split())
+        if title in have:
+            continue
+        new = cards.create_card(
+            board,
+            title,
+            str(it.get("body") or ""),
+            labels=[str(x) for x in it.get("labels") or []],
+            deps=[str(x) for x in it.get("deps") or []],
+            parent=card.id,
+        )
+        have.add(title)
+        made.append(f"{new.id} ({title})")
+    if made:
+        add_comment(card.path, "merge: filed follow-ups\n" + "\n".join(made))
+    return made
 
 
 def unmerged(wt: Path) -> list[str]:
@@ -289,7 +435,10 @@ def commit_stray(board: Board, files: list[str], log: Path) -> tuple[list[str], 
     rc, out = sh(["git", "add", "--", *todo], where, log)
     if rc == 0:
         msg = STRAY_MSG.format(", ".join(todo))
-        rc, out = sh(["git", "commit", "-q", "-m", msg, "--", *todo], where, log)
+        # --no-verify: pre-commit-merge-guard refuses commits to the
+        # integration branch while a merge runs, and this one is that merge.
+        cmd = ["git", "commit", "-q", "--no-verify", "-m", msg, "--", *todo]
+        rc, out = sh(cmd, where, log)
     return (todo, "") if rc == 0 else ([], out)
 
 
@@ -297,7 +446,7 @@ def merge(board: Board, card: Card, locks: Path | None = None) -> Result:
     st = card.pump2
     branch = st.get("branch")
     if not branch:
-        _stop(card, "stopped", "merge: card has no pump2.branch", "-", 1, "")
+        _stop(board, card, "merge: card has no pump2.branch", ["-"], 1, "", direct=True)
         return Result("error", "no branch")
     note = ensure_ignored(board.repo)
     wt = ensure_worktree(board, card.id, branch)
@@ -327,29 +476,28 @@ def _tail_bytes(text: str, cap: int) -> str:
     return "(older lines cut)\n" + "\n".join(reversed(kept))
 
 
-def _handoff(
+def _to_resolve(
     board: Board,
     card: Card,
     wt: Path,
     why: str,
     green: str | None,
+    cmd: list[str],
+    rc: int,
+    out: str,
     *,
-    base: str = "",
     conflicts: list[str] | None = None,
     dirty: list[str] | None = None,
 ) -> Result:
-    """The mechanical merge did not land: write ``.pump/merge-facts.md`` and
-    hand the card to the mergefix stage. ``base``: the commit the
-    integration branch's new commits are counted from."""
+    """The mechanical merge did not land: write ``.pump/merge-facts.md`` (a
+    conflict stays in progress in the worktree) and stop to resolve."""
     facts = merge_facts(
-        board, card.id, wt, why, green, base=base, conflicts=conflicts, dirty=dirty
+        board, card.id, wt, why, green, conflicts=conflicts, dirty=dirty
     )
-    (wt / ".pump" / "merge-facts.md").write_text(facts)
-    set_pump2(card.path, stage="mergefix", job=None, mergefix=_mergefixes(card) + 1)
-    add_comment(
-        card.path, f"merge: {why}\nto mergefix: {wt / '.pump' / 'merge-facts.md'}"
-    )
-    return Result("mergefix", why)
+    f = wt / ".pump" / "merge-facts.md"
+    f.write_text(facts)
+    _stop(board, card, f"merge: {why}\nfacts: {f}", cmd, rc, out)
+    return Result("conflict", why)
 
 
 def merge_facts(
@@ -359,7 +507,6 @@ def merge_facts(
     why: str,
     green: str | None,
     *,
-    base: str = "",
     conflicts: list[str] | None = None,
     dirty: list[str] | None = None,
 ) -> str:
@@ -368,8 +515,16 @@ def merge_facts(
     byte-capped uncommitted diffs and the conflicted files."""
     out = [f"# merge facts: {card_id}", "", f"why: {why}", "", "## Green tip"]
     out.append(green or "not tested (the board tests have not run on this merge)")
-    since = base or green or "HEAD"
+    since = green or "HEAD"
     nocards = ["--", ".", f":(exclude){CARDS}"]  # pump2's own, never the card's
+    rc, _ = sh(["git", "merge-base", "--is-ancestor", since, board.branch], wt)
+    _, mb = sh(["git", "merge-base", since, board.branch], wt)
+    out += ["", "## Ancestry"]
+    out.append(
+        f"{since[:12]} is an ancestor of {board.branch}: "
+        + ("yes" if rc == 0 else "no (the branch and the card diverged)")
+    )
+    out.append(f"merge-base: {mb.strip() or '(none)'}")
     _, lg = sh(["git", "log", "--oneline", f"{since}..{board.branch}", *nocards], wt)
     commits = lg.splitlines()
     shown = commits[:FACTS_COMMITS]
@@ -377,7 +532,10 @@ def merge_facts(
     out += ["```", "\n".join(shown) or "(none)", "```"]
     if len(commits) > len(shown):
         out.append(f"({len(commits) - len(shown)} older not shown)")
-    _, side_raw = sh(["git", "diff", "--name-only", f"{since}..{board.branch}"], wt)
+    # `since..branch` is a tree diff; when `since` is not
+    # an ancestor of the branch it listed the card's own files as the
+    # branch's. File lists are measured from the merge-base (three-dot).
+    _, side_raw = sh(["git", "diff", "--name-only", f"{since}...{board.branch}"], wt)
     _, names_raw = sh(["git", "diff", "--name-only", f"{board.branch}...{since}"], wt)
     mine = [f for f in names_raw.split() if not is_card(f)]
     theirs = [f for f in side_raw.split() if not is_card(f)]
@@ -412,37 +570,9 @@ def merge_facts(
     return "\n".join(out) + "\n"
 
 
-MERGEFIX_MAX = 3  # mergefixes per merge attempt for docs-only re-failures
 KILLED_RC = 137  # the merge test run died of SIGKILL (testrun's OOM kill)
-KILLED_MAX = 2  # reruns of a killed merge test run before the owner is asked
-
-
-def _mergefixes(card: Card) -> int:
-    """Mergefixes so far in this merge attempt (an old ``true`` counts 1)."""
-    v = read_card(card.path).pump2.get("mergefix")
-    try:
-        return int(v or 0)
-    except (TypeError, ValueError):
-        return 1
-
-
-def _second(card: Card) -> bool:
-    """A mergefix already ran in this merge attempt."""
-    return _mergefixes(card) > 0
-
-
-def _again(card: Card, files: list[str]) -> str:
-    """After a mergefix, may a new failure over ``files`` go to mergefix again?
-    "" = yes (none yet, or docs only and under MERGEFIX_MAX), else
-    why it stops for the owner."""
-    m = _mergefixes(card)
-    if not m:
-        return ""
-    if not all(is_noncode(f) for f in files):
-        return "second merge failure after a mergefix"
-    if m >= MERGEFIX_MAX:
-        return f"merge failure after {m} mergefixes in this merge attempt"
-    return ""
+KILLED_MAX = 2  # reruns of a killed merge test run before resolve
+MOVED_MAX = 3  # mechanical re-merges of a moved integration branch, then resolve
 
 
 def _incoming(board: Board, wt: Path, green: str) -> list[str]:
@@ -459,7 +589,7 @@ def _after_sync(board: Board, card: Card, wt: Path, log: Path) -> Result | None:
     argv = board.after_sync
     rc, out = sh(argv, wt, log)
     if rc:
-        _stop(card, "stopped", "merge: after_sync FAILED", shlex.join(argv), rc, out)
+        _stop(board, card, "merge: after_sync FAILED", argv, rc, out)
         return Result("error", out)
     _, st = sh(["git", "status", "--porcelain", "--untracked-files=all"], wt)
     if not st.strip():
@@ -469,14 +599,7 @@ def _after_sync(board: Board, card: Card, wt: Path, log: Path) -> Result | None:
     if rc == 0:
         rc, cout = sh(["git", "commit", "-q", "-m", msg], wt, log)
     if rc:
-        _stop(
-            card,
-            "stopped",
-            "merge: commit of the after_sync changes FAILED",
-            shlex.join(argv),
-            rc,
-            out + cout,
-        )
+        _stop(board, card, "merge: commit of after_sync FAILED", argv, rc, out + cout)
         return Result("error", cout)
     return None
 
@@ -485,7 +608,6 @@ def _attempt(
     board: Board, card: Card, wt: Path, log: Path, locks: Path | None
 ) -> Result:
     st = card.pump2
-    n = int(st.get("attempt") or 0)
     test = board.test
     if st.get("green") and _still_green(board, wt, str(st["green"])):
         # tests passed on this exact branch tip, which already holds the
@@ -499,44 +621,25 @@ def _attempt(
     mcmd = ["git", "merge", "--no-ff", "--no-edit", board.branch]
     rc, out = sh(mcmd, wt, log)
     if rc and unmerged(wt):
-        if not resolve_card_conflicts(wt, log):  # card files only
+        if not resolve_card_conflicts(wt, log, board, card):  # card files only
             rc, out = sh(["git", "commit", "-q", "--no-edit"], wt, log)
     if rc:
         files = unmerged(wt)
         what = "CONFLICT" if "CONFLICT" in out else "git merge FAILED"
-        why = _again(card, files)
-        if what == "CONFLICT" and files and not why:
-            return _handoff(
-                board,
-                card,
-                wt,
-                f"CONFLICT merging {board.branch} into the card branch",
-                None,
-                conflicts=files,
+        why = f"{what} merging {board.branch} into the card branch"
+        if what == "CONFLICT" and files:
+            return _to_resolve(
+                board, card, wt, why, None, mcmd, rc, out, conflicts=files
             )
         sh(["git", "merge", "--abort"], wt, log)
-        again = f"\n{why}; stopped for the owner" if why else ""
-        _stop(
-            card,
-            "stopped",
-            f"merge: {what} merging {board.branch} into the card branch{again}",
-            shlex.join(mcmd),
-            rc,
-            out,
-        )
+        _stop(board, card, f"merge: {why}", mcmd, rc, out)
         return Result("conflict", out)
     err = _after_sync(board, card, wt, log)
     if err:
         return err
     if not test:
-        _stop(
-            card,
-            "stopped",
-            "merge: board has no test command (pump2_test / test)",
-            "-",
-            1,
-            "",
-        )
+        why = "merge: board has no test command (pump2_test / test)"
+        _stop(board, card, why, ["-"], 1, "", direct=True)
         return Result("error", "no test command")
     with slots.heavy_slot(board.name, locks) as ok:
         if not ok:
@@ -547,40 +650,17 @@ def _attempt(
         # to build by a host-wide OOM, and the build then had nothing to change
         k = int(st.get("killed") or 0) + 1
         over = k > KILLED_MAX
-        _stop(
-            card,
-            "stopped" if over else "merge",
-            f"merge: tests killed (exit {rc}, memory), not judged; "
-            + ("stopped for the owner" if over else f"retry {k}/{KILLED_MAX}"),
-            shlex.join(cmd),
-            rc,
-            out,
-            killed=None if over else k,
+        why = f"merge: tests killed (exit {rc}, memory), not judged" + (
+            "" if over else f"; retry {k}/{KILLED_MAX}"
         )
+        stage = "stopped" if over else "merge"
+        _stop(board, card, why, cmd, rc, out, stage, killed=None if over else k)
         return Result("busy" if not over else "error", "killed")
     if rc:
         failed = failed_ids(out)
         listing = "failing tests:\n" + "\n".join(failed) + "\n" if failed else ""
-        title = f"merge: tests RED (attempt {n + 1})\n{listing}".rstrip()
-        if n >= 1:
-            _stop(
-                card,
-                "stopped",
-                title + "\nsecond red: stopped for the owner",
-                shlex.join(cmd),
-                rc,
-                out,
-            )
-        else:
-            _stop(
-                card,
-                "build",
-                title + "\nback to build",
-                shlex.join(cmd),
-                rc,
-                out,
-                attempt=n + 1,
-            )
+        title = f"merge: tests RED\n{listing}".rstrip()
+        _stop(board, card, title, cmd, rc, out, green=None)
         return Result("red", "\n".join(failed))
     _, tip = sh(["git", "rev-parse", "HEAD"], wt)
     set_pump2(card.path, green=tip.strip(), killed=None)
@@ -590,40 +670,26 @@ def _attempt(
 def _land_stray(
     board: Board, card: Card, wt: Path, log: Path, stray: list[str]
 ) -> Result | None:
-    """mergefix said commit-stray: commit the docs edit on the integration
+    """resolve listed stray files: commit the docs edit on the integration
     branch, bring that commit into the card branch (docs only: no test run)
     and keep the green result for the new tip. None = go on to the ff."""
     done, err = commit_stray(board, stray, log)
     if err:
-        _stop(card, "stopped", "merge: commit of the stray edit FAILED", "-", 1, err)
+        _stop(board, card, "merge: commit of the stray edit FAILED", ["-"], 1, err)
         return Result("error", err)
     if done:
         mcmd = ["git", "merge", "--no-ff", "--no-edit", board.branch]
         rc, out = sh(mcmd, wt, log)
         if rc:
             files = unmerged(wt)
-            why = _again(card, files)
-            if files and _second(card) and not why:
-                green = str(read_card(card.path).pump2.get("green") or "") or None
-                set_pump2(card.path, stray=None)
-                return _handoff(
-                    board,
-                    card,
-                    wt,
-                    f"CONFLICT merging the stray commit of {board.branch}",
-                    green,
-                    conflicts=files,
+            why = f"merging the stray commit of {board.branch} FAILED"
+            green = str(read_card(card.path).pump2.get("green") or "") or None
+            if files:
+                return _to_resolve(
+                    board, card, wt, why, green, mcmd, rc, out, conflicts=files
                 )
             sh(["git", "merge", "--abort"], wt, log)
-            _stop(
-                card,
-                "stopped",
-                f"merge: merging the stray commit of {board.branch} FAILED "
-                f"({why or 'second merge failure after a mergefix'})",
-                shlex.join(mcmd),
-                rc,
-                out,
-            )
+            _stop(board, card, f"merge: {why}", mcmd, rc, out)
             return Result("conflict", out)
         _, tip = sh(["git", "rev-parse", "HEAD"], wt)
         set_pump2(card.path, green=tip.strip())
@@ -643,7 +709,7 @@ def _fast_forward(board: Board, card: Card, wt: Path, log: Path, test: str) -> R
     """Green: fast-forward the integration branch to the card branch. The only
     writer of the integration branch (besides commit_stray's docs commit)."""
     where = _integration_checkout(board, log)
-    if align_cards(board, wt, log):
+    if align_cards(board, wt, log, card):
         _, tip = sh(["git", "rev-parse", "HEAD"], wt)
         if read_card(card.path).pump2.get("green"):
             set_pump2(card.path, green=tip.strip())
@@ -651,97 +717,62 @@ def _fast_forward(board: Board, card: Card, wt: Path, log: Path, test: str) -> R
     rc, out = sh(ffcmd, where, log)
     if rc:
         green = str(read_card(card.path).pump2.get("green") or "") or None
-        moved = "Not possible to fast-forward" in out
-        files = [] if moved else dirty_overlap(board, card.pump2["branch"])
-        again = ""
-        if moved and _second(card):
-            # docs only came in since green: mergefix again, bounded
-            again = (
-                _again(card, _incoming(board, wt, green)) if green else "no green tip"
-            )
-        if again or (files and _second(card)):
-            why = (
-                f"{board.branch} moved again"
-                if moved
-                else "uncommitted changes in " + ", ".join(files)
-            )
-            if again.startswith("merge failure after"):
-                why += f" ({again})"
-            _stop(
-                card,
-                "stopped",
-                f"merge: tests green, fast-forward of {board.branch} in {where} "
-                f"FAILED again after a mergefix: {why}; stopped for the owner",
-                shlex.join(ffcmd),
-                rc,
-                out,
-            )
-            return Result("error", out)
-        if moved:
-            # the integration branch moved during/after the tests: merge it
-            # into the card branch here (git writes stay in code), then let
-            # mergefix judge what came in
-            mcmd = ["git", "merge", "--no-ff", "--no-edit", board.branch]
-            mrc, mout = sh(mcmd, wt, log)
-            conflicts = resolve_card_conflicts(wt, log) if mrc else []
-            if mrc and not conflicts and merging(wt):  # card files only
-                mrc, mout = sh(["git", "commit", "-q", "--no-edit"], wt, log)
-            if mrc and not conflicts:
-                sh(["git", "merge", "--abort"], wt, log)
-                _stop(
-                    card,
-                    "stopped",
-                    "merge: git merge FAILED",
-                    shlex.join(mcmd),
-                    mrc,
-                    mout,
-                )
-                return Result("error", mout)
-            return _handoff(
-                board,
-                card,
-                wt,
-                f"{board.branch} moved after the tests went green",
-                green,
-                conflicts=conflicts,
-            )
+        if "Not possible to fast-forward" in out:
+            return _moved(board, card, wt, log, test, green)
+        files = dirty_overlap(board, card.pump2["branch"])
         if files:
             # someone's uncommitted edit in the live checkout (e.g.
-            # docs/DECISIONS.md): mergefix decides
-            return _handoff(
-                board,
-                card,
-                wt,
+            # docs/DECISIONS.md): resolve decides
+            why = (
                 f"fast-forward of {board.branch} blocked by uncommitted changes "
-                f"in {where} to " + ", ".join(files),
-                green,
-                dirty=files,
+                f"in {where} to " + ", ".join(files)
             )
-        # anything else is not a race: stop loud with git's words
-        _stop(
-            card,
-            "stopped",
-            f"merge: tests green, fast-forward of {board.branch} in {where} FAILED",
-            shlex.join(ffcmd),
-            rc,
-            out,
-        )
+            return _to_resolve(board, card, wt, why, green, ffcmd, rc, out, dirty=files)
+        why = f"tests green, fast-forward of {board.branch} in {where} FAILED"
+        _stop(board, card, f"merge: {why}", ffcmd, rc, out)
         return Result("error", out)
     _, sha = sh(["git", "rev-parse", "HEAD"], where)
     sha = sha.strip()
-    set_pump2(
-        card.path,
-        stage="done",
-        job=None,
-        green=None,
-        mergefix=None,
-        stray=None,
-        merged=sha,
-    )
+    done = dict(stage="done", job=None, green=None, moved=None, stray=None)
+    set_pump2(card.path, merged=sha, **done)
     set_status(card.path, "done")  # the board's word for merged; releases deps
     add_comment(
         card.path,
         f"merge: merged {sha} into {board.branch}\ntests: {test}\nlog: {log}",
     )
     add_comment(card.path, criteria.summary(wt, "done"))
+    file_followups(board, card, wt)
     return Result("merged", sha)
+
+
+def _moved(
+    board: Board, card: Card, wt: Path, log: Path, test: str, green: str | None
+) -> Result:
+    """The integration branch moved after green: merge it in here (git writes
+    stay in code). Non-code only came in: still green, ff again; code came in:
+    the next merge run tests it. A conflict, or past MOVED_MAX, goes to resolve."""
+    k = int(card.pump2.get("moved") or 0) + 1
+    mcmd = ["git", "merge", "--no-ff", "--no-edit", board.branch]
+    rc, out = sh(mcmd, wt, log)
+    conflicts = resolve_card_conflicts(wt, log, board, card) if rc else []
+    if rc and not conflicts and merging(wt):  # card files only
+        rc, out = sh(["git", "commit", "-q", "--no-edit"], wt, log)
+    why = f"{board.branch} moved after the tests went green"
+    if conflicts or k > MOVED_MAX:
+        why += f" ({k - 1} re-merges)" if not conflicts else ""
+        return _to_resolve(
+            board, card, wt, why, green, mcmd, rc, out, conflicts=conflicts
+        )
+    if rc:
+        sh(["git", "merge", "--abort"], wt, log)
+        _stop(board, card, "merge: git merge FAILED", mcmd, rc, out)
+        return Result("error", out)
+    _, tip = sh(["git", "rev-parse", "HEAD"], wt)
+    came = _incoming(board, wt, green) if green else ["(no green tip)"]
+    code = [f for f in came if not is_noncode(f)]
+    set_pump2(card.path, moved=k, green=None if code else tip.strip())
+    how = f"code came in, tests again: {code[:9]}" if code else "non-code: still green"
+    add_comment(card.path, f"merge: {why}; re-merged ({k}/{MOVED_MAX}), {how}")
+    if code:
+        return Result("busy", "moved")
+    return _fast_forward(board, read_card(card.path), wt, log, test)

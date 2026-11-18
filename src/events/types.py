@@ -54,6 +54,9 @@ class ScheduledEvent(Event):
     # Explicit run-as user, set by the handler for item jobs; 0 = resolve
     # from created_by / target_chat_ids as before.
     run_as: int = 0
+    # dv-f6c4: the profile whose turn created the job (None = derive from
+    # working_directory); its reply is delivered as that profile's message.
+    profile_slug: Optional[str] = None
 
 
 @dataclass

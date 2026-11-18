@@ -19,6 +19,13 @@ fixed viewport for every shot. A state that fails is logged on stderr and left
 out (the gate reports it missing). Exit 0 when anything rendered, 1 when
 nothing did, 2 for an unknown screen or a bad ``--out``.
 
+Beside each PNG it writes the critic's sidecar ``<state>-<theme>.boxes.json``
+(dv-696e): ``{"scale", "content_height", "blocks": [{"id", "x", "y", "w",
+"h"}]}`` in CSS px, ``getBoundingClientRect`` of every ``[data-testid]`` in
+BLOCKS (document order). The critic cuts its block crops from these boxes,
+never by hand, and ignores the blank viewport below ``content_height``. Leave
+BLOCKS empty and the critic judges the whole PNGs.
+
 Playwright is imported lazily: ``--help`` and ``py_compile`` work without it.
 """
 
@@ -26,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import socket
 import subprocess
@@ -39,6 +47,23 @@ VIEWPORT = (390, 844)  # CSS px; with SCALE 3 every PNG is 1170x2532
 SCALE = 3
 THEMES = ("dark", "light")
 IDLE_MS = 15000
+# TODO 4: the data-testid of each top-level block of a screen, the critic's
+# unit of comparison (about 4-8 per screen).
+BLOCKS: dict[str, tuple[str, ...]] = {
+    "home": ("hero", "list"),
+}
+BOXES_JS = """(ids) => {
+  const blocks = [];
+  for (const el of document.querySelectorAll('[data-testid]')) {
+    const id = el.getAttribute('data-testid');
+    if (!ids.includes(id) || blocks.some((b) => b.id === id)) continue;
+    const r = el.getBoundingClientRect();
+    blocks.push({id, x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height});
+  }
+  const content = Math.max(...blocks.map((b) => b.y + b.h), 0)
+    || document.documentElement.scrollHeight;
+  return {content_height: Math.ceil(content), blocks};
+}"""
 
 # TODO 1: screen id (docs/features.yaml) -> {state: URL path that opens it}.
 # Open a state by deep link and wait for network idle, never for CSS classes:
@@ -92,8 +117,17 @@ def serve(worktree: Path) -> Iterator[str]:
             proc.wait(timeout=10)
 
 
-def shoot(url: str, states: dict[str, str], out: Path) -> int:
-    """One PNG per state x theme; returns how many were written."""
+def boxes(page: Any, ids: tuple[str, ...]) -> dict[str, Any]:
+    """The sidecar of the open page: block boxes and content height."""
+    data = page.evaluate(BOXES_JS, list(ids))
+    return {"scale": SCALE, **data}
+
+
+def shoot(
+    url: str, states: dict[str, str], out: Path, blocks: tuple[str, ...] = ()
+) -> int:
+    """One PNG per state x theme (and its sidecar when ``blocks``); returns
+    how many PNGs were written."""
     from playwright.sync_api import sync_playwright
 
     done = 0
@@ -112,6 +146,9 @@ def shoot(url: str, states: dict[str, str], out: Path) -> int:
                         page.goto(url + path)
                         page.wait_for_load_state("networkidle", timeout=IDLE_MS)
                         page.screenshot(path=str(out / f"{state}-{theme}.png"))
+                        if blocks:
+                            sidecar = out / f"{state}-{theme}.boxes.json"
+                            sidecar.write_text(json.dumps(boxes(page, blocks)))
                         done += 1
                     except Exception as exc:  # noqa: BLE001 - gate reports it
                         print(f"render {state}-{theme}: {exc}", file=sys.stderr)
@@ -139,7 +176,7 @@ def main() -> int:
         print(f"bad --out {a.out}: {exc}", file=sys.stderr)
         return 2
     with serve(a.worktree.resolve()) as url:
-        done = shoot(url, states, a.out)
+        done = shoot(url, states, a.out, BLOCKS.get(a.screen, ()))
     return 0 if done else 1
 
 

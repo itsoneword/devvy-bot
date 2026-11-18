@@ -10,7 +10,8 @@ Three outcomes:
 * ``deny``  -- credential files, multi-tenant stores, protected data-root
   areas, guest read scope. Holds for every profile.
 * ``ask``   -- destructive or outbound operations on a full-access profile,
-  and every non-read-only ``exchange_*`` tool on any profile
+  and every non-read-only ``exchange_*`` tool and ``webform_submit`` on any
+  profile
   (``src/security/destructive.py``). The caller turns it into an owner
   Approve/Deny button.
 * ``allow`` -- everything else.
@@ -34,7 +35,14 @@ from .denylist import (
     protected_path_error,
     protected_search_error,
 )
-from .destructive import RUN_RM_ALONE, _is_free_path, classify, exchange_tool_ask
+from .destructive import (
+    OWNER_TIER,
+    RUN_RM_ALONE,
+    _is_free_path,
+    ask_tier,
+    classify_all,
+    named_tool_ask,
+)
 from .read_scope import ReadScope, build_read_scope
 
 ALLOW = "allow"
@@ -89,6 +97,9 @@ class Decision:
     reason: str = ""
     # What the owner is shown on an ``ask``.
     preview: str = ""
+    # How long an unattended job's ask may wait (dv-3d18): ``fast`` = denied
+    # after the short timeout, ``owner`` = waits for the owner.
+    tier: str = OWNER_TIER
 
 
 def turn_policy_for(
@@ -259,15 +270,19 @@ def _decide_one(
     reason = _deny_reason(tool_name, tool_input, turn)
     if reason:
         return Decision(DENY, reason)
-    # Exchange tools ask on every profile: a money move is not something a
-    # sandbox makes safe (dv-8664).
-    exchange = exchange_tool_ask(tool_name, tool_input)
-    if exchange:
-        return Decision(ASK, exchange[0], exchange[1])
+    # Exchange and web-form submit tools ask on every profile: a money move
+    # or a filed claim is not something a sandbox makes safe (dv-8664,
+    # dv-5a25).
+    named = named_tool_ask(tool_name, tool_input)
+    if named:
+        return Decision(ASK, named[0], named[1])
     # Ask-gate: full-access profiles only; sandboxed profiles can't do
     # cross-FS/network damage from bash.
     if turn.full_access:
-        reason = classify(tool_name, tool_input, turn.working_directory, turn.free_root)
+        reasons = classify_all(
+            tool_name, tool_input, turn.working_directory, turn.free_root
+        )
+        reason = reasons[0] if reasons else None
         if reason == RUN_RM_ALONE:
             # A job's in-tree rm chained after an interpreter: the agent
             # reruns it alone in seconds, the owner is never asked (dv-3d18).
@@ -279,7 +294,8 @@ def _decide_one(
                 or tool_input.get("path")
                 or ""
             )
-            return Decision(ASK, reason, str(preview))
+            tier = ask_tier([r for r in reasons if r != RUN_RM_ALONE])
+            return Decision(ASK, reason, str(preview), tier)
     return Decision()
 
 

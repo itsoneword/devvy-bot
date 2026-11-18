@@ -1,4 +1,4 @@
-"""A board's custom stage (dv-3b99): the board's prompt file, filled with
+"""A board's custom stage: the board's prompt file, filled with
 ``fill_template``, plus a fixed report contract; ``.pump/<report>`` carries a
 review-style verdict (``review.parse``). pass -> the next pipeline entry;
 return -> ``return_to`` on the card's shared return budget. A ``writes: false``
@@ -103,7 +103,9 @@ class CustomStage:
             if err:
                 return stopped(f"{s.stage}: {err}")
         done = f", committed {sha}" if sha else ""
-        warn = cr.record_scores(board.name, card.id, s.stage, card.pump2, raw)
+        warn = cr.record_scores(
+            board.name, card.id, s.stage, card.pump2, raw, remarks=remarks
+        )
         res = self._judged(board, card, wt, verdict, remarks, done)
         if warn:
             res.comment += "\n" + warn
@@ -112,8 +114,8 @@ class CustomStage:
     def _judged(
         self, board: Board, card: Card, wt: Path, verdict: str, remarks: str, done: str
     ) -> Outcome:
-        """Remarks always go through ``criteria.judge``: custom stages are new
-        (dv-3b99), no pre-dv-d5aa card reaches one, so review's legacy
+        """Remarks always go through ``criteria.judge``: custom stages are new,
+        no pre-criteria card reaches one, so review's legacy
         "any return returns" path does not apply."""
         s = self.spec
         f = wt / ".pump" / s.report

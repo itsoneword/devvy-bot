@@ -78,3 +78,99 @@ class TestSendFileToUser:
         assert validate_image_path(str(pdf), tmp_path) is None
         att = validate_image_path(str(pdf), tmp_path, any_file=True)
         assert att is not None and att.mime_type == "application/pdf"
+
+
+class TestSendReview:
+    @staticmethod
+    def _sections(img: Path) -> list:
+        return [
+            {
+                "heading": "h",
+                "layout": "grid",
+                "items": [{"image": str(img), "caption": "c"}] * 2,
+            }
+        ]
+
+    @staticmethod
+    def _png(path: Path) -> Path:
+        from PIL import Image
+
+        Image.new("RGB", (40, 60), (10, 200, 10)).save(path)
+        return path
+
+    async def test_renders_pdf_and_cover(self, tmp_path: Path) -> None:
+        from src.mcp.telegram_server import send_review
+
+        img = self._png(tmp_path / "a.png")
+        out = tmp_path / "rev.pdf"
+        result = await send_review("T", self._sections(img), str(out))
+        assert "Review queued for delivery" in result
+        assert out.read_bytes().startswith(b"%PDF")
+        assert (tmp_path / "rev-sheet.png").exists()
+
+    async def test_path_must_be_an_absolute_pdf(self, tmp_path: Path) -> None:
+        from src.mcp.telegram_server import send_review
+
+        img = self._png(tmp_path / "a.png")
+        assert "Error" in await send_review("T", self._sections(img), "rev.pdf")
+        assert "Error" in await send_review(
+            "T", self._sections(img), str(tmp_path / "rev.txt")
+        )
+
+    async def test_output_outside_roots_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.mcp.telegram_server import send_review
+
+        root = tmp_path / "ws"
+        root.mkdir()
+        monkeypatch.setenv("TELEGRAM_IMAGE_ROOTS", str(root))
+        img = self._png(root / "a.png")
+        out = tmp_path / "outside.pdf"
+        result = await send_review("T", self._sections(img), str(out))
+        assert "outside the deliverable roots" in result
+        assert not out.exists()
+
+    async def test_input_image_outside_roots_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.mcp.telegram_server import send_review
+
+        root = tmp_path / "ws"
+        root.mkdir()
+        monkeypatch.setenv("TELEGRAM_IMAGE_ROOTS", str(root))
+        stray = self._png(tmp_path / "stray.png")
+        out = root / "rev.pdf"
+        result = await send_review("T", self._sections(stray), str(out))
+        assert "outside the deliverable roots" in result
+        assert not out.exists()
+
+    async def test_missing_relative_and_bad_spec_refused(self, tmp_path: Path) -> None:
+        from src.mcp.telegram_server import send_review
+
+        out = str(tmp_path / "rev.pdf")
+        gone = [{"layout": "grid", "items": [{"image": str(tmp_path / "x.png")}]}]
+        assert "not found" in await send_review("T", gone, out)
+        rel = [{"layout": "grid", "items": [{"image": "x.png"}]}]
+        assert "absolute" in await send_review("T", rel, out)
+        assert "layout" in await send_review(
+            "T", [{"layout": "wall", "items": [{"caption": "x"}]}], out
+        )
+
+    async def test_bot_delivers_cover_then_pdf(self, tmp_path: Path) -> None:
+        from src.bot.utils.image_extractor import (
+            attachments_for_tool_call,
+            is_send_file_call,
+        )
+
+        call = {
+            "name": "mcp__telegram__send_review",
+            "input": {"file_path": str(tmp_path / "rev.pdf")},
+        }
+        assert is_send_file_call(call)
+        # before the tool ran (the stream intercept): bounds only
+        pending = attachments_for_tool_call(call, tmp_path, pending=True)
+        assert [a.path.name for a in pending] == ["rev-sheet.png", "rev.pdf"]
+        assert attachments_for_tool_call(call, tmp_path) == []
+        outside = {"name": "send_review", "input": {"file_path": "/etc/rev.pdf"}}
+        assert attachments_for_tool_call(outside, tmp_path, pending=True) == []

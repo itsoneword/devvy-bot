@@ -2,6 +2,86 @@
 
 Release notes for Devvy. Newest first.
 
+## 1.8 — 2026-11-17
+
+### Design pipeline
+- Design elements and mockups: images are drawn with FLUX (free, self-hosted
+  or hosted queue; retries on gateway errors) with an optional paid
+  OpenRouter fallback capped per run (`design.mockups.paid_max_usd`).
+- Design map: `MAP.md` is generated after every elements/mockups run:
+  screens with their next step, built marks, pump variants and reports; a
+  built mark wins over a waiting card.
+- A second profile can draw for a board (`design.profiles`); element folders
+  carry the author's prefix.
+- Overnight design rounds: a critic scores each round and feeds back, and a
+  rerun resumes. The critic's rows record the round and variant (migration
+  0016).
+- `pump2 design run --mockup FILE` builds to a mockup you picked outside the
+  run. Mockups read your earlier verdicts and references; when the critic
+  rejects every variant, NOT READY comes first. Full-page renders are cut
+  into screen-high columns for the collage.
+- Review PDF: design pictures go into one PDF (`send_review` tool, automatic
+  paths) instead of a stream of photos.
+
+### Pump and jobs
+- Analyze decides easily reversible questions with the default and asks only
+  about irreversible ones; the 3-open-tasks cap per agent is dropped.
+- Job `limit_fallback`: a background job that hits a usage limit reruns once
+  on another Claude model.
+- A job's card is named by its title in the pin, finish pings and `job_list`.
+- Board cards can live in a separate boards repo (`cards_dir`).
+
+### Bot
+- The busy notice of a background turn goes to that turn's profile topic, not
+  the DM.
+- Telegram over IPv4 only (IPv6 connects to api.telegram.org hung ~20 % of
+  the time); getFile/download of photos, documents and voice retry; photo and
+  document sends survive upload timeouts and retry over a fresh connection,
+  and undelivered files are said in chat. `TELEGRAM_FILE_API_URL` points
+  media retries at a local Bot API server.
+- A failing bot-command menu update no longer aborts startup.
+- A document sent in a group topic is saved under that topic's profile.
+- `/stop` works in bound reports topics.
+- Voice: ElevenLabs retries on connect failures and 429/5xx.
+- Web forms: the page opens on load, `networkidle` best effort.
+- Incoming photos, voice and documents are kept and retried in the background,
+  also after a restart; a failed one can be retried with a tap, and `/stop`
+  cancels a download in progress (migration 0013).
+- Replies and markdown notifications are sent as Telegram rich messages
+  (`sendRichMessage`): real tables, headings and lists. Any error or an
+  over-limit message falls back to the HTML path (`ENABLE_RICH_MESSAGES`).
+- A Telegram message delivered twice starts only one agent turn.
+- `/limits` can render as a Telegram widget in the owner's DM with a Refresh
+  button (`LIMITS_WIDGET_ENABLED`); when Telegram refuses the widget it stays
+  text.
+- Web form tools `webform_fill` / `webform_submit`: a headless browser fills
+  a form and the owner approves each submit (`WEBFORMS_BROWSERS_PATH`).
+- Devlog channel agent: post drafts with a picture; the owner taps the
+  preview to publish (migration 0014).
+- GitHub Issues intake: `github_issues` / `github_issue_read` /
+  `github_issue_file` tools and `scripts/gh_intake`; pump2 posts status
+  comments back to the issue.
+- Scheduled jobs reply as the profile that created them, in its topic
+  (migration 0015).
+- Notify API: card inline buttons; dropped pictures are named in the message.
+- Local TUI chat with agents: an internal chat endpoint and a chat pane in
+  `scripts/devvy-tui` (chat is no longer Telegram-only).
+- Memory: project decisions are stored as links to `docs/DECISIONS.md`;
+  per-task decisions go to the task card as comments, not into the memory
+  prompt.
+- Memory: changing a pinned or core fact refreshes that window's bundle on
+  the next turn (migration 0009).
+
+### Jobs and limits
+- Fewer false-positive owner asks for background jobs: `systemctl`/`nc` inside
+  heredoc text and `rm` inside the job's own tree no longer ask.
+- Background-job fast-tier asks: a low-stakes ask unanswered after
+  `JOB_FAST_ASK_TIMEOUT_SECONDS` is denied and the job is told nobody
+  answered.
+- Codex usage limit: no more retries; the limit is recorded and reported.
+- Board card author and assignee are set by code; the pump picks up only
+  cards assigned to this install.
+
 ## 1.7 — 2026-11-09
 
 ### Pump v2 replaces the old pump

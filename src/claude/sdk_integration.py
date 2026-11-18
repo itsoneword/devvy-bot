@@ -2734,10 +2734,15 @@ class ClaudeSDKManager:
             return
         env = cfg.setdefault("env", {})
         if isinstance(env, dict):
+            profile = (
+                self.profile_registry.get_by_working_dir(working_directory)
+                if self.profile_registry is not None
+                else None
+            )
             env[IMAGE_ROOTS_ENV] = image_roots_env(
                 self.config.approved_directory,
                 working_directory,
-                self._extra_dirs_for(working_directory),
+                tuple(getattr(profile, "image_dirs", ()) or ()),
             )
 
     def _load_mcp_config(self, config_path: Path) -> Dict[str, Any]:

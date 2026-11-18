@@ -18,7 +18,7 @@ If the repo has the `frontend-design` skill, use it.
 
 ## The brief
 
-{{BRIEF}}
+{{BRIEF}}{{KIT}}{{COMPONENTS}}{{MOCKUP}}
 
 ## Your variant
 

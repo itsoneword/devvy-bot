@@ -1,4 +1,4 @@
-"""Worktree sweep (dv-8bf8): the tick removes the checkout of a finished card.
+"""Worktree sweep: the tick removes the checkout of a finished card.
 
 A card at ``pump2.stage: done`` loses ``.pump-worktrees/<id>/``; a done
 designloop card loses its ``<id>-vN`` / ``<id>-current`` copies (the picked
@@ -98,9 +98,7 @@ def _design_dirs(board: Board, card: Card, cards: list[Card]) -> list[Path]:
     pick = design._fm_str(card, "design_pick")
     if pick:
         waiting = any(
-            card.id in [str(d) for d in (c.fm.get("deps") or [])]
-            and c.fm.get("status") != "done"
-            for c in cards
+            c.fm.get("status") != "done" for c in design.dependents(card, cards)
         )
         if waiting:
             names.discard(f"{card.id}-{pick}")

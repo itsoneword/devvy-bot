@@ -91,6 +91,9 @@ def fake_steps(
         def prepare(self) -> list[str]:
             return []
 
+        def with_owner(self, brief: Any) -> Any:
+            return brief
+
         def kwargs(self) -> dict[str, Any]:
             async def generate(brief: Any, feedback: Any) -> list[str]:
                 made["brief"] = brief
@@ -359,12 +362,13 @@ def test_reply_2_closes_the_card_and_meets_the_build_dep(
     assert fm(path, "design_pick") == "v2"
     assert fm(path, "design_branch") == BRANCHES[1]
     text = path.read_text()
-    assert "### @owner" in text and reply in text
-    assert "### @pump2" in text and "Design picked: 2" in text
+    assert "/owner — " in text and reply in text
+    assert "/pump2 — " in text and "Design picked: 2" in text
     assert hold_reason(build, board_of(gym)) == ""
 
 
-@pytest.mark.parametrize("reply", ["the second one looks nice", "7", "0", "ok"])
+# "0" is the owner's reject-all since dv-a5aa (test_pump2_design_verdicts.py)
+@pytest.mark.parametrize("reply", ["the second one looks nice", "7", "ok"])
 def test_a_reply_that_is_not_a_variant_number_changes_nothing(
     gym: Path, tmp_path: Path, capsys: Any, reply: str
 ) -> None:

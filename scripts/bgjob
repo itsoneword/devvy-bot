@@ -50,12 +50,13 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+from src.utils.boards import card_title, home_tasks_dir, job_label  # noqa: E402
 from src.utils.job_scope import cwd_in_profile  # noqa: E402
 
 JOBS_ROOT = Path(os.environ.get("BGJOB_ROOT", REPO.parent / "jobs"))
 PROFILES_YAML = REPO / "config" / "profiles.yaml"
 AGENTCTL = REPO / "scripts" / "agentctl"
-HOME_TASKS = REPO / ".deviz" / "tasks"
+HOME_TASKS = home_tasks_dir()  # the home board's cards dir (dv-36b2)
 PREAMBLE = REPO / "templates" / "bgjob_preamble.md"
 
 SUMMARY_LINES = 15
@@ -988,6 +989,17 @@ def job_harness(python_bin: str, agentjob: Path, args: argparse.Namespace) -> st
     return str(route["harness"])
 
 
+def _confinement_notice(cwd: str, extra_dirs: list[str]) -> str:
+    """The job's own statement of its write box (dv-be37)."""
+    paths = ", ".join(dict.fromkeys([cwd, *extra_dirs]))
+    return (
+        f"Filesystem: you can write only to {paths} (plus your job dir and "
+        "CLI state). Everything else is read-only ON PURPOSE: this job runs "
+        "confined. That is not a host fault; do not diagnose it, remount or "
+        "use sudo. If you need another path, say so in your summary."
+    )
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     profiles = load_profiles()
     cwd = profiles.get(args.profile)
@@ -1041,7 +1053,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     task = getattr(args, "task", None)
     ticket = ""
     if task:
-        # The home board's card file: <repo>/.deviz/tasks/<id>.md.
+        # The home board's card file: <cards dir>/<id>.md (dv-36b2).
         board, _, bare = task.rpartition(":")
         card = HOME_TASKS / f"{bare}.md"
         found = board in ("", "devvy") and card.is_file()
@@ -1169,6 +1181,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             sys.exit(f"error: invalid --allow-dir: {p}")
         write_paths.append(str(p))
         effective_dirs.append(str(p))
+    if not quiet:
+        # dv-be37: the job is told its box is deliberate, built from the real
+        # write set (a static template line would be wrong under --cwd).
+        args.prompt = _confinement_notice(cwd, effective_dirs) + "\n\n" + args.prompt
+        (d / "prompt.txt").write_text(args.prompt, encoding="utf-8")
+        meta["prompt"] = args.prompt[:2000]
+        (d / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     bwrap_prefix = job_box(d, write_paths)
     agent_prefix = "" if native_codex else bwrap_prefix + " "
@@ -1202,13 +1221,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         's="INCOMPLETE (background work was still running and was killed)"; '
         # agentjob exit 4 (dv-7ad9): the usage limit ran out. Not a failure of
         # the work; the reset comes from agentjob's quota line.
-        f"elif [ $rc -eq 4 ]; then icon=\"⏸\"; "
+        f'elif [ $rc -eq 4 ]; then icon="⏸"; '
         "until_iso=$(sed -n 's/^agentjob quota: .* until \\([^ ]*\\).*$/\\1/p' "
         f"{str(d / 'stderr.log')!r} 2>/dev/null | tail -n 1); "
         'at=$(date -u -d "$until_iso" "+%H:%M UTC" 2>/dev/null || echo "?"); '
         's="stopped on usage limit (resets $at)"; '
         'else icon="❌"; s="FAILED (rc=$rc)"; fi\n'
-        f'msg="$icon {args.profile} · job \\"{args.name}\\" $s\n'
+        f'msg="$icon {args.profile} · job \\"{job_label(args.name)}\\" $s\n'
         f"started $started_h · ran $dur\n"
         f"id: {job_id}\n"
         f'output: {str(output)}"\n'
@@ -1365,12 +1384,16 @@ def _launch_cmd_job(
             'if [ $rc -eq 0 ]; then icon="✅"; else icon="❌"; fi\n'
             f"line=$({py} {me} oneline {shlex.quote(job_id)})\n"
             'msg="$icon '
-            + f'{args.name}: $line"\n'
+            + f'{job_label(args.name)}: $line"\n'
             + "sent=0\n"
             + "for i in $(seq 1 30); do\n"
             + f"  if {str(AGENTCTL)!r} notify --source bgjob --ref {ref} "
             + f"--profile {shlex.quote(args.profile)} "
-            + f'{_notify_chat_flag(args)}"$msg" '
+            + f"{_notify_chat_flag(args)}"
+            # The `image:` lines the command printed are its pictures, the
+            # same contract as a prompt job's summary (dv-d971).
+            + f"--images-from {shlex.quote(str(output))} "
+            + '"$msg" '
             + f">>{str(d / 'notify.log')!r} 2>&1; then sent=1; break; fi\n"
             + "  sleep 10\n"
             + "done\n"
@@ -1581,7 +1604,9 @@ def cmd_list(args: argparse.Namespace) -> int:
         size = out.stat().st_size if out.exists() else 0
         if compact:
             task = f" {meta['task']}" if meta.get("task") else ""
-            print(f"{jid} {states[jid]} {size}B{task}")
+            title = card_title(meta.get("name", jid))
+            title = f" — {title}" if title else ""
+            print(f"{jid} {states[jid]} {size}B{task}{title}")
         else:
             profile = meta.get("profile", "?")
             print(f"{jid:<34} {states[jid]:<32} {size:>7}B  {profile}")
@@ -1675,7 +1700,7 @@ def render_jobs_status(exclude: str | None = None) -> str:
                 bits = [b for b in (job_elapsed(jid), "queued") if b]
             tail = f" ({' · '.join(bits)})" if bits else ""
             prof = meta.get("profile", "?")
-            lines.append(f"• {prof} · {meta.get('name', jid)}{tail}")
+            lines.append(f"• {prof} · {job_label(meta.get('name', jid))}{tail}")
     if not lines:
         return ""
     stamp = datetime.now(UTC).strftime("%H:%M UTC")
@@ -1949,6 +1974,9 @@ def main() -> int:
     p = sub.add_parser("oneline", help="one-line result of a --cmd job")
     p.add_argument("id")
     p.set_defaults(fn=cmd_oneline)
+
+    p = sub.add_parser("pin-text", help="print the running-jobs pin text")
+    p.set_defaults(fn=lambda a: print(render_jobs_status()) or 0)
 
     p = sub.add_parser("pin", help="refresh the pinned running-jobs status post")
     p.add_argument(

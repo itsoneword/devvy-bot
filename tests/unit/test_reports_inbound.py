@@ -104,6 +104,16 @@ async def test_gate_unbound_topic_and_commands_ignored() -> None:
         await gate(_msg(21, text="/start"), MagicMock())
 
 
+async def test_gate_stop_in_bound_topic_passes() -> None:
+    gate = _gate(_router())
+    assert await gate(_msg(21, text="/stop"), MagicMock()) is None
+    assert await gate(_msg(21, text="/stop@DevvyBot"), MagicMock()) is None
+    with pytest.raises(ApplicationHandlerStop):
+        await gate(_msg(99, text="/stop"), MagicMock())
+    with pytest.raises(ApplicationHandlerStop):
+        await _gate(_router(), role="guest")(_msg(21, text="/stop", uid=5), MagicMock())
+
+
 async def test_gate_without_router_ignores_everything() -> None:
     with pytest.raises(ApplicationHandlerStop):
         await _gate(None)(_msg(21), MagicMock())

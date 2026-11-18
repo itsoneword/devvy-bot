@@ -13,8 +13,9 @@ Owner decisions, 2026-10-18:
   owner. Implementation still needs the owner's ``pump2 answer``.
 * Any agent may comment on any open task; its comments are marked
   ``from <slug> (agent)``, count <=10 a day, and the pump treats them as data.
-* Limits per agent: <=3 open devops tasks, <=5 new tasks per UTC day, exact
-  duplicate titles return the open task instead of filing another.
+* Limits per agent: <=5 new tasks per UTC day, exact duplicate titles return
+  the open task instead of filing another. (The <=3 open devops tasks cap was
+  removed 2026-11-11 by the owner: it blocked filing while cards waited.)
 * A pump branch built for an agent-originated task that touches a privileged
   path is flagged on the review card and merging it asks the owner
   (``pump_privileged`` frontmatter). This covers the likely routes only; the
@@ -31,6 +32,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from src.utils.boards import all_tasks_dirs, repo_tasks_dir
+
 # The one profile allowed to change task status (and to file tasks without the
 # agent rules). Exact slug: a guest workspace of it (``devops#u123``) is not it.
 PRIVILEGED_PROFILE = "devops"
@@ -39,14 +42,14 @@ PRIVILEGED_PROFILE = "devops"
 # cap, the "from <agent>" header and the privilege check off it.
 AGENT_LABEL = "agent"
 
-MAX_OPEN_AGENT_TASKS = 3
 MAX_AGENT_TASKS_PER_DAY = 5
 MAX_COMMENT_CHARS = 2000
 MAX_COMMENTS_PER_DAY = 10  # per agent, across all tasks (UTC day)
 
 # Marker every non-devops agent comment carries; the pump keys its
-# "untrusted data" prompt note off it.
-AGENT_COMMENT_RE = re.compile(r"^- \d{4}-\d{2}-\d{2} from \S+ \(agent\): ", re.M)
+# "untrusted data" prompt note off it. Legacy: a `- <date> from x (agent): `
+# bullet; since dv-33c8 the line under a `### @<install>/<profile>` header.
+AGENT_COMMENT_RE = re.compile(r"^(?:- \d{4}-\d{2}-\d{2} )?from \S+ \(agent\): ", re.M)
 
 # Paths (repo-relative, fnmatch) whose change by an agent-originated pump
 # build needs the owner's explicit confirmation before merge. The likely ways
@@ -78,8 +81,9 @@ PRIVILEGED_PATHS: tuple[str, ...] = (
 )
 
 # Where merge confirmation looks for a pump task's frontmatter, besides the
-# command's working directory. Tests point this at a tmp board.
-TASK_DIRS: List[Path] = [Path(__file__).resolve().parents[2] / ".deviz" / "tasks"]
+# command's working directory: every board's cards dir, home first.
+# Tests point this at a tmp board.
+TASK_DIRS: List[Path] = list(all_tasks_dirs().values())
 
 _PUMP_BRANCH = re.compile(r"\bpump/(dv-[0-9a-z]{3,8})\b")
 # The subcommand is the first word after git's own options (`-C dir`,
@@ -93,7 +97,9 @@ _GIT_INTEGRATE = re.compile(
 
 
 def base_slug(slug: Optional[str]) -> str:
-    return (slug or "").split("#", 1)[0].strip()
+    """The profile slug of an author or assignee: ``coach#u1`` -> ``coach``,
+    ``devvybot-vps/devops`` -> ``devops`` (dv-33c8 ``<install>/<profile>``)."""
+    return (slug or "").split("#", 1)[0].strip().rsplit("/", 1)[-1]
 
 
 def is_privileged(slug: Optional[str]) -> bool:
@@ -105,8 +111,21 @@ def is_agent_task(labels: Iterable[str]) -> bool:
     return AGENT_LABEL in labels
 
 
-def wants_devops(assignee: Optional[str]) -> bool:
-    return base_slug(assignee) == PRIVILEGED_PROFILE
+def wants_devops(assignee: Optional[str], me: Optional[str] = None) -> bool:
+    """A bare ``devops`` or ``<me>/devops`` (this install's devops; another
+    install's devops is theirs, src/pump2/identity.py). ``me``: this
+    install's name, default the identity in force."""
+    a = (assignee or "").split("#", 1)[0].strip()
+    if "/" not in a:
+        return a == PRIVILEGED_PROFILE
+    install, _, profile = a.partition("/")
+    if profile != PRIVILEGED_PROFILE:
+        return False
+    if me is None:
+        from src.pump2 import identity  # lazy: this module is stdlib only
+
+        me = identity.current().install
+    return install == me
 
 
 def privileged_paths(paths: Iterable[str]) -> List[str]:
@@ -172,17 +191,6 @@ async def file_agent_task(
         }
 
     for_devops = wants_devops(assignee)
-    if for_devops:
-        open_devops = [t for t in mine if t.is_open and is_agent_task(t.labels)]
-        if len(open_devops) >= MAX_OPEN_AGENT_TASKS:
-            return {
-                "status": "limit",
-                "message": f"{origin} already has {len(open_devops)} open tasks "
-                f"for devops (max {MAX_OPEN_AGENT_TASKS}): "
-                + ", ".join(t.id for t in open_devops)
-                + "; comment on one of them instead",
-            }
-
     labels = [origin] + ([AGENT_LABEL] if for_devops else [])
     task_id = await board.add_task(
         title=title,
@@ -198,8 +206,9 @@ async def file_agent_task(
     out: Dict[str, Any] = {"status": "created", "task_id": task_id}
     if for_devops:
         out["note"] = (
-            "queued for devops: the pump analyses it and asks the owner; "
-            "implementation starts only after the owner answers"
+            "already started (status in_progress): the pump analyses it on its "
+            "next tick and asks the owner; implementation starts only after "
+            "the owner answers. No job_start needed; tell the user it is started"
         )
     return out
 
@@ -212,22 +221,24 @@ def has_agent_comments(text: str) -> bool:
 
 
 def comments_today(text: str, slug: str) -> int:
-    """Count today's agent-marked comments by ``slug`` in one task file."""
+    """Count today's comments by ``slug`` in one task file: headers
+    ``### @<install>/<slug> — <today>`` plus legacy ``- <today> from <slug>
+    (agent): `` bullets."""
     stamp = datetime.now(UTC).strftime("%Y-%m-%d")
-    return len(
-        re.findall(
-            rf"^- {stamp} from {re.escape(base_slug(slug))} \(agent\): ", text, re.M
-        )
-    )
+    s = re.escape(base_slug(slug))
+    legacy = re.findall(rf"^- {stamp} from {s} \(agent\): ", text, re.M)
+    new = re.findall(rf"^### @[^\s/]+/{s}(?:#\S*)? — {stamp}T", text, re.M)
+    return len(legacy) + len(new)
 
 
 def comment_line(slug: str, text: str) -> str:
-    """devops writes ``@devops:``; any other agent ``from <slug> (agent):``."""
-    stamp = datetime.now(UTC).strftime("%Y-%m-%d")
+    """The text of an agent comment (the header with author and time is
+    written by ``DevizBoard.append_comment``): devops writes it as is, any
+    other agent ``from <slug> (agent): `` + text."""
     body = " ".join(text.split())
     if is_privileged(slug):
-        return f"{stamp} @{slug}: {body}"
-    return f"{stamp} from {base_slug(slug)} (agent): {body}"
+        return body
+    return f"from {base_slug(slug)} (agent): {body}"
 
 
 # ------------------------------------------------------- merge confirmation
@@ -257,7 +268,7 @@ def privileged_merge_reason(
         return None
     dirs = list(TASK_DIRS)
     if working_directory is not None:
-        dirs.insert(0, Path(working_directory) / ".deviz" / "tasks")
+        dirs.insert(0, repo_tasks_dir(Path(working_directory)))
     for task_id in _PUMP_BRANCH.findall(command):
         flagged = _task_privileged(task_id, dirs)
         if flagged:

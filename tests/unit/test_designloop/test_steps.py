@@ -92,7 +92,8 @@ class Runner:
             return subprocess.CompletedProcess(cmd, 0, self.gate_out, "")
         if cmd[0] == "py":
             out = Path(cmd[cmd.index("--out") + 1])
-            out.write_bytes(b"\x89PNG\r\n\x1a\ncollage")
+            out.write_bytes(b"%PDF collage")
+            Path(cmd[cmd.index("--cover") + 1]).write_bytes(b"\x89PNG\r\n\x1a\n")
             return subprocess.CompletedProcess(cmd, 0, "", "")
         return subprocess.run(cmd, **kw)
 
@@ -154,9 +155,9 @@ async def test_a_ready_run_commits_three_real_app_variants_and_offers_them(
     assert [v.tradeoff for v in outcome.offered] == [
         f"v{n} groups the filters" for n in (1, 2, 3)
     ]
-    assert outcome.collage == repo / ".screens" / "design" / CARD / "collage.png"
+    assert outcome.collage == repo / ".screens" / "design" / CARD / "review.pdf"
     text, images = seen[-1]
-    assert images == [outcome.collage]
+    assert images == [outcome.collage.with_name("review-sheet.png"), outcome.collage]
     assert "v2 groups the filters" in text
     # The board gate got the variant's renders and the current refs.
     assert runner.gates[0][2] == str(repo / ".screens" / "design" / CARD / "current")

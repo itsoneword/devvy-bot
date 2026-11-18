@@ -1,5 +1,5 @@
 """The one ``{{KEY}}`` template filler: the design loop's generator prompt and
-pump2's custom stage prompts (dv-3b99). A key with no value stays as written."""
+pump2's custom stage prompts. A key with no value stays as written."""
 
 from __future__ import annotations
 

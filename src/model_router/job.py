@@ -24,6 +24,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -149,16 +150,56 @@ def parse_ask_context(text: Optional[str]) -> Optional[Dict[str, str]]:
 
 
 def pump_worktree_root(cwd: Path) -> Optional[Path]:
-    """*cwd* when it is a pump worktree, else ``None`` (dv-58db).
+    """*cwd* when it is a pump worktree, else ``None`` (dv-58db, dv-3d18).
 
-    A pump worktree is ``$PUMP_WORKTREES/<id>`` or ``.../<board>/<id>``
-    (default ``<repo>/../pump-worktrees``, as in ``scripts/pump2``) whose
-    ``.git`` is a file, i.e. a linked worktree. Resolved first, so a symlink
-    into the dir from outside, or out of it, does not count. Not the job's
-    cwd in general: a non-pump job runs in the live checkout.
+    pump2 layout: ``<board repo>/.pump-worktrees/<id>`` (``src/pump2/state.py``)
+    whose ``.git`` is a file naming ``<board repo>/.git/worktrees/<name>``,
+    i.e. a linked worktree of the repo it sits in, for any board. With
+    ``PUMP_WORKTREES`` set: ``$PUMP_WORKTREES/<id>`` or ``.../<board>/<id>``.
+    A path through a symlink, a subdir of a worktree, a plain dir of that
+    name and the live checkout do not count.
     """
-    default = Path(__file__).resolve().parents[2].parent / "pump-worktrees"
-    worktrees = Path(os.environ.get("PUMP_WORKTREES") or default).resolve()
+    override = os.environ.get("PUMP_WORKTREES")
+    if override:
+        return _override_worktree_root(Path(override), cwd)
+    resolved = Path(cwd).resolve()
+    if Path(os.path.abspath(cwd)) != resolved:
+        return None  # reached through a symlink
+    if resolved.parent.name != PUMP2_WORKTREES_DIR:
+        return None
+    repo = resolved.parent.parent
+    gitdir = _gitdir_of(resolved)
+    if gitdir is None:
+        return None
+    if gitdir.parent != (repo / ".git" / "worktrees").resolve():
+        return None
+    return resolved
+
+
+# Where pump2 puts a card's worktree inside its board repo (src/pump2/state.py).
+PUMP2_WORKTREES_DIR = ".pump-worktrees"
+
+
+def _gitdir_of(worktree: Path) -> Optional[Path]:
+    """The resolved ``gitdir:`` of a linked worktree's ``.git`` file, else None."""
+    dot_git = worktree / ".git"
+    if not dot_git.is_file():
+        return None
+    try:
+        text = dot_git.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.match(r"gitdir:\s*(.+?)\s*$", text.splitlines()[0] if text else "")
+    if not match:
+        return None
+    target = Path(match.group(1))
+    if not target.is_absolute():
+        target = worktree / target
+    return target.resolve()
+
+
+def _override_worktree_root(worktrees_dir: Path, cwd: Path) -> Optional[Path]:
+    worktrees = worktrees_dir.resolve()
     resolved = Path(cwd).resolve()
     try:
         parts = resolved.relative_to(worktrees).parts
@@ -183,6 +224,28 @@ def _write_session_file(path: Optional[Path], session_id: Any) -> None:
 # Written in the job dir while an ask waits on the owner, so the pump can
 # say what a slow job is waiting for (dv-97a4); removed when it returns.
 ASK_MARKER = "ask_pending.json"
+
+
+@dataclass(frozen=True)
+class AskAnswer:
+    """The bot's answer to a job's ask; truthy when the owner approved.
+
+    ``timed_out``: nobody answered in time (dv-3d18), not the owner's deny."""
+
+    approved: bool
+    timed_out: bool = False
+
+    def __bool__(self) -> bool:
+        return self.approved
+
+
+# The tool error for an ask nobody answered (dv-3d18): the agent must not
+# wait on it again, but find another way.
+NO_ANSWER_ERROR = (
+    "Denied: no owner answer in time (confirmation gate): {reason}. "
+    "Do not retry this command; work around it (another way to reach the "
+    "goal), or leave it for the owner in your report."
+)
 
 
 class BotLink:
@@ -220,11 +283,16 @@ class BotLink:
         preview: str,
         source: str,
         context: Optional[Dict[str, str]] = None,
-    ) -> bool:
-        """Owner's answer to an ask rule; False on any failure."""
+        tier: Optional[str] = None,
+    ) -> "AskAnswer":
+        """Owner's answer to an ask rule; a denial on any failure.
+
+        ``tier`` (dv-3d18) picks the bot's wait: ``fast`` = the short one."""
         body: Dict[str, Any] = {"reason": reason, "preview": preview, "source": source}
         if context:
             body["context"] = context
+        if tier:
+            body["tier"] = tier
         self._mark_ask(reason, preview)
         try:
             answer = await asyncio.to_thread(
@@ -232,10 +300,10 @@ class BotLink:
             )
         except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
             logger.warning("ask could not reach the bot -> denied", error=str(exc))
-            return False
+            return AskAnswer(False)
         finally:
             self._unmark_ask()
-        return bool(answer.get("approved"))
+        return AskAnswer(bool(answer.get("approved")), bool(answer.get("timed_out")))
 
     def _mark_ask(self, reason: str, preview: str) -> None:
         """Best effort: a marker that cannot be written never fails the ask."""
@@ -273,9 +341,18 @@ class RemoteModelCallRecorder:
 
     def __init__(self, link: BotLink) -> None:
         self._link = link
+        self.recorded = 0
+        self.lost = 0  # rows the bot refused or never got (dv-00ef)
 
-    async def record(self, call: Any) -> None:
-        await self._link.record(dataclasses.asdict(call))
+    async def record(self, call: Any) -> bool:
+        """True when the bot took the row. Not a row id: the router keeps
+        no id for a remote row (``ModelRouter._record`` drops a bool)."""
+        ok = bool(await self._link.record(dataclasses.asdict(call)))
+        if ok:
+            self.recorded += 1
+        else:
+            self.lost += 1
+        return ok
 
 
 def install_job_router(repo_root: Path) -> Any:
@@ -315,16 +392,25 @@ async def job_tool_decision(
         )
         return decision.reason
     if decision.action == policy.ASK:
-        approved = await link.ask(
-            decision.reason, decision.preview, source, context=ask_context
+        answer = await link.ask(
+            decision.reason,
+            decision.preview,
+            source,
+            context=ask_context,
+            tier=decision.tier,
         )
-        if not approved:
+        if not answer:
+            timed_out = isinstance(answer, AskAnswer) and answer.timed_out
             logger.warning(
                 "Destructive op denied by confirmation gate",
                 backend=backend,
                 tool_name=tool_name,
                 reason=decision.reason,
+                tier=decision.tier,
+                timed_out=timed_out,
             )
+            if timed_out:
+                return NO_ANSWER_ERROR.format(reason=decision.reason)
             return f"Denied by owner (confirmation gate): {decision.reason}"
     return None
 
@@ -683,6 +769,8 @@ async def run_job(spec: JobSpec, link: BotLink, out: Any = None) -> int:
         print(line, file=sys.stderr, flush=True)
 
     trace.close(completed=final is not None and not final.is_error)
+    limit_rerun = _limit_rerun(spec)
+    limit = None
 
     if final is not None:
         _write_session_file(spec.session_file, final.session_id)
@@ -700,14 +788,26 @@ async def run_job(spec: JobSpec, link: BotLink, out: Any = None) -> int:
         reason = error or (
             str(final.result or final.subtype) if final is not None else "no result"
         )
-        print(f"agentjob failed: {reason}", file=sys.stderr, flush=True)
         outcome, code, error = "error", 1, reason[:500]
-        # dv-7ad9: a usage limit is not a failure of the work. Exit
-        # QUOTA_EXIT with the reset time on stderr; the pump pauses on it.
         limit = parse_limit(reason)
-        if limit is not None:
-            print(quota_line(limit), file=sys.stderr, flush=True)
-            code = QUOTA_EXIT
+        if limit is not None and limit_rerun is not None:
+            # The row's limit_fallback (owner 17.11.26): rerun once on that
+            # model. No `agentjob failed` / quota line, so bgjob does not
+            # record a limit that would stop every other Claude job.
+            print(
+                f"agentjob: {model} hit a limit ({limit.message[:120]}); "
+                f"rerunning on {limit_rerun.model}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(f"agentjob failed: {reason}", file=sys.stderr, flush=True)
+            # dv-7ad9: a usage limit is not a failure of the work. Exit
+            # QUOTA_EXIT with the reset time on stderr; the pump pauses on it.
+            if limit is not None:
+                print(quota_line(limit), file=sys.stderr, flush=True)
+                code = QUOTA_EXIT
+            limit = None
 
     provider: Optional[str] = None
     if route is not None and route.is_third_party:
@@ -739,7 +839,22 @@ async def run_job(spec: JobSpec, link: BotLink, out: Any = None) -> int:
             "job_name": spec.name,
         }
     )
+    if limit is not None and limit_rerun is not None:
+        return await run_job(limit_rerun, link, out)
     return code
+
+
+def _limit_rerun(spec: JobSpec) -> Optional[JobSpec]:
+    """The same job on the route's ``limit_fallback`` model (once), or None."""
+    route = spec.route
+    if route is None or not route.limit_fallback:
+        return None
+    model = route.limit_fallback
+    return dataclasses.replace(
+        spec,
+        model=model,
+        route=dataclasses.replace(route, model=model, limit_fallback=None),
+    )
 
 
 def _wire_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

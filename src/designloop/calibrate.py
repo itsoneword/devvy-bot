@@ -7,8 +7,7 @@ critic output per screen, so a reader can judge whether the critique is
 specific and actionable. If it is not, rerun with ``point_by_point``: the
 critic then compares the screen with each reference pattern in turn.
 
-Run after merge from the devops chat (owner answer 2.1: a build job cannot
-write ``~/.codex``): ``scripts/designloop_calibrate``.
+Run from the devops chat: ``scripts/designloop_calibrate``.
 """
 
 from __future__ import annotations
@@ -120,7 +119,7 @@ def render_report(outcomes: Sequence[Outcome], point_by_point: bool) -> str:
         "# Design critic calibration",
         "",
         f"Run {datetime.now(UTC):%Y-%m-%d %H:%M} UTC, prompt mode: {mode}, "
-        "route: design_critic (Codex, no fallback).",
+        "route: design_critic (Claude opus, no fallback).",
         f"Criteria: {', '.join(CRITERIA)}. Each is `ok` or `fix: <what>`.",
         "",
         "Specific and actionable? A fix should name the element and the change.",

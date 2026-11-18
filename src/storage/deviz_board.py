@@ -19,14 +19,17 @@ them when an agent marks a task done.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
-import secrets
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
+
+from ..pump2 import cards, identity
+from ..pump2.state import comment_header
 
 logger = structlog.get_logger()
 
@@ -38,21 +41,6 @@ VALID_STATUSES = ("todo", "in_progress", "review", "waiting_user", "done")
 
 DEFAULT_PRIORITY = "medium"
 ID_PREFIX = "dv"
-
-# Frontmatter keys we own, in the order the deviz CLI writes them. Anything
-# else found in a file is preserved and appended after these.
-_KNOWN_ORDER = (
-    "id",
-    "title",
-    "status",
-    "priority",
-    "assignee",
-    "labels",
-    "deps",
-    "parent",
-    "created",
-    "updated",
-)
 
 _FM_RE = re.compile(r"\A---\n(.*?)\n---\n?(.*)\Z", re.DOTALL)
 _SECTION_RE = re.compile(r"^## +(.+?) *$", re.MULTILINE)
@@ -174,8 +162,10 @@ class DevizBoard:
     ``list_tasks``.
     """
 
-    def __init__(self, tasks_dir: Path | str = Path(".deviz/tasks")) -> None:
-        self._dir = Path(tasks_dir).expanduser().resolve()
+    def __init__(self, tasks_dir: Path | str | None = None) -> None:
+        from src.utils.boards import home_tasks_dir
+
+        self._dir = Path(tasks_dir or home_tasks_dir()).expanduser().resolve()
         self._lock = asyncio.Lock()
 
     @property
@@ -266,19 +256,6 @@ class DevizBoard:
 
     # ----------------------------------------------------------------- write
 
-    def _new_id(self) -> str:
-        for _ in range(100):
-            candidate = f"{ID_PREFIX}-{secrets.token_hex(2)}"
-            if not self._find(candidate):
-                return candidate
-        raise RuntimeError("could not allocate a free task id")
-
-    def _render(self, fm: Dict[str, str], body: str) -> str:
-        ordered = [k for k in _KNOWN_ORDER if k in fm]
-        ordered += [k for k in fm if k not in _KNOWN_ORDER]
-        lines = "\n".join(f"{k}: {fm[k]}" for k in ordered)
-        return f"---\n{lines}\n---\n{body}"
-
     async def add_task(
         self,
         title: str,
@@ -292,36 +269,36 @@ class DevizBoard:
         parent: str = "",
     ) -> str:
         """Create a task file. Returns the new ``dv-xxxx`` id. ``parent``: the
-        id of the task it was split from."""
+        id of the task it was split from. ``created_by``: the caller's
+        profile; stored as ``<install>/<profile>`` (dv-33c8), a value naming
+        an install raises ValueError."""
+        created_by = identity.author(created_by)
 
         def _work() -> str:
-            self._dir.mkdir(parents=True, exist_ok=True)
-            task_id = self._new_id()
-            now = _now_iso()
             # created_by is ours, not deviz's -- attribution is the whole
             # reason the shared board existed, and the CLI has no field for it.
-            tags = list(labels or [])
-            fm = {
-                "id": task_id,
-                "title": " ".join(title.split()),
-                "status": status if status in VALID_STATUSES else DEFAULT_STATUS,
-                "priority": priority,
-                "assignee": assignee or "",
-                "labels": f"[{', '.join(tags)}]",
-                "deps": "[]",
-                "parent": parent,
-                "created": now,
-                "updated": now,
-                "created_by": created_by,
-            }
-            if due_at is not None:
-                fm["due"] = due_at.isoformat()
-            sections = f"\n## Description\n\n{(body or title).strip()}\n\n"
-            sections += "## Acceptance Criteria\n\n## Notes\n\n## Comments\n"
-            (self._dir / f"{task_id}.md").write_text(
-                self._render(fm, sections), encoding="utf-8"
+            extra = {"due": due_at.isoformat()} if due_at is not None else {}
+            # dv-65aa: the one id + exclusive-create primitive (live dir,
+            # archive, HEAD and pump2/* branches); never overwrites a file
+            made = cards.new_card_file(
+                self._dir,
+                lambda cid: cards.card_text(
+                    cid,
+                    title,
+                    body or title,
+                    status=status if status in VALID_STATUSES else DEFAULT_STATUS,
+                    priority=priority,
+                    assignee=assignee or "",
+                    labels=list(labels or []),
+                    parent=parent,
+                    created_by=created_by,
+                    extra=extra,
+                ),
+                prefix=ID_PREFIX,
             )
-            return task_id
+            # a moved board's card is a boards-repo commit (dv-36b2)
+            cards.commit_cards(self._dir, f"task_add: create {made.id}")
+            return made.id
 
         async with self._lock:
             task_id = await asyncio.to_thread(_work)
@@ -355,22 +332,29 @@ class DevizBoard:
         logger.info("Task status set", task_id=task_id, status=status, found=ok)
         return ok
 
-    async def append_comment(self, task_id: str, comment: str) -> bool:
-        """Append a bullet under ``## Comments``. Used by the consolidation
-        service to add evidence to an existing open task instead of filing a
-        duplicate."""
+    async def append_comment(
+        self, task_id: str, comment: str, profile: str = "user"
+    ) -> bool:
+        """Append a ``### @<install>/<profile> — <time>`` comment under
+        ``## Comments`` (dv-33c8: the author is stamped here, ``profile`` is
+        fixed by the calling code). Used by task_comment and the
+        consolidation service."""
+        head = comment_header(identity.author(profile))
 
         def _work() -> bool:
             path = self._find(task_id)
             if path is None:
                 return False
             text = path.read_text(encoding="utf-8")
-            line = f"- {comment.strip()}\n"
+            line = f"{head}\n{comment.strip()}\n"
             if "## Comments" in _parse_frontmatter(text)[1]:
-                text = text.rstrip("\n") + "\n" + line
+                text = text.rstrip("\n") + "\n\n" + line
             else:
                 text = text.rstrip("\n") + "\n\n## Comments\n\n" + line
-            path.write_text(_set_keys(text, {"updated": _now_iso()}), encoding="utf-8")
+            # atomic replace: a reader (the pump) never sees a half-written card
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(_set_keys(text, {"updated": _now_iso()}), encoding="utf-8")
+            os.replace(tmp, path)
             return True
 
         async with self._lock:

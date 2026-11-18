@@ -4,6 +4,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import structlog
@@ -15,14 +16,22 @@ from src.storage.memory_repository import (
     truncate_at_word,
 )
 
-from .decision_refs import is_decision_ref
+from .decision_refs import card_ref_id, is_decision_ref
 
 if TYPE_CHECKING:
+    from src.storage.deviz_board import DevizBoard
     from src.storage.window_bundle_repository import WindowBundleRepository
 
     from .decision_refs import DecisionRefChecker
 
 logger = structlog.get_logger()
+
+# dv-3e28: a repo agent's per-task decision naming a card is appended to the
+# card and stored under this kind: searchable by recall(), never injected
+# (every injection query filters kind='user_fact' / 'conversation_result').
+# Set only by the writer; the validator does not accept it from the model.
+CARD_DECISION_KIND = "card_decision"
+CARD_COMMENT_PREFIX = "decision (memory): "
 
 # A user_fact above this is coerced to kind='conversation_result' (dv-7517
 # step 5): stored in full, injected only as a one-line pointer, retrieved via
@@ -65,6 +74,8 @@ class OpOutcome:
     # dv-32fe: a repo agent's decision its repo does not hold yet, written as
     # a full user_fact flagged "missing:<ref>" (still counted as added).
     not_in_repo: bool = False
+    # dv-3e28: ``<board>:<id>`` of the card the decision was appended to.
+    card_ref: Optional[str] = None
     # Tier of the fact the op touched: the new row's tier for add/supersede,
     # the closed row's for invalidate. A supersede that changes tier keeps
     # the "livelier" one, since either side reaching the prompt matters.
@@ -112,6 +123,14 @@ class ApplyResult:
             1
             for o in self.outcomes
             if o.not_in_repo and o.outcome in ("added", "superseded")
+        )
+
+    @property
+    def to_card(self) -> int:
+        return sum(
+            1
+            for o in self.outcomes
+            if o.card_ref and o.outcome in ("added", "superseded")
         )
 
     @property
@@ -206,6 +225,8 @@ class MemoryWriter:
         # (fixed in 0a8e68f / 6ec8a09), not necessarily from the model.
         self.duplicates_rejected = 0
         self.ops_applied = 0
+        # one DevizBoard per cards dir, so its lock serialises our writes
+        self._boards: Dict[str, "DevizBoard"] = {}
 
     async def apply_ops(
         self,
@@ -279,8 +300,9 @@ class MemoryWriter:
                 label = op.get("label")
                 source_ref = op.get("source_ref")
                 tier_val = str(op.get("tier") or "general")
+                card: Optional[Tuple[str, str, Path]] = None
                 if self._decision_refs is not None and target == agent_id:
-                    kind, source_ref = self._route_decision(
+                    kind, source_ref, card = self._route_decision(
                         agent_id, kind, source_ref, content, outcome
                     )
                 if (
@@ -317,6 +339,10 @@ class MemoryWriter:
                             candidate=normalized[:120],
                         )
                         continue
+                    if card is not None:
+                        kind, source_ref = await self._to_card(
+                            agent_id, card, content, kind, source_ref, outcome
+                        )
                     new_id = await self._repo.add_fact(
                         target,
                         str(op["tier"]),
@@ -344,6 +370,10 @@ class MemoryWriter:
                             candidate=normalized[:120],
                         )
                         continue
+                    if card is not None:
+                        kind, source_ref = await self._to_card(
+                            agent_id, card, content, kind, source_ref, outcome
+                        )
                     new_id = await self._repo.supersede_fact(
                         old_id,
                         target,
@@ -418,23 +448,35 @@ class MemoryWriter:
         source_ref: object,
         content: str,
         outcome: OpOutcome,
-    ) -> Tuple[str, object]:
-        """(kind, source_ref) for an op of a repo agent's own scope (dv-32fe).
+    ) -> Tuple[str, object, Optional[Tuple[str, str, Path]]]:
+        """(kind, source_ref, card) for an op of a repo agent's own scope.
 
         Only refs naming a decision location are checked; everything else
-        passes unchanged. Verified -> ``conversation_result`` pointing at the
-        ref (full text stays in the row). Not verified -> ``user_fact`` with
-        ``missing:<ref>``: injected in full with a visible flag until the
-        sweep finds it in the repo.
+        passes unchanged. A card ref (dv-3e28) whose card is found returns
+        the card (board, id, file) with the flagged full fact as the
+        fallback: :meth:`_to_card` writes the comment once the duplicate
+        check has passed. A DECISIONS ref keeps dv-32fe: verified ->
+        ``conversation_result`` pointer, else ``user_fact`` with
+        ``missing:<ref>`` until the sweep finds it in the repo.
         """
         assert self._decision_refs is not None
         ref = str(source_ref).strip() if isinstance(source_ref, str) else ""
         # A ref already carrying the flag (an echoed row) is checked afresh.
         ref = split_ref(ref)[0] or ""
         if not self._decision_refs.handles(agent_id) or not is_decision_ref(ref):
-            return kind, source_ref
-        if self._decision_refs.verify(agent_id, ref, content):
-            return "conversation_result", ref
+            return kind, source_ref, None
+        parsed = card_ref_id(ref)
+        if parsed is not None:
+            found = self._decision_refs.resolve_card(agent_id, ref)
+            if found is not None:
+                outcome.not_in_repo = True  # cleared when the comment lands
+                return (
+                    "user_fact",
+                    MISSING_REF_PREFIX + ref,
+                    (found[0], parsed[1], found[1]),
+                )
+        elif self._decision_refs.verify(agent_id, ref, content):
+            return "conversation_result", ref, None
         outcome.not_in_repo = True
         logger.info(
             "memory_decision_not_in_repo",
@@ -442,7 +484,33 @@ class MemoryWriter:
             ref=ref,
             content=content[:120],
         )
-        return "user_fact", MISSING_REF_PREFIX + ref
+        return "user_fact", MISSING_REF_PREFIX + ref, None
+
+    async def _to_card(
+        self,
+        agent_id: str,
+        card: Tuple[str, str, Path],
+        content: str,
+        kind: str,
+        source_ref: object,
+        outcome: OpOutcome,
+    ) -> Tuple[str, object]:
+        """Append the decision to its card; (kind, source_ref) to store.
+
+        Comment first, row second: a card that cannot be written leaves the
+        given fallback (the flagged full fact), never a lost decision."""
+        board, cid, path = card
+        if await append_card_decision(self._boards, agent_id, cid, path, content):
+            outcome.not_in_repo = False
+            outcome.card_ref = f"{board}:{cid}"
+            return CARD_DECISION_KIND, outcome.card_ref
+        logger.info(
+            "memory_decision_not_in_repo",
+            agent_id=agent_id,
+            ref=f"{board}:{cid}",
+            reason="card write failed",
+        )
+        return kind, source_ref
 
     async def _load_scope(self, agent_id: str) -> List[Tuple[Optional[int], str]]:
         """(id, normalised content) for every active fact in a scope."""
@@ -481,4 +549,39 @@ class MemoryWriter:
         for fact_id, content in existing:
             if fact_id == old_id:
                 return is_duplicate(normalized, content)
+        return False
+
+
+async def append_card_decision(
+    boards: Dict[str, "DevizBoard"],
+    agent_id: str,
+    card_id: str,
+    path: Path,
+    content: str,
+) -> bool:
+    """Append ``content`` to the card file ``path`` as a comment authored by
+    the speaking profile (dv-3e28). ``boards`` caches one DevizBoard per cards
+    dir. False on any failure; never raises."""
+    from src.storage.deviz_board import DevizBoard
+
+    tasks_dir = path.parent.parent if path.parent.name == "archive" else path.parent
+    key = str(tasks_dir)
+    try:
+        board = boards.get(key)
+        if board is None:
+            board = boards[key] = DevizBoard(tasks_dir)
+        return bool(
+            await board.append_comment(
+                card_id,
+                CARD_COMMENT_PREFIX + content.strip(),
+                profile=agent_id.split("#", 1)[0],
+            )
+        )
+    except Exception as e:
+        logger.warning(
+            "card decision comment failed",
+            agent_id=agent_id,
+            card=card_id,
+            error=str(e),
+        )
         return False

@@ -672,3 +672,36 @@ async def test_transcribe_whisper_passes_language(whisper_config):
     await handler._transcribe_whisper(b"fake-ogg")
 
     assert model.transcribe.call_args.kwargs["language"] == "en"
+
+
+async def test_elevenlabs_post_retries_connect_errors_and_5xx(
+    mistral_config, monkeypatch
+):
+    """09.11.26: one ConnectTimeout lost a voice message; connect failures and
+    429/5xx are retried, a 4xx is returned at once."""
+    import httpx
+
+    handler = VoiceHandler(config=mistral_config)
+    monkeypatch.setattr(VoiceHandler, "ELEVENLABS_RETRY_DELAYS", (0, 0, 0))
+    calls = []
+    outcomes = [
+        httpx.ConnectTimeout("t"),
+        httpx.Response(503),
+        httpx.Response(200, json={"text": "ok"}),
+    ]
+
+    class Client:
+        async def post(self, *a, **k):
+            calls.append(1)
+            o = outcomes.pop(0)
+            if isinstance(o, Exception):
+                raise o
+            return o
+
+    r = await handler._post_elevenlabs(Client(), {}, b"x")
+    assert r.status_code == 200 and len(calls) == 3
+
+    outcomes[:] = [httpx.Response(401)]
+    calls.clear()
+    r = await handler._post_elevenlabs(Client(), {}, b"x")
+    assert r.status_code == 401 and len(calls) == 1

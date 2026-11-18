@@ -15,6 +15,7 @@ from typing import Dict, Optional, Union
 
 from telegram import PhotoSize
 
+from src.bot.telegram_retry import fetch_media_bytes
 from src.config import Settings
 
 
@@ -54,8 +55,7 @@ class ImageHandler:
         """Process uploaded image"""
 
         # Download image
-        file = await photo.get_file()
-        image_bytes = await file.download_as_bytearray()
+        image_bytes = await fetch_media_bytes(photo)
 
         # _detect_image_type is a stub that always says "screenshot", so the
         # branchy prompts below sent EVERY photo — including a plate of food

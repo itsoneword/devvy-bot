@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 from src.model_router.job import (
     ASK_TIMEOUT_SECONDS,
+    AskAnswer,
     BotLink,
     JobSpec,
     job_options,
@@ -86,13 +87,13 @@ async def test_plain_call_is_allowed() -> None:
 async def test_unreachable_bot_means_deny() -> None:
     # Nothing listens on port 1; the ask must fail closed, not raise.
     link = BotLink("http://127.0.0.1:1", "s")
-    assert await link.ask("reason", "preview", "job") is False
+    assert await link.ask("reason", "preview", "job") == AskAnswer(False)
     assert await link.record({"purpose": "background_job"}) is False
 
 
 async def test_missing_secret_means_deny() -> None:
     link = BotLink("http://127.0.0.1:1", None)
-    assert await link.ask("reason", "preview", "job") is False
+    assert await link.ask("reason", "preview", "job") == AskAnswer(False)
 
 
 def test_job_options_keep_the_print_mode_defaults_and_add_the_gate() -> None:
@@ -1042,3 +1043,71 @@ async def test_failed_openrouter_job_is_not_retried_on_another_harness(
     (call,) = await _rows(bot_db, "model_calls")
     assert call["outcome"] == "error"
     assert call["provider"] == "openrouter"
+
+
+async def test_model_limit_reruns_once_on_the_limit_fallback(monkeypatch, capsys):
+    """owner 17.11.26: a Fable-limit hit on a job whose row has limit_fallback
+    reruns it on that model; no quota line (it would stop every Claude job)."""
+    from src.model_router import job as job_mod
+    from src.model_router.quota import find_limit
+    from src.model_router.routes import Route
+
+    limit = "You've reached your Fable limit. Switch to another model, to continue."
+    run, queries, posted, out = _multi_turn_job(
+        monkeypatch,
+        [
+            [_result(limit, is_error=True, subtype="error_during_execution")],
+            [_result("the plan")],
+        ],
+    )
+    real = job_mod.run_job
+
+    async def run_with_route() -> int:
+        spec = job_mod.JobSpec(
+            purpose="background_job",
+            name="pump2-analyze-x",
+            prompt="analyze",
+            model="fable",
+            working_directory=Path("/tmp"),
+            full_access=False,
+            unrestricted=False,
+            route=Route("claude", "anthropic_sub", "fable", "opus"),
+        )
+        return await real(spec, BotLink("http://127.0.0.1:1", "s"), out=out)
+
+    link_posts: list = []
+    monkeypatch.setattr(
+        BotLink, "post", lambda self, p, b, timeout: link_posts.append(b) or {}
+    )
+    assert await run_with_route() == 0
+    assert len(queries) == 2 and "the plan" in out.getvalue()
+    err = capsys.readouterr().err
+    assert find_limit(err) is None, err
+    assert "rerunning on opus" in err
+    assert [r["outcome"] for r in link_posts if "outcome" in r] == ["error", "ok"]
+
+
+async def test_limit_on_the_fallback_model_exits_4(monkeypatch, capsys):
+    """The rerun hits a limit too: exit 4 with the quota line, no third run."""
+    from src.model_router import job as job_mod
+    from src.model_router.routes import Route
+
+    limit = "You've hit your weekly limit · resets 9am (UTC)"
+    run, queries, _, out = _multi_turn_job(
+        monkeypatch,
+        [[_result(limit, is_error=True, subtype="error_during_execution")]] * 3,
+    )
+    monkeypatch.setattr(BotLink, "post", lambda self, p, b, timeout: {})
+    spec = job_mod.JobSpec(
+        purpose="background_job",
+        name="j",
+        prompt="p",
+        model="fable",
+        working_directory=Path("/tmp"),
+        full_access=False,
+        unrestricted=False,
+        route=Route("claude", "anthropic_sub", "fable", "opus"),
+    )
+    assert await job_mod.run_job(spec, BotLink("http://127.0.0.1:1", "s"), out=out) == 4
+    assert len(queries) == 2
+    assert "agentjob quota:" in capsys.readouterr().err

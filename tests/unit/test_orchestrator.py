@@ -171,6 +171,7 @@ def test_callback_pattern_covers_every_prefix(agentic_settings, deps):
         "watchdog:hold",
         "restart:force",
         "qi:ab12cd34",
+        "devlog:pub:12:0123456789abcdef",
         "lim:freeze",
         "lim:codex",
         "publish:go:devvy",

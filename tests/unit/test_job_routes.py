@@ -234,3 +234,17 @@ jobs:
       openrouter: acme/no-such-model-xyz
 """,
         )
+
+
+def test_limit_fallback_is_read_for_a_claude_job_row(tmp_path):
+    """owner 17.11.26: pump_analyze on fable, rerun on opus at the Fable limit."""
+    routes = _routes(
+        tmp_path,
+        "jobs:\n  pump_analyze:\n    models: {claude: fable}\n"
+        "    limit_fallback: opus\n",
+    )
+    route = routes.resolve_job("pump_analyze")
+    assert (route.model, route.limit_fallback) == ("fable", "opus")
+    assert routes.resolve_job("pump_implement").limit_fallback is None
+    # The same model as the fallback: nothing to rerun on.
+    assert routes.resolve_job("pump_analyze", model="opus").limit_fallback is None

@@ -108,6 +108,11 @@ class ProfileDefinition:
     # (Aster, MEXC). Owner turns only; the loader refuses it on a
     # guest-allowed profile.
     exchange: bool = False
+    # Web forms the bot may fill for this profile (dv-5a25), ids from
+    # ``src.webforms.FORMS``. The webform_* tools mount on owner turns only
+    # (the browser runs on the host, outside the box), so unlike ``exchange``
+    # the key is allowed on a guest-allowed profile: a guest never sees them.
+    web_forms: Tuple[str, ...] = ()
     # Extra directories a *sandboxed* profile may write to, beyond its own
     # workspace (dv-3103): an Obsidian vault, another project checkout. Wired
     # to the CLI ``--add-dir`` (bash inside the bwrap jail) and to the
@@ -155,6 +160,24 @@ class ProfileDefinition:
     # Slugs a user's ``/model`` pick may choose on this profile; a pick outside
     # the list is ignored. Empty = no per-profile list.
     allowed_models: Tuple[str, ...] = ()
+    # The devlog channel tools (dv-fc9d): sources, picture, screenshot,
+    # draft. Owner turns only; the loader refuses it on a guest-allowed or
+    # unsandboxed profile. Publishing is the owner's tap on the preview, never
+    # a tool.
+    publisher: bool = False
+    # The channel a publisher profile's drafts go to (``@name`` or ``-100…``).
+    publish_channel: Optional[str] = None
+    # Monthly cap on ``post_image`` spend in model_calls (USD).
+    image_cap_usd: float = 10.0
+
+    @property
+    def image_dirs(self) -> Tuple[Path, ...]:
+        """Roots outside the workspace whose files the agent may send to the
+        chat: its write roots plus its read-only ones. Sending a file the
+        agent can already read exposes nothing new (both lists are
+        owner-only); 16.11.26 packops could not send sheets from the shared
+        design root it reads."""
+        return tuple(self.extra_dirs) + tuple(self.sandbox_read_dirs)
 
     def allows_role(self, role: str) -> bool:
         """Owners always pass; other roles must be explicitly allowed."""
@@ -429,6 +452,24 @@ def _parse_user_data_tools(item: Dict[str, Any], slug: str) -> FrozenSet[str]:
             f" {sorted(unknown)} (valid: {sorted(VALID_USER_DATA_TOOL_GROUPS)})"
         )
     return parsed
+
+
+def _parse_web_forms(item: Dict[str, Any], slug: str) -> Tuple[str, ...]:
+    """Parse `web_forms: [william_russell_claim, ...]` for one profile."""
+    forms = item.get("web_forms")
+    if forms is None:
+        return ()
+    if not isinstance(forms, list) or not all(isinstance(f, str) for f in forms):
+        raise ValueError(f"Profile '{slug}': web_forms must be a list of form ids")
+    from src.webforms import FORMS
+
+    forms = [f.strip() for f in forms]
+    unknown = sorted(set(forms) - set(FORMS))
+    if unknown:
+        raise ValueError(
+            f"Profile '{slug}': unknown web_forms {unknown} (known: {sorted(FORMS)})"
+        )
+    return tuple(dict.fromkeys(forms))
 
 
 def _parse_provider(
@@ -855,6 +896,10 @@ def load_profile_registry(
                 " guest-allowed profile"
             )
 
+        publisher, publish_channel, image_cap_usd = _parse_publisher(
+            item, slug, resolved_sandbox=resolved_sandbox, allowed_roles=allowed_roles
+        )
+
         unrestricted = item.get("unrestricted", False)
         if not isinstance(unrestricted, bool):
             raise ValueError(f"Profile '{slug}': unrestricted must be true or false")
@@ -938,6 +983,7 @@ def load_profile_registry(
             today_digest=bool(item.get("today_digest", False)),
             hireli=bool(item.get("hireli", False)),
             exchange=exchange,
+            web_forms=_parse_web_forms(item, slug),
             extra_dirs=extra_dirs,
             project_instructions=project_instructions,
             sandbox_read_dirs=read_dirs,
@@ -948,6 +994,9 @@ def load_profile_registry(
             provider=provider,
             model=model,
             allowed_models=allowed_models,
+            publisher=publisher,
+            publish_channel=publish_channel,
+            image_cap_usd=image_cap_usd,
         )
         if validate_paths:
             _validate_profile_paths(definition)
@@ -966,6 +1015,44 @@ def load_profile_registry(
         disabled=[p.slug for p in profiles if not p.enabled],
     )
     return ProfileRegistry(profiles)
+
+
+def _parse_publisher(
+    item: Dict[str, Any],
+    slug: str,
+    *,
+    resolved_sandbox: bool,
+    allowed_roles: FrozenSet[str],
+) -> Tuple[bool, Optional[str], float]:
+    """``publisher`` / ``publish_channel`` / ``image_cap_usd`` (dv-fc9d)."""
+    publisher = item.get("publisher", False)
+    if not isinstance(publisher, bool):
+        raise ValueError(f"Profile '{slug}': publisher must be true or false")
+    channel = item.get("publish_channel")
+    if channel is not None:
+        if isinstance(channel, int) and not isinstance(channel, bool):
+            channel = str(channel)
+        if not isinstance(channel, str) or not re.fullmatch(
+            r"@[A-Za-z0-9_]{5,32}|-100\d{5,}", channel.strip()
+        ):
+            raise ValueError(
+                f"Profile '{slug}': publish_channel must be @name or -100… id"
+            )
+        channel = channel.strip()
+    cap = item.get("image_cap_usd", 10.0)
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or cap < 0:
+        raise ValueError(f"Profile '{slug}': image_cap_usd must be a number >= 0")
+    if (channel is not None or "image_cap_usd" in item) and not publisher:
+        raise ValueError(
+            f"Profile '{slug}': publish_channel / image_cap_usd need publisher: true"
+        )
+    if publisher and "guest" in allowed_roles:
+        raise ValueError(
+            f"Profile '{slug}': publisher is not allowed on a guest-allowed profile"
+        )
+    if publisher and not resolved_sandbox:
+        raise ValueError(f"Profile '{slug}': publisher requires a sandboxed profile")
+    return publisher, channel, float(cap)
 
 
 def _parse_allowed_domains(item: Dict[str, Any], slug: str) -> Tuple[str, ...]:

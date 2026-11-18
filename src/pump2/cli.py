@@ -1,5 +1,5 @@
-"""pump2 <tick|status|doctor|pending|start|merge|answer|pin|freeze|thaw|
-urgent|design|migrate|run-stage>.
+"""pump2 <tick|status|doctor|pending|start|merge|answer|new|pin|freeze|thaw|
+urgent|design|migrate|cards-move|feedback|run-stage>.
 
 The scripts/pump2 front.
 """
@@ -14,11 +14,13 @@ import sys
 from pathlib import Path
 
 from . import (
+    cards,
     criteria,
     design,
     doctor,
     feedback,
     freeze,
+    identity,
     migrate,
     pin,
     render,
@@ -27,7 +29,9 @@ from . import (
 )
 from .merge import BUSY_RC, merge
 from .state import (
+    RESTART_CLEARS,
     RUN_STAGES,
+    Board,
     Card,
     add_comment,
     add_owner_answer,
@@ -35,6 +39,8 @@ from .state import (
     find_card,
     list_cards,
     load_boards,
+    now_iso,
+    set_keys,
     set_pump2,
     set_status,
 )
@@ -72,6 +78,23 @@ def main(argv: list[str] | None = None) -> int:
     an = sub.add_parser("answer", help="answer the owner questions of a card")
     an.add_argument("card", help="<board>:<card-id>")
     an.add_argument("text")
+    nw = sub.add_parser("new", help="create a card with an id no branch or agent holds")
+    nw.add_argument("board")
+    nw.add_argument("--title", required=True)
+    nw.add_argument("--body", default="")
+    nw.add_argument("--status", default="todo")
+    nw.add_argument("--label", action="append", default=[])
+    nw.add_argument("--dep", action="append", default=[])
+    nw.add_argument("--parent", default="")
+    # no --by: the author is stamped by code (<install>/cli)
+    nw.add_argument(
+        "--assignee", default="", help="<install> or <install>/<profile>; empty = ours"
+    )
+    asg = sub.add_parser(
+        "assign", help="set a card's assignee: <install>[/<profile>], - = nobody"
+    )
+    asg.add_argument("card", help="<board>:<card-id>")
+    asg.add_argument("who")
     pn = sub.add_parser("pin", help="redraw each board's pinned summary")
     pn.add_argument("board", nargs="?")
     pn.add_argument("--dry-run", action="store_true", help="print, send nothing")
@@ -87,16 +110,39 @@ def main(argv: list[str] | None = None) -> int:
     dr = dsub.add_parser("run", help="run a designloop card: variants, gate, critic")
     dr.add_argument("card", help="<board>:<card-id>")
     dr.add_argument("--by", default="owner")
+    dr.add_argument(
+        "--mockup", help="build to this mockup file (the owner's pick from a sprint)"
+    )
+    dp = dsub.add_parser(
+        "prompt", help="print a card's builder prompt (read-only, no model call)"
+    )
+    dp.add_argument("card", help="<board>:<card-id>")
+    dn = dsub.add_parser(
+        "note", help="log the owner's remark on a design (no run) for the next run"
+    )
+    dn.add_argument("board")
+    dn.add_argument("text", help="the owner's words, verbatim")
+    ds = dsub.add_parser(
+        "spec", help="the board's style spec: seed a draft from its images, approve"
+    )
+    ds.add_argument("spec_action", choices=("seed", "approve"))
+    ds.add_argument("board")
     mg = sub.add_parser(
         "migrate", help="old pump (1.5/1.6) -> pump2: boards.json and cards"
     )
     mg.add_argument("--apply", action="store_true", help="write (default: dry run)")
     mg.add_argument("--dry-run", action="store_true", help="the default; no writes")
+    cm = sub.add_parser("cards-move", help="move a board's cards into the boards repo")
+    cm.add_argument("board")
+    cm.add_argument("--apply", action="store_true", help="write (default: dry run)")
+    fb = sub.add_parser("feedback", help="the owner's Feedback-topic question")
+    fb.add_argument("action", choices=["preview", "ask"])
+    fb.add_argument("card", help="<board:id>")
     r = sub.add_parser("run-stage")
     r.add_argument("stage")
     r.add_argument("card")
     # --boards may follow the subcommand too (the launcher appends it last)
-    for p in (t, s, dc, pe, st, m, an, pn, fz, th, ur, dr, mg, r):
+    for p in (t, s, dc, pe, st, m, an, nw, asg, pn, fz, th, ur, dr, mg, cm, fb, r):
         p.add_argument("--boards", type=Path, default=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     # The default file is guarded by each board's "pump2": true; an explicit
@@ -113,8 +159,26 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if a.cmd == "cards-move":
+        from . import cards_move
+
+        return cards_move.run(path, boards, a.board, apply=a.apply)
+    with identity.using(path):
+        return _dispatch(a, boards)
+
+
+def _dispatch(a: argparse.Namespace, boards: dict[str, Board]) -> int:
+    if a.cmd in ("start", "merge", "answer", "urgent") or (
+        a.cmd == "design" and getattr(a, "action", "") == "run"
+    ):
+        refused = _theirs(boards, a.card)
+        if refused:
+            print(refused, file=sys.stderr)
+            return 2
     if a.cmd == "doctor":
         return doctor.cmd_doctor(boards, a.board)
+    if a.cmd == "feedback":
+        return _feedback(boards, a.action, a.card)
     if a.cmd == "tick":
         for line in runner.tick(boards, boards_file=a.boards, only=a.board):
             print(line)
@@ -130,10 +194,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             head = freeze.status_line()
             lines = render.status_lines(boards, a.board)
+            lines += render.theirs_lines(boards, a.board)
             for board in boards.values():
                 if not a.board or board.name == a.board:
-                    cards = list_cards(board)[0]
-                    lines.append(f"{board.name} {series.series_line(board, cards)}")
+                    cs = list_cards(board)[0]
+                    lines.append(f"{board.name} {series.series_line(board, cs)}")
             print("\n".join(([head] if head else []) + lines))
     elif a.cmd == "pending":
         recs = render.pending_records(boards, a.board)
@@ -158,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
         board = boards[name]
         res = merge(board, find_card(board, cid))
         print(f"{res.outcome}: {res.detail}".rstrip(": "))
-        return {"merged": 0, "mergefix": 0, "busy": BUSY_RC}.get(
+        return {"merged": 0, "conflict": 0, "busy": BUSY_RC}.get(
             res.outcome, 1 if res.outcome != "red" else 0
         )
     elif a.cmd == "answer":
@@ -166,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         card = find_card(boards[name], cid)
         if design.is_designloop(card):
             # the owner's design pick: the same answer channel
-            return design.answer_pick(card, a.text, a.card)
+            return design.answer_pick(card, a.text, a.card, boards[name])
         if card.fm.get("status") != "waiting_user" or not card.pump2.get("stage"):
             print(
                 f"{a.card}: not waiting for an answer (status {card.fm.get('status')})"
@@ -177,6 +242,29 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"{a.card}: answer recorded, stage {card.pump2['stage']} reruns next tick"
         )
+    elif a.cmd == "new":
+        if a.board not in boards:
+            print(f"pump2: no board {a.board!r}", file=sys.stderr)
+            return 2
+        if a.assignee and not identity.valid_assignee(a.assignee):
+            print(
+                f"pump2: bad assignee {a.assignee!r}: {ASSIGNEE_FORM}", file=sys.stderr
+            )
+            return 2
+        made = cards.create_card(
+            boards[a.board],
+            a.title,
+            a.body,
+            status=a.status,
+            labels=a.label,
+            deps=a.dep,
+            parent=a.parent,
+            created_by=identity.author("cli"),
+            assignee=a.assignee,
+        )
+        print(f"{a.board}:{made.id} {made.path}")
+    elif a.cmd == "assign":
+        return _assign(boards, a.card, a.who)
     elif a.cmd == "freeze":
         freeze.freeze(a.by)
         print(f"pump2 frozen by {a.by}: no new launches; running jobs finish")
@@ -186,10 +274,74 @@ def main(argv: list[str] | None = None) -> int:
     elif a.cmd == "urgent":
         return _urgent(boards, a.card, a.by)
     elif a.cmd == "design":
+        if a.action == "note":
+            if a.board not in boards:
+                print(f"pump2: no board {a.board!r}", file=sys.stderr)
+                return 2
+            return design.add_owner_note(boards[a.board], a.text)
+        if a.action == "prompt":
+            return design.cmd_prompt(boards, a.card)
+        if a.action == "spec":
+            if a.board not in boards:
+                print(f"pump2: no board {a.board!r}", file=sys.stderr)
+                return 2
+            if a.spec_action == "seed":
+                return design.spec_seed(boards[a.board])
+            return design.spec_approve(boards[a.board])
+        if a.mockup:
+            rc = design.use_owner_mockup(boards, a.card, a.mockup)
+            if rc:
+                return rc
         return design.cmd_design(boards, a.card, a.by)
     else:
         print(f"run-stage {a.stage}: not built yet (analyze/tests/build/review)")
         return 2
+    return 0
+
+
+ASSIGNEE_FORM = "<install> or <install>/<profile>, each [a-z0-9][a-z0-9-]*"
+
+
+def _card_of(boards: dict[str, Board], full: str) -> Card | None:
+    name, _, cid = full.partition(":")
+    if name not in boards:
+        return None
+    try:
+        return find_card(boards[name], cid)
+    except FileNotFoundError:
+        return None
+
+
+def _theirs(boards: dict[str, Board], full: str) -> str:
+    """'' when the card is ours (or not found: the command says so); else
+    the one-line refusal naming its assignee (theirs is read-only)."""
+    card = _card_of(boards, full)
+    if card is None:
+        return ""
+    who = identity.owner_of(card.fm)
+    ours = identity.ours_check(extra={b.profile for b in boards.values()})
+    if ours(who):
+        return ""
+    return (
+        f"{full}: assigned to {who} (another install), read-only here -- "
+        f"`pump2 assign {full} <name>` hands it over"
+    )
+
+
+def _assign(boards: dict[str, Board], full: str, who: str) -> int:
+    """Set (``-``: clear) a card's assignee; a code-authored comment says so."""
+    card = _card_of(boards, full)
+    if card is None:
+        print(f"{full}: no such card on a served board", file=sys.stderr)
+        return 2
+    who = "" if who.strip() == "-" else who.strip()
+    if who and not identity.valid_assignee(who):
+        print(f"{full}: bad assignee {who!r}: {ASSIGNEE_FORM}", file=sys.stderr)
+        return 2
+    was = identity.owner_of(card.fm)
+    set_keys(card.path, assignee=who, updated=now_iso())
+    add_comment(card.path, f"assigned to {who or 'nobody'} (was {was or 'nobody'})")
+    print(f"{full}: assignee {who or '(none)'}")
     return 0
 
 
@@ -223,8 +375,24 @@ def release_tick() -> list[str]:
     return lines
 
 
+def _feedback(boards: dict[str, Board], action: str, full: str) -> int:
+    """``feedback preview`` prints the v2 question (nothing sent, no state);
+    ``feedback ask`` sends it now. Each is one paid model call."""
+    try:
+        if action == "preview":
+            print(feedback.preview_card(boards, full))
+            return 0
+        lines = feedback.ask_card(boards, full)
+    except KeyError as e:
+        print(str(e).strip("'\""), file=sys.stderr)
+        return 2
+    for line in lines:
+        print(line)
+    return 0 if any(" asked " in ln for ln in lines) else 1
+
+
 def feedback_tick(boards: dict) -> list[str]:
-    """The owner's feature survey (dv-a42c): at most one question per
+    """The owner's feature survey: at most one question per
     interval, none while one is open. Best effort: a failure is a log line."""
     try:
         return feedback.run(boards)
@@ -279,19 +447,9 @@ def _start(boards: dict, full: str, by: str, stage: str | None = None) -> int:
     return 0
 
 
-_LAST_PUMP2 = re.compile(r"^### @pump2\b[^\n]*\n(.*)", re.M)
-_STAGE_PREFIX = re.compile(r"(analyze|tests|build|review|mergefix|merge)\b")
-# keys of a stopped run that a restart drops: its job, retry and fix-round
-# counters; `jobs` and `returns` stay (the card's cost guards)
-_RESTART_CLEARS = (
-    "job",
-    "job_of",
-    "retry",
-    "format_retry",
-    "build_red",
-    "tests_red",
-    "stopped_at",
-)
+# a pump2 comment's first line: legacy `### @pump2 — t`, new `### @<me>/pump2 — t`
+_LAST_PUMP2 = re.compile(r"^### @(?:[a-z0-9-]+/)?pump2 [^\n]*\n(.*)", re.M)
+_STAGE_PREFIX = re.compile(r"(analyze|tests|build|review|merge|resolve)\b")
 
 
 def stopped_stage(card: Card) -> str:
@@ -314,7 +472,7 @@ def _restart(card: Card, full: str, by: str, stage: str | None) -> int:
         )
         return 2
     at = stage or stopped_stage(card)
-    set_pump2(card.path, stage=at, **{k: None for k in _RESTART_CLEARS})
+    set_pump2(card.path, stage=at, **{k: None for k in RESTART_CLEARS})
     add_comment(card.path, f"{at}: restarted by {by} at {at}")
     set_status(card.path, "in_progress")
     print(f"{full}: restarted at stage {at}, picked up on the next tick")

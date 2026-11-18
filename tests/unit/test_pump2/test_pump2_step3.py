@@ -104,11 +104,14 @@ def test_tests_stage_rejects(repo: Path, tmp_path: Path, case: str, msg: str) ->
     elif case == "unchanged":
         git(wt, "add", "tests/test_new.py")
         git(wt, "commit", "-qm", "pre")
+        # dv-47e7: a file committed on the card branch only is kept; one
+        # identical to the integration branch is still rejected
+        git(wt, "update-ref", "refs/heads/main", "HEAD")
         write_tests_json(wt, ["tests/test_new.py"])
     elif case == "extra":
         write_tests_json(wt, ["tests/test_new.py"])
     f.tick(b, tmp_path)
-    assert stage_of(b) == "stopped" and msg in body(b)
+    assert stage_of(b) == "resolve" and msg in body(b)
     assert not git(repo, "log", "--format=%s", "pump2/dv-0001").startswith("dv-0001")
 
 
@@ -137,14 +140,14 @@ def test_build_edited_test_file_stops(repo: Path, tmp_path: Path) -> None:
     put(wt, "tests/test_new.py", "def test_a():\n    pass\n")
     put(wt, "feature.py")
     f.tick(b, tmp_path)
-    assert stage_of(b) == "stopped"
+    assert stage_of(b) == "resolve"
     assert "build edited test files: ['tests/test_new.py']" in body(b)
 
 
 def test_build_changed_nothing_stops(repo: Path, tmp_path: Path) -> None:
     b, f, wt = built(repo, tmp_path, "true", script(tmp_path, "py", "exit 0"))
     f.tick(b, tmp_path)
-    assert stage_of(b) == "stopped" and "build changed nothing" in body(b)
+    assert stage_of(b) == "resolve" and "build changed nothing" in body(b)
 
 
 def test_docs_only_build_commits_without_tests(repo: Path, tmp_path: Path) -> None:
@@ -162,18 +165,16 @@ def test_docs_only_build_changed_nothing_stops(repo: Path, tmp_path: Path) -> No
     b, f = board(repo, "true"), Fake()
     setup(repo, tmp_path, "build", b, f)
     f.tick(b, tmp_path)
-    assert stage_of(b) == "stopped" and "build changed nothing" in body(b)
+    assert stage_of(b) == "resolve" and "build changed nothing" in body(b)
 
 
-def test_build_red_stops_with_node_ids(repo: Path, tmp_path: Path) -> None:
+def test_build_red_goes_to_resolve_with_node_ids(repo: Path, tmp_path: Path) -> None:
     red = script(tmp_path, "py", "echo 'FAILED tests/test_new.py::test_a - x'; exit 1")
     b, f, wt = built(repo, tmp_path, "true", red)
     put(wt, "feature.py")
-    f.tick(b, tmp_path)  # first red: one fix round (dv-80b8)
-    assert stage_of(b) == "build"
-    f.tick(b, tmp_path)  # relaunch
-    f.tick(b, tmp_path)  # second red
-    assert stage_of(b) == "stopped"
+    f.tick(b, tmp_path)  # dv-b8bb: no blind rerun, resolve decides
+    assert stage_of(b) == "resolve"
+    assert "tests/test_new.py::test_a" in (wt / ".pump" / "stop.md").read_text()
     assert "RED" in body(b) and "tests/test_new.py::test_a" in body(b)
     assert not git(repo, "log", "-1", "--format=%s", "pump2/dv-0001").endswith("build")
 
@@ -207,7 +208,7 @@ def test_build_passes_no_cov_only_when_board_uses_it(
     b, f, wt = built(repo, tmp_path, test, red)
     put(wt, "feature.py")
     f.tick(b, tmp_path)
-    assert stage_of(b) == "build"  # first red: a fix round (dv-80b8)
+    assert stage_of(b) == "resolve"  # dv-b8bb: a red goes to resolve
     assert ("--no-cov" in body(b)) is has
 
 
@@ -294,7 +295,7 @@ def test_build_gate_past_timeout_stops_not_rebuilds(
     b, f, wt = built(repo, tmp_path, "true", slow)
     put(wt, "feature.py")
     f.tick(b, tmp_path)
-    assert stage_of(b) == "stopped"
+    assert stage_of(b) == "resolve"
     assert "ran past 1 s" in body(b)
 
 

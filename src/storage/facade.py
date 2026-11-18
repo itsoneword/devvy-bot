@@ -22,6 +22,7 @@ from .models import (
     SessionModel,
     UserModel,
 )
+from .pending_media import PendingMediaRepository
 from .pending_notes import PendingNoteRepository
 from .pinned_messages import PinnedMessageRepository
 from .reactions import ReactionRepository
@@ -84,12 +85,13 @@ class Storage:
         self.analytics = AnalyticsRepository(self.db_manager)
         self.preferences = UserPreferencesRepository(self.db_manager)
         self.memory_repository = MemoryRepository(self.db_manager)
-        self.tasks = DevizBoard(tasks_dir or Path(".deviz/tasks"))
+        self.tasks = DevizBoard(tasks_dir)
         self.legacy_tasks = TaskRepository(self.db_manager)
         self.bot_users = BotUserRepository(self.db_manager)
         self.sent_messages = SentMessageRepository(self.db_manager)
         self.reactions = ReactionRepository(self.db_manager)
         self.pending_notes = PendingNoteRepository(self.db_manager)
+        self.pending_media = PendingMediaRepository(self.db_manager)
         self.holds = UserHoldRepository(self.db_manager)
         self.pinned_messages = PinnedMessageRepository(self.db_manager)
         # dv-5e4f Phase 0: repos for SQL moved out of

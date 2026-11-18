@@ -30,6 +30,8 @@ ALLOWED: Dict[str, Set[str]] = {
     },
     r"openrouter\.ai/api/v1/chat": {"src/model_router/openrouter_plain.py"},
     r"api\.typesafe\.ai": {"src/model_router/typesafe_decide.py"},
+    # dv-75f1: the FLUX image server's endpoint, only in its adapter.
+    r"/v1/generate": {"src/model_router/flux_plain.py"},
 }
 
 # Not moved yet (dv-ef90, waits for the owner's sign-off on how background

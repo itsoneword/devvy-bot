@@ -1,6 +1,5 @@
 """dv-a42c: owner feedback survey over feature chains (pure logic, offline)."""
 
-import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -104,7 +103,18 @@ def test_tick_one_question_until_answered(tmp_path):
     ]
     sent: list = []
     state = tmp_path / "feedback.json"
-    kw = dict(notify=sent.append, state_path=state, interval_min=45)
+    facts = feedback.Facts(text="Открой /limits", paths=["src/bot/x.py"])
+
+    async def ok(*a, **k):
+        return json.dumps({"class": "a", "change": "x", "steps": ["Открой /limits"]})
+
+    kw = dict(
+        notify=sent.append,
+        state_path=state,
+        interval_min=45,
+        complete=ok,
+        facts={"dv-1": facts, "dv-7": facts},
+    )
     feedback.tick(chains, now=NOW, **kw)
     feedback.tick(chains, now=NOW + timedelta(minutes=60), **kw)
     assert len(sent) == 1  # question still open
@@ -118,18 +128,81 @@ def test_tick_one_question_until_answered(tmp_path):
     assert "pump2:feedback" in sent[0]
 
 
-def test_question_text_and_fallback():
+def test_question_failure_sends_nothing_and_retries(tmp_path):
+    """dv-f34d: no v1 fallback; a model error leaves the chain askable."""
     chain = _merged_chain("dv-1", "2026-11-05T10:00:00Z")
-    view = {"prod_sha": "b", "prod_time": "", "staging": [("dv-1", "bbbbbbb")]}
+    facts = {"dv-1": feedback.Facts(text="Открой /limits", paths=["src/x.py"])}
 
     async def boom(*a, **k):
         raise RuntimeError("model down")
 
-    async def ok(*a, **k):
-        return "It makes X do Y."
+    sent: list = []
+    state = tmp_path / "f.json"
+    out = feedback.tick(
+        [chain],
+        now=NOW,
+        notify=sent.append,
+        state_path=state,
+        complete=boom,
+        facts=facts,
+    )
+    assert not sent and any("question failed" in x for x in out)
+    assert feedback.load_state(state)["asked"] == {}
 
-    text = asyncio.run(feedback.question_text(chain, view, complete=boom))
-    assert "dv-1" in text and "2026-11-05" in text and "staging" in text
-    assert "pump2" in text or "chat" in text or "job" in text
-    text2 = asyncio.run(feedback.question_text(chain, view, complete=ok))
-    assert "It makes X do Y." in text2
+
+def test_chain_not_linked_by_a_mention():
+    """dv-f34d C6: an id named in a description does not chain cards."""
+    a = mk("dv-57ba", body="## Description\nsee dv-52d5 for context\n")
+    b = mk("dv-52d5")
+    chains = feedback.build_chains(board(), [a, b])
+    assert len(chains) == 2
+
+
+def test_reverted_feature_not_asked(tmp_path):
+    chain = _merged_chain("dv-1", "2026-11-05T10:00:00Z")
+    facts = {"dv-1": feedback.Facts(text="x", paths=["src/x.py"], reverted=True)}
+    sent: list = []
+    out = feedback.tick(
+        [chain],
+        now=NOW,
+        notify=sent.append,
+        state_path=tmp_path / "f.json",
+        complete=None,
+        facts=facts,
+    )
+    assert not sent and any("skipped reverted dv-1" in x for x in out)
+
+
+def test_screenshot_sent_as_image(tmp_path):
+    chain = _merged_chain("dv-1", "2026-11-05T10:00:00Z")
+    png = tmp_path / "s.png"
+    facts = {
+        "dv-1": feedback.Facts(
+            text="Открой /limits",
+            paths=["docs/screens/dv-1/s.png", "src/x.py"],
+            screens=[str(png)],
+        )
+    }
+
+    async def ok(*a, **k):
+        return json.dumps({"class": "a", "change": "x", "steps": ["Открой /limits"]})
+
+    sent: list = []
+    feedback.tick(
+        [chain],
+        now=NOW,
+        notify=sent.append,
+        state_path=tmp_path / "f.json",
+        complete=ok,
+        facts=facts,
+    )
+    (argv,) = sent
+    assert argv[argv.index("--image") + 1] == str(png)
+
+
+def test_revert_guard_needs_the_card_named_by_the_verb():
+    g = feedback._gone
+    assert g('Revert "dv-d7d3: status tab"', "dv-d7d3", "Status tab")
+    assert g("drop the dv-d7d3 tab", "dv-d7d3", "x")
+    assert g("remove Status tab", "dv-d7d3", "Status tab")
+    assert not g("dv-275f: remove Read image path", "dv-275f", "view_image")

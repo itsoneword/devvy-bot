@@ -28,7 +28,8 @@ PYPROJECT = REPO / "pyproject.toml"
 # Lowest version that closes every advisory pip-audit reported on 2026-10-25
 # for the packages it flagged (max of each package's fix_versions; mcp takes
 # the 1.x fix, 2.x is a separate migration). Offline floor: holds without
-# network, the live audit below is the authoritative one.
+# network, the live audit below is the authoritative one. opentelemetry-api
+# was raised to 1.45.2 for GHSA-mf5v-w3w3-f6cg (2026-11-13).
 FIX_FLOORS = {
     "anyio": "4.14.2",
     "black": "26.10.1",
@@ -38,7 +39,7 @@ FIX_FLOORS = {
     "fsspec": "2026.6.0",
     "idna": "3.15",
     "mcp": "1.30.0",
-    "opentelemetry-api": "1.45.1",
+    "opentelemetry-api": "1.45.2",
     "pydantic-settings": "2.14.2",
     "pygments": "2.20.0",
     "pyjwt": "2.15.0",

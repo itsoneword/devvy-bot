@@ -23,8 +23,9 @@ of `CHANGELOG.public.md` (1.5 and 1.6 still ran the old task pump,
    ```
 
    It adds `"pump2": true` to each board in `config/taskpump/boards.json`,
-   drops the old-pump keys (`stages`, `acceptance`, `mergecheck`, `intake`;
-   `publish` stays, `scripts/release` reads it), adds `pump2_home` for this repo's own board (and creates the file
+   drops the old-pump keys (`stages`, `acceptance`, `mergecheck`;
+   `publish` stays, `scripts/release` reads it; `intake` stays, pump2 reads
+   its `github` key), adds `pump2_home` for this repo's own board (and creates the file
    when there was none), and clears `pump:` / `pump_*` keys off every card. An
    open card keeps its old state in a `### @pump2` comment; no card is
    started. A second `--apply` must report `0 card(s) changed`.

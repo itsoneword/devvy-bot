@@ -6,7 +6,7 @@ of feed/main, event_page/other and profile_tab/main (dark + light) against
 industry references (Strava, Meetup/Partiful, Airbnb) through the router's
 ``design_critic`` route, and writes the raw critic output per screen to
 ``report`` (docs/research/dv-9133/calibration.md in the real run, after
-merge: owner answer 2.1). The router here is a fake: no real Codex call.
+merge: owner answer 2.1). The router here is a fake: no real Claude call.
 """
 
 import inspect
@@ -59,13 +59,13 @@ async def test_calibration_report_holds_raw_critic_output_for_the_three_screens(
 
     calls: List[CallRequest] = []
 
-    async def codex(request: CallRequest) -> CallResult:
+    async def claude(request: CallRequest) -> CallResult:
         calls.append(request)
         note = f"NOTE-{_screen_of(request)}-cards-misaligned"
         return CallResult(text=json.dumps(conforming(request.json_schema or {}, note)))
 
-    async def claude(request: CallRequest) -> CallResult:
-        raise AssertionError("calibration never runs on Claude")
+    async def codex(request: CallRequest) -> CallResult:
+        raise AssertionError("calibration never runs on Codex")
 
     set_router(
         ModelRouter(
@@ -105,9 +105,7 @@ async def test_calibration_report_holds_raw_critic_output_for_the_three_screens(
 
     rows = await _rows(db)
     assert len(rows) == 3
-    assert {(r["purpose"], r["harness"]) for r in rows} == {
-        ("design_critic", "openai_codex")
-    }
+    assert {(r["purpose"], r["harness"]) for r in rows} == {("design_critic", "claude")}
 
 
 async def _rows(db: DatabaseManager) -> List[dict]:

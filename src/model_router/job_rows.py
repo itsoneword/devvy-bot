@@ -57,7 +57,7 @@ JOB_LABELS: Dict[str, str] = {
     "pump_review": "ревью",
     "pump_acceptance": "приёмка",
     "pump_merge": "слияние",
-    "pump_mergefix": "исправление слияния",
+    "pump_resolve": "разбор остановки",
     "background_job": "фоновые задачи",
     "monitor": "монитор сервера",
     "design_generate": "дизайн-варианты",

@@ -1,5 +1,6 @@
 """DevizBoard: the file-backed task board that replaced agent_tasks (dv-1327)."""
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,7 +32,7 @@ async def test_add_task_writes_a_file_and_returns_a_dv_id(board: DevizBoard) -> 
     assert task is not None
     assert task.title == "Test task"
     assert task.body is not None and task.body.startswith("body text")
-    assert task.created_by == "coach#u111111111"
+    assert task.created_by.endswith("/coach#u111111111")
     assert task.assignee == "user"
     assert task.due_at == datetime(2026, 8, 18, 18, tzinfo=UTC)
     assert task.labels == ["coach"]
@@ -115,7 +116,8 @@ async def test_comment_and_status_keep_nested_pump2_block(board: DevizBoard) -> 
     text = path.read_text()
     assert block in text
     assert "\nstage:" not in text
-    assert "status: in_progress" in text and text.rstrip().endswith("- a note")
+    assert "status: in_progress" in text and text.rstrip().endswith("\na note")
+    assert re.search(r"^### @[a-z0-9-]+/user — \S+\na note$", text, re.M)
 
 
 async def test_find_open_by_title_and_append_comment(board: DevizBoard) -> None:

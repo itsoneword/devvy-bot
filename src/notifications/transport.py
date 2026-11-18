@@ -121,10 +121,12 @@ class Transport(Protocol):
 class TelegramTransport:
     """``telegram.Bot`` behind the transport calls (moved code, same calls)."""
 
-    def __init__(self, bot: Any) -> None:
+    def __init__(self, bot: Any, rich_messages: bool = False) -> None:
         from telegram.error import BadRequest, TelegramError
 
         self.bot = bot
+        # ENABLE_RICH_MESSAGES (dv-1c98): markdown goes out via sendRichMessage.
+        self.rich_messages = rich_messages
         self.Error: type[Exception] = TelegramError
         self.BadRequest: type[Exception] = BadRequest
 
@@ -170,6 +172,20 @@ class TelegramTransport:
         )
         return msg.message_id  # type: ignore[no-any-return]
 
+    async def send_rich(
+        self, chat_id: int, markdown: str, *, thread_id: Optional[int] = None
+    ) -> Optional[int]:
+        """The message id of a Rich Message, or None: off, over the limits or
+        rejected (logged); the caller then sends the text path."""
+        if not self.rich_messages:
+            return None
+        from ..bot.rich_message import try_send_rich
+
+        sent = await try_send_rich(
+            self.bot, chat_id, markdown, message_thread_id=thread_id
+        )
+        return sent.message_id if sent else None
+
     async def edit(
         self,
         chat_id: int,
@@ -210,24 +226,17 @@ class TelegramTransport:
         thread_id: Optional[int] = None,
     ) -> None:
         """Raster photos as one album (one photo: a plain photo), the rest as
-        documents (dv-f90c)."""
-        from telegram import InputMediaPhoto
+        documents (dv-f90c). Photos are retried one by one on a timeout and
+        the ones that never arrive are named in a text message."""
+        from ..bot.utils.photo_send import send_photos, undelivered_note
 
         topic_kw = self._kwargs(None, thread_id, None)
-        if len(photos) == 1:
-            with open(photos[0], "rb") as f:
-                await self.bot.send_photo(chat_id=chat_id, photo=f, **topic_kw)
-        elif photos:
-            handles = [open(p, "rb") for p in photos[:10]]  # noqa: SIM115
-            try:
-                await self.bot.send_media_group(
-                    chat_id=chat_id,
-                    media=[InputMediaPhoto(media=h) for h in handles],
-                    **topic_kw,
+        if photos:
+            result = await send_photos(self.bot, chat_id, photos, **topic_kw)
+            if result.failed:
+                await self.bot.send_message(
+                    chat_id=chat_id, text=undelivered_note(result.failed), **topic_kw
                 )
-            finally:
-                for h in handles:
-                    h.close()
         for doc in documents:
             with open(doc, "rb") as f:
                 await self.bot.send_document(

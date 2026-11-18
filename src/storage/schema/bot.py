@@ -88,6 +88,29 @@ bot_users = Table(
     Index("idx_bot_users_family", "family_id"),
 )
 
+channel_posts = Table(
+    "channel_posts",
+    metadata,
+    Column("id", INTEGER, primary_key=True, nullable=True),
+    Column("profile", TEXT, nullable=False),
+    Column("status", TEXT, nullable=False),
+    Column("text", TEXT, nullable=False),
+    Column("headline", TEXT),
+    Column("image_path", TEXT, nullable=False),
+    Column("image_sha256", TEXT, nullable=False),
+    Column("image_kind", TEXT, nullable=False),
+    Column("leak_hits", TEXT, nullable=False, server_default=text("'[]'")),
+    Column("superseded_by", INTEGER),
+    Column("preview_chat_id", INTEGER),
+    Column("preview_message_id", INTEGER),
+    Column("channel_message_id", INTEGER),
+    Column("created_at", TIMESTAMP, nullable=False),
+    Column("updated_at", TIMESTAMP, nullable=False),
+    Column("published_at", TIMESTAMP),
+    Index("idx_channel_posts_profile", "profile", "status"),
+    sqlite_autoincrement=True,
+)
+
 conversation_windows = Table(
     "conversation_windows",
     metadata,
@@ -303,6 +326,33 @@ pending_notes = Table(
     sqlite_autoincrement=True,
 )
 
+# dv-c977: a voice / photo / document stored at receipt, so a file Telegram
+# will not hand out yet is retried in the background (and after a restart)
+# instead of being lost. Times are epoch seconds (UTC).
+pending_media = Table(
+    "pending_media",
+    metadata,
+    Column("id", INTEGER, primary_key=True, nullable=True),
+    Column("chat_id", INTEGER, nullable=False),
+    Column("thread_id", INTEGER),
+    Column("message_id", INTEGER, nullable=False),
+    Column("user_id", INTEGER, nullable=False),
+    Column("profile_slug", TEXT),
+    Column("kind", TEXT, nullable=False),
+    Column("file_id", TEXT, nullable=False),
+    Column("update_json", TEXT, nullable=False),
+    Column("status", TEXT, nullable=False, server_default=text("'pending'")),
+    Column("attempts", INTEGER, nullable=False, server_default=text("0")),
+    Column("last_error", TEXT),
+    Column("status_message_id", INTEGER),
+    Column("sent_at", REAL),
+    Column("received_at", REAL, nullable=False),
+    Column("window_start", REAL),
+    Column("closed_at", REAL),
+    Index("idx_pending_media_status", "status"),
+    sqlite_autoincrement=True,
+)
+
 local_messages = Table(
     "local_messages",
     metadata,
@@ -367,6 +417,7 @@ scheduled_jobs = Table(
     Column("item_id", INTEGER),
     Column("timezone", TEXT),
     Column("ends_at", TEXT),
+    Column("profile_slug", TEXT),
     Index("idx_scheduled_jobs_active", "is_active"),
     Index("idx_scheduled_jobs_item", "item_id"),
 )
@@ -424,6 +475,13 @@ message_reactions = Table(
     Column("criterion", TEXT),
     Column("card_size", TEXT),
     Column("card_kind", TEXT),
+    # dv-925f: judge rows of the design critic (stage design_critic /
+    # design_critic_remark): renders round / variant, a remark's element and
+    # kind (build | data). ``comment`` holds the evidence / remark text.
+    Column("round", INTEGER),
+    Column("variant", INTEGER),
+    Column("element", TEXT),
+    Column("remark_kind", TEXT),
     UniqueConstraint("telegram_chat_id", "telegram_message_id", "user_id"),
     Index("idx_message_reactions_profile", "profile_slug", "reacted_at"),
     Index("idx_message_reactions_feature", "feature_id"),

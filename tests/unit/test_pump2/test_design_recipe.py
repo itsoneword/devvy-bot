@@ -331,8 +331,9 @@ def test_C2_doc_temp_db_rule_and_no_private_names() -> None:
     assert "temp" in low and ("db" in low or "database" in low)
     assert "parallel" in low or "concurrent" in low
     assert "artefact" in low or "artifact" in low
-    for bad in ("gymbro", "withkeys"):
+    private = "gym" + "bro"  # built so this file does not carry the name
+    for bad in (private, "withkeys"):
         assert bad not in low
     for f in (RENDER, GATE):
         if f.is_file():
-            assert "gymbro" not in f.read_text().lower()
+            assert private not in f.read_text().lower()

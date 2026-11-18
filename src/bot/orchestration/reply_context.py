@@ -132,6 +132,28 @@ async def build_reply_context(
         and (pump_id := pump_task_from_ref(getattr(entry, "ref", None)))
     ):
         envelope = pump_envelope(pump_id)
+    elif (
+        is_own_bot
+        and entry is not None
+        and entry.kind == "scheduled_reminder"
+        and _is_profile_dm_reply(quoted_text, entry_slug)
+    ):
+        # A profile's agent-turn reply delivered in the shared DM (scheduled
+        # job, dv-f6c4): it starts with the profile badge. It came from a
+        # turn, but possibly in another session (the job's working dir), so
+        # keep the text. A bare slug in the ledger counts as the same profile
+        # as its per-user agent id (``slug#u<id>``).
+        if _same_profile(entry_slug, current_agent_id):
+            envelope = (
+                "[replied-to: a message you (this agent profile) sent the "
+                "user from a scheduled job; it may not be in this "
+                f'conversation\'s transcript. It said:\n"{quoted_text}"]'
+            )
+        else:
+            envelope = (
+                "[replied-to: a scheduled job message from another agent "
+                f'profile ({entry_slug}), not you:\n"{quoted_text}"]'
+            )
     elif is_own_bot and entry is not None and entry.kind == "scheduled_reminder":
         # A verbatim scheduled reminder: composed by the profile's agent at
         # schedule time, delivered without an agent turn — so it is in no
@@ -174,6 +196,26 @@ async def build_reply_context(
         envelope = f'[replied-to message, from: {origin}:\n"{quoted_text}"]'
 
     return f"{envelope}\n\n{user_text}", user_text
+
+
+def _is_profile_dm_reply(quoted_text: str, entry_slug: Optional[str]) -> bool:
+    """True when ``quoted_text`` opens with ``entry_slug``'s profile badge, the
+    mark ``NotificationService`` puts on a profile's message in the DM
+    (dv-f6c4). Verbatim reminders open with ``⏰`` instead."""
+    if not entry_slug:
+        return False
+    from .routing import _PROFILE_BADGES
+
+    slug = entry_slug.split("#", 1)[0]
+    badge = _PROFILE_BADGES.get(slug, slug)
+    return quoted_text.split("\n", 1)[0].strip() == badge
+
+
+def _same_profile(entry_slug: Optional[str], current: Optional[str]) -> bool:
+    """Same agent: equal ids, or a bare-slug entry and ``slug#u<id>``."""
+    if not entry_slug or not current or entry_slug == current:
+        return True
+    return "#" not in entry_slug and current.split("#", 1)[0] == entry_slug
 
 
 def _origin_label(quoted: Any) -> str:

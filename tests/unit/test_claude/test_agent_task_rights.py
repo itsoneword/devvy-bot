@@ -109,7 +109,11 @@ async def test_agents_comment_on_any_open_task_marked_as_agent(
     # devops keeps its own marker and is not "an agent"
     await _call(mount("devops"), "task_comment", task_id=other, text="d")
     text = (await board.get_task(other)).path.read_text()  # type: ignore[union-attr]
-    assert "@devops: d" in text and "from devops" not in text
+    assert (
+        "/devops — " in text
+        and text.rstrip().endswith("\nd")
+        and "from devops" not in text
+    )
     await board.set_status(other, "done")
     assert (await _call(tools, "task_comment", task_id=other, text="e"))["error"]
 
@@ -153,7 +157,7 @@ async def test_agent_task_for_devops_goes_to_the_pump(
     assert task is not None
     assert task.status == "in_progress"
     assert task.labels == ["markets", "agent"]
-    assert task.created_by == "markets"
+    assert task.created_by.endswith("/markets")
     assert task.assignee == "devops"
     # No pump key: the pump's eligibility rule picks it up next tick.
     assert "pump:" not in task.path.read_text()  # type: ignore[union-attr]
@@ -164,7 +168,7 @@ async def test_agent_task_for_itself_stays_todo(mount: Any, board: DevizBoard) -
     task = await board.get_task(out["task_id"])
     assert task is not None
     assert task.status == "todo" and task.labels == ["coach"]
-    assert task.created_by == "coach#u7"
+    assert task.created_by.endswith("/coach#u7")
 
 
 async def test_devops_task_add_is_unchanged(mount: Any, board: DevizBoard) -> None:
@@ -184,24 +188,12 @@ async def test_duplicate_open_title_returns_the_existing_task(
     assert third["status"] == "created"
 
 
-async def test_open_devops_cap(mount: Any, board: DevizBoard) -> None:
+async def test_no_open_devops_cap(mount: Any) -> None:
+    """Owner 2026-11-11: an agent may hold any number of open devops tasks."""
     tools = mount("markets")
-    ids = []
-    for i in range(board_policy.MAX_OPEN_AGENT_TASKS):
+    for i in range(4):
         out = await _call(tools, "task_add", title=f"d{i}", assignee="devops")
         assert out["status"] == "created"
-        ids.append(out["task_id"])
-    over = await _call(tools, "task_add", title="d-over", assignee="devops")
-    assert over["status"] == "limit" and ids[0] in over["message"]
-    # Its own (non-devops) items are not held by the devops cap.
-    assert (await _call(tools, "task_add", title="own"))["status"] == "created"
-    # Another agent has its own cap.
-    other = await _call(mount("coach"), "task_add", title="c", assignee="devops")
-    assert other["status"] == "created"
-    # Closing one frees a slot.
-    await board.set_status(ids[0], "done")
-    again = await _call(tools, "task_add", title="d-again", assignee="devops")
-    assert again["status"] == "created"
 
 
 async def test_daily_cap_counts_today_only(
@@ -353,3 +345,15 @@ async def test_http_agent_rules(tmp_path: Path) -> None:
     owner = client.post("/internal/tasks", json={"title": "owner thing"}, headers=auth)
     owner_task = await DevizBoard(tmp_path / "tasks").get_task(owner.json()["task_id"])
     assert owner_task is not None and owner_task.status == "todo"
+
+
+def test_wants_devops_only_this_installs_devops() -> None:
+    """dv-33c8: `<other install>/devops` is theirs, not a devops queue item."""
+    w = board_policy.wants_devops
+    assert w("devops", me="devvybot-vps")
+    assert w("devops#u1", me="devvybot-vps")
+    assert w("devvybot-vps/devops", me="devvybot-vps")
+    assert not w("romanbot/devops", me="devvybot-vps")
+    assert not w("devvybot-vps/builder", me="devvybot-vps")
+    assert not w("builder", me="devvybot-vps")
+    assert not w(None, me="devvybot-vps")

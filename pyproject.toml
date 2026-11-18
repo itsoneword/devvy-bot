@@ -1,6 +1,6 @@
 [project]
 name = "devvy"
-version = "1.7.0"
+version = "1.8.0"
 description = "Devvy -- a self-hosted Telegram front-end for the Claude Code and OpenAI Codex CLIs"
 readme = "README.md"
 license = "MIT"

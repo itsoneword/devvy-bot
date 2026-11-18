@@ -10,7 +10,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import structlog
 
@@ -95,6 +95,7 @@ def validate_image_path(
     approved_directory: Union[Path, Sequence[Path]],
     caption: str = "",
     any_file: bool = False,
+    pending: bool = False,
 ) -> Optional[ImageAttachment]:
     """Validate a single image path from an MCP ``send_image_to_user`` call.
 
@@ -107,10 +108,27 @@ def validate_image_path(
     Returns an :class:`ImageAttachment` if the path is a valid, existing image
     inside *approved_directory*, or ``None`` otherwise.
     """
+    return check_image_path(file_path, approved_directory, caption, any_file, pending)[
+        0
+    ]
+
+
+def check_image_path(
+    file_path: str,
+    approved_directory: Union[Path, Sequence[Path]],
+    caption: str = "",
+    any_file: bool = False,
+    pending: bool = False,
+) -> Tuple[Optional[ImageAttachment], str]:
+    """:func:`validate_image_path` with the reason: (attachment, "") or
+    (None, why it is not deliverable) -- the one validator (dv-f90c).
+    ``pending``: the file may not exist yet (``send_review`` renders it while
+    the tool runs, after the stream intercept saw the call); every bound
+    still applies, existence and size are checked at delivery."""
     try:
         path = Path(file_path)
         if not path.is_absolute():
-            return None
+            return None, "not an absolute path"
 
         resolved = path.resolve()
 
@@ -126,7 +144,7 @@ def validate_image_path(
                 path=str(resolved),
                 approved=[str(r) for r in roots],
             )
-            return None
+            return None, "outside the profile's folders"
 
         # Data-root areas no agent may read (dv-2c1c): an approved root that
         # is an ancestor (e.g. APPROVED_DIRECTORY=~/Devvybot) must not make
@@ -135,15 +153,18 @@ def validate_image_path(
 
         if any(_is_within(resolved, d) for d in protected_dirs().everyone):
             logger.warning("MCP image path in a protected dir", path=str(resolved))
-            return None
+            return None, "in a protected folder"
 
-        if not resolved.is_file():
-            return None
+        if not (pending and not resolved.exists()):
+            if not resolved.is_file():
+                return None, "missing (no such file)"
 
-        file_size = resolved.stat().st_size
-        if file_size > MAX_FILE_SIZE_BYTES:
-            logger.debug("MCP image file too large", path=str(resolved), size=file_size)
-            return None
+            file_size = resolved.stat().st_size
+            if file_size > MAX_FILE_SIZE_BYTES:
+                logger.debug(
+                    "MCP image file too large", path=str(resolved), size=file_size
+                )
+                return None, "too large"
 
         ext = resolved.suffix.lower()
         mime_type = IMAGE_EXTENSIONS.get(ext)
@@ -152,16 +173,19 @@ def validate_image_path(
                 mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
             )
         if not mime_type:
-            return None
+            return None, "not an image"
 
-        return ImageAttachment(
-            path=resolved,
-            mime_type=mime_type,
-            original_reference=caption or file_path,
+        return (
+            ImageAttachment(
+                path=resolved,
+                mime_type=mime_type,
+                original_reference=caption or file_path,
+            ),
+            "",
         )
     except (OSError, ValueError) as e:
         logger.debug("MCP image path validation failed", path=file_path, error=str(e))
-        return None
+        return None, f"unreadable ({e})"
 
 
 def should_send_as_photo(path: Path) -> bool:
@@ -182,19 +206,22 @@ def should_send_as_photo(path: Path) -> bool:
 
 # MCP tools whose calls carry a file for the user (bare names; the SDK
 # namespaces them as "mcp__<server>__<tool>").
-SEND_FILE_TOOLS = ("send_image_to_user", "send_file_to_user")
+SEND_FILE_TOOLS = ("send_image_to_user", "send_file_to_user", "send_review")
 
 
 def is_send_file_call(tool_call: Dict[str, Any]) -> bool:
-    """True if *tool_call* is a ``send_image_to_user`` / ``send_file_to_user``."""
+    """True if *tool_call* is a send_image/send_file/send_review call."""
     return str(tool_call.get("name", "")).rsplit("__", 1)[-1] in SEND_FILE_TOOLS
 
 
 def attachment_from_tool_call(
     tool_call: Dict[str, Any],
     approved_directory: Union[Path, Sequence[Path]],
+    pending: bool = False,
 ) -> Optional[ImageAttachment]:
-    """Validated attachment for one send_image/send_file tool call, else None.
+    """Validated attachment for one send_image/send_file/send_review tool
+    call, else None (for send_review: the PDF; see
+    :func:`attachments_for_tool_call` for the cover too).
 
     The one place a tool call becomes a deliverable file: the chat stream
     intercept and the scheduled/webhook turn (dv-ff39) both go through it.
@@ -209,8 +236,34 @@ def attachment_from_tool_call(
         str(tc_input.get("file_path", "")),
         approved_directory,
         str(tc_input.get("caption", "") or ""),
-        any_file=bare == "send_file_to_user",
+        any_file=bare in ("send_file_to_user", "send_review"),
+        pending=pending and bare == "send_review",
     )
+
+
+def attachments_for_tool_call(
+    tool_call: Dict[str, Any],
+    approved_directory: Union[Path, Sequence[Path]],
+    pending: bool = False,
+) -> List[ImageAttachment]:
+    """The files one tool call delivers: ``send_review`` is its cover PNG (a
+    photo) then its PDF (a document); the others one file. [] = refused."""
+    from ...designloop.review_pdf import cover_path
+
+    pdf = attachment_from_tool_call(tool_call, approved_directory, pending)
+    if pdf is None:
+        return []
+    if str(tool_call.get("name", "")).rsplit("__", 1)[-1] != "send_review":
+        return [pdf]
+    if pdf.path.suffix.lower() != ".pdf":
+        return []
+    cover = validate_image_path(
+        str(cover_path(pdf.path)),
+        approved_directory,
+        "review cover",
+        pending=pending,
+    )
+    return ([cover] if cover else []) + [pdf]
 
 
 def attachments_from_tools_used(
@@ -228,8 +281,8 @@ def attachments_from_tools_used(
     for tc in tools_used if isinstance(tools_used, list) else []:
         if not isinstance(tc, dict) or not is_send_file_call(tc) or tc.get("error"):
             continue
-        img = attachment_from_tool_call(tc, approved_directory)
-        if img is None:
+        imgs = attachments_for_tool_call(tc, approved_directory)
+        if not imgs:
             logger.warning(
                 "send_image_to_user path failed validation "
                 "(image will not reach the user despite the tool call "
@@ -237,10 +290,11 @@ def attachments_from_tools_used(
                 file_path=str(tc.get("input"))[:300],
             )
             continue
-        if img.path in seen:
-            continue
-        seen.add(img.path)
-        out.append(img)
+        for img in imgs:
+            if img.path in seen:
+                continue
+            seen.add(img.path)
+            out.append(img)
         if len(out) >= MAX_IMAGES_PER_RESPONSE:
             break
     return out

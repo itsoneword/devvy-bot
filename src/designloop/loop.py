@@ -13,10 +13,11 @@ Every step is injected, so ``pump2 design run`` wires the real ones
 - ``critic(brief, renders) -> Critique`` (:mod:`.critic`), per variant.
 - ``collage(variants) -> Path``; ``deliver(text, images)``.
 
-Stop: every variant ``ready``, :data:`MAX_ROUNDS` rounds, or the same fixes
-as last round. The ``ready`` variants reach the owner as a choice; a loop
+Stop: every variant ``ready``, :data:`MAX_ROUNDS` rounds, the same fixes
+as last round, or (mockup mode, from round 2) a round that raised no
+revising variant's lowest dimension (``stalled``). The ``ready`` variants reach the owner as a choice; a loop
 that stops on rounds / repeated without one still offers every critiqued
-variant (dv-2d00), with its open remarks. Either way the offer is sorted by
+variant, with its open remarks. Either way the offer is sorted by
 critic score, best first (= recommended). Only a loop where no variant got
 past the gate sends a short "design failed: reasons" note, no images and no
 pick.
@@ -39,6 +40,7 @@ from typing import (
 
 from .brief import Brief
 from .critic import Critique, repeated
+from .review_pdf import cover_path
 
 MAX_ROUNDS = 3
 # Generator re-runs per round for gate failures; past it the variant is
@@ -80,7 +82,7 @@ class Variant:
 
 @dataclass
 class Outcome:
-    """``stop``: ready | rounds | repeated | gate. ``offered`` are the
+    """``stop``: ready | rounds | repeated | stalled | gate. ``offered`` are the
     variants the owner picks from (1..n, in order); empty = design failed."""
 
     stop: str
@@ -89,10 +91,48 @@ class Outcome:
     offered: List[Variant] = field(default_factory=list)
     collage: Optional[Path] = None
     message: str = ""
+    # the target mockup the variants were built to (mockup mode).
+    mockup: Optional[Path] = None
 
 
 def notes_of(critique: Critique) -> Tuple[str, ...]:
-    return tuple(f"{name}: {fix}" for name, fix in critique.fixes.items())
+    """What goes back to the designer: the criteria's fixes, then each
+    dimension below the threshold as ``<dimension> n/10: <evidence>``, then
+    every ``build`` block remark, uncapped (``data`` remarks are seed content
+    the builder cannot fix: left out)."""
+    notes = [f"{name}: {fix}" for name, fix in critique.fixes.items()]
+    notes += [
+        f"{name} {score}/10: {evidence}"
+        for name, (score, evidence) in critique.low_dimensions.items()
+    ]
+    notes += [r.line for r in critique.build_remarks]
+    return tuple(notes)
+
+
+def stalled(previous: Mapping[str, Critique], revising: Sequence["Variant"]) -> bool:
+    """Mockup mode's early stop: no revising variant raised its lowest
+    dimension (``Critique.score``) over the previous round."""
+    scored = [v for v in revising if v.critique and v.critique.dimensions]
+    if not scored or not all(v.branch in previous for v in scored):
+        return False
+    return not any(
+        v.critique.score > previous[v.branch].score  # type: ignore[union-attr]
+        for v in scored
+    )
+
+
+def scores_line(critique: Critique) -> str:
+    """All dimension scores of a mockup-mode critique on one line."""
+    return " · ".join(
+        f"{name} {score}/10" for name, (score, _) in critique.dimensions.items()
+    )
+
+
+def review_files(pdf: Path) -> List[Path]:
+    """What the owner receives for a review: its cover PNG (a chat preview,
+    when rendered) then the PDF."""
+    cover = cover_path(pdf)
+    return ([cover] if cover.exists() else []) + [pdf]
 
 
 async def run_loop(
@@ -107,8 +147,11 @@ async def run_loop(
     describe: Optional[Describe] = None,
     title: str = "",
     max_rounds: int = MAX_ROUNDS,
+    mockup: Optional[Path] = None,
 ) -> Outcome:
-    """Run the loop to a stop; deliver the collage or the failure note."""
+    """Run the loop to a stop; deliver the collage or the failure note.
+    ``mockup``: the target the variants were built to (mockup mode), named
+    in the owner's message; the critic step already judges against it."""
     title = title or brief.screen_id
     feedback: Dict[str, List[str]] = {}
     last: Dict[str, Critique] = {}
@@ -134,21 +177,27 @@ async def run_loop(
         ):
             stop = "repeated"
             break
+        # A next round only when this one raised the lowest dimension.
+        if n < max_rounds and n >= 2 and last and stalled(last, revising):
+            stop = "stalled"
+            break
         last = {v.branch: v.critique for v in passed if v.critique}
         feedback = {v.branch: list(v.notes) for v in revising}
 
     offered = [v for v in variants if v.ready]
-    if not offered and stop in ("rounds", "repeated"):
+    if not offered and stop in ("rounds", "repeated", "stalled"):
         offered = [v for v in variants if v.critique is not None]
     offered.sort(key=lambda v: v.critique.score if v.critique else 0, reverse=True)
-    outcome = Outcome(stop=stop, rounds=rounds, variants=variants, offered=offered)
+    outcome = Outcome(
+        stop=stop, rounds=rounds, variants=variants, offered=offered, mockup=mockup
+    )
     if offered:
         if describe:
             for variant in offered:
                 variant.tradeoff = (await describe(variant.branch)).strip()
         outcome.collage = await collage(offered)
         outcome.message = offer_text(title, outcome)
-        await deliver(outcome.message, [outcome.collage])
+        await deliver(outcome.message, review_files(outcome.collage))
     else:
         outcome.message = failed_text(title, outcome)
         await deliver(outcome.message, [])
@@ -189,6 +238,8 @@ STOP_WHY = {
     "rounds": f"no variant ready after {MAX_ROUNDS} critic rounds",
     "repeated": "the critic's notes repeated: the generator is not moving",
     "gate": "no variant passed the mechanical gate",
+    "stalled": "the last critic round did not raise the lowest dimension: "
+    "stopped before another round",
 }
 
 
@@ -206,17 +257,30 @@ def offer_text(title: str, outcome: Outcome) -> str:
     if ready:
         lines = [f"🎨 {title}: {n} design variant{plural}, critic: ready"]
     else:
+        best = max((v.critique.score for v in outcome.offered if v.critique), default=0)
+        rounds = f"{outcome.rounds} critic round{'s' if outcome.rounds != 1 else ''}"
+        # the verdict must not hide in the middle of a line.
         lines = [
-            f"🎨 {title}: {n} design variant{plural}; the critic called none ready "
-            f"after {outcome.rounds} critic round{'s' if outcome.rounds != 1 else ''}"
-            " — best score first, 1 is recommended"
+            f"⚠️ NOT READY: the critic rejected all {n} variant{plural} "
+            f"(best {best}/10 after {rounds}).",
+            f"🎨 {title}: best score first, 1 is recommended only as the least bad;"
+            " «none, because …» reruns the design.",
         ]
+    if outcome.mockup is not None:
+        lines.append(
+            f"target mockup: {Path(outcome.mockup).name} (left of each render in "
+            "the sheet); score = the lowest dimension"
+        )
+    if outcome.stop == "stalled":
+        lines.append(f"stopped after round {outcome.rounds}: {STOP_WHY['stalled']}")
     for i, variant in enumerate(outcome.offered, 1):
         score = variant.critique.score if variant.critique else 0
         line = f"{i}. {variant.tradeoff or variant.branch} ({score}/10)"
         if not ready and i == 1:
             line += " — recommended"
         lines.append(line)
+        if variant.critique is not None and variant.critique.dimensions:
+            lines.append(f"   {scores_line(variant.critique)}")
         if not variant.ready:
             for note in variant.notes[:REMARKS_SHOWN]:
                 if len(note) > REMARK_CHARS:
@@ -225,7 +289,10 @@ def offer_text(title: str, outcome: Outcome) -> str:
             if len(variant.notes) > REMARKS_SHOWN:
                 lines.append(f"   · +{len(variant.notes) - REMARKS_SHOWN} more")
     choices = ", ".join(str(i) for i in range(1, n + 1))
-    lines.append(f"↩ reply with the number of the one to build: {choices}")
+    lines.append(
+        f"↩ reply with the number of the one to build: {choices} (a line why is "
+        "welcome), or «none, because …» if none fits"
+    )
     return "\n".join(lines)
 
 

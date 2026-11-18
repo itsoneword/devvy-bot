@@ -397,7 +397,6 @@ def _aster_place(account: str, args: Dict[str, Any]) -> Invocation:
     _reject(args, _SPOT_ONLY, "for perp (size is margin x leverage)")
     _reject(args, ("take_profit",), "on aster perp.js (no take-profit support)")
     side = _side(args, ("LONG", "SHORT"))
-    _only_wallet1(account, "perp.js")
     leverage = _int(args, "leverage", 1, 200)
     if leverage is None:
         raise BadArgs("leverage is required")
@@ -409,7 +408,7 @@ def _aster_place(account: str, args: Dict[str, Any]) -> Invocation:
     stop = _num(args, "stop_price", required=False)
     if stop:
         argv += ["--stop", stop]
-    return Invocation("perp.js", tuple(argv))
+    return Invocation("perp.js", (*argv, "--account", account))
 
 
 def _mexc_place(account: str, args: Dict[str, Any]) -> Invocation:
@@ -482,10 +481,12 @@ def _aster_close(account: str, args: Dict[str, Any]) -> Invocation:
 
 
 def _aster_move_stop(account: str, args: Dict[str, Any]) -> Invocation:
-    _only_wallet1(account, "move_stop.js")
     symbol = _symbol(args)
     assert symbol
-    return Invocation("move_stop.js", (symbol, _num(args, "stop_price") or ""))
+    return Invocation(
+        "move_stop.js",
+        (symbol, _num(args, "stop_price") or "", "--account", account),
+    )
 
 
 def _aster_modify(account: str, args: Dict[str, Any]) -> Invocation:
@@ -940,7 +941,7 @@ _SPECS: List[Tuple[str, str, Dict[str, Any], Any]] = [
         "SELL sells quantity, limit takes quantity+price (mexc also quote_amount+price). "
         "perp: side LONG|SHORT, margin (USDT) x leverage, price for limit, optional "
         "stop_price (aster --stop, mexc --sl), take_profit (mexc only), isolated (aster). "
-        "aster trades wallet1 only." + _WRITE_NOTE,
+        "aster spot: wallet1 only; aster perp: wallet1 or wallet2." + _WRITE_NOTE,
         _schema(
             {
                 "exchange": _EXCHANGE,
@@ -993,7 +994,7 @@ _SPECS: List[Tuple[str, str, Dict[str, Any], Any]] = [
         "exchange_move_stop",
         "Set or move the close-position stop (STOP_MARKET, mark price) on an open perp "
         "position: places the new stop, then cancels old ones; refuses a stop on the "
-        "wrong side of mark (aster move_stop.js, wallet1)." + _WRITE_NOTE,
+        "wrong side of mark (aster move_stop.js)." + _WRITE_NOTE,
         _schema(
             {
                 "exchange": _EXCHANGE,

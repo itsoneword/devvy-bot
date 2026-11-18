@@ -10,6 +10,7 @@ Features:
 import asyncio
 from typing import Any, Callable, Dict, Optional
 
+import httpx
 import structlog
 from telegram import Update
 from telegram.ext import (
@@ -19,6 +20,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from ..config.settings import Settings
 from ..exceptions import ClaudeCodeTelegramError
@@ -30,8 +32,39 @@ from .features.registry import FeatureRegistry
 from .orchestrator import MessageOrchestrator
 from .rate_limit import DevvyRateLimiter
 from .telegram_retry import is_transient_network_error, with_telegram_retry
+from .telegram_widgets import allowed_updates
 
 logger = structlog.get_logger()
+
+
+# Commands that pass the reports-chat gate in a bound topic: /stop halts that
+# topic's agent (agentic_stop resolves the topic's profile). Other commands
+# stay dropped there (10.11.26: /stop was silently ignored in a topic).
+_TOPIC_COMMANDS = frozenset({"stop"})
+
+
+def _is_topic_command(text: str) -> bool:
+    head = text.split(maxsplit=1)[0][1:]
+    return head.split("@", 1)[0].lower() in _TOPIC_COMMANDS
+
+
+def _telegram_request(pool_size: int, timeout: Optional[float] = None) -> HTTPXRequest:
+    """Telegram HTTP client bound to IPv4 (``local_address`` 0.0.0.0)."""
+    transport = httpx.AsyncHTTPTransport(
+        local_address="0.0.0.0", limits=httpx.Limits(max_connections=pool_size)
+    )
+    timeouts: Dict[str, Any] = {}
+    if timeout is not None:
+        timeouts = dict.fromkeys(
+            ("connect_timeout", "read_timeout", "write_timeout", "pool_timeout"),
+            timeout,
+        )
+    return HTTPXRequest(
+        connection_pool_size=pool_size,
+        httpx_kwargs={"transport": transport},
+        **timeouts,
+    )
+
 
 _STALE_CALLBACK_MARKERS = (
     "query is too old",
@@ -83,11 +116,11 @@ class ClaudeCodeBot:
         # timeout and Telegram's callback-query staleness window expire.
         builder.concurrent_updates(True)
 
-        # Configure connection settings
-        builder.connect_timeout(30)
-        builder.read_timeout(30)
-        builder.write_timeout(30)
-        builder.pool_timeout(30)
+        # IPv4 only: from this host ~1 in 5 IPv6 connects to api.telegram.org
+        # hangs until timeout while IPv4 is clean (probe 10.11.26,
+        # docs/FINDINGS.md); httpx has no happy-eyeballs fallback.
+        builder.request(_telegram_request(pool_size=256, timeout=30))
+        builder.get_updates_request(_telegram_request(pool_size=1))
 
         self.app = builder.build()
 
@@ -105,8 +138,12 @@ class ClaudeCodeBot:
         # HTTP client is ready before we make API calls.
         await self.app.initialize()
 
-        # Set bot commands for menu (requires initialized HTTP client)
-        await self._set_bot_commands()
+        # Set bot commands for menu (requires initialized HTTP client).
+        # Cosmetic only — a Telegram hiccup here must not block startup.
+        try:
+            await self._set_bot_commands()
+        except Exception as e:
+            logger.warning("Failed to set bot commands, continuing", error=str(e))
 
         # Register handlers
         self._register_handlers()
@@ -169,6 +206,9 @@ class ClaudeCodeBot:
         from .middleware.security import security_middleware
 
         # Middleware runs in order of group numbers (lower = earlier)
+        # Inbound dedup gate first: a repeat never reaches audit/auth (dv-002b)
+        self._add_inbound_dedup()
+
         # Security middleware first (validate inputs)
         self.app.add_handler(
             MessageHandler(
@@ -195,8 +235,29 @@ class ClaudeCodeBot:
 
         self._add_reports_chat_handlers()
         self._add_reaction_handler()
+        self._add_widget_query_handler()
 
         logger.info("Middleware added to bot")
+
+    def _add_inbound_dedup(self) -> None:
+        """Drop repeated deliveries of one message before any handler (dv-002b)."""
+        from telegram.ext import ApplicationHandlerStop
+
+        from .middleware.dedup import InboundDedup, log_drop
+
+        assert self.app is not None
+        dedup = InboundDedup()
+
+        async def dedup_gate(
+            update: Update, context: ContextTypes.DEFAULT_TYPE
+        ) -> None:
+            # No await before check(): concurrent copies must not interleave.
+            reason = dedup.check(update)
+            if reason is not None:
+                log_drop(update, reason)
+                raise ApplicationHandlerStop()
+
+        self.app.add_handler(MessageHandler(filters.ALL, dedup_gate), group=-5)
 
     def _add_reports_chat_handlers(self) -> None:
         """Reports group (dv-e215): record membership changes, ignore chatter.
@@ -264,7 +325,13 @@ class ClaudeCodeBot:
                     and message is not None
                     and user is not None
                     and (
-                        (message.text and not message.text.startswith("/"))
+                        (
+                            message.text
+                            and (
+                                not message.text.startswith("/")
+                                or _is_topic_command(message.text)
+                            )
+                        )
                         or getattr(message, "voice", None)
                         or getattr(message, "photo", None)
                         or getattr(message, "document", None)
@@ -350,6 +417,33 @@ class ClaudeCodeBot:
             group=-4,
         )
 
+    def _add_widget_query_handler(self) -> None:
+        """Widget queries (Bot API 10.4, dv-4665): the /limits widget's
+        Refresh. PTB 22.6 has no such update type: the field sits in
+        ``update.api_kwargs`` (``telegram_widgets``). The message middleware
+        never matches it, so the answer checks the sender itself. Runs for
+        every update: a dict lookup, never ApplicationHandlerStop.
+        """
+        from telegram.ext import TypeHandler
+
+        from .telegram_widgets import widget_query_from_update
+
+        async def on_widget_query(
+            update: Update, context: ContextTypes.DEFAULT_TYPE
+        ) -> None:
+            query = widget_query_from_update(update)
+            if query is None:
+                return
+            from .features.limits_widget import handle_widget_query
+
+            for key, value in self.deps.items():
+                context.bot_data.setdefault(key, value)
+            context.bot_data.setdefault("settings", self.settings)
+            await handle_widget_query(query, context)
+
+        assert self.app is not None
+        self.app.add_handler(TypeHandler(Update, on_widget_query), group=-4)
+
     def _create_middleware_handler(self, middleware_func: Callable) -> Callable:
         """Create middleware handler that injects dependencies.
 
@@ -419,6 +513,7 @@ class ClaudeCodeBot:
         )
 
         lag_task = asyncio.create_task(monitor_loop_lag())
+        media_task = asyncio.create_task(self._resume_pending_media())
         try:
             self.is_running = True
 
@@ -430,14 +525,14 @@ class ClaudeCodeBot:
                     url_path=self.settings.webhook_path,
                     webhook_url=self.settings.webhook_url,
                     drop_pending_updates=True,
-                    allowed_updates=Update.ALL_TYPES,
+                    allowed_updates=allowed_updates(),
                 )
             else:
                 # Polling mode - initialize and start polling manually
                 await self.app.initialize()
                 await self.app.start()
                 await self.app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
+                    allowed_updates=allowed_updates(),
                     drop_pending_updates=True,
                 )
 
@@ -449,7 +544,22 @@ class ClaudeCodeBot:
             raise ClaudeCodeTelegramError(f"Failed to start bot: {str(e)}") from e
         finally:
             lag_task.cancel()
+            self.orchestrator.shutdown_media()
+            media_task.cancel()
             self.is_running = False
+
+    async def _resume_pending_media(self) -> None:
+        """Restart pickup (dv-c977): once the app runs, retry every media
+        message a previous process left without its file."""
+        try:
+            while self.app is None or not self.app.running:
+                await asyncio.sleep(1)
+            resumed = await self.orchestrator.resume_pending_media(self.app)
+            logger.info("Pending media resumed", count=resumed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("Pending media resume failed", error=str(e))
 
     async def stop(self) -> None:
         """Gracefully stop the bot."""
@@ -461,6 +571,9 @@ class ClaudeCodeBot:
 
         try:
             self.is_running = False  # Stop the main loop first
+            # Media retries cancelled from here on stay open for the restart
+            # pickup instead of closing as /stop (dv-c977).
+            self.orchestrator.shutdown_media()
 
             # Shutdown feature registry
             if self.feature_registry:
@@ -512,13 +625,21 @@ class ClaudeCodeBot:
                 ),
             )
             msg = update.effective_message if update else None
+            # A media message with a pending_media row is kept and retried in
+            # the background (dv-c977): no "resend" for it.
+            pending = (context.bot_data or {}).get("media_pending_ids") or ()
+            kept = msg is not None and getattr(msg, "message_id", None) in pending
+            notice = (
+                "⏳ Telegram timed out on this message. It is kept and "
+                "retried in the background; /stop cancels."
+                if kept
+                else "⚠️ Telegram timed out: your message was NOT "
+                "processed. Please resend it."
+            )
             if msg is not None:
                 try:
                     await with_telegram_retry(
-                        lambda: msg.reply_text(
-                            "⚠️ Telegram timed out: your message was NOT "
-                            "processed. Please resend it."
-                        ),
+                        lambda: msg.reply_text(notice),
                         what="network error notice",
                     )
                 except Exception:

@@ -199,7 +199,7 @@ def test_extra_questions_move_to_assumptions(repo: Path, tmp_path: Path) -> None
     b, _, wt = ctx(repo, tmp_path)
     write_plan(wt, mkplan(size="S", questions=qs))
     out = analyze.finish(b, card(b), wt)
-    assert out.next == "waiting_user"
+    assert out.next == "stopped"  # dv-f707: a question stop, to resolve first
     assert "q1?" in out.comment and "q3?" not in out.comment
     assert "2" in out.comment and "moved" in out.comment
     p = analyze.parse((wt / ".pump/plan.md").read_text())
@@ -229,7 +229,7 @@ def test_format_error_retries_once_then_stops(repo: Path, tmp_path: Path) -> Non
     f.running = False
     write_plan(wt, bad)
     f.tick(b, tmp_path)
-    assert card(b).pump2["stage"] == "stopped"
+    assert card(b).pump2["stage"] == "resolve"
 
 
 # ---- criterion 6: analyze prompt -------------------------------------------
@@ -278,7 +278,7 @@ def test_second_pass_rewrites_sha(repo: Path, tmp_path: Path) -> None:
     b, _, wt = ctx(repo, tmp_path)
     write_plan(wt, mkplan(questions=q))
     first = analyze.finish(b, card(b), wt)
-    assert first.next == "waiting_user" and first.state["criteria_sha"]
+    assert first.next == "stopped" and first.state["criteria_sha"]
     write_plan(wt, mkplan(criteria=C_OK.replace("hello", "bye")))
     second = analyze.finish(b, card(b), wt)
     assert second.state["criteria_sha"] != first.state["criteria_sha"]
@@ -322,8 +322,8 @@ def test_defect_class_with_evidence_blocks(repo: Path, tmp_path: Path, d: str) -
     assert r.next == "build"
 
 
-# (source card, remark no., id, text); the original wording is in the gymbro
-# cards' review-return comments (report §3.4). 14 BLOCK Cn, 3 defects, 2 no id.
+# (source card, remark no., id, text); the original wording is in the app board's
+# review-return comments (report §3.4). 14 BLOCK Cn, 3 defects, 2 no id.
 FIX = [
     ("gb-1a38", 1, "C1", "AC6 explain script missing"),
     ("gb-1a38", 2, "D3", "translate() sends bind params so the index is not used"),
@@ -480,7 +480,7 @@ def test_summary_on_return_budget_stop(repo: Path, tmp_path: Path) -> None:
     )
     f.tick(b, tmp_path)  # reaps
     c = card(b)
-    assert c.pump2["stage"] == "stopped"
+    assert c.pump2["stage"] == "resolve"
     for h in HEADS:
         assert h in c.body, h
 

@@ -202,7 +202,7 @@ class PumpClient:
         if board not in boards:
             names = ", ".join(sorted(boards))
             return failed(f"error: no board named {board} (boards: {names})")
-        tasks_dir = boards[board].repo / ".deviz" / "tasks"
+        tasks_dir = boards[board].tasks
         tid = _run_sync(
             DevizBoard(tasks_dir).add_task(
                 title=title[:120], body=body or None, created_by="owner"

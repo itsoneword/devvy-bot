@@ -20,9 +20,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import series
-from .render import _COMMENT, _title, last_line, minutes, question_block
-from .state import HOME_BOARD, Board, Card, list_cards
+from . import identity, series
+from .render import (
+    _COMMENT,
+    CLOSED,
+    THEIRS_HEAD,
+    _title,
+    decided_block,
+    last_line,
+    minutes,
+    question_block,
+    theirs_row,
+)
+from .state import HOME_BOARD, Board, Card, comment_profile, list_cards
 
 REPO = Path(__file__).resolve().parents[2]
 AGENTCTL = REPO / "scripts" / "agentctl"
@@ -36,6 +46,8 @@ CALL_TIMEOUT = 120.0
 # Telegram's limit is 4096; keep headroom for markdown escaping.
 PIN_MAX = 3900
 # (question lines kept, list rows kept) tried in order until the pin fits.
+# rows of the Theirs block (other installs' cards) before "+K more"
+THEIRS_CAP = 10
 SHRINK_STEPS: list[tuple[int | None, int | None]] = [
     (None, None),
     (8, None),
@@ -223,7 +235,7 @@ def stop_reason(card: Card) -> str:
     """The first line of the card's last ``@pump2`` comment."""
     heads = list(_COMMENT.finditer(card.body))
     for i in range(len(heads) - 1, -1, -1):
-        if heads[i].group(1) != "pump2":
+        if comment_profile(heads[i].group(1)) != "pump2":
             continue
         end = heads[i + 1].start() if i + 1 < len(heads) else len(card.body)
         for ln in card.body[heads[i].end() : end].splitlines():
@@ -275,10 +287,12 @@ def _render(
     ask_lines: int | None,
     cap: int | None,
     series_text: str = "",
+    theirs: list[Card] | None = None,
 ) -> str:
     by_id = {c.id: c for c in cards}
     out = [f"pump2 · {board.name} · {now.strftime('%d.%m %H:%MZ')}"]
     out += [series_text] if series_text else []
+    out += [design_line(cards)] if design_line(cards) else []
     out += ["", "In work"]
     rows = []
     for c in (c for c in cards if is_in_work(c)):
@@ -303,6 +317,12 @@ def _render(
             rows.append(f"• {c.id} {short_title(c)} — {c.pump2['stage']} asks:")
             rows.append(_ask_excerpt(c, ask_lines))
     out += rows or ["• nothing"]
+    decided = _decided_rows(cards, 160 if cap is None else 80)
+    if decided:  # dv-f707: the board agent's answers, for the owner to overrule
+        out += ["", "Decided for you", *_capped(decided, cap)]
+    if theirs:  # other installs' cards: read-only, never in the lists above
+        rows = [f"• {theirs_row(c, short_title(c))}" for c in theirs]
+        out += ["", THEIRS_HEAD, *_capped(rows, min(cap or THEIRS_CAP, THEIRS_CAP))]
     out += ["", "On staging, not on prod"]
     rows = []
     for cid, sha in view.get("staging") or []:
@@ -318,12 +338,39 @@ def _render(
     return "\n".join(out)
 
 
+def _decided_rows(cards: list[Card], width: int) -> list[str]:
+    """One row per held card with a ``decided for you`` comment of its agent."""
+    rows = []
+    for c in (c for c in cards if is_held(c)):
+        who, text = decided_block(c)
+        if not text:
+            continue
+        line = "; ".join(ln.strip() for ln in text.splitlines() if ln.strip())
+        if len(line) > width:
+            line = line[: width - 1] + "…"
+        rows.append(f"• {c.id} {short_title(c)} — {who}: {line}")
+    return rows
+
+
+def design_line(cards: list[Card]) -> str:
+    """The owner's design verdicts on this board's designloop cards,
+    one short line; '' on a board without them."""
+    from .design import design_stats
+
+    stats = design_stats(cards)
+    if stats is None:
+        return ""
+    picked, rejected, runs = stats
+    return f"🎨 design: picked {picked} · rejected-all {rejected} · runs {runs}"
+
+
 def render_pin(
     board: Board,
     cards: list[Card],
     view: dict[str, Any],
     recommendation: str,
     now: datetime | None = None,
+    theirs: list[Card] | None = None,
 ) -> str:
     """The pin text, kept under ``PIN_MAX``: Telegram rejects a message over
     4096 chars and a failed pin edit is only logged, so an over-long pin would
@@ -334,7 +381,9 @@ def render_pin(
     line = series.series_line(board, cards, now)  # never raises
     text = ""
     for ask_lines, cap in SHRINK_STEPS:
-        text = _render(board, cards, view, recommendation, now, ask_lines, cap, line)
+        text = _render(
+            board, cards, view, recommendation, now, ask_lines, cap, line, theirs
+        )
         if len(text) <= PIN_MAX:
             return text
     return text[: PIN_MAX - 2] + "\n…"
@@ -343,19 +392,38 @@ def render_pin(
 # --- state diff ----------------------------------------------------------
 
 
-def fingerprint(cards: list[Card], view: dict[str, Any]) -> str:
+def split_theirs(board: Board, cards: list[Card]) -> tuple[list[Card], list[Card]]:
+    """(our cards, other installs' open cards)."""
+    ours = identity.ours_check(extra={board.profile})
+    mine = [c for c in cards if ours(c.fm.get("assignee"))]
+    theirs = [
+        c
+        for c in cards
+        if not ours(c.fm.get("assignee")) and c.fm.get("status") not in CLOSED
+    ]
+    return mine, theirs
+
+
+def fingerprint(
+    cards: list[Card], view: dict[str, Any], theirs: list[Card] | None = None
+) -> str:
     """The card set the recommendation depends on: ids + stage + status of
-    held cards, staging ids, prod sha. No minutes or log lines."""
+    held cards, staging ids, prod sha, other installs' cards. No minutes or
+    log lines."""
     held = sorted(
         (c.id, str(c.pump2.get("stage")), str(c.fm.get("status")))
         for c in cards
         if is_held(c)
     )
-    key = {
+    key: dict[str, Any] = {
         "held": held,
         "staging": sorted(cid for cid, _ in view.get("staging") or []),
         "prod": view.get("prod_sha"),
     }
+    if theirs:  # absent when none: older fingerprints still match
+        key["theirs"] = sorted(
+            (c.id, str(c.fm.get("assignee")), str(c.fm.get("status"))) for c in theirs
+        )
     return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:16]
 
 
@@ -437,17 +505,18 @@ def refresh(
     complete = complete or _complete
     path = (state_dir or STATE_DIR) / f"pin-{board.name}.json"
     state = _load(path)
-    cards = list_cards(board)[0]
-    view = board_deploy_view(board, cards)
+    every = list_cards(board)[0]
+    view = board_deploy_view(board, every)
+    cards, theirs = split_theirs(board, every)
     rec = str(state.get("recommendation") or "")
-    fp = fingerprint(cards, view)
+    fp = fingerprint(cards, view, theirs)
     if dry_run:
-        return render_pin(board, cards, view, rec, now)
+        return render_pin(board, cards, view, rec, now, theirs)
     if fp != state.get("fingerprint"):
         held = [c for c in cards if is_held(c)]
         if held or view.get("staging"):
             try:
-                draft = render_pin(board, cards, view, "", now)
+                draft = render_pin(board, cards, view, "", now, theirs)
                 rec = asyncio.run(
                     complete(
                         _recommend_prompt(draft),
@@ -511,7 +580,7 @@ def refresh(
         except Exception as e:  # retried next tick
             print(f"pump2 pin {board.name}: topic line for {c.id} not sent: {e}")
     state["topic_sent"] = sorted(sent & shown)
-    text = render_pin(board, cards, view, rec, now)
+    text = render_pin(board, cards, view, rec, now, theirs)
     state["text"] = text
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

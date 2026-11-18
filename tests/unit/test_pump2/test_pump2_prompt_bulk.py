@@ -11,9 +11,9 @@ from src.pump2.state import add_comment, add_owner_answer, find_card, read_card
 
 from .test_pump2 import Fake, board, git
 from .test_pump2 import repo as _repo  # noqa: F401
-from .test_pump2_mergefix import Rig, card_branch, commit_file
-from .test_pump2_mergefix import repo as _mrepo  # noqa: F401
-from .test_pump2_mergefix import writes
+from .test_pump2_merge_resolve import Rig, card_branch, commit_file
+from .test_pump2_merge_resolve import repo as _mrepo  # noqa: F401
+from .test_pump2_merge_resolve import writes
 from .test_pump2_step3 import put, setup
 
 repo = _repo

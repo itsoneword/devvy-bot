@@ -34,6 +34,7 @@ from .json_contract import JSON_MODES, JSON_NATIVE, JSON_VALIDATE
 from .types import (
     CLAUDE_HARNESS,
     CODEX_HARNESS,
+    FLUX_HARNESS,
     JOB_ROUTE_NAMES,
     OPENROUTER_HARNESS,
     PLAIN_PURPOSES,
@@ -55,6 +56,12 @@ VALID_PROVIDERS = frozenset({PROVIDER_OPENROUTER})
 OPENROUTER_ANTHROPIC_BASE_URL = "https://openrouter.ai/api"
 OPENROUTER_KEY_SERVICE = "openrouter"
 OPENROUTER_KEY_NAME = "OPENROUTER_API_KEY"
+# dv-75f1: a friend's free FLUX server. Token and URL come only from key-store
+# service ``flux`` (never a literal: the server is private).
+PROVIDER_FLUX = "flux"
+FLUX_KEY_SERVICE = "flux"
+FLUX_TOKEN_NAME = "FLUX_API_TOKEN"
+FLUX_URL_NAME = "FLUX_API_URL"
 
 _PRICING_PATH = Path(__file__).resolve().parents[2] / "config" / "llm_pricing.json"
 
@@ -64,6 +71,9 @@ class Route:
     harness: str
     provider: str
     model: Optional[str]
+    # A job's Claude model to rerun on once when ``model`` hits its usage
+    # limit (models.yaml ``jobs.<row>.limit_fallback``, owner 17.11.26).
+    limit_fallback: Optional[str] = None
 
     @property
     def is_third_party(self) -> bool:
@@ -126,20 +136,42 @@ def user_pick_allowed(
     return pick in profile.allowed_models
 
 
-def openrouter_key() -> Optional[str]:
+def openrouter_key(key_ref: Optional[str] = None) -> Optional[str]:
     """The OpenRouter key from the owner's key store (``/setkey openrouter``).
 
     The process env is scrubbed of secrets at startup, so the store is the
-    source; the env is a fallback for dev runs.
+    source; the env is a fallback for dev runs. ``key_ref``
+    ("<service>:<NAME>") picks another key of the store, no fallback.
     """
     from src.security.keystore import default_keystore
 
     store = default_keystore()
+    if key_ref:
+        service, _, name = key_ref.partition(":")
+        if store is None or not service or not name:
+            return None
+        return (store.env(service).get(name) or "").strip() or None
     if store is not None:
         value = store.env(OPENROUTER_KEY_SERVICE).get(OPENROUTER_KEY_NAME)
         if value:
             return value
     return os.environ.get(OPENROUTER_KEY_NAME) or None
+
+
+def flux_credentials() -> Optional[Tuple[str, str]]:
+    """(token, base URL) from key-store service ``flux``; None when either is
+    missing. No env fallback and no other service (owner 13.11, dv-75f1)."""
+    from src.security.keystore import default_keystore
+
+    store = default_keystore()
+    if store is None:
+        return None
+    env = store.env(FLUX_KEY_SERVICE)
+    token = (env.get(FLUX_TOKEN_NAME) or "").strip()
+    url = (env.get(FLUX_URL_NAME) or "").strip().rstrip("/")
+    if not token or not url:
+        return None
+    return token, url
 
 
 def provider_env(route: Route, key: Optional[str]) -> Dict[str, str]:
@@ -263,6 +295,7 @@ CALL_HARNESS_PROVIDERS: Mapping[str, str] = {
     CLAUDE_HARNESS: PROVIDER_ANTHROPIC_SUB,
     CODEX_HARNESS: PROVIDER_OPENAI,
     OPENROUTER_HARNESS: PROVIDER_OPENROUTER,
+    FLUX_HARNESS: PROVIDER_FLUX,
 }
 CALL_HARNESSES = frozenset(CALL_HARNESS_PROVIDERS)
 # A purpose row's harness: run on the caller's ``backend`` hint (the chat's
@@ -317,6 +350,13 @@ class RouteRow:
 
 NO_FALLBACK = FallbackSpec(harness="")
 
+# dv-fc9d: Nano Banana 2.1, image_output 0.00003 USD/token (~0.04 USD/image).
+POST_IMAGE_MODEL = "google/gemini-nano-banana-2.1"
+
+# dv-75f1: the design loop's mockups. FLUX is free; the model name is a label
+# for the model_calls row (the server picks its preset's model).
+FLUX_MODEL = "flux3-klein"
+
 # The built-in default row: Claude on the subscription; Sonnet is what an
 # unconfigured plain call (onboarding) ran on. No fallback (owner 2026-10-25).
 DEFAULT_ROUTE = RouteRow(
@@ -338,6 +378,10 @@ DEFAULT_CALL_ROUTES: Mapping[str, RouteRow] = {
     # Reconciler + the reconcile gate's decide leg: haiku (owner D4).
     "reconcile": RouteRow(models={CLAUDE_HARNESS: "haiku"}),
     "consolidation": RouteRow(models={CLAUDE_HARNESS: "haiku"}),
+    # dv-65dd: does a done card hold this fact? On the 14.11 replay haiku
+    # closed 2-5 of 12 run to run, sonnet 9 of 12 twice, no keep fact either
+    # way (docs/research/dv-65dd/). Called only for candidates.
+    "consolidation_cards": RouteRow(models={CLAUDE_HARNESS: "sonnet"}),
     "fact_quality": RouteRow(models={CLAUDE_HARNESS: "haiku"}),
     "onboarding": RouteRow(),
     # Sonnet: Haiku judging safety is doubtful (owner, dv-781f).
@@ -357,9 +401,51 @@ DEFAULT_CALL_ROUTES: Mapping[str, RouteRow] = {
     ),
     # The screen's decide leg (off today: fallback_model=None).
     "screen": RouteRow(models={CLAUDE_HARNESS: "haiku"}),
-    # The design critic (dv-9133): a different family than the Claude
-    # generator, so Codex only. A Claude fallback would quietly defeat it.
-    "design_critic": RouteRow(harness=CODEX_HARNESS, fallback=NO_FALLBACK),
+    # The design critic: Claude opus on the subscription, images through the
+    # Claude plain path, no fallback (owner 13.11, dv-a5aa; supersedes
+    # dv-9133's Codex-only "another family" rule).
+    "design_critic": RouteRow(
+        harness=CLAUDE_HARNESS,
+        models={CLAUDE_HARNESS: "opus"},
+        fallback=NO_FALLBACK,
+    ),
+    # The owner's speech patterns for the devlog channel (dv-fc9d): his own
+    # transcripts, so the Claude subscription only (never OpenRouter).
+    "devlog_style": RouteRow(
+        harness=CLAUDE_HARNESS,
+        models={CLAUDE_HARNESS: "sonnet"},
+        fallback=NO_FALLBACK,
+    ),
+    # The devlog channel's picture (dv-fc9d): only OpenRouter draws, so no
+    # fallback. Slug and price read from openrouter.ai/api/v1/models 2026-11-12.
+    "post_image": RouteRow(
+        harness=OPENROUTER_HARNESS,
+        models={OPENROUTER_HARNESS: POST_IMAGE_MODEL},
+        fallback=NO_FALLBACK,
+    ),
+    # dv-75f1: design step 0 on free FLUX. No paid fallback (owner 13.11
+    # 21:16: a FLUX failure fails the mockup; the client retries gateway
+    # errors itself). Paid mockups only via design_mockup_paid.
+    "design_mockup": RouteRow(
+        harness=FLUX_HARNESS,
+        models={FLUX_HARNESS: FLUX_MODEL},
+        fallback=NO_FALLBACK,
+    ),
+    # The paid mockup source, only on a card labelled ``paidmockup``.
+    "design_mockup_paid": RouteRow(
+        harness=OPENROUTER_HARNESS,
+        models={OPENROUTER_HARNESS: POST_IMAGE_MODEL},
+        fallback=NO_FALLBACK,
+    ),
+    # The mockups' subject sentences from the brief (JSON).
+    "design_mockup_prompt": RouteRow(models={CLAUDE_HARNESS: "sonnet"}),
+    # A board's style spec drafted from its images: images in, so Claude opus
+    # like the critic.
+    "design_spec": RouteRow(
+        harness=CLAUDE_HARNESS,
+        models={CLAUDE_HARNESS: "opus"},
+        fallback=NO_FALLBACK,
+    ),
 }
 
 # A route may resolve to no model only where its caller picks one itself.
@@ -407,9 +493,9 @@ DEFAULT_JOB_ROUTES: Mapping[str, RouteRow] = {
     # dv-ca8b: merges resolve conflicts (about half of them have some), the
     # same model as the hand-written merge jobs it replaces.
     "pump_merge": RouteRow(models={CLAUDE_HARNESS: "opus"}),
-    # dv-2c5c: pump2's mergefix stage judges a failed merge and resolves its
-    # conflicts, like pump_merge.
-    "pump_mergefix": RouteRow(models={CLAUDE_HARNESS: "opus"}),
+    # dv-b8bb: pump2's resolve stage, the board's agent on every stop (it
+    # replaced dv-2c5c's mergefix: conflicts, red tests, guard stops).
+    "pump_resolve": RouteRow(models={CLAUDE_HARNESS: "opus"}),
     # dv-9133: the design loop's variant generator. Claude, so the Codex
     # critic is another family; not opus (owner 27.10 on 3.2: generation can
     # run on a cheaper model, the brief and the critic carry the quality).
@@ -433,6 +519,8 @@ class CallRoutes:
     # The owner's jobs switch (/menu → 🧠 Модели, quota.job_route_override): every job on this
     # harness, above the rows. Set by process_call_routes, never by a file.
     job_switch: Optional[str] = None
+    # jobs.<row>.limit_fallback: Claude model for a rerun on a usage limit.
+    job_limit_fallbacks: Mapping[str, str] = field(default_factory=dict)
 
     def resolve_job(
         self,
@@ -486,7 +574,13 @@ class CallRoutes:
                 route_model=row_model,
             )
             model = None
-        return Route(program, provider, model or row_model)
+        fallback = None
+        if provider == PROVIDER_ANTHROPIC_SUB:
+            fallback = self.job_limit_fallbacks.get(name)
+        resolved = model or row_model
+        if fallback == resolved:
+            fallback = None
+        return Route(program, provider, resolved, fallback)
 
     def resolve(
         self,
@@ -688,6 +782,7 @@ def load_call_routes(
     jobs_default = DEFAULT_JOB_ROUTE
     default = DEFAULT_ROUTE
     source = "built-in"
+    limit_fallbacks: Dict[str, str] = {}
     path = _from_repo(path)
     if path is not None and path.exists():
         data = _read_yaml(path)
@@ -717,6 +812,13 @@ def load_call_routes(
             raise ValueError("jobs: must be a mapping")
         for job, raw in job_rows.items():
             where = f"jobs.{job}"
+            if isinstance(raw, dict) and "limit_fallback" in raw:
+                raw = dict(raw)
+                value = raw.pop("limit_fallback")
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(f"{where}.limit_fallback: must be a model name")
+                if value:
+                    limit_fallbacks[job] = value
             if isinstance(raw, dict) and "fallback" in raw:
                 raise ValueError(
                     f"{where}.fallback: jobs never fall back to another "
@@ -740,6 +842,7 @@ def load_call_routes(
         source=source,
         jobs_default=jobs_default,
         jobs=jobs,
+        job_limit_fallbacks=limit_fallbacks,
     )
     routes.check()
     return routes
@@ -906,7 +1009,10 @@ def describe_call_routes(routes: CallRoutes) -> List[str]:
         )
     for name in sorted(JOB_ROUTE_NAMES):
         job = routes.resolve_job(name)
-        lines.append(f"job {name}: {job.harness} / {job.provider} / {job.model}")
+        line = f"job {name}: {job.harness} / {job.provider} / {job.model}"
+        if job.limit_fallback:
+            line += f"  on limit: {job.limit_fallback}"
+        lines.append(line)
     return lines
 
 
@@ -943,6 +1049,7 @@ __all__ = [
     "cost_for",
     "cost_from_tokens",
     "openrouter_key",
+    "flux_credentials",
     "pricing_rule_for",
     "provider_env",
     "profiles_off_pick",

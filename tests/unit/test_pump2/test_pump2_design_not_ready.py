@@ -29,6 +29,10 @@ def steps_with(monkeypatch, tmp_path: Path, gate_fails: bool) -> None:
         def prepare(self) -> list[str]:
             return []
 
+        def with_owner(self, brief: Any) -> Any:
+
+            return brief
+
         def kwargs(self) -> dict[str, Any]:
             async def generate(brief: Any, feedback: Any) -> list[str]:
                 return list(BRANCHES)

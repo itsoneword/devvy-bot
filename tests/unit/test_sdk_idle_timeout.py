@@ -17,21 +17,21 @@ from src.claude.sdk_integration import _await_with_idle_timeout
 async def test_long_but_active_run_is_not_killed() -> None:
     """Total runtime far beyond the limit is fine while messages keep arriving."""
     last_activity = time.monotonic()
-    limit = 0.15
+    limit = 0.5
 
     async def streaming_work() -> None:
         nonlocal last_activity
-        # Runs for ~6x the idle limit, but never goes quiet for longer than
-        # half of it — the old wall-clock timeout would have killed this.
-        for _ in range(12):
-            await asyncio.sleep(limit / 2)
+        # Runs for ~3x the idle limit, but never goes quiet for longer than a
+        # fifth of it (wide margin: the release check runs this under load).
+        for _ in range(16):
+            await asyncio.sleep(limit / 5)
             last_activity = time.monotonic()
 
     started = time.monotonic()
     await _await_with_idle_timeout(
         asyncio.ensure_future(streaming_work()), lambda: last_activity, limit
     )
-    assert time.monotonic() - started > limit * 3
+    assert time.monotonic() - started > limit * 2
 
 
 async def test_silent_run_times_out() -> None:

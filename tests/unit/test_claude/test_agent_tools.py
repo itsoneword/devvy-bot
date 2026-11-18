@@ -1749,7 +1749,7 @@ class TestTaskBoard:
         task = await board.get_task(task_id)
         assert task is not None
         assert task.title == "Разбор недели"
-        assert task.created_by == "general"  # attribution, not the model's word
+        assert task.created_by.endswith("/general")  # attribution, not the model's word
         assert task.labels == ["general"]
         assert task.due_at is not None
 

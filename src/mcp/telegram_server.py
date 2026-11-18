@@ -6,8 +6,12 @@ delivery is handled by the bot's stream callback which intercepts the tool
 call.
 """
 
+import asyncio
+import importlib.util
 import os
+import sys
 from pathlib import Path
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -112,6 +116,115 @@ async def send_file_to_user(file_path: str, caption: str = "") -> str:
             )
 
     return f"File queued for delivery: {path.name}"
+
+
+REVIEW_SCRIPT = Path(__file__).resolve().parent.parent / "designloop" / "review_pdf.py"
+
+
+def _load_review_pdf() -> Any:
+    """The renderer, loaded by path: this file runs as a script, with no
+    ``src`` package on its path."""
+    spec = importlib.util.spec_from_file_location("review_pdf", REVIEW_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["review_pdf"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _outside_roots(path: Path) -> str:
+    """The error text when ``path`` is outside the deliverable roots, else ""."""
+    roots = [r for r in os.environ.get(IMAGE_ROOTS_ENV, "").split(os.pathsep) if r]
+    if roots and not any(_within(path.resolve(), Path(r)) for r in roots):
+        return (
+            f"Error: '{path}' is outside the deliverable roots and nothing was "
+            f"sent. Use a path under one of these: {', '.join(roots)}"
+        )
+    return ""
+
+
+def _protected(path: Path) -> str:
+    """The error text when ``path`` is in a protected data dir (the bot's
+    denylist, as at delivery: a picture of secrets/ must not enter a PDF),
+    else "". Fails closed when the denylist cannot be loaded."""
+    try:
+        repo = str(Path(__file__).resolve().parent.parent.parent)
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        from src.security.denylist import protected_dirs
+
+        resolved = path.resolve()
+        if any(_within(resolved, d) for d in protected_dirs().everyone):
+            return f"Error: '{path}' is in a protected folder and was not used"
+    except Exception as e:  # noqa: BLE001 - fail closed
+        return f"Error: cannot check '{path}' against the protected folders: {e}"
+    return ""
+
+
+@mcp.tool()
+async def send_review(
+    title: str,
+    sections: list[dict[str, Any]],
+    file_path: str,
+    intro: str = "",
+) -> str:
+    """Send 2+ pictures for the user to review as ONE structured PDF (a cover
+    photo plus the PDF). Use it for mockups, element sheets, v1 vs v2,
+    screenshots; one picture alone goes through send_image_to_user.
+
+    Args:
+        title: Document title (cover page).
+        sections: List of {heading, layout, note?, columns?, items}. layout is
+            "table" (row per item: thumbnail, caption, label, score; columns:
+            optional [caption header, score header]), "grid" (columns tiles
+            per row, default 3, numbered tiles), "compare" (items in pairs:
+            left, right; label above each side) or "single" (one picture per
+            page). items: list of {image: absolute path, caption, score?,
+            label?}. Items are numbered 1, 2, 3 ... through the whole
+            document, so the user can answer "ok: 3, 7"; mention the numbers
+            in your message.
+        file_path: Absolute path of the PDF to write (a .pdf inside your
+            workspace); the cover goes to <name>-sheet.png next to it.
+        intro: Optional text under the title on the cover.
+
+    Returns:
+        Confirmation with the page count, or an error (nothing sent).
+    """
+    path = Path(file_path)
+    if not path.is_absolute() or path.suffix.lower() != ".pdf":
+        return f"Error: file_path must be an absolute .pdf path, got '{file_path}'"
+    bad = _outside_roots(path) or _protected(path)
+    if bad:
+        return bad
+    review = _load_review_pdf()
+    spec = {"title": title, "intro": intro, "sections": sections}
+    try:
+        spec = review.validate(spec)
+    except review.ReviewError as e:
+        return f"Error: {e}"
+    for sec in spec["sections"]:
+        for it in sec["items"]:
+            raw = it.get("image")
+            if not raw:
+                continue
+            img = Path(str(raw))
+            if not img.is_absolute():
+                return f"Error: image path must be absolute, got '{raw}'"
+            if not img.is_file():
+                return f"Error: image not found: {raw}"
+            bad = _outside_roots(img) or _protected(img)
+            if bad:
+                return bad
+    try:
+        pages = await asyncio.to_thread(
+            review.render, spec, path, review.cover_path(path)
+        )
+    except (OSError, ValueError) as e:
+        return f"Error: render failed, nothing sent: {e}"
+    size = path.stat().st_size
+    if size > MAX_FILE_BYTES:
+        return "Error: the PDF is larger than Telegram's 50 MB limit; split it"
+    return f"Review queued for delivery: {path.name}, {pages} pages"
 
 
 if __name__ == "__main__":

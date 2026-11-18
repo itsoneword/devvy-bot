@@ -151,6 +151,17 @@ class Settings(BaseSettings):
             "from this value."
         ),
     )
+    job_fast_ask_timeout_seconds: float = Field(
+        180.0,
+        gt=0,
+        le=3600,
+        description=(
+            "How long a background job's low-stakes ask (kill, docker rm/prune, "
+            "chmod/chown -R, truncate, git clean, git reset --hard) waits for "
+            "the owner before it is denied and the job works around it "
+            "(dv-3d18). Every other job ask waits one hour."
+        ),
+    )
     claude_timeout_seconds: int = Field(
         DEFAULT_CLAUDE_TIMEOUT_SECONDS,
         description=(
@@ -658,11 +669,13 @@ class Settings(BaseSettings):
         "today-state digest and the evening gap-ping",
     )
     # The task board (dv-1327). Markdown files, not a table: agents, the owner's
-    # kanban UI and the pump all work the same files. Relative paths resolve
-    # against the bot's working directory (the repo).
-    deviz_tasks_dir: Path = Field(
-        Path(".deviz/tasks"),
-        description="Directory holding the deviz task board markdown files",
+    # kanban UI and the pump all work the same files. Unset = the home board's
+    # cards dir from boards.json (src/utils/boards.py, dv-36b2); an override is
+    # for tests.
+    deviz_tasks_dir: Optional[Path] = Field(
+        None,
+        description="Override of the home board's cards dir (default: "
+        "boards.json pump2_home cards_dir, else <repo>/.deviz/tasks)",
     )
     # DEPRECATED (2026-09-10), read by nothing that decides anything. Kept so
     # an existing SESSION_TIMEOUT_HOURS in a deployment's env stays harmless.
@@ -889,6 +902,15 @@ class Settings(BaseSettings):
         ),
     )
 
+    # /limits widget (dv-4665, Bot API 10.4 pilot)
+    limits_widget_enabled: bool = Field(
+        True,
+        description=(
+            "Answer /limits in the private chat with a Telegram widget instead "
+            "of text. Set to false to return the DM to the text reply."
+        ),
+    )
+
     # Output verbosity (0=quiet, 1=normal, 2=detailed)
     verbose_level: int = Field(
         1,
@@ -899,6 +921,15 @@ class Settings(BaseSettings):
         ),
         ge=0,
         le=2,
+    )
+
+    enable_rich_messages: bool = Field(
+        True,
+        description=(
+            "Send agent replies and markdown notifications as Telegram Rich "
+            "Messages (sendRichMessage: native tables, headings, lists); any "
+            "error falls back to the HTML text path"
+        ),
     )
 
     # Streaming drafts (Telegram sendMessageDraft)
@@ -924,6 +955,14 @@ class Settings(BaseSettings):
         None, description="Phoenix base URL, e.g. http://127.0.0.1:6006"
     )
     phoenix_project: str = Field("devvy", description="Phoenix project for traces")
+
+    # Local Telegram Bot API server (telegram-bot-api --local) used only by the
+    # background media retry to fetch files the cloud getFile cannot serve
+    # (16.11.26: cloud answered 504 after 120 s). Its --dir must be the same
+    # absolute path inside and outside the container: file_path is read as is.
+    telegram_file_api_url: Optional[str] = Field(
+        None, description="Local Bot API base URL, e.g. http://127.0.0.1:8081"
+    )
 
     # Development
     debug: bool = Field(False, description="Enable debug mode")
@@ -982,6 +1021,12 @@ class Settings(BaseSettings):
     )
     hireli_service_key: Optional[SecretStr] = Field(
         None, description="Hireli trusted-client service key"
+    )
+    # webform_* tools (dv-5a25): where Playwright's Chromium lives, passed to
+    # the browser child as PLAYWRIGHT_BROWSERS_PATH. Unset = Playwright's
+    # default cache (~/.cache/ms-playwright).
+    webforms_browsers_path: Optional[str] = Field(
+        None, description="Playwright browsers directory for the webform tools"
     )
     notification_chat_ids: Optional[List[int]] = Field(
         None, description="Default Telegram chat IDs for proactive notifications"

@@ -95,4 +95,4 @@ def test_answer_after_double_dash_is_verbatim(repo: Path, bf: Path) -> None:
     assert cli_main(["--boards", str(bf), "answer", "t:dv-0001", "--", text]) == 0
     c = find_card(board(repo, "true"), "dv-0001")
     assert c.fm["status"] == "in_progress"
-    assert "### @owner" in c.body and text in c.body
+    assert "/owner — " in c.body and text in c.body

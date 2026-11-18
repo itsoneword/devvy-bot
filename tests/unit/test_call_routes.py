@@ -53,9 +53,9 @@ GOLDEN = {
     ("ask_explain", None): ("claude", "sonnet"),
     ("scorer", None): ("openrouter", None),
     ("screen", None): ("claude", "haiku"),
-    # dv-9133: the design critic is a different family than the generator,
-    # pinned to Codex with no fallback.
-    ("design_critic", None): ("openai_codex", CODEX_MODEL),
+    # dv-a5aa (owner 13.11): the design critic runs on Claude opus, no
+    # fallback (supersedes dv-9133's Codex pin).
+    ("design_critic", None): ("claude", "opus"),
 }
 
 NINE_PLAIN = {
@@ -396,7 +396,20 @@ def test_every_plain_purpose_has_exactly_one_route_row():
     from src.model_router.types import PLAIN_PURPOSES, PURPOSES, TURN_PURPOSES
 
     # Purposes added after the dv-781f golden table (no golden row yet).
-    later = {"pump_summary", "feedback_question", "feedback_extract"}
+    later = {
+        "pump_summary",
+        "feedback_question",
+        "feedback_extract",
+        "post_image",
+        "devlog_style",
+        # dv-75f1: the design loop's mockups and style spec.
+        "design_mockup",
+        "design_mockup_paid",
+        "design_mockup_prompt",
+        "design_spec",
+        # dv-65dd: the sweep's done-card judgement.
+        "consolidation_cards",
+    }
     assert set(PLAIN_PURPOSES) == NINE_PLAIN | later
     assert set(DEFAULT_CALL_ROUTES) == set(PLAIN_PURPOSES)
     assert not set(TURN_PURPOSES) & set(PLAIN_PURPOSES)
@@ -582,26 +595,24 @@ default:
 """
 
 
-def test_design_critic_resolves_to_codex_with_no_fallback(tmp_path):
-    """Built-in row: Codex, no fallback. An owner's models.yaml whose default
-    row is Claude with a Claude fallback moves neither: the critic's point is
-    a different model family than the Claude generator."""
+def test_design_critic_resolves_to_claude_opus_with_no_fallback(tmp_path):
+    """Built-in row: Claude opus, no fallback (dv-a5aa). An owner's
+    models.yaml whose default row is Claude sonnet with a fallback moves
+    neither the model nor adds a fallback."""
     from src.model_router.routes import CallRoutes
 
     route = CallRoutes().resolve("design_critic")
-    assert route.harness == "openai_codex" and route.model == CODEX_MODEL
+    assert route.harness == "claude" and route.model == "opus"
     assert route.fallback is None
 
     route = _routes(tmp_path, _DEFAULT_CLAUDE_WITH_FALLBACK).resolve("design_critic")
-    assert route.harness == "openai_codex"
+    assert route.harness == "claude" and route.model == "opus"
     assert route.fallback is None
 
 
 @pytest.mark.parametrize("with_yaml", [False, True])
-async def test_failed_design_critic_call_never_falls_back_to_claude(
-    tmp_path, db, with_yaml
-):
-    fakes = _fakes(openai_codex=ModelCallError("codex down"))
+async def test_failed_design_critic_call_never_falls_back(tmp_path, db, with_yaml):
+    fakes = _fakes(claude=ModelCallError("claude down"))
     kwargs: Dict[str, Any] = {}
     if with_yaml:
         kwargs["call_routes"] = _routes(tmp_path, _DEFAULT_CLAUDE_WITH_FALLBACK)
@@ -612,11 +623,11 @@ async def test_failed_design_critic_call_never_falls_back_to_claude(
         **kwargs,
     )
 
-    with pytest.raises(ModelCallError, match="codex down"):
+    with pytest.raises(ModelCallError, match="claude down"):
         await router.complete(_plain("design_critic"))
 
-    assert len(fakes["openai_codex"].calls) == 1
-    assert not fakes["claude"].calls and not fakes["openrouter"].calls
+    assert len(fakes["claude"].calls) == 1
+    assert not fakes["openai_codex"].calls and not fakes["openrouter"].calls
     (row,) = await _rows(db)
     assert row["purpose"] == "design_critic"
-    assert row["harness"] == "openai_codex" and row["outcome"] == "error"
+    assert row["harness"] == "claude" and row["outcome"] == "error"

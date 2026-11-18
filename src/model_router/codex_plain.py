@@ -18,7 +18,14 @@ from typing import Any, Dict, List, Optional
 from src.utils.agent_env import agent_child_env
 
 from . import quota
-from .types import CallRequest, CallResult, ModelCallError, ModelCallTimeout
+from .types import (
+    CODEX_HARNESS,
+    CallRequest,
+    CallResult,
+    ModelCallError,
+    ModelCallTimeout,
+    refuse_image_output,
+)
 
 _MODEL_PREFIX = "openai-codex/"
 
@@ -55,6 +62,7 @@ class CodexPlainCaller:
         return argv + ["-o", str(workdir / "out.txt"), "-"]
 
     async def __call__(self, request: CallRequest) -> CallResult:
+        refuse_image_output(request, CODEX_HARNESS)
         limit = quota.active(provider="openai")
         if limit is not None:
             raise ModelCallError(

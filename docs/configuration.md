@@ -129,6 +129,13 @@ CLAUDE_TIMEOUT_SECONDS=300
 # outlive this wait + 60/120 s; background jobs use their own 3600 s ask wait.
 CONFIRMATION_TIMEOUT_SECONDS=600
 
+# Seconds a background job's low-stakes ask (kill/pkill, docker rm/prune,
+# chmod/chown -R, truncate, git clean, git reset --hard; the "fast" tier in
+# src/security/destructive.py) waits for the owner before it is denied with a
+# "no owner answer, work around it" tool error (dv-3d18). Every other job ask
+# waits 3600 s. Max 3600.
+JOB_FAST_ASK_TIMEOUT_SECONDS=180
+
 # Max bytes for one stream-json message on the CLI's stdout. The SDK's own
 # default is 1 MiB, which a single image Read overflows and kills the turn.
 CLAUDE_MAX_BUFFER_SIZE=16777216
@@ -186,7 +193,8 @@ every key. `config/models.yaml` (gitignored) only lists what you change:
 |---|---|---|---|
 | `extraction`, `screen_extraction` | memory evaluator | the chat's backend | claude: sonnet, openai_codex: openai-codex/gpt-6-sol |
 | `reconcile` | evaluator reconciler, reconcile gate's decide leg | claude | haiku |
-| `consolidation` | stale-fact sweep (rotation, valve, weekly) | claude | haiku |
+| `consolidation` | stale-fact sweep (rotation, valve, nightly) | claude | haiku |
+| `consolidation_cards` | the sweep's done-card check (dv-65dd): does a done card hold the fact? | claude | sonnet |
 | `fact_quality` | daily fact-quality judge | claude | haiku |
 | `onboarding` | `/setup` free-form extraction | claude | sonnet (default row) |
 | `ask_explain` | ask-card explanation (sees the task title, dv-781f) | claude | sonnet |
@@ -270,7 +278,7 @@ move jobs.
 | `monitor` | `agentjob --purpose monitor` | sonnet |
 | `pump_analyze`, `pump_testdesign`, `pump_implement` | Pump stages | opus |
 | `pump_review` | Pump stage | sonnet |
-| `pump_mergefix` | Pump stage (failed merge) | opus |
+| `pump_resolve` | Pump stage (every stop goes to it first, dv-b8bb) | opus |
 | `design_generate` | design-loop variant generator | sonnet |
 
 Job harnesses: `claude` (CLI on the subscription), `openrouter` (the same CLI
@@ -462,7 +470,7 @@ malformed), reported to the owner chat(s) as e.g.
 **Report-only.** It never closes, edits or deletes a fact — fixes stay
 owner-approved via `scripts/cleanup_episodic.py`. Off by default; it needs
 `ENABLE_SCHEDULER=true` as well, since it registers as a native scheduler job
-alongside the weekly consolidation pass.
+alongside the nightly consolidation pass.
 
 ```bash
 # Run the daily check and report to the owner (default off)
@@ -658,6 +666,7 @@ WEBHOOK_API_SECRET=your-secret       # Bearer token for generic providers
 
 # Job Scheduler
 ENABLE_SCHEDULER=false                # Enable cron job scheduler
+ENABLE_RICH_MESSAGES=true             # Replies as Telegram Rich Messages (native tables); false = HTML text
 
 # Notifications
 NOTIFICATION_CHAT_IDS=123456,789012  # Default Telegram chat IDs for proactive notifications
@@ -681,7 +690,7 @@ Alternatively, when `DEVVY_DATA_ROOT` is set, put only the numeric chat ID in
 `<data-root>/reports_chat_id`. `REPORTS_CHAT_ID` in the environment takes
 precedence. Restart the bot after changing either setting.
 
-**Owner feature survey (dv-a42c).** The pump2 tick asks the owner to rate
+**Owner feature survey (dv-a42c, v2 dv-f34d).** The pump2 tick asks the owner to rate
 finished features in the unbound `Feedback` topic (`docs/pump-v2.md` §5b).
 Read from the environment of the `pump2 tick` process (not Settings: the
 pump runs without the bot's config):
@@ -690,7 +699,9 @@ pump runs without the bot's config):
 # FEEDBACK_ENABLED=true          # false/0/off = no questions
 # FEEDBACK_INTERVAL_MIN=45       # at most one question per this many minutes
 # FEEDBACK_MIN_AGE_HOURS=24      # ask only this long after a feature's last merge
-# FEEDBACK_LOOKBACK_DAYS=14      # and only when that merge is this recent
+# FEEDBACK_LOOKBACK_DAYS=5       # and only when that merge is this recent
+# FEEDBACK_OPEN_TTL_H=24         # an unanswered question closes after this, re-asked in 3 days
+# FEEDBACK_B_WAIT_DAYS=3         # a "measured" feature without numbers (or no checkable step): retry after
 ```
 
 **Talking to agents in topics (inbound).** Bind topics to profiles; a message
@@ -783,6 +794,16 @@ PHOENIX_URL=http://127.0.0.1:6006
 PHOENIX_PROJECT=devvy
 ```
 
+#### Local Telegram Bot API server
+
+```bash
+# Base URL of a local telegram-bot-api (--local) server. Used only by the
+# background media retry to fetch files the cloud getFile cannot serve.
+# Its --dir must be the same absolute path inside and outside the container.
+# Unset (default) = the retry uses the cloud API only.
+TELEGRAM_FILE_API_URL=http://127.0.0.1:8081
+```
+
 #### Development
 
 ```bash
@@ -844,8 +865,10 @@ sandboxed bash box, e.g. shared tool checkouts; owner-only), `sandbox_allowed_do
 an egress proxy exists; validated and kept; owner-only), `sandbox_keys` (key-store
 services a sandboxed profile's shell gets in its env, values redacted from output;
 both backends — on Codex via the policy hook's `--redact-env` wrapper, dv-28f2;
-owner-only) and `enabled` (`false` hides a profile
-without deleting it). See `config/profiles.example.yaml`.
+owner-only), `publisher` / `publish_channel` / `image_cap_usd` (the devlog
+channel tools and where its posts go, dv-fc9d; owner-only, sandboxed) and
+`enabled` (`false` hides a profile without deleting it). See
+`config/profiles.example.yaml`.
 
 Owners manage profiles from Telegram: `/agents → ⚙ Manage` toggles `enabled:`
 in the YAML and offers the restart (the registry is read once at boot);
@@ -870,6 +893,17 @@ Controls how much of Claude's background activity is streamed to the user
 while a turn runs. `1` shows tool names plus reasoning snippets; `2` adds tool
 input summaries and longer reasoning text. Users override per session with
 `/verbose 0|1|2`. A typing indicator refreshes every ~2s at every level.
+
+#### /limits widget
+
+```bash
+LIMITS_WIDGET_ENABLED=true
+```
+
+`/limits` in the private chat with the bot answers with a Telegram widget
+(Bot API 10.4; `src/bot/features/limits_widget.py`) instead of text; its
+Refresh tap re-reads the limits. Groups and topics always get text, and so
+does the DM when the send fails. `false` + restart returns the DM to text.
 
 #### Voice Transcription
 
@@ -920,6 +954,23 @@ that profile's `mcp` seam (`config/mcp/channel-intel.json`), which reads the
 same token env var (from Settings) and hands it to the agent CLI by
 environment, referenced as `${CHANNEL_INTEL_TOKEN}`, never in argv. Other profiles do not receive these
 tools unless their profile config explicitly points at an MCP seam.
+
+#### Web forms (webform_* tools)
+
+```bash
+WEBFORMS_BROWSERS_PATH=/home/<user>/gymbro/.pw-browsers   # unset = ~/.cache/ms-playwright
+```
+
+A profile with `web_forms: [william_russell_claim]` (ids: `src/webforms/FORMS`)
+gets `webform_fill` / `webform_submit` on **owner turns only** (a guest on the
+same profile never sees them, so the key is allowed on a guest-allowed
+profile). The browser runs on the host in a child process
+(`src/webforms/runner.py`), needs Playwright 1.64.0 in the bot's venv
+(planned as the optional extra `webforms`) and a matching Chromium build in `WEBFORMS_BROWSERS_PATH` (passed to
+the child as `PLAYWRIGHT_BROWSERS_PATH`). `scripts/check_install.py
+--preflight` fails when a profile enables the key and either is missing.
+`webform_submit` asks the owner on every profile and only runs after a
+successful `webform_fill` of the same data within 30 minutes.
 
 ## Cost Limits
 

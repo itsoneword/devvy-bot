@@ -20,10 +20,10 @@ on the branch `pump2/<id>`, and writes its report into that worktree's `.pump/`.
 | `build` | makes the tests pass; may not edit the files in `tests.json` | code |
 | `review` | reads the diff; passes or returns the work to build once | `review.md` |
 | `merge` | merges the integration branch into the card branch, runs the board's test command, fast-forwards on green | `merge.log` |
-| `mergefix` | only when the mechanical merge did not land: resolves conflicts and says land / retest / stop | `mergefix.md` |
+| `resolve` | every stop comes here first (at most 2 per card): the board's own agent fixes and continues at a stage, reruns one with a note, or asks you one question | `resolve.md` |
 | `stopped` | the card needs a person; the last `@pump2` comment says why | — |
 
-A failed stage reruns once automatically, then the card is `stopped`. A stop
+A crashed job reruns once automatically; every stop then goes to `resolve`, the third one to `stopped`. A stop
 shows the command, its exit code and the tail of the job log. Only `merge`
 writes to the integration branch.
 
@@ -40,7 +40,7 @@ lives in the worktree's `.pump/`. There is no database. Do not hand-edit the
 The bot is installed and runs (README). Then, in the bot's checkout:
 
 1. **The repo.** A git repo with one commit, an integration branch and a deviz
-   board (`.deviz/tasks/`). Add `.pump-worktrees/` to its `.gitignore`.
+   board (`.deviz/tasks/` or `cards_dir`). Add `.pump-worktrees/` to `.gitignore`.
 2. **A bot profile for the board.** Stage jobs run under it, so the pump needs
    `config/profiles.yaml` even if the bot runs single-profile
    (`PROFILES_CONFIG_PATH` unset: one profile, no file): without the file
@@ -55,7 +55,7 @@ The bot is installed and runs (README). Then, in the bot's checkout:
    branch, absolute paths).
 4. **Models (optional).** Without `config/models.yaml` every stage runs on the
    built-in rows: `pump_analyze`, `pump_testdesign` (tests), `pump_implement`
-   (build), `pump_review`, `pump_mergefix`; a custom stage `x` on `pump_x`
+   (build), `pump_review`, `pump_resolve`; a custom stage `x` on `pump_x`
    (else `jobs.default`). To change one, copy only that row from
    `config/models.example.yaml` (`jobs:`) into `config/models.yaml`; the
    table is in `docs/configuration.md`.
@@ -110,7 +110,7 @@ In the bot, the devops agent does the same with its `pump_pending` /
 
 - A git repo with at least one commit, and an integration branch (`main` by
   default, `pump2_branch` otherwise).
-- A deviz board in it: `.deviz/tasks/` (one `<id>.md` per card).
+- A deviz board: `.deviz/tasks/` in it or `cards_dir` (one `<id>.md` per card).
 - A bot profile whose workspace or `extra_dirs` covers the repo: the jobs run
   under that profile, and the worktrees live in `<repo>/.pump-worktrees/`
   (add it to the repo's `.gitignore`).
@@ -188,8 +188,7 @@ other remark is advice in the card comment, and a `return` without a blocking
 remark counts as a pass. A card returns once per run: a second return from any
 judge stage stops it. A missing or malformed report stops the card with the
 error and the raw text. `## Scores` (review writes it too) is stored for
-comparison and never changes the verdict. Missing or bad scores only add a
-warning line.
+comparison, never changes the verdict; missing or bad scores add a warning.
 
 A copywriter prompt file (`config/taskpump/copy.md`; a fuller one ships as
 `config/taskpump/copy.example.md`) could read:
@@ -202,20 +201,14 @@ and judge it against the plan: tone, clarity, spelling, consistent terms.
 {{DIFF}}
 ```
 
-Each custom stage runs on its own `config/models.yaml` row
-`jobs: pump_<stage>:` (`pump_copy` here, e.g. `{models: {claude: sonnet}}`).
-Without that row it uses `jobs.default`.
+Each custom stage runs on its `config/models.yaml` row `jobs: pump_<stage>:`
+(`pump_copy` here, e.g. `{models: {claude: sonnet}}`), else `jobs.default`.
 
-The pipeline is checked when the boards file is loaded. Any of the following
-raises an error that names the board and the rule:
-
-- it does not start with `analyze` or end with `merge`;
-- it has no `build`;
-- a writing stage sits at or after `review`;
-- a name is bad, duplicated or unknown;
-- `return_to` is not an earlier stage;
-- the prompt file is missing;
-- a `when` key or value is unknown.
+The pipeline is checked when the boards file is loaded; an error names the
+board and the rule. It must start with `analyze`, end with `merge` and contain
+`build`; no writing stage at or after `review`; no bad, duplicated or unknown
+name; `return_to` an earlier stage; the prompt file present; every `when` key
+and value known.
 
 ## Design loop (advanced)
 
@@ -260,12 +253,10 @@ for the current app, whose PNGs become `{refs}`. Write one
 at one fixed size. Exit non-zero only when nothing rendered: a failing state
 is left out and the gate reports it missing. Two rules:
 
-- **Per-run temp DB.** Variants render in parallel. Every run seeds its own
-  throwaway DB or data dir; renders sharing one database wipe each other's
-  seed data mid-shot.
-- **No build artefacts.** A worktree is a fresh checkout: no installed
-  dependencies, no build output. Build or serve the app from the worktree's
-  own code.
+- **Per-run temp DB.** Variants render in parallel: each run seeds its own
+  throwaway DB or data dir, or they wipe each other's seed data mid-shot.
+- **No build artefacts.** A worktree is a fresh checkout with no installed
+  dependencies or build output: build or serve from the worktree's own code.
 
 **Gate.** Mechanical, no model. Print one JSON list of failures (or
 `{"failures": [...]}`) on stdout; `[]` = pass; non-JSON output counts as a
@@ -275,14 +266,12 @@ blank image, identical dark/light, or a render identical to its ref.
 **Brief.** The loop reads `docs/features.yaml` (what must stay reachable),
 `docs/SCREENS.md` (the screen's passport, shared tokens), `docs/UI_GUIDE.md`
 (rules) and `docs/screens/<screen>/<state>-<theme>.png` (committed refs).
-
-Output lands in `<repo>/.screens/design/<card>`: add `.screens/` to
-`.gitignore`.
+Output lands in `<repo>/.screens/design/<card>`: add `.screens/` to `.gitignore`.
 
 ## How it actually works
 
-What runs where, with the code behind each claim. The stage list and what each
-stage writes: [Stages](#stages); a board's own stages: [Custom stages](#custom-stages).
+What runs where, with the code behind each claim ([Stages](#stages),
+[Custom stages](#custom-stages)).
 
 **The tick is a script, not a model.** `pump2.timer` fires every 2 min
 (`deploy/pump2.timer.template:8`) and runs `scripts/pump2 tick`
@@ -306,10 +295,11 @@ whole context is the prompt that code builds:
   (`build.py:24`), review gets the plan, the diff, `build.md` and its earlier
   `review.md` remarks (`review.py:58-63`, `:190-192`), a custom stage gets
   `{{PLAN}}`, `{{DIFF}}`, `{{PREV}}` (`src/pump2/stages/custom.py:66-80`),
-  mergefix gets `merge-facts.md` (`mergefix.py:59-61`).
+  resolve gets `stop.md`, `merge-facts.md` and its earlier decisions
+  (`stages/resolve.py:prompt`).
 
-A prompt over 100 KB goes to `.pump/prompt-<stage>.md` and the job is told to
-read it (`runner.py:214-225`).
+A prompt over 100 KB goes to `.pump/prompt-<stage>.md` for the job to read
+(`runner.py:214-225`).
 
 **What the stage agent sees** (Claude harness, `job_options`,
 `src/model_router/job.py:392-430`):
@@ -339,18 +329,22 @@ the `jobs:` row of that name in `config/models.yaml` (reference:
 | build | agent (`stages/build.py:23`) | digest + `plan.md` + `tests.json`, review remarks on a return | code, `.pump/build.md` | `pump_implement` |
 | custom `x` | agent (`stages/custom.py:66`) | the board's prompt file with `{{CARD}}` … `{{PREV}}` | `.pump/<report>` | `pump_x` (no built-in row: `jobs.default` until configured) |
 | review | agent (`stages/review.py:158`) | digest + plan + diff + `build.md` | `.pump/review.md` | `pump_review` |
-| merge | **script, no model**: `bgjob_launch` runs `scripts/pump2 merge` with no `--route` (`runner.py:160-186`) | the card branch, the board's test command (`src/pump2/merge.py:40`) | `.pump/merge.log`; fast-forward or hand-off to mergefix (`merge.py:296`) | none |
-| mergefix | agent (`stages/mergefix.py:59`) | digest + `.pump/merge-facts.md` | `.pump/mergefix.md` | `pump_mergefix` |
+| merge | **script, no model**: `bgjob_launch` runs `scripts/pump2 merge` with no `--route` (`runner.py:160-186`) | the card branch, the board's test command (`src/pump2/merge.py:40`) | `.pump/merge.log`; fast-forward, or a stop to resolve (`merge.py:_to_resolve`) | none |
+| resolve | agent (`stages/resolve.py:prompt`) | digest + `.pump/stop.md` (+ `merge-facts.md`) | `.pump/resolve.md` | `pump_resolve` |
 
-A card whose `touches` are docs only skips the tests stage: analyze sends it
-to build (`src/pump2/stages/analyze.py:191`), which writes the docs from a
-docs-only prompt and commits with no test run when there is no `tests.json`
-(`build.py:42`, `:113`), then review.
+A docs-only card (`touches`) skips tests: analyze sends it to build
+(`src/pump2/stages/analyze.py:191`), which writes the docs and commits with no
+test run when there is no `tests.json` (`build.py:42`, `:113`), then review.
 
 ## Writing a card
 
 The one set of card rules for every board. Agents: read this before you create
 a card; personas do not repeat it.
+
+**Creating a card (its id):** `scripts/pump2 new <board> --title ...` or the
+`task_add` tool with `own_board: true` (`src/pump2/cards.py`: an id free on the
+live tree and every branch, exclusive create); never Write a card file yourself;
+a pump stage lists follow-ups in `.pump/followups.json`, filed at land.
 
 **What the author writes** (frontmatter + body):
 
@@ -362,6 +356,25 @@ a card; personas do not repeat it.
 | `deps` | `[dv-a, dv-b]`: ids **on the same board**. The card is held until each is `done` (`src/pump2/state.py:475-488`); a missing id holds it forever (`dv-x(missing)` in `pump2 status`). A `board:id` prefix is not resolved: it reads as missing |
 | `start_at` | ISO time; held until then. No zone = UTC (`state.py:460-466`, `:472-474`) |
 | `status` | `todo` when filed; `in_progress` starts the pump. Never set `waiting_user`, `stopped` or `done` yourself |
+| `assignee` | who does it (one per card). Empty = this install; `<install>` (e.g. `romanbot`) or `<install>/<profile>` (`devvybot-vps/builder`) for a named one; legacy bare profile slugs (`devops`, `builder`) still mean this install. Change it with `scripts/pump2 assign <board:id> <name\|->` |
+
+**Set by code, never by you**: `created_by` and every comment header are
+stamped `<install>/<profile>` (`created_by: devvybot-vps/devops`,
+`### @devvybot-vps/pump2 — <ISO time>`): this install's identity plus the
+calling code's profile (the turn's profile, `pump2`, `owner`, `cli` for a
+shell's `pump2 new`, which has no `--by`). Nothing sets another install's
+name. Legacy forms (`created_by: devops`, `### @pump2 — …`, `### @owner — …`,
+`- <date> from x (agent): …`) still parse.
+
+**Two levels, ownership per install.** The *install* (one bot deployment, one
+owner) is named by the top-level `"me"` of `config/taskpump/boards.json`
+(`me_aliases`: more bare names for it); its *profiles* (devops, builder, …)
+are sub-agents. An `in_progress` card launches only when its assignee is ours:
+empty, `me`, `me/<any profile>`, a local profile or an alias
+(`src/pump2/identity.py:is_ours`). Any other name is another install's card:
+never launched, listed under "Theirs" in `pump2 status` and the pin, refused by
+`start`/`answer`/`merge`/`urgent`/`design run`. `me` unset = every card is
+ours. `pump2 doctor` prints `me`, the names counted as ours and foreign cards.
 
 **What analyze computes, not the author:** `touches` (code, db, ui, docs),
 `size` (S, M, L), `kind` (bug, feature, new screen, docs, ops; lists:
@@ -383,9 +396,8 @@ must be true in the description; analyze turns it into criteria.
 On a board that sets `stage_labels`, the card gets one comment naming its other
 labels: "they switch no stage on" (`warn_labels`, `runner.py:123-134`).
 
-**Minimum fields.** Give the title, a description that says what should be
-true afterwards, and `deps` / `start_at` only when they are real. Leave out
-everything analyze computes or the pump writes.
+**Minimum fields.** A title, a description of what should be true afterwards,
+`deps` / `start_at` only when real; nothing analyze computes or the pump writes.
 
 Bad:
 
@@ -401,9 +413,8 @@ pump2: {stage: build}
 it's broken
 ```
 
-(No problem or result. `size`/`touches` are ignored. `code`, `urgent` and `M`
-switch nothing on. The cross-board dep holds the card forever. The `pump2:`
-block skips analyze.)
+(No problem or result; `size`/`touches` ignored; the labels switch nothing on;
+the cross-board dep holds it forever; the `pump2:` block skips analyze.)
 
 Good:
 

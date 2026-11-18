@@ -226,6 +226,7 @@ class JobScheduler:
         item_id: Optional[int] = None,
         timezone: Optional[str] = None,
         ends_at: Optional[datetime] = None,
+        profile_slug: Optional[str] = None,
     ) -> str:
         """Add a new scheduled job.
 
@@ -246,6 +247,8 @@ class JobScheduler:
                 then reads the live item and runs as its assignee.
             timezone: IANA zone the cron fields are read in (None = UTC).
             ends_at: last instant a cron job may fire (None = forever).
+            profile_slug: the profile whose turn created the job; its reply
+                is delivered as that profile's message (dv-f6c4).
 
         Returns:
             The job ID.
@@ -286,6 +289,7 @@ class JobScheduler:
                 "delivery": delivery,
                 "created_by": created_by,
                 "item_id": item_id,
+                "profile_slug": profile_slug,
             },
             id=job_id,
             name=job_name,
@@ -305,6 +309,7 @@ class JobScheduler:
             item_id=item_id,
             timezone=timezone if run_at is None else None,
             ends_at=ends_at if run_at is None else None,
+            profile_slug=profile_slug,
         )
 
         logger.info(
@@ -380,6 +385,7 @@ class JobScheduler:
         delivery: str = "agent",
         created_by: int = 0,
         item_id: Optional[int] = None,
+        profile_slug: Optional[str] = None,
     ) -> None:
         """Called by APScheduler when a job triggers. Publishes a ScheduledEvent."""
         event = ScheduledEvent(
@@ -392,6 +398,7 @@ class JobScheduler:
             delivery=delivery,
             created_by=created_by,
             item_id=item_id,
+            profile_slug=profile_slug,
         )
 
         logger.info(
@@ -466,6 +473,7 @@ class JobScheduler:
                             "delivery": row_dict.get("delivery") or "agent",
                             "created_by": row_dict.get("created_by") or 0,
                             "item_id": row_dict.get("item_id"),
+                            "profile_slug": row_dict.get("profile_slug"),
                         },
                         id=row_dict["job_id"],
                         name=row_dict["job_name"],
@@ -501,6 +509,7 @@ class JobScheduler:
         item_id: Optional[int] = None,
         timezone: Optional[str] = None,
         ends_at: Optional[datetime] = None,
+        profile_slug: Optional[str] = None,
     ) -> None:
         """Persist a job definition to the database."""
         chat_ids_str = ",".join(str(cid) for cid in target_chat_ids)
@@ -517,6 +526,7 @@ class JobScheduler:
             item_id=item_id,
             timezone=timezone,
             ends_at_iso=ends_at.astimezone(UTC).isoformat() if ends_at else None,
+            profile_slug=profile_slug,
         )
 
     async def _delete_job(self, job_id: str) -> None:

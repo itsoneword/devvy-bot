@@ -6,14 +6,21 @@ scorer was the first. The key comes from the owner's key store
 the bot scrubs secrets from its env at startup, so an env-only read never
 worked inside the bot (dv-781f).
 
+An ``image_output`` call (dv-fc9d, purpose ``post_image``) asks for
+``modalities: ["image", "text"]`` and returns the first picture's bytes in
+``CallResult.image``; its cost is OpenRouter's reported ``usage.cost``.
+Its ``images`` (dv-4032: mockup references) go as ``image_url`` data URLs
+after the prompt; a text call with images is refused (dv-9133).
+
 A schema call sends strict ``response_format``; a model that rejects it is
 asked once more without it, inside the same call (dv-781f phase 2).
 """
 
 from __future__ import annotations
 
+import base64
 import json
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import httpx
 
@@ -24,6 +31,7 @@ from .types import (
     CallResult,
     ModelCallError,
     ModelCallTimeout,
+    read_images,
     refuse_images,
 )
 
@@ -35,16 +43,30 @@ class OpenRouterPlainCaller:
     """Runs one :class:`CallRequest` as a chat completion and returns its text."""
 
     async def __call__(self, request: CallRequest) -> CallResult:
-        refuse_images(request, OPENROUTER_HARNESS)
-        key = openrouter_key()
+        if not request.image_output:
+            refuse_images(request, OPENROUTER_HARNESS)
+        images = read_images(request)  # a bad file fails before any HTTP
+        key = openrouter_key(request.key_ref)
         if not key:
             raise ModelCallError(
-                f"{OPENROUTER_KEY_ENV} is not in the key store: "
+                f"{request.key_ref or OPENROUTER_KEY_ENV} is not in the key store: "
                 f"/setkey openrouter {OPENROUTER_KEY_ENV} <value>"
             )
         if not request.model:
             raise ModelCallError("OpenRouter call needs a model")
-        messages = [{"role": "user", "content": request.prompt}]
+        content: Any = request.prompt
+        if images:
+            content = [{"type": "text", "text": request.prompt}] + [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{media};base64,"
+                        + base64.b64encode(data).decode("ascii")
+                    },
+                }
+                for media, data in images
+            ]
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": content}]
         if request.system_prompt:
             messages.insert(0, {"role": "system", "content": request.system_prompt})
         # Plain calls judge and extract; they want the same answer for the
@@ -54,6 +76,9 @@ class OpenRouterPlainCaller:
             "messages": messages,
             "temperature": 0,
         }
+        if request.image_output:
+            body["modalities"] = ["image", "text"]
+            body.pop("temperature")
         if request.json_schema is not None:
             # The router sent the strict form (json_contract.native_schema).
             body["response_format"] = {
@@ -87,8 +112,10 @@ class OpenRouterPlainCaller:
             raise ModelCallError(f"OpenRouter call failed: {exc}") from exc
 
         try:
-            text = str(data["choices"][0]["message"]["content"])
-        except (KeyError, IndexError, TypeError) as exc:
+            message = data["choices"][0]["message"]
+            text = str(message.get("content") or "")
+            image = _first_image(message) if request.image_output else None
+        except (KeyError, IndexError, TypeError, AttributeError, ValueError) as exc:
             raise ModelCallError(
                 f"unexpected OpenRouter response shape: {data!r}"
             ) from exc
@@ -96,16 +123,33 @@ class OpenRouterPlainCaller:
         model = str(data.get("model") or request.model)
         input_tokens = _int(usage.get("prompt_tokens"))
         output_tokens = _int(usage.get("completion_tokens"))
+        if request.image_output and image is None:
+            raise ModelCallError("OpenRouter returned no image")
+        reported = usage.get("cost")
+        if isinstance(reported, (int, float)) and not isinstance(reported, bool):
+            cost: Any = float(reported)
+        else:
+            # Tokens x llm_pricing.json; None when no rule (unknown is not 0).
+            cost = cost_from_tokens(
+                model, input_tokens=input_tokens, output_tokens=output_tokens
+            )
         return CallResult(
             text=text,
             model=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            # Tokens x llm_pricing.json; None when no rule (unknown is not 0).
-            cost_usd=cost_from_tokens(
-                model, input_tokens=input_tokens, output_tokens=output_tokens
-            ),
+            cost_usd=cost,
+            image=image,
         )
+
+
+def _first_image(message: Dict[str, Any]) -> Any:
+    """Bytes of the first ``images[].image_url.url`` data URL, else None."""
+    for item in message.get("images") or []:
+        url = str(((item or {}).get("image_url") or {}).get("url") or "")
+        if url.startswith("data:") and "," in url:
+            return base64.b64decode(url.split(",", 1)[1], validate=False)
+    return None
 
 
 # How OpenRouter says a model or provider cannot do structured outputs.

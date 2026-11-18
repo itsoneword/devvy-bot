@@ -72,20 +72,33 @@ def answered_features_sync(db_path: Path) -> set[str]:
         conn.close()
 
 
+# dv-925f: optional per-row columns of a judge row (migration bot 0016),
+# plus ``stage`` to override the call's stage for that row.
+STAGE_ROW_EXTRAS = ("round", "variant", "element", "remark_kind")
+
+# One judge row: (criterion, score) or (criterion, score, comment) or
+# (criterion, score, comment, extras); score / comment may be None.
+StageRow = tuple[Any, ...]
+
+
 def record_stage_scores_sync(
     db_path: Path,
     *,
     board: str,
     card_id: str,
     stage: str,
-    scores: Iterable[tuple[str, int]],
+    scores: Iterable[StageRow],
     size: Optional[str],
     kind: Optional[str],
 ) -> Optional[str]:
-    """One ``kind='stage_score'`` row per (criterion, score), for a process
-    without the bot's storage (the pump2 tick). The NOT NULL telegram triple
-    is (0, the next row id, 0): unique, never a real chat. Returns None, or
-    the error text (a missing DB / table is an error, never raised)."""
+    """One ``kind='stage_score'`` row per judge row (criterion, score,
+    comment, extras), for a process without the bot's storage (the pump2
+    tick, a design run). ``extras`` may set ``STAGE_ROW_EXTRAS`` columns and
+    ``stage``; a column is named in the INSERT only when a row sets it, so a
+    plain score row works on a DB before 0016. The NOT NULL telegram triple
+    is (0, the next row id, 0): unique, never a real chat. All rows go in one
+    transaction. Returns None, or the error text (a missing DB / table /
+    column is an error, never raised)."""
     rows = list(scores)
     if not rows:
         return None
@@ -98,14 +111,33 @@ def record_stage_scores_sync(
         return str(e)
     try:
         with conn:
-            for crit, score in rows:
+            for row in rows:
+                crit, score = row[0], row[1]
+                comment = row[2] if len(row) > 2 else None
+                extras: Mapping[str, Any] = row[3] if len(row) > 3 else {}
+                cols = [c for c in STAGE_ROW_EXTRAS if extras.get(c) is not None]
+                names = "".join(f", {c}" for c in cols)
+                marks = ", ?" * len(cols)
                 conn.execute(
                     "INSERT INTO message_reactions (telegram_chat_id, "
                     "telegram_message_id, user_id, emoji, score, reacted_at, kind, "
-                    "board, card_id, stage, criterion, card_size, card_kind) "
+                    "board, card_id, stage, criterion, card_size, card_kind, "
+                    f"comment{names}) "
                     "VALUES (0, (SELECT COALESCE(MAX(id), 0) + 1 FROM "
-                    "message_reactions), 0, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (score, now, STAGE_SCORE, board, card_id, stage, crit, size, kind),
+                    f"message_reactions), 0, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{marks})",
+                    (
+                        score,
+                        now,
+                        STAGE_SCORE,
+                        board,
+                        card_id,
+                        extras.get("stage") or stage,
+                        crit,
+                        size,
+                        kind,
+                        comment,
+                        *(extras[c] for c in cols),
+                    ),
                 )
         return None
     except sqlite3.Error as e:

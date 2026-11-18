@@ -171,6 +171,15 @@ def prompt(board: Board, card: Card, wt: Path) -> str:
             "new nits you did not raise before.\n\n=== earlier review.md ===\n"
             f"{prev.read_text().rstrip()}\n=== end earlier review ===\n"
         )
+    edits = _test_edits(card)
+    if edits:
+        _, d = sh(["git", "diff", f"{board.branch}...HEAD", "--", *edits], wt)
+        again += (
+            "\nA resolve step edited these test files: " + ", ".join(edits) + ". "
+            "Check each test was not weakened to go green (assertions dropped or "
+            "loosened, cases skipped); name each file in review.md, a review naming "
+            f"none of them is rejected.\n```diff\n{d.rstrip()}\n```\n"
+        )
     return f"""You are the REVIEW stage of a task pipeline. Review the work on this branch.
 
 Repository (your working directory): {wt}
@@ -223,6 +232,10 @@ optional.
 """
 
 
+def _test_edits(card: Card) -> list[str]:
+    return [str(x) for x in card.pump2.get("test_edits") or []]
+
+
 def finish(board: Board, card: Card, wt: Path) -> Outcome:
     f = wt / ".pump" / "review.md"
     if not f.exists():
@@ -230,12 +243,19 @@ def finish(board: Board, card: Card, wt: Path) -> Outcome:
     raw = f.read_text()
     try:
         verdict, remarks = parse(raw, changed=capped_names(board, wt))
+        edits = _test_edits(card)
+        if edits and not any(e in raw for e in edits):
+            raise ReviewError(f"names none of the test files resolve edited: {edits}")
     except ReviewError as e:
         return Outcome(
             "stopped", f"review: review.md rejected: {e}\n```\n{raw.rstrip()}\n```"
         )
-    warn = cr.record_scores(board.name, card.id, "review", card.pump2, raw)
+    warn = cr.record_scores(
+        board.name, card.id, "review", card.pump2, raw, remarks=remarks
+    )
     res = _judged(board, card, wt, f, verdict, remarks)
+    if res.next == "merge":
+        res.state["test_edits"] = None  # checked
     if warn:
         res.comment += "\n" + warn
     return res
@@ -244,7 +264,7 @@ def finish(board: Board, card: Card, wt: Path) -> Outcome:
 def _judged(
     board: Board, card: Card, wt: Path, f: Path, verdict: str, remarks: str
 ) -> Outcome:
-    if not cr.frozen(card.pump2):  # a pre-dv-d5aa plan: the old rules
+    if not cr.frozen(card.pump2):  # a pre-criteria plan: the old rules
         return _legacy(card, f, verdict, remarks)
     plan = wt / ".pump" / "plan.md"
     sha = cr.criteria_sha(plan.read_text()) if plan.exists() else ""

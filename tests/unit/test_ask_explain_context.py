@@ -582,7 +582,8 @@ def test_policy_ask_endpoint_forwards_only_known_capped_context_keys() -> None:
         },
         headers=AUTH,
     )
-    assert response.status_code == 200 and response.json() == {"approved": False}
+    assert response.status_code == 200
+    assert response.json() == {"approved": False, "timed_out": False}
     context = manager.request.await_args.kwargs["context"]
     assert isinstance(context, AskContext)
     assert (context.profile, context.job, context.task_id, context.stage) == (

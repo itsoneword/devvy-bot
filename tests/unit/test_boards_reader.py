@@ -111,3 +111,23 @@ def test_board_of_profile_missing_or_broken_file(tmp_path):
     assert board_of_profile("app", bad) is None
     bad.write_text("{nope")
     assert board_of_profile("app", bad) is None
+
+
+def test_job_label_adds_card_title_shell_safe(tmp_path: Path) -> None:
+    from src.utils.boards import card_title, job_label
+
+    cards = tmp_path / "gb" / ".deviz" / "tasks"
+    cards.mkdir(parents=True)
+    (cards / "gb-8a80.md").write_text(
+        '---\nid: gb-8a80\ntitle: "Kit `x` $HOME \\"q\\" components"\n---\n'
+    )
+    cfg = tmp_path / "boards.json"
+    cfg.write_text(
+        json.dumps(
+            {"boards": [{"name": "gb", "repo": str(tmp_path), "cards_dir": str(cards)}]}
+        )
+    )
+    assert card_title("pump2-build-gb-8a80", cfg) == "Kit x HOME q components"
+    assert job_label("pump2-build-gb-8a80", cfg).startswith("pump2-build-gb-8a80 — Kit")
+    assert job_label("flux-best-elements", cfg) == "flux-best-elements"
+    assert job_label("pump2-build-gb-0000", cfg) == "pump2-build-gb-0000"

@@ -345,6 +345,22 @@ class TestMediaUploadDir:
         upload = orchestrator._media_upload_dir(context, GUEST_ID)
         assert upload == roots["chef"] / "guests" / str(GUEST_ID) / "uploads"
 
+    def test_topic_document_lands_in_the_topic_profile(
+        self, orchestrator, registry, roots, monkeypatch
+    ):
+        """12.11.26: a PDF sent in the coach topic was saved under the active
+        profile (devops), so the coach turn could not read it."""
+        context = _context("owner", registry, {"active_profile": "devops"})
+        monkeypatch.setattr(
+            orchestrator,
+            "_topic_working_dir",
+            lambda ctx, slug, role, uid: roots["chef"],
+        )
+        saved = orchestrator._save_uploaded_document(
+            context, OWNER_ID, "x.pdf", b"%PDF", "chef"
+        )
+        assert saved == roots["chef"] / "users" / str(OWNER_ID) / "uploads" / "x.pdf"
+
     def test_owner_and_guest_uploads_are_disjoint(self, orchestrator, registry, roots):
         owner_ctx = _context("owner", registry, {"active_profile": "chef"})
         guest_ctx = _context("guest", registry, {"active_profile": "chef"})

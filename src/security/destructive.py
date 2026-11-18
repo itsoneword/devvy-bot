@@ -46,7 +46,7 @@ import shlex
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Set, Tuple
 
 from ..storage.board_policy import privileged_merge_reason
 from .denylist import STREAM_PSEUDO_FILES
@@ -105,7 +105,7 @@ _SYSTEM_PREFIXES = (
 )
 
 # (compiled pattern, human reason). Order doesn't matter; first match wins.
-# Matched against commands, not literal text (``_command_rule_reason``).
+# Matched against commands, not literal text (``_command_rule_reasons``).
 _BASH_RULES: List[Tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bdd\b[^|]*\bof="), "raw disk write (dd)"),
     (re.compile(r"\bmkfs\b"), "filesystem format (mkfs)"),
@@ -124,7 +124,11 @@ _BASH_RULES: List[Tuple[re.Pattern[str], str]] = [
         re.compile(r"\bsystemctl\s+(stop|restart|disable|mask|kill)\b"),
         "service control (systemctl)",
     ),
-    (re.compile(r"\b(kill|pkill|killall)\b"), "process termination (kill/pkill)"),
+    # `kill -0 PID` only probes that the process exists (dv-3d18).
+    (
+        re.compile(r"\b(?!kill\s+-0(?:\s|$))(kill|pkill|killall)\b"),
+        "process termination (kill/pkill)",
+    ),
     (re.compile(r"\bmv\s+[^\n]+\s+/dev/null\b"), "move to /dev/null (data loss)"),
 ]
 
@@ -827,20 +831,21 @@ def _blank(text: str) -> str:
     return re.sub(r"[^\n]", " ", text)
 
 
-def _command_rule_reason(walked: List[Tuple[List[str], str]]) -> Optional[str]:
-    """First ``_BASH_RULES`` hit on a command a shell runs (not on literal text)."""
+def _command_rule_reasons(walked: List[Tuple[List[str], str]]) -> Iterator[str]:
+    """Every ``_BASH_RULES`` hit on a command a shell runs, in rule order."""
     for original_argv, masked in walked:
         if original_argv and original_argv[0] == _UNKNOWN_SHELL_INPUT:
-            return "unresolved script input to shell"
+            yield "unresolved script input to shell"
+            continue
         if _docker_removal(original_argv):
-            return "docker resource removal (docker rm/prune)"
+            yield "docker resource removal (docker rm/prune)"
         try:
             shlex.split(masked)
         except ValueError:
             # an unterminated quote masks nothing: search it all (fail-safe)
             for pattern, reason in _BASH_RULES:
                 if pattern.search(masked):
-                    return reason
+                    yield reason
             continue
         # `env -S 'cmd args'` splits its quoted value into executable words.
         # The normal literal mask hides that value, so use the parsed argv.
@@ -854,8 +859,7 @@ def _command_rule_reason(walked: List[Tuple[List[str], str]]) -> Optional[str]:
         line = " ".join([os.path.basename(argv[0]), *argv[1:]])
         for pattern, reason in _BASH_RULES:
             if pattern.match(line):
-                return reason
-    return None
+                yield reason
 
 
 def _docker_removal(argv: List[str]) -> bool:
@@ -1358,6 +1362,23 @@ def _expand(target: str, variables: Dict[str, str]) -> str:
     return value + rest
 
 
+def _inherited_variables() -> Dict[str, str]:
+    """Variables the shell is known to start with: the job's own ``TMPDIR``.
+
+    bgjob gives each job a private TMPDIR (``scripts/bgjob``) and the shell
+    inherits it from this process, so ``$TMPDIR/x`` is a temp path (dv-3d18).
+    Only when it is set and is the temp dir Python uses here; unset, the
+    shell reads ``$TMPDIR/x`` as ``/x``.
+    """
+    value = os.environ.get("TMPDIR")
+    if not value or not os.path.isabs(value):
+        return {}
+    value = os.path.normpath(value)
+    if value != os.path.normpath(tempfile.gettempdir()):
+        return {}
+    return {"TMPDIR": value}
+
+
 def _mktemp_assignment(item: List[_Segment]) -> Optional[str]:
     """``NAME`` of ``NAME=$(mktemp ...)`` (a path in a temp dir), else None."""
     name: Optional[str] = None
@@ -1435,7 +1456,7 @@ def _deletion_reason(
     start: Optional[str] = str(cwd)
     if not ordered and moves:
         start = None
-    ways: Set[_Way] = {(start, True, frozenset())}
+    ways: Set[_Way] = {(start, True, frozenset(_inherited_variables().items()))}
     history_ok = True  # every command so far is a companion
     followed = False  # a `cd` moved the shell away from the turn's cwd
     reason: Optional[str] = None
@@ -1475,9 +1496,10 @@ def _deletion_reason(
                     words = []
                 for word in words:
                     key, _, value = word.partition("=")
-                    if _ENV_ASSIGNMENT.match(word) and not any(
-                        ch in value for ch in "$`"
-                    ):
+                    if not _ENV_ASSIGNMENT.match(word):
+                        continue
+                    value = _expand(value, variables)
+                    if not any(ch in value for ch in "$`"):
                         variables[key] = value
         for run in by_item.get(index, []):
             argv = run.argv
@@ -1682,19 +1704,66 @@ def classify(
     *free_root*: a pump job's own worktree, where deleting needs no owner
     (dv-58db). ``None`` everywhere else.
     """
+    return next(_reasons(tool_name, tool_input, working_directory, free_root), None)
+
+
+def classify_all(
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    working_directory: Path,
+    free_root: Optional[Path] = None,
+) -> List[str]:
+    """Every reason the op matches, highest priority first (``classify`` is
+    the first). The ask tier needs all of them (dv-3d18): an owner-grade
+    step must never ride on a low-stakes one."""
+    return list(_reasons(tool_name, tool_input, working_directory, free_root))
+
+
+# Ask tiers (dv-3d18). A job's ask whose every reason is in FAST_REASONS is
+# denied after ``job_fast_ask_timeout_seconds`` when nobody answers; any
+# other ask waits for the owner (``ASK_TIMEOUT_SECONDS``). The list is the one
+# the owner accepted on 31.10; deletion outside the tree, egress, push,
+# merge, money, systemctl and SQL stay owner tier.
+FAST_TIER = "fast"
+OWNER_TIER = "owner"
+FAST_REASONS: FrozenSet[str] = frozenset(
+    {
+        "process termination (kill/pkill)",
+        "docker resource removal (docker rm/prune)",
+        "recursive permission change (chmod -R)",
+        "recursive ownership change (chown -R)",
+        "file truncation (truncate)",
+        "git clean -f (deletes untracked files)",
+        "git reset --hard",
+    }
+)
+
+
+def ask_tier(reasons: List[str]) -> str:
+    """``fast`` only when every reason is low-stakes; else ``owner``."""
+    if reasons and all(reason in FAST_REASONS for reason in reasons):
+        return FAST_TIER
+    return OWNER_TIER
+
+
+def _reasons(
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    working_directory: Path,
+    free_root: Optional[Path],
+) -> Iterator[str]:
+    """Every ask reason, in the priority order ``classify`` reports."""
     if tool_name in _BASH_TOOLS:
         command = tool_input.get("command", "") or ""
         walked = _walk(command)
         commands = [argv for argv, _ in walked]
-        rule_reason = _command_rule_reason(walked)
-        if rule_reason:
-            return rule_reason
+        yield from _command_rule_reasons(walked)
         for pattern, reason in _LITERAL_RULES:
             if pattern.search(command):
-                return reason
+                yield reason
         money_reason = _money_script_reason(command)
         if money_reason:
-            return money_reason
+            yield money_reason
         # dv-535b: a pump branch an agent-filed task built over privileged
         # paths (sandbox, security, tool rights, ...) is merged only after an
         # explicit owner OK. The pump marks it; this is the button. Checked
@@ -1703,16 +1772,16 @@ def classify(
         for argv in commands:
             merge_reason = privileged_merge_reason(" ".join(argv), working_directory)
             if merge_reason:
-                return merge_reason
+                yield merge_reason
         deletion = _deletion_reason(command, working_directory, free_root)
-        parsed_reason = (
-            (None if deletion == RUN_RM_ALONE else deletion)
-            or _egress_reason(commands)
-            or _publish_reason(commands)
-            or _embedded_rm_reason(command)
-        )
-        if parsed_reason:
-            return parsed_reason
+        for parsed_reason in (
+            None if deletion == RUN_RM_ALONE else deletion,
+            _egress_reason(commands),
+            _publish_reason(commands),
+            _embedded_rm_reason(command),
+        ):
+            if parsed_reason:
+                yield parsed_reason
         # Redirect into a system path (e.g. `echo x > /etc/hosts`), in a
         # command a shell runs. Discarding a stream into /dev/null (or the
         # equivalent stdout/stderr/stdin pseudo-files) is exempt — there's
@@ -1723,22 +1792,19 @@ def classify(
                 if _is_safe_redirect_target(path):
                     continue
                 if _under_system_prefix(path):
-                    return f"redirect into system path ({path})"
+                    yield f"redirect into system path ({path})"
         # Lowest priority: any real ask above goes to the owner instead.
-        return deletion
+        if deletion == RUN_RM_ALONE:
+            yield deletion
+        return
 
     if tool_name in _FILE_WRITE_TOOLS:
         path_str = tool_input.get("file_path") or tool_input.get("path")
-        if not path_str:
-            return None
         # Only system/sensitive locations are gated; ordinary cross-directory
         # writes (e.g. the notes vault) run freely, and the security denylist
         # is the backstop for secret files.
-        if _under_system_prefix(str(path_str)):
-            return f"write to system path ({path_str})"
-        return None
-
-    return None
+        if path_str and _under_system_prefix(str(path_str)):
+            yield f"write to system path ({path_str})"
 
 
 # -- exchange_* agent tools (dv-8664) ---------------------------------------
@@ -1811,6 +1877,14 @@ def _split_tool_name(tool_name: str) -> Tuple[Optional[str], str]:
     return None, tool_name
 
 
+def _mcp_args(tool_input: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The tool's own arguments; a harness may wrap MCP arguments."""
+    args: Dict[str, Any] = tool_input or {}
+    if isinstance(args.get("arguments"), dict):
+        args = args["arguments"]
+    return args
+
+
 def exchange_tool_ask(
     tool_name: str, tool_input: Dict[str, Any]
 ) -> Optional[Tuple[str, str]]:
@@ -1821,10 +1895,7 @@ def exchange_tool_ask(
     ours = server in (None, _EXCHANGE_TOOL_SERVER)
     if ours and name in EXCHANGE_READ_ONLY_TOOLS:
         return None
-    args: Dict[str, Any] = tool_input or {}
-    # A harness may wrap MCP arguments; judge the arguments themselves.
-    if isinstance(args.get("arguments"), dict):
-        args = args["arguments"]
+    args = _mcp_args(tool_input)
     if ours and name in EXCHANGE_DRY_RUN_TOOLS and args.get("dry_run") is True:
         return None
     action = name[len(EXCHANGE_TOOL_PREFIX) :].replace("_", " ")
@@ -1842,3 +1913,74 @@ def exchange_tool_ask(
     known = set(_EXCHANGE_PREVIEW_KEYS) | {"dry_run"}
     lines += [f"{key}: {args[key]}" for key in sorted(args) if key not in known]
     return reason, "\n".join([tool_name, *lines])
+
+
+# -- webform_* agent tools (dv-5a25) ----------------------------------------
+#
+# webform_fill drives a form up to (not including) Submit; webform_submit
+# files it, which cannot be undone. Same default-deny shape as the exchange
+# tools: every ``webform_`` tool asks on every profile unless listed here as
+# free, and a same-named tool on another MCP server always asks.
+
+WEBFORM_TOOL_PREFIX = "webform_"
+WEBFORM_FREE_TOOLS: "frozenset[str]" = frozenset({"webform_fill"})
+
+
+def _preview_value(value: Any) -> str:
+    return " ".join(str(value).split())
+
+
+def webform_tool_ask(
+    tool_name: str, tool_input: Dict[str, Any]
+) -> Optional[Tuple[str, str]]:
+    """``(reason, preview)`` when a webform tool call needs the owner, else None.
+
+    The preview names the form, the claimant, every bill (date, amount,
+    currency) and the files, so the owner approves what is filed.
+    """
+    server, name = _split_tool_name(tool_name or "")
+    if not name.startswith(WEBFORM_TOOL_PREFIX):
+        return None
+    ours = server in (None, _EXCHANGE_TOOL_SERVER)
+    if ours and name in WEBFORM_FREE_TOOLS:
+        return None
+    args = _mcp_args(tool_input)
+    form = str(args.get("form") or "?")
+    data = args.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    action = name[len(WEBFORM_TOOL_PREFIX) :].replace("_", " ")
+    claimant = _preview_value(data.get("name") or "")
+    reason = f"web form: {action} {form}" + (f" for {claimant}" if claimant else "")
+    lines = [tool_name, f"form: {form}"]
+    for key in ("name", "policy", "member", "symptoms_from", "diagnosis"):
+        if data.get(key) not in (None, ""):
+            lines.append(f"{key}: {_preview_value(data[key])}")
+    bills = data.get("bills")
+    if isinstance(bills, list):
+        for i, bill in enumerate(bills, start=1):
+            if not isinstance(bill, dict):
+                continue
+            parts = [
+                _preview_value(bill[k])
+                for k in ("date", "currency", "amount", "invoice")
+                if bill.get(k) not in (None, "")
+            ]
+            lines.append(f"bill {i}: " + " ".join(parts))
+    payout = data.get("payout")
+    if isinstance(payout, dict) and payout.get("last4"):
+        lines.append(f"payout: bank account ...{_preview_value(payout['last4'])}")
+    files = data.get("files")
+    if isinstance(files, list):
+        names = [Path(str(f)).name for f in files]
+        lines.append("files: " + (", ".join(names) if names else "none"))
+    return reason, "\n".join(lines)
+
+
+def named_tool_ask(
+    tool_name: str, tool_input: Dict[str, Any]
+) -> Optional[Tuple[str, str]]:
+    """The bot's own named tools that ask on every profile (money, filings)."""
+    return exchange_tool_ask(tool_name, tool_input) or webform_tool_ask(
+        tool_name, tool_input
+    )

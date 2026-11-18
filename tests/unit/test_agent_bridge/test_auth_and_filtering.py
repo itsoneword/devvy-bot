@@ -230,11 +230,16 @@ class TestToolFiltering:
         # export_my_data is not visible; hireli_* need a client + `hireli: true`
         # (tests/unit/test_hireli_tools.py covers their gating); exchange_*
         # likewise (tests/unit/test_exchange_tools.py); onchain_activity is
-        # mounted with the exchange tools, so it is hidden with them.
+        # mounted with the exchange tools, so it is hidden with them; webform_*
+        # need a client + `web_forms` (tests/unit/test_webforms.py); github_*
+        # need the caller's board to set intake.github
+        # (tests/unit/test_pump2/test_pump2_github_intake.py).
         opt_in = {
             n
             for n in exported_tool_names()
-            if n.startswith(("hireli_", "exchange_")) or n == "onchain_activity"
+            # devlog_* need AgentServices.devlog + `publisher: true` (dv-fc9d).
+            if n.startswith(("hireli_", "exchange_", "devlog_", "webform_", "github_"))
+            or n == "onchain_activity"
         }
         # task_done is devops-only (dv-535b): other agents create + comment.
         # restart_bot needs AgentServices.request_restart wired (dv-da50).

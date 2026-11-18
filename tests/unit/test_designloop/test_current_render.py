@@ -3,6 +3,7 @@
 Same fakes as test_steps.py; only the processes are faked, git is real.
 """
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any, List
@@ -147,9 +148,9 @@ async def test_collage_starts_with_the_current_dark_tile(repo, tmp_path):
         for n in (1, 2)
     ]
     await s.collage(variants)
-    cmd = cmds[0]
-    tiles = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tile"]
-    labels = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--label"]
-    assert tiles[0] == str(s.out / "current" / "main-dark.png")
-    assert labels[:3] == ["0. current", "1. t1", "2. t2"]
-    assert len(tiles) == 3
+    spec = json.loads((s.out / "review-spec.json").read_text(encoding="utf-8"))
+    current, grid = spec["sections"]
+    assert current["items"][0]["image"] == str(s.out / "current" / "main-dark.png")
+    assert current["numbered"] is False  # the pick numbers are the variants'
+    assert [i["caption"] for i in grid["items"]] == ["t1", "t2"]
+    assert len(cmds) == 1

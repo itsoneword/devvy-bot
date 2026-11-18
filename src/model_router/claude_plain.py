@@ -8,9 +8,10 @@ servers, no slash commands. These callers send a prompt and read text back.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from datetime import UTC, datetime
-from typing import Any, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -28,8 +29,34 @@ from .types import (
     CallResult,
     ModelCallError,
     ModelCallTimeout,
-    refuse_images,
+    read_images,
+    refuse_image_output,
 )
+
+
+def image_blocks(request: CallRequest) -> List[Dict[str, Any]]:
+    """``request.images`` as base64 image blocks, in the given order
+    (:func:`read_images`: a bad file raises before any call)."""
+    return [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media,
+                "data": base64.b64encode(data).decode("ascii"),
+            },
+        }
+        for media, data in read_images(request)
+    ]
+
+
+async def _one_message(content: List[Dict[str, Any]]) -> AsyncIterator[Dict[str, Any]]:
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "parent_tool_use_id": None,
+        "session_id": "default",
+    }
 
 
 def lean_options(
@@ -62,7 +89,10 @@ class ClaudePlainCaller:
         self._cli_path = cli_path
 
     async def __call__(self, request: CallRequest) -> CallResult:
-        refuse_images(request, CLAUDE_HARNESS)
+        refuse_image_output(request, CLAUDE_HARNESS)
+        # Images first, then the prompt, in one user message; a call without
+        # images keeps the plain string query (dv-a5aa).
+        blocks = image_blocks(request) if request.images else []
         client = ClaudeSDKClient(lean_options(request, self._cli_path))
         messages: List[Any] = []
 
@@ -75,7 +105,11 @@ class ClaudePlainCaller:
             latest: Optional[Tuple[Any, datetime]] = None
             try:
                 await client.connect()
-                await client.query(request.prompt)
+                if blocks:
+                    content = [*blocks, {"type": "text", "text": request.prompt}]
+                    await client.query(_one_message(content))
+                else:
+                    await client.query(request.prompt)
                 async for message in client.receive_response():
                     messages.append(message)
                     if isinstance(message, RateLimitEvent):

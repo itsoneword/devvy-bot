@@ -208,8 +208,8 @@ def record(limit: Limit, source: str) -> None:
 
     try:
         update_record(change)
-    except OSError:
-        pass
+    except OSError as exc:  # a read-only box (dv-00ef): one short line
+        logger.warning("limit not recorded", provider=provider, error=str(exc))
 
 
 def active(
@@ -273,8 +273,8 @@ def notify_once(limit: Limit, profile: str, deliver: Callable[[], bool]) -> bool
 
     try:
         update_record(change)
-    except OSError:
-        logger.warning("limit notice not claimed", key=key, exc_info=True)
+    except OSError as exc:
+        logger.warning("limit notice not claimed", key=key, error=str(exc))
     return sent
 
 
@@ -554,8 +554,8 @@ def record_usage(
 
     try:
         update_record(change)
-    except OSError:
-        logger.warning("claude usage not recorded", source=source, exc_info=True)
+    except OSError as exc:  # a read-only box (dv-00ef): no traceback
+        logger.warning("claude usage not recorded", source=source, error=str(exc))
 
 
 def record_usage_soon(

@@ -392,7 +392,8 @@ class TestTaskBoard:
             )
         task = await board.get_task(created["task_id"])
         assert task is not None
-        assert task.created_by == "coach"
+        # authors are <install>/<profile> since dv-33c8; the profile is the turn's
+        assert task.created_by.rpartition("/")[2] == "coach"
         assert task.labels == ["coach"]
 
     async def test_task_done_is_refused_for_a_non_devops_agent(

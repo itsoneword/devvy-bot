@@ -192,7 +192,7 @@ rows before trusting it).
 | Job | Where | When | Model call |
 |---|---|---|---|
 | Memory evaluator | `src/bot/orchestration/windowing.py` | window roll, token checkpoint, "remember", `/new` — see `configuration.md` § Memory Evaluator | `claude` CLI (`EVALUATOR_MODEL`), codex CLI on the codex backend |
-| Memory consolidation report | `src/main.py` APScheduler | `0 6 * * 1` + debounced pressure-valve runs | `claude` CLI |
+| Memory sweep (`memory-consolidation`) | `src/main.py` APScheduler | `0 3 * * *` (nightly since dv-65dd) + after every window rotation + debounced pressure-valve runs; owner ping only when something closed | `claude` CLI |
 | Fact-quality check | `src/evaluator/fact_quality.py` | `0 7 * * *`, off unless `FACT_QUALITY_CHECK_ENABLED` | `claude` CLI, haiku |
 | Reminders / items | `scheduled_jobs` table, `src/scheduler/` | per row | `deliver=agent`: an agent turn; `message`: none |
 | Pump v2 | user `pump2.timer` → `scripts/pump2 tick` | every 2 min; only boards with `"pump2": true` in `boards.json` (docs/pump.md) | tick: none; spawns stage jobs, then runs `scripts/release tick` (public-release check / reminders, best-effort). Install: `python3 scripts/render_deploy.py && cp deploy/rendered/pump2.{service,timer} ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now pump2.timer` |

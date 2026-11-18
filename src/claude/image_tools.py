@@ -117,7 +117,7 @@ def _roots(services: AgentServices, ctx: TurnContext) -> List[Path]:
     registry = services.profile_registry
     if registry is not None and ctx.working_dir is not None:
         profile = registry.get_by_working_dir(ctx.working_dir)
-        extra = tuple(getattr(profile, "extra_dirs", ()) or ()) if profile else ()
+        extra = tuple(getattr(profile, "image_dirs", ()) or ()) if profile else ()
     return allowed_image_roots(ctx.working_dir, extra)
 
 

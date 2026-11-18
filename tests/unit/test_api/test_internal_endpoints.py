@@ -1,7 +1,7 @@
 """Tests for the agent-facing /internal/* endpoints."""
 
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -308,7 +308,7 @@ class TestInternalTasks:
 
         listed = client.get("/internal/tasks", headers=AUTH)
         assert [t["id"] for t in listed.json()] == [task_id]
-        assert listed.json()[0]["created_by"] == "coach"
+        assert listed.json()[0]["created_by"].endswith("/coach")
 
         done = client.patch(
             f"/internal/tasks/{task_id}", json={"status": "done"}, headers=AUTH
@@ -408,13 +408,15 @@ class TestInternalPolicyAsk:
             headers=AUTH,
         )
 
-        assert response.status_code == 200 and response.json() == {"approved": True}
+        assert response.status_code == 200
+        assert response.json() == {"approved": True, "timed_out": False}
         manager.request.assert_awaited_once_with(
             "rm outside tmp",
             "rm x",
             timeout_seconds=ASK_TIMEOUT_SECONDS,
             source="pump-1",
             context=None,
+            on_timeout=ANY,
         )
 
     def test_ask_without_a_manager_is_denied(self) -> None:
@@ -423,7 +425,10 @@ class TestInternalPolicyAsk:
         response = client.post(
             "/internal/policy/ask", json={"reason": "r"}, headers=AUTH
         )
-        assert response.status_code == 200 and response.json() == {"approved": False}
+        assert response.status_code == 200 and response.json() == {
+            "approved": False,
+            "timed_out": False,
+        }
 
     def test_ask_requires_auth(self) -> None:
         app = create_api_app(EventBus(), make_settings())

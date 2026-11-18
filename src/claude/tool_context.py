@@ -68,6 +68,12 @@ class AgentServices:
     # Optional["ExchangeClient"] (dv-8664): runs the fetchcrypto/fetchmexc
     # scripts for the exchange_* tools. None -> those tools are not mounted.
     exchange: Any = None
+    # Optional["DevlogService"] (dv-fc9d): bot, bot.db path, boards for the
+    # devlog_* tools. None -> those tools are not mounted.
+    devlog: Any = None
+    # Optional["WebformClient"] (dv-5a25): runs the headless-browser form
+    # filler for the webform_* tools. None -> those tools are not mounted.
+    webforms: Any = None
     # IANA zone naive schedule times are interpreted in (dv-ca94). Install-
     # wide today (Settings.user_timezone, default Europe/Lisbon) — there is
     # no per-user timezone yet; that lands with the dv-752a settings menu.
@@ -165,6 +171,11 @@ class ToolSpec:
     handler: ToolHandler
     available: ToolPredicate = always
     group: Optional[str] = None
+
+    @property
+    def input_schema(self) -> Dict[str, Any]:
+        """``schema`` under the MCP name (``inputSchema``)."""
+        return self.schema
 
 
 def sdk_tool(spec: ToolSpec, services: AgentServices, ctx: TurnContext) -> Any:

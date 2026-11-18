@@ -23,6 +23,7 @@ from ..bot.card_buttons import clean_buttons
 from ..config.settings import Settings
 from ..events.bus import EventBus
 from ..events.types import AgentResponseEvent, ScheduledEvent, WebhookEvent
+from ..pump2 import identity
 from ..storage import board_policy
 from ..storage.database import DatabaseManager
 from ..storage.deviz_board import DevizBoard
@@ -89,6 +90,9 @@ class PolicyAskRequest(BaseModel):
     # Untrusted (the job's agent runs beside it): unknown keys are dropped,
     # values capped (AskContext.from_mapping).
     context: Optional[Dict[str, Any]] = None
+    # dv-3d18: ``fast`` = a low-stakes ask, denied after
+    # ``job_fast_ask_timeout_seconds``; anything else waits the full hour.
+    tier: Optional[str] = None
 
 
 class CallbackRequest(BaseModel):
@@ -310,28 +314,45 @@ def create_api_app(
             )
         return profile.working_dir
 
-    def _validated_images(paths: List[str], profile_slug: Optional[str]) -> List[str]:
-        """Keep only paths deliverable for this profile (one validator, dv-f90c)."""
-        if not paths or not profile_registry or not profile_slug:
-            return []
-        profile = profile_registry.get_by_slug(profile_slug)
-        if not profile:
-            return []
+    def _validated_images(
+        paths: List[str], profile_slug: Optional[str]
+    ) -> "tuple[List[str], List[tuple[str, str]]]":
+        """(kept paths, (dropped path, reason) pairs)
+        for this profile (one validator, dv-f90c; reasons dv-d971)."""
+        if not paths:
+            return [], []
         from ..bot.utils.image_extractor import (
             MAX_IMAGES_PER_RESPONSE,
             allowed_image_roots,
-            validate_image_path,
+            check_image_path,
         )
 
-        roots = allowed_image_roots(profile.working_dir, profile.extra_dirs)
+        paths = paths[:MAX_IMAGES_PER_RESPONSE]
+        profile = (
+            profile_registry.get_by_slug(profile_slug)
+            if profile_registry and profile_slug
+            else None
+        )
+        if profile is None:
+            why = f"unknown profile {profile_slug!r}" if profile_slug else "no profile"
+            logger.warning("notify images: unknown profile", profile=profile_slug)
+            return [], [(p, why) for p in paths]
+        roots = allowed_image_roots(profile.working_dir, profile.image_dirs)
         out: List[str] = []
-        for raw in paths[:MAX_IMAGES_PER_RESPONSE]:
-            img = validate_image_path(raw, roots, any_file=False)
+        dropped: List[tuple[str, str]] = []
+        for raw in paths:
+            # A review PDF (dv-f59b design pictures) is a document, not a photo.
+            img, why = check_image_path(
+                raw, roots, any_file=raw.lower().endswith(".pdf")
+            )
             if img is None:
-                logger.warning("notify image rejected", path=raw, profile=profile_slug)
+                logger.warning(
+                    "notify image rejected", path=raw, profile=profile_slug, why=why
+                )
+                dropped.append((raw, why))
                 continue
             out.append(str(img.path))
-        return out
+        return out, dropped
 
     @app.post("/internal/notify")
     async def internal_notify(
@@ -340,7 +361,13 @@ def create_api_app(
     ) -> Dict[str, str]:
         """Send a Telegram message to the user right now."""
         _require_internal_auth(authorization)
-        image_paths = _validated_images(body.images, body.profile)
+        image_paths, dropped = _validated_images(body.images, body.profile)
+        # dv-d971: a dropped picture is named in the text, never lost silently.
+        tick = "`" if body.markdown else ""
+        text = "\n".join(
+            [body.text]
+            + [f"⚠ picture not sent: {tick}{p}{tick} ({why})" for p, why in dropped]
+        )
         deliver_profile = None
         if body.deliver:
             # Never a 4xx: the pump's outbox would retry a rejected card forever.
@@ -355,7 +382,7 @@ def create_api_app(
         event = AgentResponseEvent(
             chat_id=body.chat_id or 0,
             image_paths=image_paths,
-            text=body.text,
+            text=text,
             parse_mode="markdown" if body.markdown else None,
             pin_as=body.pin_as,
             repin=body.repin,
@@ -407,22 +434,31 @@ def create_api_app(
         body: PolicyAskRequest,
         authorization: Optional[str] = Header(None),
     ) -> Dict[str, bool]:
-        """A background job's ask rule: the owner's button, one hour, then deny."""
+        """A background job's ask rule: the owner's button, then deny.
+
+        One hour, or ``job_fast_ask_timeout_seconds`` for a ``fast`` ask
+        (dv-3d18); ``timed_out`` tells the job nobody answered."""
         _require_internal_auth(authorization)
         if confirmation_manager is None:
             logger.warning("policy ask with no confirmation manager -> denied")
-            return {"approved": False}
+            return {"approved": False, "timed_out": False}
         from src.model_router.job import ASK_TIMEOUT_SECONDS
         from src.security.ask_explain import AskContext
+        from src.security.destructive import FAST_TIER
 
+        timeout = ASK_TIMEOUT_SECONDS
+        if body.tier == FAST_TIER:
+            timeout = float(settings.job_fast_ask_timeout_seconds)
+        timed_out: List[bool] = []
         approved = await confirmation_manager.request(
             body.reason,
             body.preview,
-            timeout_seconds=ASK_TIMEOUT_SECONDS,
+            timeout_seconds=timeout,
             source=body.source,
             context=AskContext.from_mapping(body.context),
+            on_timeout=lambda: timed_out.append(True),
         )
-        return {"approved": bool(approved)}
+        return {"approved": bool(approved), "timed_out": bool(timed_out)}
 
     # --- local channel (dv-fe4d): the TUI's inbox and its button taps ------
     # Mounted only on a channel=local install, and authenticated with the
@@ -677,6 +713,17 @@ def create_api_app(
         due_at = body.due_at
         if due_at is not None and due_at.tzinfo is None:
             due_at = due_at.replace(tzinfo=UTC)
+        try:  # dv-33c8: a profile name only; the install part is ours
+            identity.author(body.created_by)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if body.assignee and not identity.valid_assignee(
+            board_policy.base_slug(body.assignee)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="assignee: <install> or <install>/<profile>",
+            )
         if _is_other_profile(body.created_by):
             # dv-535b: a profile filing over HTTP gets the same agent rules
             # as its task_add tool.

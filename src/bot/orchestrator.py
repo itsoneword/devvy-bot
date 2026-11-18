@@ -311,7 +311,7 @@ class MessageOrchestrator(
         app.add_handler(
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_callback),
-                pattern=r"^(cd:|model:|agent:|agents:|auth:|rem:|vset:|onb:|qi:|lim:|limits:|publish:)",
+                pattern=r"^(cd:|model:|agent:|agents:|auth:|rem:|vset:|onb:|qi:|lim:|limits:|publish:|devlog:|mr:)",
             )
         )
 

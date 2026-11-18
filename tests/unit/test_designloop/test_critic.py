@@ -1,5 +1,5 @@
-"""The design critic: Codex, through the model router, with the renders as
-images (dv-9133 phase 2).
+"""The design critic: Claude opus (dv-a5aa; Codex before, dv-9133), through
+the model router, with the renders as images.
 
 Contract (docs/research/dv-9133/analysis.md, phase 2 step 4):
 ``src.designloop.critic.critique(brief, renders, references=()) -> Critique``
@@ -10,7 +10,6 @@ criteria, each ``ok`` | ``fix: <what>``) and ``verdict`` ``ready`` |
 the variant renders. ``Critique.verdict`` / ``Critique.criteria``.
 """
 
-import asyncio
 import inspect
 import json
 from pathlib import Path
@@ -25,7 +24,7 @@ from src.model_router import (
     ModelRouter,
     set_router,
 )
-from src.model_router.codex_plain import CodexPlainCaller
+from src.model_router.claude_plain import ClaudePlainCaller
 from src.model_router.harness import HarnessVersions
 from src.storage.database import DatabaseManager
 from src.storage.model_calls import ModelCallRepository
@@ -37,25 +36,13 @@ class _Versions(HarnessVersions):
         return f"{harness}-9.9"
 
 
-class _NeverClaude:
+class _NeverCodex:
     def __init__(self) -> None:
         self.calls: List[CallRequest] = []
 
     async def __call__(self, request: CallRequest) -> CallResult:
         self.calls.append(request)
-        raise AssertionError("the design critic never runs on Claude")
-
-
-class _FakeProcess:
-    pid = 4242
-    returncode = 0
-
-    def __init__(self) -> None:
-        self.received_input: bytes = b""
-
-    async def communicate(self, input: bytes = b"") -> Any:  # noqa: A002
-        self.received_input = input
-        return b"", b""
+        raise AssertionError("the design critic never runs on Codex")
 
 
 @pytest.fixture
@@ -93,32 +80,54 @@ def _renders(tmp_path: Path) -> List[Path]:
     return out
 
 
-async def test_critic_sends_renders_to_codex_as_images_and_gets_the_fixed_json(
+async def test_critic_sends_renders_to_claude_as_images_and_gets_the_fixed_json(
     app_repo, tmp_path, monkeypatch, db
 ):
-    """End to end down to the `codex exec` argv: every render and every
-    current-screen reference is an `-i` image, the brief goes over stdin,
-    the answer is parsed into 6 criteria + a verdict, one row is recorded."""
+    """End to end down to the SDK client: every render and every
+    current-screen reference is an image block before the brief, the answer
+    is parsed into 6 criteria + a verdict, one row is recorded."""
+    from claude_agent_sdk import ResultMessage
+
     from src.designloop.brief import build_brief
     from src.designloop.critic import critique
+    from src.model_router import claude_plain
 
     captured: Dict[str, Any] = {}
-    process = _FakeProcess()
 
-    async def fake_exec(*args: str, **kwargs: Any) -> _FakeProcess:
-        argv = list(args)
-        captured["argv"] = argv
-        schema = json.loads(Path(argv[argv.index("--output-schema") + 1]).read_text())
-        captured["schema"] = schema
-        answer = conforming(schema, "the filter row crowds the first card")
-        Path(argv[argv.index("-o") + 1]).write_text(json.dumps(answer))
-        return process
+    class _Client:
+        def __init__(self, options: Any) -> None:
+            captured["options"] = options
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    claude = _NeverClaude()
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def query(self, prompt: Any) -> None:
+            captured["messages"] = [m async for m in prompt]
+
+        async def receive_response(self) -> Any:
+            schema = captured["options"].output_format["schema"]
+            captured["schema"] = schema
+            answer = conforming(schema, "the filter row crowds the first card")
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="s",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                result=json.dumps(answer),
+                structured_output=answer,
+            )
+
+    monkeypatch.setattr(claude_plain, "ClaudeSDKClient", _Client)
+    codex = _NeverCodex()
     set_router(
         ModelRouter(
-            plain_callers={"openai_codex": CodexPlainCaller(), "claude": claude},
+            plain_callers={"claude": ClaudePlainCaller(), "openai_codex": codex},
             recorder=ModelCallRepository(db),
             versions=_Versions(),
         )
@@ -128,12 +137,13 @@ async def test_critic_sends_renders_to_codex_as_images_and_gets_the_fixed_json(
 
     result = await _maybe(critique(brief, renders))
 
-    argv = captured["argv"]
-    images = [str(Path(argv[i + 1]).resolve()) for i, t in enumerate(argv) if t == "-i"]
-    for path in list(renders) + [Path(p) for p in brief.refs]:
-        assert str(Path(path).resolve()) in images, path
-    assert argv[-1] == "-"
-    prompt = process.received_input.decode()
+    assert captured["options"].model == "opus"
+    (message,) = captured["messages"]
+    content = message["message"]["content"]
+    images = [c for c in content if c["type"] == "image"]
+    assert len(images) == len(renders) + len(brief.refs)
+    assert content[-1]["type"] == "text"
+    prompt = content[-1]["text"]
     for feature in FEED_FEATURES:
         assert feature in prompt, feature
 
@@ -149,9 +159,9 @@ async def test_critic_sends_renders_to_codex_as_images_and_gets_the_fixed_json(
     assert len(fixes) == 1 and fixes[0].startswith("fix:")
     assert "filter row crowds the first card" in fixes[0]
 
-    assert not claude.calls
+    assert not codex.calls
     (row,) = await _rows(db)
-    assert row["purpose"] == "design_critic" and row["harness"] == "openai_codex"
+    assert row["purpose"] == "design_critic" and row["harness"] == "claude"
     assert row["outcome"] == "ok"
 
 
@@ -159,23 +169,23 @@ async def test_critic_refuses_a_criterion_that_is_neither_ok_nor_fix(
     app_repo, tmp_path
 ):
     """`great!` is not `ok` or `fix: <what>`: the critique is not accepted as
-    is (a vague verdict would reach the owner), and Claude never answers
+    is (a vague verdict would reach the owner), and Codex never answers
     instead."""
     from src.designloop.brief import build_brief
     from src.designloop.critic import critique
 
     calls: List[CallRequest] = []
 
-    async def codex(request: CallRequest) -> CallResult:
+    async def claude(request: CallRequest) -> CallResult:
         calls.append(request)
         answer = conforming(request.json_schema or {}, "x")
         answer["criteria"] = {k: "great!" for k in answer["criteria"]}
         return CallResult(text=json.dumps(answer))
 
-    claude = _NeverClaude()
+    codex = _NeverCodex()
     set_router(
         ModelRouter(
-            plain_callers={"openai_codex": codex, "claude": claude},
+            plain_callers={"claude": claude, "openai_codex": codex},
             versions=_Versions(),
         )
     )
@@ -186,4 +196,4 @@ async def test_critic_refuses_a_criterion_that_is_neither_ok_nor_fix(
 
     assert calls and all(r.purpose == "design_critic" for r in calls)
     assert all(r.images for r in calls)
-    assert not claude.calls
+    assert not codex.calls

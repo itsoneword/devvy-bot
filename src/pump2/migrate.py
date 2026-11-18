@@ -3,8 +3,9 @@ releases 1.5 / 1.6) to pump2. Pure file I/O, safe to rerun.
 
 1. ``config/taskpump/boards.json``: every board gets ``"pump2": true`` and
    loses the keys pump2 does not read (``stages``, ``acceptance``,
-   ``mergecheck``, ``intake``; each one is named in the output). ``publish``
-   stays: ``scripts/release`` reads it.
+   ``mergecheck``; each one is named in the output). ``publish`` stays:
+   ``scripts/release`` reads it; ``intake`` stays: pump2 reads its
+   ``github`` key.
    ``name`` / ``repo`` / ``profile`` / ``test`` stay. The repo's own board,
    built in on the old pump, gets a ``pump2_home`` object. A missing file is
    created. The old content is copied to ``boards.json.bak`` before a change.
@@ -31,9 +32,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from src.utils.boards import tasks_dir
+
 from .state import HOME_BOARD, HOME_REPO
 
-OLD_BOARD_KEYS = ("stages", "acceptance", "mergecheck", "intake")
+OLD_BOARD_KEYS = ("stages", "acceptance", "mergecheck")
 RETIRED_ROUTES = ("pump_architect", "pump_acceptance")
 CLOSED = {"done", "closed", "cancelled", "canceled", "wontfix", "archived"}
 OLD_KEY = re.compile(r"^(pump(?:_[\w-]+)?)\s*:(.*)$")
@@ -89,16 +92,17 @@ def migrate_boards(path: Path) -> tuple[str | None, list[str]]:
 def task_dirs(path: Path) -> list[tuple[str, Path]]:
     """(board name, tasks dir) for the home board and every board in ``path``
     (flag or not: pre-pump2 boards are exactly the ones to migrate)."""
-    out: list[tuple[str, Path]] = [(HOME_BOARD, HOME_REPO / ".deviz" / "tasks")]
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         data = {}
+    home = data.get("pump2_home") if isinstance(data, dict) else None
+    out: list[tuple[str, Path]] = [(HOME_BOARD, tasks_dir(home, HOME_REPO))]
     for b in _entries(data if isinstance(data, dict) else {}):
         if not b.get("repo"):
             continue
         repo = Path(str(b["repo"])).expanduser()
-        out.append((str(b.get("name") or repo.name), repo / ".deviz" / "tasks"))
+        out.append((str(b.get("name") or repo.name), tasks_dir(b, repo)))
     seen: set[Path] = set()
     uniq = []
     for name, d in out:
@@ -156,9 +160,12 @@ def carry_over(old: dict[str, str], full: str) -> str:
     ):
         if v(key):
             rows.append(f"- {label}: {v(key)}")
+    from .identity import author
+    from .state import comment_header
+
     stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     return (
-        f"### @pump2 — {stamp}\n"
+        f"{comment_header(author('pump2'), stamp)}\n"
         "Old pump removed (pump2 migrate); its state on this card, carried over:\n"
         + "\n".join(rows)
         + "\nEarlier answers above stay valid. Not started in pump2: "

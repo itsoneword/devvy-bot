@@ -205,7 +205,7 @@ async def test_job_ask_shows_in_inbox_and_callback_approve_runs_it(db) -> None: 
     )
     assert r.status_code == 200
     await asyncio.wait_for(task, 5)
-    assert result["body"] == {"approved": True}
+    assert result["body"] == {"approved": True, "timed_out": False}
 
 
 async def test_callback_deny_blocks_it(db) -> None:  # type: ignore[no-untyped-def]
@@ -227,7 +227,7 @@ async def test_callback_deny_blocks_it(db) -> None:  # type: ignore[no-untyped-d
         headers=TUI_AUTH,
     )
     await asyncio.wait_for(task, 5)
-    assert result["body"] == {"approved": False}
+    assert result["body"] == {"approved": False, "timed_out": False}
 
 
 async def test_unanswered_ask_is_denied_after_timeout_and_card_edited(
@@ -243,7 +243,7 @@ async def test_unanswered_ask_is_denied_after_timeout_and_card_edited(
             headers=AUTH,
         ).json(),
     )
-    assert body == {"approved": False}
+    assert body == {"approved": False, "timed_out": True}
     rows = _inbox(client)
     assert len(rows) == 1
     assert rows[0]["edited_at"]  # the card was edited in place, not left pending

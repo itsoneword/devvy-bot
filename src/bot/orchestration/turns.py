@@ -10,6 +10,7 @@ import html
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -29,7 +30,7 @@ from telegram.ext import ContextTypes
 from ...profiles.registry import user_media_root
 from ...storage.repositories import MessageRepository
 from ...utils.turn_locks import take_interrupt_note
-from ..telegram_retry import with_telegram_retry
+from ..telegram_retry import is_transient_network_error, with_telegram_retry
 from ..utils.draft_streamer import DraftStreamer, generate_draft_id
 from ..utils.ephemeral_updater import EphemeralUpdater
 from ..utils.formatting import FormattedMessage
@@ -38,9 +39,14 @@ from ..utils.image_extractor import (
     allowed_image_roots,
     should_send_as_photo,
 )
-from .base import OrchestratorBase
 from .callbacks import INTERRUPT_NOTE, interrupt_markup
 from .formatting import image_save_extension
+from .media_jobs import (  # noqa: F401 — media_row_fields re-exported
+    MediaJob,
+    MediaJobsMixin,
+    media_row_fields,
+    store_pending_media,
+)
 from .routing import (
     ProfileAccessDenied,
     apply_route,
@@ -75,10 +81,20 @@ BINARY_DOCUMENT_EXTENSIONS = {
 
 
 def _profile_extra_dirs(context: Any, working_dir: Any) -> Any:
-    """The owning profile's extra_dirs (deliverable image roots, dv-f90c)."""
+    """The owning profile's deliverable image roots beyond its workspace
+    (``image_dirs``: extra_dirs + sandbox_read_dirs, dv-f90c)."""
     registry = context.bot_data.get("profile_registry")
     profile = registry.get_by_working_dir(working_dir) if registry else None
-    return tuple(getattr(profile, "extra_dirs", ()) or ())
+    return tuple(getattr(profile, "image_dirs", ()) or ())
+
+
+def _appended_text(before: List[str], after: List[FormattedMessage]) -> str:
+    """What ``_render_footer`` added to *before* (a suffix or a new message)."""
+    if len(after) > len(before):
+        return "\n\n" + after[-1].text
+    if after and before and after[-1].text.startswith(before[-1]):
+        return after[-1].text[len(before[-1]) :]
+    return ""
 
 
 @dataclass
@@ -210,7 +226,7 @@ def _media_kind(message: Any) -> str:
     return "media"
 
 
-class TurnsMixin(OrchestratorBase):
+class TurnsMixin(MediaJobsMixin):
     """Text/document/photo/voice turn pipelines and their helpers."""
 
     if TYPE_CHECKING:
@@ -258,6 +274,7 @@ class TurnsMixin(OrchestratorBase):
         user_id: int,
         file_name: Optional[str],
         data: bytes,
+        topic_slug: Optional[str] = None,
     ) -> Optional[Path]:
         """Persist a binary upload into the active profile's working dir.
 
@@ -266,7 +283,7 @@ class TurnsMixin(OrchestratorBase):
         the profile directory.
         """
         try:
-            base = self._media_upload_dir(context, user_id)
+            base = self._media_upload_dir(context, user_id, topic_slug)
             base.mkdir(parents=True, exist_ok=True)
             safe = Path(file_name or "upload").name or "upload"
             target = base / safe
@@ -496,6 +513,9 @@ class TurnsMixin(OrchestratorBase):
         logger.info(
             "Agentic text message",
             user_id=user_id,
+            update_id=update.update_id,
+            chat_id=update.effective_chat.id if update.effective_chat else None,
+            message_id=update.message.message_id if update.message else None,
             message_length=len(message_text),
         )
 
@@ -1534,8 +1554,13 @@ class TurnsMixin(OrchestratorBase):
         update: Update,
         formatted_messages: List[FormattedMessage],
         images: List[ImageAttachment],
+        rich_markdown: Optional[str] = None,
     ) -> None:
         """Send the reply: text (+ images), ledgering every outgoing message.
+
+        ``rich_markdown`` (dv-1c98): the reply's original markdown. Sent as one
+        Rich Message when ``ENABLE_RICH_MESSAGES`` is on; any failure falls
+        through to the HTML ``formatted_messages`` below.
 
         Text path (``resilient_send``): HTML send -> plain retry -> failure
         notice. Media path: no fallback (preserved drift) — a send error
@@ -1635,6 +1660,34 @@ class TurnsMixin(OrchestratorBase):
         # Send text messages (skip if caption was already embedded in photos)
         if caption_sent:
             return
+        if (
+            rich_markdown
+            and redirect is None  # a Jobs redirect keeps its HTML quote + pointer
+            and self.settings.enable_rich_messages
+        ):
+            from ..rich_message import try_send_rich
+
+            msg0 = update.message
+            thread = (
+                getattr(msg0, "message_thread_id", None)
+                if getattr(msg0, "is_topic_message", False)
+                else None
+            )
+            rich_sent = await try_send_rich(
+                context.bot,
+                msg0.chat_id,
+                rich_markdown,
+                message_thread_id=thread,
+                reply_to_message_id=msg0.message_id,
+            )
+            if rich_sent is not None:
+                await _ledger_sent(
+                    SimpleNamespace(
+                        message_id=rich_sent.message_id,
+                        chat=SimpleNamespace(id=rich_sent.chat_id),
+                    )
+                )
+                formatted_messages = []
         for i, message in enumerate(formatted_messages):
             if not message.text or not message.text.strip():
                 continue
@@ -1868,6 +1921,7 @@ class TurnsMixin(OrchestratorBase):
         )
 
         success = True
+        rich_markdown: Optional[str] = None
         try:
             # Media always passes images= (even None for doc/voice); text
             # never passes the kwarg at all. The splat keeps each path's
@@ -1934,7 +1988,11 @@ class TurnsMixin(OrchestratorBase):
             formatted_messages = formatter.format_claude_response(
                 claude_response.content
             )
+            before_footer = [m.text for m in formatted_messages]
             self._render_footer(state, claude_response, formatted_messages)
+            rich_markdown = claude_response.content + _appended_text(
+                before_footer, formatted_messages
+            )
 
             # Aborted run: the "response" above is just mid-task narration (no
             # final result exists). Tell the user instead of passing it off as
@@ -1944,6 +2002,7 @@ class TurnsMixin(OrchestratorBase):
                 formatted_messages.append(
                     FormattedMessage(text=notice, parse_mode=None)
                 )
+                rich_markdown += f"\n\n{notice}"
 
         except Exception as e:
             if not request.catch_run_errors:
@@ -1962,6 +2021,7 @@ class TurnsMixin(OrchestratorBase):
             formatted_messages = [
                 FormattedMessage(_format_error_message(e), parse_mode="HTML")
             ]
+            rich_markdown = None  # an error notice stays HTML
         finally:
             heartbeat.cancel()
             # Stop + await the updater BEFORE anything final is sent: no stale
@@ -1984,6 +2044,9 @@ class TurnsMixin(OrchestratorBase):
         except Exception:
             logger.debug("Failed to delete progress message, ignoring")
 
+        if rich_markdown is not None and badge:
+            rich_markdown = f"{badge}\n\n{rich_markdown}"
+
         # Prefix the profile badge onto the first outgoing message (profile mode).
         if badge and formatted_messages and formatted_messages[0].text:
             first = formatted_messages[0]
@@ -1993,7 +2056,9 @@ class TurnsMixin(OrchestratorBase):
             )
 
         # Use MCP-collected images (from send_image_to_user tool calls)
-        await self._deliver_reply(state, update, formatted_messages, mcp_images)
+        await self._deliver_reply(
+            state, update, formatted_messages, mcp_images, rich_markdown=rich_markdown
+        )
 
         # Recipe search-retry (dv-300d / dv-5d5f follow-up): AFTER delivery,
         # so the user sees the original answer first. Only runs when the
@@ -2059,6 +2124,20 @@ class TurnsMixin(OrchestratorBase):
             return
 
         chat = update.message.chat
+        # dv-c977: the row (file_id + update) exists before the first getFile.
+        job = await self._open_media_job(update, context)
+        async with self._media_job_scope(job, context):
+            await self._document_turn(update, context, job, user_id, chat)
+
+    async def _document_turn(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        job: MediaJob,
+        user_id: int,
+        chat: Any,
+    ) -> None:
+        document = update.message.document
         lock, progress_msg, was_queued = await self._begin_media_turn(
             update, user_id, "Working...", context
         )
@@ -2069,34 +2148,34 @@ class TurnsMixin(OrchestratorBase):
                 except Exception:
                     pass
 
-            # Try enhanced file handler, fall back to basic
-            features = context.bot_data.get("features")
-            file_handler = features.get_file_handler() if features else None
-            prompt: Optional[str] = None
-
             # Binary documents (pdf/office/archives) must never be inlined into
             # the prompt as text -- they aren't UTF-8 and the old fallback just
             # bailed with "Must be text-based". Save them to the profile's
             # working dir and hand the agent the PATH so it can open them with
             # the pdf/docx/xlsx skills (or Read) like any other file on disk.
             ext = Path(document.file_name or "").suffix.lower()
-            if ext in BINARY_DOCUMENT_EXTENSIONS:
-                file_handler = None
 
-            if file_handler:
-                try:
-                    processed_file = await file_handler.handle_document_upload(
-                        document,
-                        user_id,
-                        update.message.caption or "Please review this file:",
-                    )
-                    prompt = processed_file.prompt
-                except Exception:
+            async def read_document() -> Tuple[Optional[str], Optional[str]]:
+                """(prompt, error text) -- the download is the media phase."""
+                # Try enhanced file handler, fall back to basic
+                features = context.bot_data.get("features")
+                file_handler = features.get_file_handler() if features else None
+                if ext in BINARY_DOCUMENT_EXTENSIONS:
                     file_handler = None
+                if file_handler:
+                    try:
+                        processed_file = await file_handler.handle_document_upload(
+                            document,
+                            user_id,
+                            update.message.caption or "Please review this file:",
+                        )
+                        return processed_file.prompt, None
+                    except Exception as exc:
+                        if is_transient_network_error(exc):
+                            raise
+                from ..telegram_retry import fetch_media_bytes
 
-            if not file_handler:
-                file = await document.get_file()
-                file_bytes = await file.download_as_bytearray()
+                file_bytes = await fetch_media_bytes(document)
                 caption = update.message.caption or "Please review this file:"
                 content: Optional[str] = None
                 if ext not in BINARY_DOCUMENT_EXTENSIONS:
@@ -2108,26 +2187,33 @@ class TurnsMixin(OrchestratorBase):
                 if content is not None:
                     if len(content) > 50000:
                         content = content[:50000] + "\n... (truncated)"
-                    prompt = (
+                    return (
                         f"{caption}\n\n**File:** `{document.file_name}`\n\n"
                         f"```\n{content}\n```"
-                    )
-                else:
-                    saved = self._save_uploaded_document(
-                        context, user_id, document.file_name, bytes(file_bytes)
-                    )
-                    if saved is None:
-                        await progress_msg.edit_text(
-                            "Could not save the uploaded file."
-                        )
-                        return
-                    prompt = (
-                        f"{caption}\n\n**File saved to:** `{saved}`\n\n"
-                        f"It is a binary document ({ext or 'no extension'}), not "
-                        f"text. Open it from that path with the appropriate "
-                        f"tool/skill rather than expecting its contents inline."
-                    )
+                    ), None
+                saved = self._save_uploaded_document(
+                    context,
+                    user_id,
+                    document.file_name,
+                    bytes(file_bytes),
+                    await self._reports_topic_slug(update, context),
+                )
+                if saved is None:
+                    return None, "Could not save the uploaded file."
+                return (
+                    f"{caption}\n\n**File saved to:** `{saved}`\n\n"
+                    f"It is a binary document ({ext or 'no extension'}), not "
+                    f"text. Open it from that path with the appropriate "
+                    f"tool/skill rather than expecting its contents inline."
+                ), None
 
+            read = await self._media_step(job, progress_msg, context, read_document)
+            if read is None:
+                return  # stopped, or handed to the background retry
+            prompt, error_text = read
+            if error_text:
+                await progress_msg.edit_text(error_text)
+                return
             if not prompt:
                 await progress_msg.edit_text("Could not read the file.")
                 return
@@ -2137,7 +2223,7 @@ class TurnsMixin(OrchestratorBase):
                 await self._run_agentic_media_turn(
                     update=update,
                     context=context,
-                    prompt=prompt,
+                    prompt=self._late_prompt(job, prompt),
                     progress_msg=progress_msg,
                     user_id=user_id,
                     chat=chat,
@@ -2176,16 +2262,44 @@ class TurnsMixin(OrchestratorBase):
             return
 
         # Album (dv-b399): one turn for the whole media group. The first item
-        # is the leader and waits for the rest; the others return here.
+        # is the leader and waits for the rest; the others return here. A
+        # resumed album (dv-c977) carries its items in the stored row.
+        message = update.message
+        self._init_media_state()
+        resumed = self._media_resume.get((message.chat_id, message.message_id))
         album = None
-        if getattr(update.message, "media_group_id", None):
-            album, is_leader = self._albums.join(update)
-            if not is_leader:
-                return
-            await self._albums.collect(album)
-        items = album.items if album is not None else [update]
+        if resumed is not None:
+            items = resumed.items or [update]
+            captions = [i.message.caption for i in items if i.message.caption]
+        else:
+            if getattr(message, "media_group_id", None):
+                album, is_leader = self._albums.join(update)
+                if not is_leader:
+                    return
+                await self._albums.collect(album)
+            items = album.items if album is not None else [update]
+            captions = album.captions() if album is not None else []
 
         chat = update.message.chat
+        job = await self._open_media_job(
+            update, context, items=items if len(items) > 1 else None
+        )
+        async with self._media_job_scope(job, context):
+            await self._photo_turn(
+                update, context, job, user_id, chat, image_handler, items, captions
+            )
+
+    async def _photo_turn(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        job: MediaJob,
+        user_id: int,
+        chat: Any,
+        image_handler: Any,
+        items: List[Any],
+        captions: List[str],
+    ) -> None:
         lock, progress_msg, was_queued = await self._begin_media_turn(
             update, user_id, "Working...", context
         )
@@ -2207,20 +2321,29 @@ class TurnsMixin(OrchestratorBase):
                     user_id,
                     await self._reports_topic_slug(update, context),
                 )
-                paths: List[Path] = []
-                for item in items:
-                    processed_image = await image_handler.process_image(
-                        item.message.photo[-1], None
-                    )
-                    paths.append(
-                        save_image_bytes(
-                            base64.b64decode(processed_image.base64_data),
-                            image_save_extension(processed_image),
-                            upload_dir,
+
+                async def download_all() -> List[Path]:
+                    # One album = one row: a timed-out item defers the whole
+                    # album, which then runs as one turn (C12).
+                    paths: List[Path] = []
+                    for item in items:
+                        processed_image = await image_handler.process_image(
+                            item.message.photo[-1], None
                         )
-                    )
-                if album is not None:
-                    caption = "\n\n".join(album.captions()) or None
+                        paths.append(
+                            save_image_bytes(
+                                base64.b64decode(processed_image.base64_data),
+                                image_save_extension(processed_image),
+                                upload_dir,
+                            )
+                        )
+                    return paths
+
+                paths = await self._media_step(job, progress_msg, context, download_all)
+                if paths is None:
+                    return  # stopped, or handed to the background retry
+                if len(items) > 1:
+                    caption = "\n\n".join(captions) or None
                 else:
                     caption = update.message.caption
                 if len(paths) > 1:
@@ -2231,7 +2354,7 @@ class TurnsMixin(OrchestratorBase):
                 await self._run_agentic_media_turn(
                     update=update,
                     context=context,
-                    prompt=prompt,
+                    prompt=self._late_prompt(job, prompt),
                     progress_msg=progress_msg,
                     user_id=user_id,
                     chat=chat,
@@ -2251,7 +2374,8 @@ class TurnsMixin(OrchestratorBase):
     async def agentic_voice(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Transcribe voice message -> Claude, minimal chrome."""
+        """Transcribe voice message -> Claude, minimal chrome. A forwarded
+        voice takes the same path (the owner's workaround, dv-c977)."""
         user_id = update.effective_user.id
 
         features = context.bot_data.get("features")
@@ -2262,6 +2386,19 @@ class TurnsMixin(OrchestratorBase):
             return
 
         chat = update.message.chat
+        job = await self._open_media_job(update, context)
+        async with self._media_job_scope(job, context):
+            await self._voice_turn(update, context, job, user_id, chat, voice_handler)
+
+    async def _voice_turn(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        job: MediaJob,
+        user_id: int,
+        chat: Any,
+        voice_handler: Any,
+    ) -> None:
         lock, progress_msg, was_queued = await self._begin_media_turn(
             update, user_id, "Transcribing...", context
         )
@@ -2273,9 +2410,16 @@ class TurnsMixin(OrchestratorBase):
                     pass
             try:
                 voice = update.message.voice
-                processed_voice = await voice_handler.process_voice_message(
-                    voice, update.message.caption
+                processed_voice = await self._media_step(
+                    job,
+                    progress_msg,
+                    context,
+                    lambda: voice_handler.process_voice_message(
+                        voice, update.message.caption
+                    ),
                 )
+                if processed_voice is None:
+                    return  # stopped, or handed to the background retry
 
                 from . import next_input
 
@@ -2297,7 +2441,7 @@ class TurnsMixin(OrchestratorBase):
                 await self._run_agentic_media_turn(
                     update=update,
                     context=context,
-                    prompt=processed_voice.prompt,
+                    prompt=self._late_prompt(job, processed_voice.prompt),
                     progress_msg=progress_msg,
                     user_id=user_id,
                     chat=chat,

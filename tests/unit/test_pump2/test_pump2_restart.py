@@ -37,13 +37,13 @@ def test_C1_start_restarts_stopped_card_at_its_stage(repo: Path) -> None:
     p = repo / TASKS / "dv-0001.md"
     set_pump2(p, stage="stopped", stopped_at="build", job="j1", job_of="build", retry=1)
     p.write_text(p.read_text().replace("status: in_progress", "status: blocked"))
-    assert restart(repo, "gymbro") == 0
+    assert restart(repo, "acme") == 0
     c = card_of(repo)
     assert c.pump2["stage"] == "build"
     for k in ("job", "job_of", "retry"):
         assert k not in c.pump2
     assert "status: in_progress" in p.read_text()
-    assert "restarted by gymbro at build" in c.body
+    assert "restarted by acme at build" in c.body
 
 
 def test_C1_start_still_refuses_live_and_done_cards(
@@ -84,7 +84,7 @@ def test_C1_red_build_stop_writes_stopped_at(repo: Path, tmp_path: Path) -> None
         ("tests: BLOCK criteria with check: test have no test named C1", "tests"),
         ("review: returned", "review"),
         ("merge: conflict", "merge"),
-        ("mergefix: gave up", "mergefix"),
+        ("resolve: continue merge", "resolve"),
         ("analyze: plan rejected", "analyze"),
         ("something unprefixed", "analyze"),
     ],
@@ -101,21 +101,18 @@ def test_C2_legacy_stopped_card_restarts_at_comment_prefix(
     assert card_of(repo).pump2["stage"] == want
 
 
-def test_C3_first_red_build_reruns_with_failing_list(
+def test_C3_first_red_build_goes_to_resolve_with_failing_list(
     repo: Path, tmp_path: Path
 ) -> None:
     b, f, wt = built(repo, tmp_path, "true", script(tmp_path, "py", RED))
     put(wt, "feature.py")
     n = len(f.launched)
-    f.tick(b, tmp_path)  # gate red
-    assert stage_of(b) == "build"
-    assert find_card(b, "dv-0001").pump2["build_red"] == 1
-    f.tick(b, tmp_path)  # rerun launched
-    assert len(f.launched) == n + 1 and f.launched[-1][1] == "build"
+    f.tick(b, tmp_path)  # gate red: dv-b8bb, resolve instead of a blind rerun
+    assert stage_of(b) == "resolve"
+    assert find_card(b, "dv-0001").pump2["resolve_from"] == "build"
+    f.tick(b, tmp_path)  # resolve launched
+    assert len(f.launched) == n + 1 and f.launched[-1][1] == "resolve"
     assert "tests/test_new.py::test_a" in f.launched[-1][3]
-    assert "build-tests.log" not in body(b) or True
-    f.tick(b, tmp_path)  # second red
-    assert stage_of(b) == "stopped"
 
 
 def test_C3_manual_restart_prompt_lists_failing_tests(
@@ -123,22 +120,21 @@ def test_C3_manual_restart_prompt_lists_failing_tests(
 ) -> None:
     b, f, wt = built(repo, tmp_path, "true", script(tmp_path, "py", RED))
     put(wt, "feature.py")
-    for _ in range(3):
-        f.tick(b, tmp_path)
-    assert stage_of(b) == "stopped"
+    set_pump2(repo / TASKS / "dv-0001.md", resolves=2)  # the budget is spent
+    f.tick(b, tmp_path)
+    assert stage_of(b) == "stopped" and "tests/test_new.py::test_a" in body(b)
     assert cli._start({"t": b}, "t:dv-0001", "devops") == 0
     assert stage_of(b) == "build"
     f.tick(b, tmp_path)
     assert f.launched[-1][1] == "build"
-    assert "tests/test_new.py::test_a" in f.launched[-1][3]
-    f.tick(b, tmp_path)  # red again: the restart got its own fix round
-    assert stage_of(b) == "build"
+    f.tick(b, tmp_path)  # red again: the restart got a fresh resolve budget
+    assert stage_of(b) == "resolve"
 
 
 def test_C4_job_start_pump_ids_registered() -> None:
     from src.claude.agent_tools import valid_task_id
 
-    for ok in ("gb-1af9", "gymbro:gb-1af9", "dv-dfb1", "pl:dv-0a1b2c"):
+    for ok in ("gb-1af9", "acme:gb-1af9", "dv-dfb1", "app:dv-0a1b2c"):
         assert valid_task_id(ok), ok
     for bad in (
         "",
@@ -147,7 +143,7 @@ def test_C4_job_start_pump_ids_registered() -> None:
         "../dv-dfb1",
         "gb-",
         "gb-1af9 --by x",
-        "gymbro:../gb-1af9",
+        "acme:../gb-1af9",
     ):
         assert not valid_task_id(bad), bad
 
@@ -174,7 +170,7 @@ def test_C6_missing_block_test_gets_one_rerun(repo: Path, tmp_path: Path) -> Non
     assert len(f.launched) == n + 1 and f.launched[-1][1] == "tests"
     assert "test_<id>" in f.launched[-1][3] or "C1" in f.launched[-1][3]
     f.tick(b, tmp_path)
-    assert stage_of(b) == "stopped"
+    assert stage_of(b) == "resolve"
 
 
 def test_C7_restart_at_job_ceiling_is_refused(

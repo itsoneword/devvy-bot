@@ -1,4 +1,4 @@
-"""The per-board "clean in a row" series (dv-8c35), from card files + git.
+"""The per-board "clean in a row" series, from card files + git.
 
 A card counts when pump2 merged it (``merge: merged <sha> into``) at or after
 ``SERIES_START``. It is clean when every comment between its first pump2
@@ -17,13 +17,13 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from .state import Board, Card
+from .state import COMMENT_HEAD, Board, Card, comment_profile
 
 SERIES_START = datetime(2026, 11, 8, 10, 0, tzinfo=UTC)
 NORMAL_AUTHORS = ("pump2", "owner")
 
 # `### @builder — 2026-11-07T18:49Z`, `### @devops merge — 2026-...`
-_HEAD = re.compile(r"^### @(\S+)(?: [^\n—]*)? — (\S+).*$", re.M)
+_HEAD = COMMENT_HEAD
 _START = re.compile(r"\bstarted by\b|picked up from in_progress")
 _RESTART = re.compile(r"restarted by \S+(?: at \S+)?")
 _MERGED = re.compile(r"^merge: merged ([0-9a-f]{7,40}) into", re.M)
@@ -55,7 +55,11 @@ def comments(card: Card) -> list[Comment]:
     for i, h in enumerate(heads):
         end = heads[i + 1].start() if i + 1 < len(heads) else len(card.body)
         out.append(
-            Comment(h.group(1), parse_time(h.group(2)), card.body[h.end() : end])
+            Comment(
+                comment_profile(h.group(1)),
+                parse_time(h.group(2)),
+                card.body[h.end() : end],
+            )
         )
     return out
 

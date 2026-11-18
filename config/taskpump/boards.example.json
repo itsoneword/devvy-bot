@@ -1,11 +1,28 @@
 {
   "_comment": [
     "Boards the pump serves; copy to boards.json and edit by hand.",
-    "Each board needs name, repo (the repo top level, with .deviz/tasks/),",
+    "Each board needs name, repo (the repo top level; cards in .deviz/tasks/ or cards_dir),",
     "\"pump2\": true (boards without it are skipped) and a test command",
     "(pump2_test, or test): merge and pump2 doctor refuse a board without one.",
-    "Every other key is optional; the full table is in docs/pump.md."
+    "Every other key is optional; the full table is in docs/pump.md.",
+    "me: this install's name on shared boards: authors are stamped",
+    "<me>/<profile>, the pump takes only cards assigned to this install (or",
+    "unassigned); unset = single-install mode, every card is taken.",
+    "me_aliases: bare assignee names that also mean this install (legacy",
+    "names that are not profiles, e.g. user, owner, claude).",
+    "design.kit: optional list of up to 6 UI kit images in the board repo,",
+    "attached first to the design critic and named to the designer (docs/pump-v2.md).",
+    "design.components: optional list of up to 12 paths / globs of kit component files;",
+    "the builder prompt lists their exported components, read from the code.",
+    "design.style_spec / design.mockups / design.threshold: optional mockup mode.",
+    "style_spec: the board's style spec YAML (approved via pump2 design spec seed|approve);",
+    "mockups: {preset: best|quality|fast, count: 3..4} turns on step 0 (free FLUX mockups,",
+    "key-store service flux); threshold 5..9 (default 7): the lowest dimension a ready render needs.",
+    "Example design block: {\"render\": [...], \"gate\": [...], \"python\": \"...\",",
+    "\"style_spec\": \"docs/style-spec.yaml\", \"mockups\": {\"preset\": \"best\", \"count\": 4}, \"threshold\": 7}"
   ],
+  "me": "myname-laptop",
+  "me_aliases": ["user", "owner"],
   "boards": [
     {
       "name": "myapp",

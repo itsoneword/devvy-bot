@@ -106,7 +106,8 @@ async def test_limits_command_reads_provider_state_without_a_model_turn(monkeypa
         user_data={},
     )
 
-    await InfoCommandsMixin.agentic_limits(object(), update, context)
+    stub = SimpleNamespace(settings=SimpleNamespace())
+    await InfoCommandsMixin.agentic_limits(stub, update, context)
 
     backend.read_account_limits.assert_awaited_once_with()
     sent = update.message.reply_text.await_args.args[0]

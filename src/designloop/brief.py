@@ -26,6 +26,7 @@ PASSPORTS_PATH = "docs/SCREENS.md"
 REFS_DIR = "docs/screens"
 GUIDE_PATH = "docs/UI_GUIDE.md"
 THEMES = ("dark", "light")
+INSTRUCTIONS_MAX = 4000  # chars of card comments in a brief, newest kept
 
 # The designer audit's biggest lever: Who needs a feature, how
 # often, and how much of the screen it deserves decide its weight; not the
@@ -45,6 +46,14 @@ Yours to change: layout, hierarchy, grouping, spacing, style. Keep the
 app's fonts, colours and components unless a change is clearly better.
 Not yours: features and API (the must-keep list), and the data shown.
 You may deviate from the current look if the result is better."""
+
+
+# Variants once showed internal ids (`activityPack`) straight from the card
+# text.
+INTERNAL_NAMES = """\
+Names in the problem text (camelCase ids, code names, labels in quotes) may
+be internal identifiers, not product wording. On-screen copy uses the app's
+existing user-facing wording; never show an internal name to the user."""
 
 
 @dataclass(frozen=True)
@@ -77,6 +86,22 @@ class Brief:
     tokens: str
     rules: str
     refs: Tuple[Path, ...]
+    # The board's owner references (its README text) and the log of
+    # his verdicts on past runs; empty when the board configures none.
+    owner_references: str = ""
+    owner_verdicts: str = ""
+    # The card's non-pump comments, oldest first, as (label, text); and the
+    # board's approved style spec (text + its path in the repo). With a
+    # spec, it is the brief's only token section (§1 is dropped).
+    card_instructions: Tuple[Tuple[str, str], ...] = ()
+    spec: str = ""
+    spec_path: str = ""
+
+    @property
+    def owner_led(self) -> bool:
+        """The owner's references or verdicts are what the design is judged
+        against (``reference_match``)."""
+        return bool(self.owner_references.strip() or self.owner_verdicts.strip())
 
     @property
     def text(self) -> str:
@@ -85,6 +110,8 @@ class Brief:
         sections = [
             f"# Design brief: {self.screen_id} ({self.passport}, {self.source})",
             "## The problem\n" + self.change_request.strip(),
+            self.instructions_section(),
+            INTERNAL_NAMES,
             "Solve this problem. The brief prescribes no variants and no "
             "layout: how to solve it is the designer's call.",
             VALUE_AND_SPACE,
@@ -92,11 +119,63 @@ class Brief:
             "it may move, merge or go behind a tap, never be lost.\n" + must_keep,
             "## Current screen (passport, docs/SCREENS.md)\n" + self.passport_text,
             "## Current screen (references, dark + light)\n" + (refs or "- (none)"),
-            "## Shared tokens (docs/SCREENS.md §1)\n" + self.tokens,
+            self.tokens_text(),
             "## Rules (docs/UI_GUIDE.md)\n" + self.rules,
             FREE_ZONE,
         ]
+        if self.owner_references.strip():
+            sections.append(
+                "## The owner's references (his own words; match what he likes)\n"
+                + self.owner_references.strip()
+            )
+        if self.owner_verdicts.strip():
+            sections.append(
+                "## The owner's verdicts on past design runs (his words; keep "
+                "what he picked, avoid what he rejected)\n"
+                + self.owner_verdicts.strip()
+            )
         return "\n\n".join(s.strip() for s in sections if s.strip()) + "\n"
+
+    def instructions_section(self) -> str:
+        """The card's comments, newest kept within ``INSTRUCTIONS_MAX``
+        chars; a comment already in the owner's verdict log is not repeated
+        (the verdicts section of this brief carries it)."""
+        verdicts = " ".join(self.owner_verdicts.split())
+        items = [
+            (label, text.strip())
+            for label, text in self.card_instructions
+            if text.strip() and " ".join(text.split()) not in verdicts
+        ]
+        kept: List[str] = []
+        used = cut = 0
+        for label, text in reversed(items):
+            block = f"[{label}]\n{text}"
+            if kept and used + len(block) > INSTRUCTIONS_MAX:
+                cut += 1
+                continue
+            kept.insert(0, block[:INSTRUCTIONS_MAX])
+            used += len(block)
+        if not kept:
+            return ""
+        head = (
+            "## Instructions on the card (owner / devops; newer wins over the "
+            "problem text)"
+        )
+        if cut:
+            head += f"\n({cut} older comment(s) cut)"
+        return head + "\n" + "\n\n".join(kept)
+
+    def tokens_text(self) -> str:
+        """The approved style spec when there is one, else SCREENS.md §1."""
+        if not self.spec.strip():
+            return "## Shared tokens (docs/SCREENS.md §1)\n" + self.tokens
+        where = f" `{self.spec_path}`" if self.spec_path else ""
+        return (
+            f"## Style spec{where} (approved: the source of truth for colours, "
+            "type, radii and spacing)\n" + self.spec.strip() + "\n\nCode token "
+            "names: read the repo; where a value differs from the spec, the spec "
+            "wins."
+        )
 
 
 def build_brief(repo: Path, screen_id: str, change_request: str) -> Brief:

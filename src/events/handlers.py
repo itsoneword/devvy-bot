@@ -49,6 +49,15 @@ def scheduled_report_source(event: ScheduledEvent) -> str:
     return f"schedule:{event.job_name}" if event.job_name else "schedule"
 
 
+def _job_label(job_name: Optional[str]) -> str:
+    """What a background turn is doing, for the busy notice and queue note."""
+    if not job_name:
+        return "scheduled job"
+    if job_name.split(":", 1)[0] == "job-finish":
+        return "reading a finished job's result"
+    return f"job {job_name}"
+
+
 class AgentHandler:
     """Translates incoming events into Claude agent executions.
 
@@ -92,6 +101,9 @@ class AgentHandler:
         # Telegram Bot, wired in main after bot.initialize(); None = no DM
         # notice for background turns (tests, headless).
         self.bot: Any = None
+        # ReportsRouter, wired in main; puts the busy notice in the turn's
+        # profile topic instead of the DM. None = DM only.
+        self.reports_router: Any = None
         # Role lookup for the cost caps. AuthManager.get_user_role needs a live
         # Telegram session, which an event-driven turn (a 3am cron job) never
         # has; UserStore reads the durable bot_users role instead. Without it
@@ -145,15 +157,30 @@ class AgentHandler:
         return self.turn_locks.hold(user_id, label, self._profile_slug_for(working_dir))
 
     @contextlib.asynccontextmanager
-    async def _busy_notice(self, chat_id: int, label: str) -> AsyncIterator[None]:
-        """Show the owner, in his DM, that a background turn holds his
-        conversation; removed when it ends. Best effort, never blocks the turn.
-        Private chats have chat_id == user_id."""
+    async def _busy_notice(
+        self, chat_id: int, label: str, profile_slug: Optional[str] = None
+    ) -> AsyncIterator[None]:
+        """Show the owner that a background turn holds his conversation with
+        ``profile_slug``; removed when it ends. Best effort, never blocks the
+        turn. Shown in that profile's own topic when it has one (the lock
+        only blocks that agent, so a DM notice would wrongly say the DM agent
+        is busy), else in the DM (private chats: chat_id == user_id)."""
         sent = None
         if self.bot is not None and chat_id:
+            target: Dict[str, Any] = {"chat_id": chat_id}
+            router = self.reports_router
+            try:
+                topic = router.profile_topic(profile_slug) if router else None
+                if topic:
+                    target = {
+                        "chat_id": router.chat_id,
+                        "message_thread_id": await router.thread_id(self.bot, topic),
+                    }
+            except Exception:
+                logger.debug("busy notice topic lookup failed", slug=profile_slug)
             try:
                 sent = await self.bot.send_message(
-                    chat_id=chat_id,
+                    **target,
                     text=f"⏳ busy: {label}… (your messages will queue)",
                     disable_notification=True,
                 )
@@ -487,25 +514,25 @@ class AgentHandler:
         # the chat that owns the job (e.g. a guest's recurring reminder).
         requester_chat_id = event.target_chat_ids[0] if event.target_chat_ids else None
         report_source = scheduled_report_source(event)
-        # A job-finish batch digest goes to the profile's own chat, not Jobs
-        # (dv-c41e amendment, 2026-10-22).
-        digest_extra: Dict[str, Any] = {}
-        if report_source == "bgjob:digest":
-            profile = None
-            if self.profile_registry is not None:
-                profile, _ = self.profile_registry.resolve_working_dir(working_dir)
-            digest_extra = {
-                "deliver_profile": profile.slug if profile else None,
-                "ledger_profile_slug": profile.slug if profile else None,
-            }
+        # A non-item job's reply belongs to the profile that created it: its
+        # topic, else the DM with its badge and a ledger row a reply reroutes
+        # through (dv-f6c4). The job-finish digest goes to the profile's own
+        # chat the same way (dv-c41e amendment, 2026-10-22).
+        profile_extra: Dict[str, Any] = {}
+        if event.item_id is None:
+            profile_extra = self._job_profile_extra(
+                event, working_dir, owner_id, owner_role
+            )
 
         try:
             # Loop guard (dv-752a): while this scheduler-driven turn runs, the
             # item tools refuse to create items for other family members.
-            label = f"job {event.job_name}" if event.job_name else "scheduled job"
+            label = _job_label(event.job_name)
             async with (
                 self._turn_lock(owner_id, label, working_dir),
-                self._busy_notice(owner_id, label),
+                self._busy_notice(
+                    owner_id, label, self._profile_slug_for(Path(working_dir))
+                ),
             ):
                 with automated_turn(owner_id):
                     response = await get_router().run_turn(
@@ -533,7 +560,7 @@ class AgentHandler:
                             originating_event_id=event.id,
                             source=report_source,
                             image_paths=image_paths,
-                            **digest_extra,
+                            **profile_extra,
                         )
                     )
 
@@ -547,7 +574,7 @@ class AgentHandler:
                             originating_event_id=event.id,
                             source=report_source,
                             image_paths=image_paths,
-                            **digest_extra,
+                            **profile_extra,
                         )
                     )
         except Exception:
@@ -556,6 +583,46 @@ class AgentHandler:
                 job_id=event.job_id,
                 event_id=event.id,
             )
+
+    def _job_profile_extra(
+        self,
+        event: ScheduledEvent,
+        working_dir: Path,
+        owner_id: int,
+        owner_role: Optional[str],
+    ) -> Dict[str, Any]:
+        """``deliver_profile`` / ``ledger_profile_slug`` for a job's reply.
+
+        The profile stored on the job (the creating turn's), else the one
+        owning ``working_dir`` (rows from before dv-f6c4, API jobs). The
+        ledger gets the profile's agent id for the job owner (``slug#u<id>``
+        on a personal_memory profile), the form the reply envelope compares.
+        No resolvable profile: empty, the reply keeps its plain route.
+        """
+        from ..profiles.registry import guest_agent_id, needs_own_workspace
+
+        slug = event.profile_slug
+        profile = None
+        if self.profile_registry is not None:
+            if slug:
+                profile = self.profile_registry.get_by_slug(slug)
+            else:
+                profile, _ = self.profile_registry.resolve_working_dir(working_dir)
+                slug = profile.slug if profile else None
+        if not slug:
+            return {}
+        # Unknown role: "owner" only for the bot's own owner, as in
+        # _per_user_workspace_for.
+        role = owner_role or ("owner" if owner_id == self.default_user_id else None)
+        agent_id = slug
+        if (
+            profile is not None
+            and owner_id
+            and role is not None
+            and needs_own_workspace(profile, role)
+        ):
+            agent_id = guest_agent_id(slug, owner_id)
+        return {"deliver_profile": slug, "ledger_profile_slug": agent_id}
 
     def _sent_files(self, response: Any, working_dir: Optional[Path]) -> List[str]:
         """Validated paths the turn sent with send_image/send_file (dv-ff39).
@@ -575,7 +642,7 @@ class AgentHandler:
         if self.profile_registry is not None and working_dir is not None:
             profile, _ = self.profile_registry.resolve_working_dir(working_dir)
             if profile is not None:
-                extra_dirs = list(profile.extra_dirs)
+                extra_dirs = list(profile.image_dirs)
         roots = allowed_image_roots(working_dir, extra_dirs)
         return [str(a.path) for a in attachments_from_tools_used(tools_used, roots)]
 

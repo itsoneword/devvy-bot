@@ -167,6 +167,23 @@
 # turns only; refused on a guest-allowed profile. Every write asks the owner
 # (src/security/destructive.py), whatever the profile's sandbox setting.
 #
+# Optional per-profile `publisher: true` mounts the devlog_* tools (dv-fc9d):
+# finished-work sources (whitelisted fields), a text-free picture through the
+# `post_image` purpose, a screenshot of our own screens, and a draft that the
+# bot sends the owner as an exact preview. `publish_channel: "@name"` (or a
+# -100… id) is where the owner's tap on that preview posts; the bot must be an
+# admin of the channel with only "post messages". `image_cap_usd` (default 10)
+# caps this month's post_image spend. Owner turns only; refused on a
+# guest-allowed or unsandboxed profile. No tool can post: only the tap.
+#
+# Optional per-profile `web_forms: [william_russell_claim]` mounts the
+# webform_fill / webform_submit tools (dv-5a25): a headless browser on the host
+# fills the listed forms (ids: src/webforms/__init__.py FORMS; an unknown id is
+# a load error) and screenshots each page. Owner turns only, so it is allowed
+# on a guest-allowed profile: guests never see the tools. Submit asks the
+# owner. Needs Playwright 1.64.0 in the bot venv and WEBFORMS_BROWSERS_PATH
+# (docs/configuration.md).
+#
 # Optional per-profile `enabled: false` hides a profile without deleting it:
 # no /slug command, no /agents button, no routing target — persona, memory
 # and workspace stay on disk. The default profile cannot be disabled. The

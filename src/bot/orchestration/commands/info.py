@@ -300,6 +300,10 @@ class InfoCommandsMixin(OrchestratorBase):
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Selected chat limits and paid spend, with no buttons or LLM call."""
+        from ...features.limits_widget import send_limits_widget
+
+        if await send_limits_widget(update, context, self.settings):
+            return  # the owner's DM: the widget replaces the text (dv-4665)
         user = getattr(update, "effective_user", None)
         text, markup = await limits_panel(context, self, user.id if user else None)
         await update.message.reply_text(text, reply_markup=markup)
@@ -728,12 +732,22 @@ class InfoCommandsMixin(OrchestratorBase):
         storage = context.bot_data.get("storage")
         user_id = update.effective_user.id
         slug = await self._turn_profile_slug(update, context) or DEFAULT_AGENT_ID
+        self._init_media_state()
+        media = self._media_registry.active(user_id, slug)
         stopped = await self._stop_scoped_turns(context, user_id, slug)
         if storage:
             await storage.log_bot_event(
                 user_id, "command_stop", {"profile": slug, "stopped": stopped}
             )
-        if stopped:
+        if media:
+            # dv-c977: a download / transcription (or its background retry)
+            # is not a backend turn, but it is what the user sees running.
+            also = " and its running turn" if stopped > media else ""
+            text = (
+                f"🛑 <b>Stopped</b> the media download/transcription{also} on "
+                f"<b>{escape_html(slug)}</b>. It will not be retried."
+            )
+        elif stopped:
             text = (
                 f"🛑 <b>Stopped</b> the running turn of <b>{escape_html(slug)}</b>. "
                 "Other agents and the scheduler are untouched."
@@ -757,6 +771,9 @@ class InfoCommandsMixin(OrchestratorBase):
             await update.message.reply_text("Killswitch unavailable.")
             return
         interrupted = await sdk.stop_all()
+        # The killswitch also ends every media download / background retry.
+        self._init_media_state()
+        interrupted += self._media_registry.cancel_all()
         if storage:
             await storage.log_bot_event(
                 user_id, "command_stop", {"interrupted": interrupted, "all": True}
@@ -1152,11 +1169,7 @@ async def spend_text(
         )
     # Codex's account query costs latency: only when Codex matters now — used
     # this week, a stage runs on it, or its limit is recorded.
-    if not codex_shown and (
-        codex_limit is not None
-        or stages.get(_OPENAI)
-        or (db is not None and await _codex_recently_used(db))
-    ):
+    if not codex_shown and await codex_matters(db, codex_limit, stages):
         blocks.append(
             "Другой провайдер — отдельный лимит:\n"
             + await _codex_block(context, codex_limit, stages.get(_OPENAI), switched)
@@ -1165,6 +1178,21 @@ async def spend_text(
     if resolved and user_id is not None and usage_text is not None:
         blocks.append(f"{_BUDGET_HEAD}\n{await usage_text(user_id, context)}")
     return "\n\n".join(b for b in blocks if b)
+
+
+async def codex_matters(
+    db: Any,
+    codex_limit: Optional["Limit"] = None,
+    stages: Optional[Dict[str, List[str]]] = None,
+) -> bool:
+    """Whether Codex's account query is worth its latency: Codex was used
+    this week, a stage runs on it, or its limit is recorded. The text panel
+    and the /limits widget (dv-4665) share this rule."""
+    if stages is None:
+        stages, _ = _stages_by_provider()
+    if codex_limit is not None or stages.get(_OPENAI):
+        return True
+    return db is not None and await _codex_recently_used(db)
 
 
 def _stages_by_provider() -> Tuple[Dict[str, List[str]], bool]:
@@ -1295,11 +1323,18 @@ def _pump_frozen() -> Optional[Dict[str, Any]]:
     return st.frozen
 
 
+def codex_limits_reader(bot_data: Dict[str, Any]) -> Any:
+    """The Codex backend's ``read_account_limits`` (an async callable), or
+    None when no Codex backend is connected. The text panel and the /limits
+    widget (dv-4665) both read Codex's numbers through it."""
+    backends = bot_data.get("backends") or {}
+    backend = backends.get("openai_codex") or bot_data.get("codex_integration")
+    return getattr(backend, "read_account_limits", None)
+
+
 async def _codex_limits_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     """The provider-side Codex limits, or why they are not there."""
-    backends = context.bot_data.get("backends") or {}
-    backend = backends.get("openai_codex") or context.bot_data.get("codex_integration")
-    reader = getattr(backend, "read_account_limits", None)
+    reader = codex_limits_reader(context.bot_data)
     if reader is None:
         return "Codex backend не подключён."
     try:

@@ -7,6 +7,7 @@ pins and the ledger live here, once, for both.
 """
 
 import asyncio
+import dataclasses
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +40,28 @@ MARKDOWN_MODE = "markdown"
 # Markdown is split BEFORE conversion (so a cut can never land inside a tag);
 # headroom because HTML escaping and tags grow the text.
 _MD_CHUNK = 3400
+
+
+def _with_profile_badge(event: AgentResponseEvent) -> AgentResponseEvent:
+    """A profile-addressed delivery (``deliver_profile``) that ends in the
+    chat itself, not the profile's topic: the shared DM, where it must read
+    and reply as that profile's message (dv-f6c4). A copy that starts with
+    the profile badge a turn reply carries and is ledgered like a reminder,
+    so a reply to it runs on that profile. Pins and events that bring their
+    own ledger kind are left as they are."""
+    if not event.deliver_profile or event.ledger_kind or event.pin_as:
+        return event
+    from ..bot.orchestration.routing import _PROFILE_BADGES
+
+    slug = event.deliver_profile
+    badge = _PROFILE_BADGES.get(slug, slug)
+    text = f"{badge}\n\n{event.text}" if event.text.strip() else event.text
+    return dataclasses.replace(
+        event,
+        text=text,
+        ledger_kind="scheduled_reminder",
+        ledger_profile_slug=event.ledger_profile_slug or slug,
+    )
 
 
 def button_pairs(rows: List[List[Dict[str, str]]]) -> List[List[Tuple[str, str]]]:
@@ -216,12 +239,8 @@ class NotificationService:
         """
         router = self.reports_router
         topic = router.topic_for(event, chat_id) if router else None
-        if event.deliver_profile and topic is None and not event.ledger_kind:
-            # DM fallback of a profile-addressed delivery: ledgered like a
-            # reminder so a reply to it runs on that profile.
-            event.ledger_kind = "scheduled_reminder"
         if router is None or topic is None:
-            await self._rate_limited_send(chat_id, event)
+            await self._rate_limited_send(chat_id, _with_profile_badge(event))
             return
         reports_chat = router.chat_id
         assert reports_chat is not None
@@ -251,7 +270,7 @@ class NotificationService:
                 source=event.source,
                 error=str(e),
             )
-        await self._rate_limited_send(chat_id, event)
+        await self._rate_limited_send(chat_id, _with_profile_badge(event))
 
     def _resolve_chat_ids(self, event: AgentResponseEvent) -> List[int]:
         """Determine which chats to send to."""
@@ -289,15 +308,27 @@ class NotificationService:
             # Split long messages (Telegram limit: 4096 chars)
             text = event.text
             is_md = event.parse_mode == MARKDOWN_MODE
+            rich_id = (
+                await self._send_rich(chat_id, text, thread_id)
+                if is_md and not event.buttons
+                else None
+            )
             chunks = (
-                self._split_markdown(text, _MD_CHUNK)
-                if is_md
-                else self._split_message(text)
+                []
+                if rich_id is not None
+                else (
+                    self._split_markdown(text, _MD_CHUNK)
+                    if is_md
+                    else self._split_message(text)
+                )
             )
             # An image-only reply (dv-ff39) has no text; Telegram rejects an
             # empty message and the error would skip the images.
             chunks = [c for c in chunks if c.strip()]
 
+            if rich_id is not None:
+                self._last_send_per_chat[chat_id] = asyncio.get_event_loop().time()
+                await self._ledger(chat_id, rich_id, event, thread_id)
             for i, chunk in enumerate(chunks):
                 # Buttons (dv-ca8b) sit under the last chunk: the card's end.
                 buttons = (
@@ -318,21 +349,7 @@ class NotificationService:
                         buttons=buttons,
                     )
                 self._last_send_per_chat[chat_id] = asyncio.get_event_loop().time()
-                # Reports sent into a topic are ledgered too (as "report"),
-                # so replying to one puts it in context (dv-e215 v2).
-                ledger_kind = event.ledger_kind or (
-                    "report" if thread_id is not None else None
-                )
-                if ledger_kind and self.sent_messages is not None:
-                    # Every chunk is ledgered — a reply can target any of them.
-                    await self.sent_messages.record(
-                        telegram_chat_id=chat_id,
-                        telegram_message_id=sent_id,
-                        kind=ledger_kind,
-                        messages_message_id=event.ledger_messages_message_id,
-                        profile_slug=event.ledger_profile_slug,
-                        ref=event.ledger_ref,
-                    )
+                await self._ledger(chat_id, sent_id, event, thread_id)
 
                 # Rate limit between chunks too
                 if len(chunks) > 1:
@@ -357,6 +374,41 @@ class NotificationService:
                 error=str(e),
                 event_id=event.id,
             )
+
+    async def _ledger(
+        self,
+        chat_id: int,
+        sent_id: int,
+        event: AgentResponseEvent,
+        thread_id: Optional[int],
+    ) -> None:
+        # Reports sent into a topic are ledgered too (as "report"),
+        # so replying to one puts it in context (dv-e215 v2).
+        ledger_kind = event.ledger_kind or ("report" if thread_id is not None else None)
+        if ledger_kind and self.sent_messages is not None:
+            # Every chunk is ledgered: a reply can target any of them.
+            await self.sent_messages.record(
+                telegram_chat_id=chat_id,
+                telegram_message_id=sent_id,
+                kind=ledger_kind,
+                messages_message_id=event.ledger_messages_message_id,
+                profile_slug=event.ledger_profile_slug,
+                ref=event.ledger_ref,
+            )
+
+    async def _send_rich(
+        self, chat_id: int, text: str, thread_id: Optional[int]
+    ) -> Optional[int]:
+        """Markdown as one Rich Message (dv-1c98), or None: the transport has
+        none (local inbox), it is off, or Telegram refused; the HTML path runs."""
+        send_rich = getattr(self.transport, "send_rich", None)
+        if send_rich is None or not text.strip():
+            return None
+        try:
+            return await send_rich(chat_id, text, thread_id=thread_id)  # type: ignore[no-any-return]
+        except Exception as e:  # noqa: BLE001 - never lose the message
+            logger.warning("rich send raised, using text", error=str(e)[:200])
+            return None
 
     async def _send_images(
         self, chat_id: int, paths: List[str], thread_id: Optional[int]

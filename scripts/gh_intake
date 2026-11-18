@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""gh_intake — GitHub issues as a board's external project board (dv-25c7).
+
+The only `gh` wrapper for a board's `intake.github` (boards.json). Callers:
+the agent tools github_issues / github_issue_read / github_issue_file
+(`src/claude/agent_tools.py`) and the pump2 tick's status sweep
+(`src/pump2/issues.py`). `--repo OWNER/NAME` is required: the board config
+decides which repo is read or written, never the cwd's remote.
+
+  gh_intake --repo O/N list
+      open issues, newest first, as `[{number, title, author, url, updated}]`
+      (no body: the list keeps outside text out of the turn)
+  gh_intake --repo O/N show 12
+      one issue as `{number, title, author, url, body}`
+  gh_intake --repo O/N status 12 --task gb:gb-ab12 --state merged --sha abc1234
+            [--pr URL]
+      one status comment: "<task> merged in <sha>[ (<pr>)]" or, with
+      --state closed, exactly "<task> closed". Any gh failure exits non-zero.
+  gh_intake --repo O/N close 12
+      closes the issue (the board's `close_issue`)
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+
+LIST_LIMIT = 100
+SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$")
+TASK = re.compile(r"^[a-z0-9][a-z0-9_-]*:[a-z][a-z0-9]*-[0-9a-z]+$")
+SHA = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def gh(args: list[str], repo: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["gh", *args, "--repo", repo], capture_output=True, text=True, timeout=60
+    )
+
+
+def _fail(what: str, r: subprocess.CompletedProcess[str]) -> int:
+    print(
+        f"gh {what}: {r.stderr.strip() or 'rc=' + str(r.returncode)}", file=sys.stderr
+    )
+    return 1
+
+
+def _json(what: str, out: str) -> object:
+    try:
+        return json.loads(out or "null")
+    except ValueError:
+        print(f"gh {what}: not JSON: {out[:200]}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+def _login(i: dict) -> str:
+    a = i.get("author")
+    return str(a.get("login") or "") if isinstance(a, dict) else ""
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    fields = "number,title,author,url,updatedAt"
+    r = gh(
+        [
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--json",
+            fields,
+            "--limit",
+            str(LIST_LIMIT),
+        ],
+        args.repo,
+    )
+    if r.returncode != 0:
+        return _fail("issue list", r)
+    issues = _json("issue list", r.stdout)
+    rows = [
+        {
+            "number": i["number"],
+            "title": i.get("title") or "",
+            "author": _login(i),
+            "url": i.get("url") or "",
+            "updated": i.get("updatedAt") or "",
+        }
+        for i in (issues if isinstance(issues, list) else [])
+        if isinstance(i, dict) and isinstance(i.get("number"), int)
+    ]
+    print(json.dumps(rows, ensure_ascii=False))
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    r = gh(
+        ["issue", "view", str(args.number), "--json", "number,title,author,url,body"],
+        args.repo,
+    )
+    if r.returncode != 0:
+        return _fail("issue view", r)
+    i = _json("issue view", r.stdout)
+    if not isinstance(i, dict):
+        print("gh issue view: not an object", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "number": i.get("number", args.number),
+                "title": i.get("title") or "",
+                "author": _login(i),
+                "url": i.get("url") or "",
+                "body": i.get("body") or "",
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def status_text(task: str, state: str, sha: str = "", pr: str = "") -> str:
+    """The whole comment, from typed fields only."""
+    if state == "closed":
+        return f"{task} closed"
+    text = f"{task} merged in {sha}" if sha else f"{task} merged"
+    return f"{text} ({pr})" if pr else text
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    if not TASK.match(args.task):
+        print(f"bad --task {args.task!r}", file=sys.stderr)
+        return 2
+    if args.sha and not SHA.match(args.sha):
+        print(f"bad --sha {args.sha!r}", file=sys.stderr)
+        return 2
+    pr_re = rf"^https://github\.com/{re.escape(args.repo)}/pull/\d+$"
+    if args.pr and not re.match(pr_re, args.pr):
+        print(f"bad --pr {args.pr!r}", file=sys.stderr)
+        return 2
+    body = status_text(args.task, args.state, args.sha, args.pr)
+    r = gh(["issue", "comment", str(args.number), "--body", body], args.repo)
+    return _fail("issue comment", r) if r.returncode != 0 else 0
+
+
+def cmd_close(args: argparse.Namespace) -> int:
+    r = gh(["issue", "close", str(args.number)], args.repo)
+    return _fail("issue close", r) if r.returncode != 0 else 0
+
+
+def _slug(v: str) -> str:
+    if not SLUG.match(v):
+        raise argparse.ArgumentTypeError(f"--repo {v!r}: OWNER/NAME")
+    return v
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="gh_intake", description=__doc__.split("\n")[0])
+    p.add_argument("--repo", required=True, type=_slug, help="OWNER/NAME")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", help="open issues, no bodies")
+    s = sub.add_parser("show", help="one issue with its body")
+    s.add_argument("number", type=int)
+    st = sub.add_parser("status", help="the one status comment")
+    st.add_argument("number", type=int)
+    st.add_argument("--task", required=True, help="board:id")
+    st.add_argument("--state", required=True, choices=("merged", "closed"))
+    st.add_argument("--sha", default="")
+    st.add_argument("--pr", default="")
+    c = sub.add_parser("close", help="close the issue")
+    c.add_argument("number", type=int)
+    args = p.parse_args()
+    cmds = {
+        "list": cmd_list,
+        "show": cmd_show,
+        "status": cmd_status,
+        "close": cmd_close,
+    }
+    return cmds[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

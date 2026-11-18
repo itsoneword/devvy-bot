@@ -266,12 +266,13 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     from src.evaluator.service import EvaluatorService
     from src.evaluator.writer import MemoryWriter
     from src.token.tracker import TokenTracker
-    from src.utils.boards import agent_repos
+    from src.utils.boards import agent_repos, all_tasks_dirs
 
     token_tracker = TokenTracker(db=storage.db_manager)
     # dv-32fe: agents with their own repo (boards.json profiles + devops)
     # store per-task decisions as pointers, checked against that repo.
-    decision_refs = DecisionRefChecker(agent_repos())
+    # dv-65dd: a card ref resolves on any board (devops decides gb- cards).
+    decision_refs = DecisionRefChecker(agent_repos(), card_dirs=all_tasks_dirs())
     from src.storage.window_bundle_repository import WindowBundleRepository
 
     # dv-ef59: every writer marks the window bundle stale on a pinned/core
@@ -742,7 +743,9 @@ async def run_application(app: Dict[str, Any]) -> None:
             # Now wire up components that need the Telegram Bot instance
             telegram_bot = bot.app.bot
             app["agent_handler"].bot = telegram_bot
-            transport = TelegramTransport(telegram_bot)
+            transport = TelegramTransport(
+                telegram_bot, rich_messages=config.enable_rich_messages
+            )
         else:
             # Local channel: the inbox the TUI reads, behind its own secret
             # (created on first boot, never in bot.env: jobs read that file,
@@ -861,6 +864,7 @@ async def run_application(app: Dict[str, Any]) -> None:
                 ledger=storage.sent_messages,
             )
             deps["reports_router"] = reports_router
+            app["agent_handler"].reports_router = reports_router
             await reports_router.ensure_bound_topics(telegram_bot)
             logger.info(
                 "Reports routing on",
@@ -890,8 +894,11 @@ async def run_application(app: Dict[str, Any]) -> None:
         # Stale-fact sweep (dv-cf07; was the dv-4c6f report-only pass). Not
         # scheduler-bound: window rotations (refresh_window / /new, via
         # bot_data) and the bundle valve call it; the scheduler below only
-        # adds the weekly all-scope run.
-        from src.consolidation.service import ConsolidationService
+        # adds the nightly all-scope run.
+        from src.consolidation.service import (
+            MEMORY_SWEEP_CRON,
+            ConsolidationService,
+        )
 
         async def _notify_owner(message: str) -> None:
             for chat_id in config.notification_chat_ids or []:
@@ -926,16 +933,17 @@ async def run_application(app: Dict[str, Any]) -> None:
             await scheduler.start()
             logger.info("Job scheduler enabled")
 
-            # Weekly sweep over every scope (dv-cf07), native async job:
-            # catches scopes that rarely rotate.
-            async def _weekly_consolidation() -> None:
+            # Nightly sweep over every scope (dv-cf07; nightly since dv-65dd,
+            # ~0.01 USD per scope call), native async job: catches scopes
+            # that rarely rotate and closes facts of done cards.
+            async def _nightly_consolidation() -> None:
                 try:
                     await consolidation_service.run()
                 except Exception as e:
-                    logger.error("Weekly consolidation failed", error=str(e))
+                    logger.error("Nightly consolidation failed", error=str(e))
 
             scheduler.add_native_job(
-                "memory-consolidation", "0 6 * * 1", _weekly_consolidation
+                "memory-consolidation", MEMORY_SWEEP_CRON, _nightly_consolidation
             )
 
             # Daily fact-quality check (dv-404f): guard + one cheap judge call
@@ -1031,6 +1039,38 @@ async def run_application(app: Dict[str, Any]) -> None:
 
                 agent_services.exchange = ExchangeClient(
                     exchange_root, keystore=default_keystore()
+                )
+            # devlog_* tools (dv-fc9d): only when some profile is a publisher
+            # and there is a Telegram bot to send the previews.
+            _registry = deps.get("profile_registry")
+            if (
+                telegram_bot is not None
+                and _registry is not None
+                and any(
+                    getattr(p, "publisher", False) for p in _registry.enabled_profiles
+                )
+            ):
+                from src.devlog.sources import devlog_boards
+                from src.devlog.tools import DevlogService
+
+                devlog_service = DevlogService(
+                    bot=telegram_bot,
+                    db_path=storage.db_manager.database_path,
+                    boards=devlog_boards(),
+                    profile_registry=_registry,
+                )
+                agent_services.devlog = devlog_service
+                deps["devlog_service"] = devlog_service
+            # webform_* tools (dv-5a25): only when a profile lists a form;
+            # the browser runs in a child process (src/webforms/runner.py).
+            _registry = deps.get("profile_registry")
+            if _registry and any(
+                getattr(p, "web_forms", ()) for p in _registry.profiles
+            ):
+                from src.claude.webform_tools import WebformClient
+
+                agent_services.webforms = WebformClient(
+                    browsers_path=config.webforms_browsers_path
                 )
         except Exception as e:  # pragma: no cover - defensive wiring guard
             logger.warning("Failed to build agent MCP services", error=str(e))

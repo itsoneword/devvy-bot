@@ -209,14 +209,15 @@ class MemoryRepository:
         kind: str = "user_fact",
         source_ref: Optional[str] = None,
         valid_from: Optional[datetime] = None,
+        conflict_group: Optional[str] = None,
     ) -> int:
         now = datetime.now(UTC).isoformat()
         async with self._db.get_connection() as conn:
             cur = await conn.execute(
                 "INSERT INTO memory_facts "
                 "(agent_id, tier, label, content, source, kind, source_ref, "
-                "valid_from, recorded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "valid_from, recorded_at, conflict_group) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     agent_id,
                     tier,
@@ -227,6 +228,7 @@ class MemoryRepository:
                     source_ref,
                     valid_from.isoformat() if valid_from else now,
                     now,
+                    conflict_group,
                 ),
             )
             await conn.commit()
@@ -323,6 +325,22 @@ class MemoryRepository:
             )
             await conn.commit()
             return cur.rowcount
+
+    async def flagged_to_card(self, agent_id: str, fact_id: int, card_ref: str) -> bool:
+        """A flagged decision now on its card (dv-3e28): kind becomes
+        ``card_decision`` (off-prompt, still searched by recall) and
+        source_ref the ``<board>:<id>``. Only an active, still-flagged row
+        matches."""
+        now = datetime.now(UTC).isoformat()
+        async with self._db.get_connection() as conn:
+            cur = await conn.execute(
+                "UPDATE memory_facts SET kind='card_decision', source_ref=?, "
+                "updated_at=? WHERE agent_id=? AND id=? AND invalid_at IS NULL "
+                "AND kind='user_fact' AND source_ref LIKE ?",
+                (card_ref, now, agent_id, fact_id, MISSING_REF_PREFIX + "%"),
+            )
+            await conn.commit()
+            return bool(cur.rowcount)
 
     async def active_scopes(self) -> List[str]:
         """Every agent_id with at least one still-active fact (invalid_at IS

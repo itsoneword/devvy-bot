@@ -65,6 +65,33 @@ class OrchestratorBase:
         self._albums = AlbumBuffer()
         # Queue-interrupt stops run off the callback handler (dv-b399).
         self._interrupt_tasks: set = set()
+        self._init_media_state()
+
+    def _init_media_state(self) -> None:
+        """Media-phase state (dv-c977); idempotent, so objects built without
+        ``__init__`` (unit tests) get it on first use."""
+        if "_media_registry" in self.__dict__:
+            return
+        from ...utils.media_registry import MediaRegistry
+
+        deps = getattr(self, "deps", None) or {}
+        # Media phase (download / transcription / background retry) per
+        # (user, agent): /stop cancels it like a turn.
+        self._media_registry: MediaRegistry = (
+            deps.get("media_registry") or MediaRegistry()
+        )
+        # Message ids with an open pending_media row; the global error handler
+        # reads it (bot_data) so a kept media message is not told "resend".
+        self._media_pending_ids: set = (
+            deps.setdefault("media_pending_ids", set())
+            if isinstance(deps, dict)
+            else set()
+        )
+        # (chat_id, message_id) -> MediaJob of a turn the retrier is resuming.
+        self._media_resume: Dict[Any, Any] = {}
+        self._media_app: Any = None
+        self._media_retrier_obj: Any = None
+        self._media_closing = False
 
     def _turn_lock(
         self, user_id: int, profile_id: Optional[str] = None
@@ -81,7 +108,10 @@ class OrchestratorBase:
             for key in ("claude_integration", "codex_integration"):
                 if context.bot_data.get(key) is not None:
                     backends[key] = context.bot_data[key]
-        stopped = 0
+        # The media phase first: a download or transcription in flight, or a
+        # background retry of a file Telegram has not handed over (dv-c977).
+        self._init_media_state()
+        stopped = self._media_registry.cancel(user_id, slug)
         for backend in backends.values():
             stop = getattr(backend, "stop_turns", None)
             if not callable(stop):

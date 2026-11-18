@@ -41,7 +41,7 @@ def _ask(command: str):
         "find . -exec kill {} \\;",
         "xargs -I {} kill {} < pids",
         # compound-command keywords before the command word
-        "if kill -0 1; then echo; fi",
+        "if kill 1; then echo; fi",
         "while true; do pkill x; done",
         # $(...) escaped inside a nested double-quoted script
         'bash -c "echo \\"\\$(kill 1)\\""',

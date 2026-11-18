@@ -580,7 +580,7 @@ async def test_request_run_debounces_and_records_board_task(service, board, repo
     # Debounce: two requests, one board task.
     assert len(tasks) == 1
     assert tasks[0].title == "Consolidation needed: devops"
-    assert tasks[0].created_by == "consolidation"
+    assert tasks[0].created_by.endswith("/consolidation")
     assert tasks[0].assignee == "user"
     assert tasks[0].status == "todo"
 

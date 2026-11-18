@@ -12,7 +12,7 @@ import httpx
 import structlog
 from telegram import Voice
 
-from src.bot.telegram_retry import with_telegram_retry
+from src.bot.telegram_retry import fetch_media_bytes
 from src.config.settings import Settings
 from src.config.voice import voice_api_key
 
@@ -70,31 +70,29 @@ class VoiceHandler:
         initial_file_size = getattr(voice, "file_size", None)
         self._ensure_allowed_file_size(initial_file_size)
 
-        # Resolve Telegram file metadata before downloading bytes.
-        file = await with_telegram_retry(voice.get_file, what="getFile")
-        resolved_file_size = getattr(file, "file_size", None)
-        self._ensure_allowed_file_size(resolved_file_size)
+        def check_file(file: Any) -> None:
+            # Resolved Telegram file metadata, before the bytes are downloaded.
+            resolved_file_size = getattr(file, "file_size", None)
+            self._ensure_allowed_file_size(resolved_file_size)
+            # Refuse unknown-size payloads to avoid unbounded downloads.
+            if not isinstance(initial_file_size, int) and not isinstance(
+                resolved_file_size, int
+            ):
+                raise ValueError(
+                    "Unable to determine voice message size before download. "
+                    "Please retry with a smaller voice message."
+                )
 
-        # Refuse unknown-size payloads to avoid unbounded downloads.
-        if not isinstance(initial_file_size, int) and not isinstance(
-            resolved_file_size, int
-        ):
-            raise ValueError(
-                "Unable to determine voice message size before download. "
-                "Please retry with a smaller voice message."
-            )
-
-        # Download voice data
-        voice_bytes = bytes(
-            await with_telegram_retry(file.download_as_bytearray, what="download")
-        )
+        # The shared media fetch (inline window, getFile probe, bytes the
+        # background retrier already holds: dv-c977).
+        voice_bytes = bytes(await fetch_media_bytes(voice, on_file=check_file))
         self._ensure_allowed_file_size(len(voice_bytes))
 
         logger.info(
             "Transcribing voice message",
             provider=self.config.voice_provider,
             duration=voice.duration,
-            file_size=initial_file_size or resolved_file_size or len(voice_bytes),
+            file_size=initial_file_size or len(voice_bytes),
         )
 
         transcription = await self.transcribe_bytes(voice_bytes)
@@ -333,11 +331,7 @@ class VoiceHandler:
             data["language_code"] = self.config.voice_language
 
         try:
-            response = await client.post(
-                "/v1/speech-to-text",
-                data=data,
-                files={"file": ("voice.ogg", voice_bytes, "audio/ogg")},
-            )
+            response = await self._post_elevenlabs(client, data, voice_bytes)
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:
@@ -364,6 +358,41 @@ class VoiceHandler:
         if not text:
             raise ValueError("ElevenLabs transcription returned an empty response.")
         return text
+
+    # A connect failure never reached ElevenLabs (nothing billed), and 429/5xx
+    # are its own transient refusals: retry those. A read timeout is not
+    # retried: the clip may already be transcribed and billed (09.11.26: one
+    # ConnectTimeout lost a 57 s voice message).
+    ELEVENLABS_RETRY_DELAYS = (2.0, 5.0, 15.0)
+
+    async def _post_elevenlabs(
+        self, client: Any, data: dict, voice_bytes: bytes
+    ) -> Any:
+        for delay in (*self.ELEVENLABS_RETRY_DELAYS, None):
+            try:
+                response = await client.post(
+                    "/v1/speech-to-text",
+                    data=data,
+                    files={"file": ("voice.ogg", voice_bytes, "audio/ogg")},
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                if delay is None:
+                    raise
+                logger.warning(
+                    "ElevenLabs connect failed, retrying",
+                    error_type=type(exc).__name__,
+                )
+            else:
+                status = getattr(response, "status_code", None)
+                transient = isinstance(status, int) and (status == 429 or status >= 500)
+                if delay is None or not transient:
+                    return response
+                logger.warning(
+                    "ElevenLabs transient status, retrying",
+                    status_code=response.status_code,
+                )
+            await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
 
     def _get_elevenlabs_client(self) -> Any:
         """Create and cache an httpx client for the ElevenLabs API on first use."""

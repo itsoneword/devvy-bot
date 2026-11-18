@@ -149,6 +149,23 @@ async def verify(
     else:
         record(True, "profiles", "single-profile mode (PROFILES_CONFIG_PATH unset)")
 
+    # 2a. web forms (dv-5a25): a profile with web_forms needs Playwright +
+    # Chromium, or the webform tools mount and fail on first use -----------
+    if registry is not None:
+        try:
+            from src.webforms import runtime_problem
+
+            problem = runtime_problem(
+                registry, getattr(config, "webforms_browsers_path", None)
+            )
+        except Exception as exc:  # noqa: BLE001
+            record(False, "web forms", _first_line(exc))
+        else:
+            if problem:
+                record(False, "web forms", problem)
+            elif any(getattr(p, "web_forms", ()) for p in registry.profiles):
+                record(True, "web forms", "Playwright and Chromium found")
+
     # 2b. pump2 boards (plain only: board health is not boot health, so a
     # red board never blocks the restart gate) --------------------------
     if not preflight:

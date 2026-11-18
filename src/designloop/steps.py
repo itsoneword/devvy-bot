@@ -18,8 +18,8 @@
   also fails, without the board's script, a variant with no commit against
   the current app or with no renders.
 - critic: :func:`src.designloop.critic.critique` through the model router.
-- collage: ``collage.py`` run by the board's python (Pillow lives there, not
-  in the bot venv).
+- collage: ``review_pdf.py`` (a PDF and its cover PNG) run by the board's
+  python (Pillow lives there).
 """
 
 from __future__ import annotations
@@ -32,18 +32,64 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import structlog
+
 from ..pump2.template import fill_template
 from .brief import Brief
-from .critic import Critique, critique
-from .loop import Variant
+from .critic import Critique, Remarks, critique, critique_mockup, critique_remarks
+from .inventory import inventory_lines
+from .loop import Variant, notes_of, scores_line
+from .references import IMAGE_SUFFIXES, OwnerInputs, kit_paths, read_inputs
+from .review_pdf import cover_path
+from .review_pdf import item as review_item
 
-COLLAGE_SCRIPT = Path(__file__).with_name("collage.py")
+log = structlog.get_logger(__name__)
+
+
+def _variant_of(name: str) -> int:
+    """The variant number of a renders folder ``vN``, 0 when it is not one."""
+    return int(name[1:]) if name[:1] == "v" and name[1:].isdigit() else 0
+
+
+REVIEW_SCRIPT = Path(__file__).with_name("review_pdf.py")
+# Block remarks (dv-696e): the render's DOM sidecar, the crop script (board
+# python), where the crops go (a subfolder: render / gate glob ``aN/*.png``)
+# and the per-round critic answers.
+CROPS_SCRIPT = Path(__file__).with_name("crops.py")
+SIDECAR_SUFFIX = ".boxes.json"
+CROPS_DIR = "critic"
+CRITIC_JSON = "critic.json"
+BLOCK_CALLS_MAX = 12
+BLOCK_CALLS_PARALLEL = 4
 JOB_ROUTE = "design_generate"
 VARIANTS = 3
+REFERENCE_IMAGES = 4  # default cap of owner reference images per critic call
+REFERENCE_IMAGES_MAX = 8
+KIT_MAX = 6  # UI kit images per critic call, outside ``reference_images``
+COMPONENTS_MAX = 12  # ``design.components`` paths / globs
 NOTES_FILE = "DESIGN_NOTES.md"
 TRADEOFF = "trade-off:"
+THRESHOLD = 7  # mockup mode: the lowest dimension needed for ready (5..9)
+MOCKUP_PRESETS = ("best", "quality", "fast")
+MOCKUP_COUNT = 4
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
+
+
+@dataclass(frozen=True)
+class MockupConfig:
+    """``design.mockups``: step 0 on, FLUX ``preset``, ``count``
+    mockups (3..4). The block is the board's opt-in: briefs go to a
+    third-party server only for boards that have it."""
+
+    preset: str = "best"
+    count: int = MOCKUP_COUNT
+    # a run whose paid mockups cost at most this many dollars
+    # draws them on OpenRouter (fast) instead of FLUX; 0 = FLUX always.
+    paid_max_usd: float = 0.0
+    # "<service>:<NAME>" of the OpenRouter key paid mockups (and the FLUX
+    # fallback) bill to; None = the default openrouter key.
+    key: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -55,12 +101,95 @@ class DesignConfig:
     / ``{renders}`` / ``{refs}`` / ``{screen}``; prints a JSON list of
     failures (or ``{"failures": [...]}``), ``[]`` = pass. ``python``: the
     board's python with Pillow, for the collage.
+
+    Owner inputs: ``references`` (path in the board repo, the owner's references
+    in his words; None = off), ``reference_images`` (max images named in it
+    attached to the critic, 0..8), ``verdicts`` (the owner's verdict log;
+    None = ``owner-verdicts.md`` next to ``references``), ``kit`` (the
+    board's UI kit images, generated once outside the loop: attached to the
+    critic first, outside ``reference_images``, and named to the designer;
+    at most 6). See :mod:`src.designloop.references`. ``components``
+    (paths or globs in the board repo, at most 12): the kit component
+    inventory named to the builder, :mod:`src.designloop.inventory`.
+
+    Mockup mode: ``style_spec`` (path in the board repo, the
+    style spec YAML, :mod:`src.designloop.stylespec`), ``mockups`` (step 0,
+    :class:`MockupConfig`; None = off), ``threshold`` (5..9, the lowest
+    dimension a ready render needs).
     """
 
     render: Tuple[str, ...]
     gate: Tuple[str, ...]
     python: str
     variants: int = VARIANTS
+    references: Optional[str] = None
+    reference_images: int = REFERENCE_IMAGES
+    verdicts: Optional[str] = None
+    kit: Tuple[str, ...] = ()
+    style_spec: Optional[str] = None
+    mockups: Optional[MockupConfig] = None
+    threshold: int = THRESHOLD
+    # None = the key is malformed: no inventory (optional, so the block
+    # stays valid); ``pump2 doctor`` reports it.
+    components: Optional[Tuple[str, ...]] = ()
+    # the pictures root (dv-design-map): None = <board workspace>/design;
+    # :mod:`src.designloop.assetmap`
+    assets: Optional[str] = None
+
+
+def _parse_mockups(raw: object) -> Optional[MockupConfig]:
+    """``design.mockups``: ``{preset?, count?, paid_max_usd?}``; raises ValueError when
+    malformed (the caller turns it into None for the whole block)."""
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        return MockupConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("mockups")
+    preset = raw.get("preset", "best")
+    count = raw.get("count", MOCKUP_COUNT)
+    if preset not in MOCKUP_PRESETS:
+        raise ValueError("mockups.preset")
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise ValueError("mockups.count")
+    paid_max = raw.get("paid_max_usd", 0.0)
+    if (
+        isinstance(paid_max, bool)
+        or not isinstance(paid_max, (int, float))
+        or paid_max < 0
+    ):
+        raise ValueError("mockups.paid_max_usd")
+    key = raw.get("key")
+    if key is not None and (not isinstance(key, str) or ":" not in key):
+        raise ValueError("mockups.key")
+    return MockupConfig(
+        preset=preset,
+        count=max(3, min(4, count)),
+        paid_max_usd=float(paid_max),
+        key=key,
+    )
+
+
+def _parse_kit(raw: object) -> Optional[Tuple[str, ...]]:
+    """``design.kit``: a list of at most 6 image paths; None = malformed."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or len(raw) > KIT_MAX:
+        return None
+    if not all(isinstance(x, str) and x.lower().endswith(IMAGE_SUFFIXES) for x in raw):
+        return None
+    return tuple(raw)
+
+
+def _parse_components(raw: object) -> Optional[Tuple[str, ...]]:
+    """``design.components``: at most 12 paths / globs; None = malformed."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or len(raw) > COMPONENTS_MAX:
+        return None
+    if not all(isinstance(x, str) and x for x in raw):
+        return None
+    return tuple(raw)
 
 
 def parse_config(raw: object) -> Optional[DesignConfig]:
@@ -78,12 +207,64 @@ def parse_config(raw: object) -> Optional[DesignConfig]:
     variants = raw.get("variants", VARIANTS)
     if isinstance(variants, bool) or not isinstance(variants, int):
         return None
+    references, verdicts = raw.get("references"), raw.get("verdicts")
+    if references is not None and not isinstance(references, str):
+        return None
+    if verdicts is not None and not isinstance(verdicts, str):
+        return None
+    images = raw.get("reference_images", REFERENCE_IMAGES)
+    if isinstance(images, bool) or not isinstance(images, int):
+        return None
+    kit = _parse_kit(raw.get("kit"))
+    if kit is None:
+        return None
+    components = _parse_components(raw.get("components"))
+    style_spec = raw.get("style_spec")
+    if style_spec is not None and not isinstance(style_spec, str):
+        return None
+    threshold = raw.get("threshold", THRESHOLD)
+    if isinstance(threshold, bool) or not isinstance(threshold, int):
+        return None
+    if not 5 <= threshold <= 9:
+        return None
+    try:
+        mockups = _parse_mockups(raw.get("mockups"))
+    except ValueError:
+        return None
     return DesignConfig(
         render=tuple(render),  # type: ignore[arg-type]
         gate=tuple(gate),  # type: ignore[arg-type]
         python=python,
         variants=max(2, min(3, variants)),
+        references=references or None,
+        reference_images=max(0, min(REFERENCE_IMAGES_MAX, images)),
+        verdicts=verdicts or None,
+        kit=kit,
+        style_spec=style_spec or None,
+        mockups=mockups,
+        threshold=threshold,
+        components=components,
+        assets=raw.get("assets") if isinstance(raw.get("assets"), str) else None,
     )
+
+
+def owner_inputs(config: DesignConfig, repo: Path) -> OwnerInputs:
+    """The board's owner references, verdict log and reference images, read
+    from the board repo's main checkout. ``FileNotFoundError`` when the
+    configured references file is missing."""
+    return read_inputs(
+        repo, config.references, config.verdicts, config.reference_images, config.kit
+    )
+
+
+def missing_kit(config: DesignConfig, repo: Path) -> List[str]:
+    """The ``design.kit`` entries absent from ``repo``: ``pump2 design run``
+    refuses, ``pump2 doctor`` reports."""
+    return [
+        name
+        for name, path in zip(config.kit, kit_paths(repo, config.kit))
+        if not path.is_file()
+    ]
 
 
 def missing_scripts(config: DesignConfig, repo: Path) -> List[str]:
@@ -143,8 +324,13 @@ class BoardSteps:
         template: Path,
         ask_context: str = "",
         run: Runner = subprocess.run,
+        restart: bool = False,
+        board: str = "",
     ) -> None:
         self.repo = Path(repo)
+        # dv-925f: the board name for the critic's judge rows; "" = none.
+        self.board = board
+        self._scores_warned = False
         self.card = card
         self.screen = screen
         self.worktrees = Path(worktrees)
@@ -159,6 +345,26 @@ class BoardSteps:
         self.attempts: Dict[str, int] = {}
         self.current_pngs: Optional[List[Path]] = None
         self.fresh: List[str] = []
+        # A run on a card the owner rejected starts every variant
+        # from the base: reworking the rejected ones anchors on them.
+        self.restart = restart
+        self._owner: Optional[OwnerInputs] = None
+        # mockup mode: the chosen target mockup and the board's
+        # approved style spec (file + text); set by the runner after step 0.
+        self.mockup: Optional[Path] = None
+        self.spec_file: Optional[Path] = None
+        self.spec_text = ""
+
+    def use_mockup(self, mockup: Path, spec_file: Path, spec_text: str) -> None:
+        """Build to ``mockup``: one variant, the critic scores dimensions."""
+        self.mockup = Path(mockup)
+        self.spec_file = Path(spec_file)
+        self.spec_text = spec_text
+
+    @property
+    def variant_count(self) -> int:
+        """One variant in mockup mode (one target), else the config's."""
+        return 1 if self.mockup is not None else self.config.variants
 
     # -- git -----------------------------------------------------------------
 
@@ -189,10 +395,11 @@ class BoardSteps:
         current app). A rerun reuses them (their commits are the work) and
         merges the current base into each, so the variant's own render
         scripts are not stale; a variant whose merge fails starts fresh from
-        the base and is listed in ``self.fresh`` (dv-af52)."""
+        the base and is listed in ``self.fresh``."""
         self.base = self._git("rev-parse", "HEAD")
         self.fresh = []
-        branches = [self.branch(n) for n in range(1, self.config.variants + 1)]
+        self._scores_warned = False
+        branches = [self.branch(n) for n in range(1, self.variant_count + 1)]
         for branch in branches:
             path = self.worktree(branch)
             if (path / ".git").exists():
@@ -224,10 +431,16 @@ class BoardSteps:
     def _update(self, branch: str) -> None:
         """Merge the base into a reused variant; on failure reset it to the
         base (the variant worktree is the loop's own, old work stays in the
-        reflog) and note it for the run summary."""
+        reflog) and note it for the run summary. A restart (the owner
+        rejected every variant) resets each one to the base."""
         path = self.worktree(branch)
         n = branch.rsplit("/", 1)[-1]
         self._commit(branch, f"design {self.card} {n}: leftovers before rerun")
+        if self.restart:
+            self._git("reset", "-q", "--hard", self.base, cwd=path)
+            self._git("clean", "-q", "-fd", cwd=path)
+            self.fresh.append(f"{n} started fresh: the owner rejected every variant")
+            return
         merged = self.run(
             ["git", "merge", "--no-edit", "-q", self.base],
             cwd=str(path),
@@ -250,12 +463,29 @@ class BoardSteps:
         self._git("add", "-A", cwd=path)
         self._git("commit", "-q", "-m", message, cwd=path)
 
+    # -- the owner's references ----------------------------------------------
+
+    def owner(self) -> OwnerInputs:
+        """Read once per run (the log does not change during it)."""
+        if self._owner is None:
+            self._owner = owner_inputs(self.config, self.repo)
+        return self._owner
+
+    def with_owner(self, brief: Brief) -> Brief:
+        """The brief plus the owner's references text and verdicts."""
+        owner = self.owner()
+        if not (owner.references or owner.verdicts):
+            return brief
+        return dataclasses.replace(
+            brief, owner_references=owner.references, owner_verdicts=owner.verdicts
+        )
+
     # -- the loop's steps ----------------------------------------------------
 
     async def generate(
         self, brief: Brief, feedback: Mapping[str, Sequence[str]]
     ) -> List[str]:
-        branches = [self.branch(n) for n in range(1, self.config.variants + 1)]
+        branches = [self.branch(n) for n in range(1, self.variant_count + 1)]
         first = not feedback
         for n, branch in enumerate(branches, 1):
             if not first and branch not in feedback:
@@ -280,7 +510,7 @@ class BoardSteps:
             if line:
                 others.append(f"- {other.rsplit('/', 1)[-1]}: {line}")
         values = {
-            "BRIEF": brief.text,
+            "BRIEF": self.with_owner(brief).text,
             "VARIANT": str(n),
             "COUNT": str(len(branches)),
             "BRANCH": branches[n - 1],
@@ -292,8 +522,60 @@ class BoardSteps:
                 if fixes
                 else "(first draft: no feedback yet)"
             ),
+            "KIT": self.kit_section(branches[n - 1]),
+            "COMPONENTS": self.components_section(branches[n - 1]),
+            "MOCKUP": self.mockup_section(),
         }
         return fill_template(self.template.read_text(encoding="utf-8"), values)
+
+    def kit_section(self, branch: str) -> str:
+        """The designer prompt's UI kit section ("" without a kit). A kit
+        file committed in the variant's worktree is named there, else in the
+        board repo's main checkout."""
+        if not self.config.kit:
+            return ""
+        wt = self.worktree(branch)
+        lines = []
+        for name, path in zip(self.config.kit, kit_paths(self.repo, self.config.kit)):
+            local = wt / name
+            shown = local if not Path(name).is_absolute() and local.is_file() else path
+            lines.append(f"- `{shown}`")
+        return (
+            "\n## UI kit (the owner's approved components)\n\n"
+            "Open these images and match their components (buttons, chips, "
+            "tabs, cards, badges) in the app's code; the shipped UI stays "
+            "code, never an image:\n\n" + "\n".join(lines) + "\n"
+        )
+
+    def components_section(self, branch: str) -> str:
+        """The builder prompt's kit component inventory ("" without
+        ``design.components``), read from the variant's worktree when it
+        exists, else the board repo's main checkout."""
+        if not self.config.components:
+            return ""
+        wt = self.worktree(branch)
+        root = wt if wt.is_dir() else self.repo
+        lines = inventory_lines(root, self.config.components)
+        if not lines:
+            return ""
+        return (
+            "\n## Kit components (from the code; build with these before "
+            "writing a new one)\n\n" + "\n".join(lines) + "\n"
+        )
+
+    def mockup_section(self) -> str:
+        """The designer prompt's target mockup section ("" without one)."""
+        if self.mockup is None:
+            return ""
+        spec = f" and the style spec `{self.spec_file}`" if self.spec_file else ""
+        return (
+            "\n## Target mockup (step 0, the one picked)\n\n"
+            f"Open `{self.mockup}`{spec}. Build the screen in the app's code to "
+            "this mockup: its layout, components and look, with the spec's exact "
+            "colours, type, radii, shadows and spacing. Texts come from the brief "
+            "(the mockup's lettering may be garbled). The shipped UI stays code, "
+            "never an image.\n"
+        )
 
     def _agentjob(self, branch: str, prompt: str) -> None:
         path = self.worktree(branch)
@@ -417,37 +699,257 @@ class BoardSteps:
             ) from exc
 
     async def critic(self, brief: Brief, renders: Sequence[Path]) -> Critique:
-        """The current render is the reference; ``brief.refs`` (docs/screens)
-        only when it left no PNG."""
+        """The current render is the "before"; ``brief.refs`` (docs/screens)
+        only when it left no PNG. With board references, the owner's text,
+        verdicts and reference images are what the critic judges against.
+
+        Mockup mode (dv-696e): renders with a DOM sidecar are judged as
+        copies cut to the content height, plus one block-remarks call per
+        sidecar block (crop of the render, mockup whole); without sidecars
+        one remarks call on the whole renders. Every round's answers go to
+        ``<renders dir>/critic.json``."""
         current = sorted(self.current_dir.glob("*.png"))
         if current:
             brief = dataclasses.replace(brief, refs=tuple(current))
-        return await critique(brief, renders)
+        brief = self.with_owner(brief)
+        owner = self.owner()
+        if self.mockup is None:
+            result = await critique(
+                brief, renders, reference_images=owner.images, kit_images=owner.kit
+            )
+            self._save_critic(renders, result, [])
+            return result
+        pages, blocks, skipped = await asyncio.to_thread(self._crops, renders)
+        result = await critique_mockup(
+            brief,
+            pages,
+            mockup=self.mockup,
+            spec_text=self.spec_text,
+            threshold=self.config.threshold,
+            kit_images=owner.kit,
+        )
+        limit = asyncio.Semaphore(BLOCK_CALLS_PARALLEL)
+        mockup = self.mockup
+
+        async def one(block: str, images: Sequence[Path]) -> Remarks:
+            async with limit:
+                return await critique_remarks(
+                    brief,
+                    images,
+                    mockup=mockup,
+                    spec_text=self.spec_text,
+                    block=block,
+                    kit_images=owner.kit,
+                )
+
+        calls = (
+            [one(block, [png]) for block, png in blocks.items()]
+            if blocks
+            else [one("", pages)]
+        )
+        answers = list(await asyncio.gather(*calls))
+        result = dataclasses.replace(
+            result, remarks=tuple(r for a in answers for r in a.remarks)
+        )
+        self._save_critic(renders, result, answers, skipped)
+        return result
+
+    def _crops(
+        self, renders: Sequence[Path]
+    ) -> Tuple[List[Path], Dict[str, Path], List[str]]:
+        """(page images for the dimensions call, block id -> crop, skipped).
+        Renders without a sidecar go as they are; blocks come from the dark
+        renders (all renders when none is dark), each id once."""
+        pages: List[Path] = []
+        blocks: Dict[str, Path] = {}
+        skipped: List[str] = []
+        dark = {p for p in renders if "dark" in Path(p).name} or set(renders)
+        for png in renders:
+            png = Path(png)
+            sidecar = png.with_name(png.stem + SIDECAR_SUFFIX)
+            if not sidecar.exists():
+                pages.append(png)
+                continue
+            cmd = [
+                self.config.python,
+                str(CROPS_SCRIPT),
+                "--png",
+                str(png),
+                "--sidecar",
+                str(sidecar),
+                "--out",
+                str(png.parent / CROPS_DIR),
+            ]
+            r = self.run(cmd, capture_output=True, text=True)
+            try:
+                if r.returncode != 0:
+                    raise ValueError(f"rc {r.returncode}")
+                made = json.loads(str(r.stdout))
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"crops of {png.name} failed ({exc}): "
+                    f"{(r.stderr or '').strip()[-400:]}"
+                ) from exc
+            pages.append(Path(made["page"]))
+            for why in made.get("skipped") or []:
+                skipped.append(f"{png.name}: {why}")
+                log.warning("design_critic_crop_skipped", render=str(png), why=why)
+            if png in dark:
+                for block, path in (made.get("blocks") or {}).items():
+                    if block not in blocks and len(blocks) < BLOCK_CALLS_MAX:
+                        blocks[block] = Path(path)
+        return pages, blocks, skipped
+
+    def _save_critic(
+        self,
+        renders: Sequence[Path],
+        result: Critique,
+        answers: Sequence[Remarks],
+        skipped: Sequence[str] = (),
+    ) -> None:
+        """``critic.json`` beside the round's renders: what the critic saw,
+        answered and what went back to the builder."""
+        if not renders:
+            return
+        folder = Path(renders[0]).parent
+        name = folder.name
+        rnd = int(name[1:]) if name[:1] == "a" and name[1:].isdigit() else 0
+        data = {
+            "round": rnd,
+            "renders": [str(p) for p in renders],
+            "images": {
+                "critic": list(result.images),
+                "remarks": [list(a.images) for a in answers],
+            },
+            "answers": {"critic": result.raw, "remarks": [a.raw for a in answers]},
+            "verdict": result.verdict,
+            "score": result.score,
+            "scores": {k: n for k, (n, _) in result.dimensions.items()},
+            "dimensions": {
+                k: {"score": n, "evidence": ev}
+                for k, (n, ev) in result.dimensions.items()
+            },
+            "criteria": dict(result.criteria),
+            "remarks": [dataclasses.asdict(r) for r in result.remarks],
+            "data_remarks": sum(r.kind == "data" for r in result.remarks),
+            "skipped_blocks": list(skipped),
+            "notes": list(notes_of(result)),
+        }
+        (folder / CRITIC_JSON).write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        self._store_critic(result, rnd, _variant_of(folder.parent.name))
+
+    def _store_critic(self, result: Critique, rnd: int, variant: int) -> None:
+        """The round's judge rows (dv-925f) in ``message_reactions``: one
+        ``design_critic`` row per dimension and one ``overall`` (score, the
+        verdict), one ``design_critic_remark`` row per block remark. A failed
+        write is printed and noted in ``self.fresh`` once per run."""
+        if not self.board:
+            return
+        from ..pump2.criteria import EVIDENCE_CAP, scores_db
+        from ..storage.reactions import StageRow, record_stage_scores_sync
+
+        at = {"round": rnd, "variant": variant}
+        rows: List[StageRow] = [
+            (k, n, (ev or "").strip()[:EVIDENCE_CAP] or None, at)
+            for k, (n, ev) in result.dimensions.items()
+        ]
+        rows.append(("overall", result.score, result.verdict or None, at))
+        for r in result.remarks:
+            text = f"mockup = {r.mockup}; render = {r.render}; change = {r.change}"
+            extras = {
+                **at,
+                "stage": "design_critic_remark",
+                "element": r.element or None,
+                "remark_kind": r.kind or None,
+            }
+            rows.append((r.block, None, text[:EVIDENCE_CAP], extras))
+        try:
+            err = record_stage_scores_sync(
+                scores_db(),
+                board=self.board,
+                card_id=self.card,
+                stage="design_critic",
+                scores=rows,
+                size=None,
+                kind=None,
+            )
+        except Exception as exc:  # noqa: BLE001 - a judge row never stops a run
+            err = str(exc)
+        if err and not self._scores_warned:
+            self._scores_warned = True
+            line = f"warning: critic scores not stored: {err}"
+            print(line)
+            self.fresh.append(line)
+            log.warning("design_critic_scores_not_stored", card=self.card, error=err)
 
     async def describe(self, branch: str) -> str:
         notes = self.worktree(branch) / NOTES_FILE
         return tradeoff_of(notes.read_text(encoding="utf-8")) if notes.exists() else ""
 
     async def collage(self, variants: Sequence[Variant]) -> Path:
-        path = self.out / "collage.png"
-        cmd = [self.config.python, str(COLLAGE_SCRIPT), "--out", str(path)]
-        current = sorted(self.current_dir.glob("*.png"))
-        if current:
-            dark = [p for p in current if "dark" in p.name]
-            cmd += ["--tile", str((dark or current)[0]), "--label", "0. current"]
+        """The review PDF of the variants (``review_pdf.py`` run by the
+        board's python) and, next to it, its cover PNG. Mockup mode: one
+        compare pair per variant (target mockup | render); else a grid, the
+        current screen first and unnumbered. Returns the PDF."""
+        path = self.out / "review.pdf"
+        items: List[Dict[str, Any]] = []
         for i, variant in enumerate(variants, 1):
             dark = [p for p in variant.renders if "dark" in p.name]
             tile = (dark or list(variant.renders))[0]
-            cmd += [
-                "--tile",
-                str(tile),
-                "--label",
-                f"{i}. {variant.tradeoff or variant.name}",
-            ]
+            caption = variant.tradeoff or variant.name
+            if variant.critique is not None and variant.critique.dimensions:
+                caption += "\n" + scores_line(variant.critique)
+            if self.mockup is not None:
+                items.append(review_item(self.mockup, "target mockup", label="mockup"))
+                items.append(review_item(tile, caption, label=f"variant {i}"))
+            else:
+                items.append(review_item(tile, caption))
+        sections: List[Dict[str, Any]] = []
+        current = sorted(self.current_dir.glob("*.png"))
+        title = f"Design variants {self.card} {self.screen}"
+        if self.mockup is not None:
+            sections.append(
+                {
+                    "heading": "Target mockup vs variants",
+                    "layout": "compare",
+                    "items": items,
+                }
+            )
+        else:
+            if current:
+                dark = [p for p in current if "dark" in p.name]
+                sections.append(
+                    {
+                        "heading": "Current screen",
+                        "layout": "single",
+                        "numbered": False,
+                        "items": [review_item((dark or current)[0], "current")],
+                    }
+                )
+            sections.append(
+                {
+                    "heading": "Variants",
+                    "layout": "grid",
+                    "columns": 3,
+                    "note": "Answer with the variant number.",
+                    "items": items,
+                }
+            )
+        spec_file = self.out / "review-spec.json"
+        self.out.mkdir(parents=True, exist_ok=True)
+        spec_file.write_text(
+            json.dumps({"title": title, "sections": sections}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        cmd = [self.config.python, str(REVIEW_SCRIPT), "--spec", str(spec_file)]
+        cmd += ["--out", str(path), "--cover", str(cover_path(path))]
         r = await asyncio.to_thread(self.run, cmd, capture_output=True, text=True)
         if r.returncode != 0 or not path.exists():
             raise RuntimeError(
-                f"collage failed (rc {r.returncode}): {(r.stderr or '').strip()[-400:]}"
+                f"review pdf failed (rc {r.returncode}): "
+                f"{(r.stderr or '').strip()[-400:]}"
             )
         return path
 

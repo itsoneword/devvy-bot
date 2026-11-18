@@ -631,9 +631,25 @@ class CallbacksMixin(OrchestratorBase):
             # Answers the query itself (a refusal is an alert popup).
             await self._handle_interrupt_callback(query, context, data)
             return
+        if data.startswith("mr:"):
+            # Retry a media message whose file never arrived (dv-c977).
+            await self._handle_media_retry_callback(  # type: ignore[attr-defined]
+                query, context, data
+            )
+            return
         if data.startswith("publish:"):
             # The publish card (dv-b05e): same owner gate, popup refusal.
             await self._handle_publish_callback(query, context, data)
+            return
+        if data.startswith("devlog:"):
+            # A devlog draft preview (dv-fc9d): the only path to the channel.
+            from .devlog_taps import handle_devlog_callback
+
+            uid = query.from_user.id if query.from_user else None
+            is_owner = self._resolve_role(uid, context) == "owner"
+            await handle_devlog_callback(
+                update, context, owner_id=uid if is_owner else None
+            )
             return
         await query.answer()
 

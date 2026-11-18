@@ -84,6 +84,7 @@ class ConfirmationManager:
         timeout_seconds: Optional[float] = None,
         source: Optional[str] = None,
         context: Optional["AskContext"] = None,
+        on_timeout: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Ask the owner to approve a destructive op. Returns True if approved.
 
@@ -91,6 +92,8 @@ class ConfirmationManager:
         background job waits an hour (owner, dv-ef90), a chat turn two
         minutes. ``source`` names who is asking (a job's name) in the prompt.
         ``context`` is what the explainer may know about the ask (dv-781f).
+        ``on_timeout`` is called when nobody answered in time, so a caller
+        can tell that denial from the owner's (dv-3d18).
         """
         timeout = self._timeout if timeout_seconds is None else timeout_seconds
         if not self._chat_ids:
@@ -157,6 +160,8 @@ class ConfirmationManager:
                 **log_fields,
             )
             await self._mark_timed_out(token, self._pending_texts.get(token, text))
+            if on_timeout is not None:
+                on_timeout()
             return False
         finally:
             if explaining is not None:

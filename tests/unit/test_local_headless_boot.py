@@ -41,6 +41,10 @@ def server(tmp_path):  # type: ignore[no-untyped-def]
     port = _free_port()
     work = tmp_path / "work"
     work.mkdir()
+    # The single-profile devops agent needs its persona file in the data root.
+    persona = tmp_path / "data" / "workspaces" / "devops" / "persona.md"
+    persona.parent.mkdir(parents=True)
+    persona.write_text("You are a test agent.\n")
     env = {
         k: v
         for k, v in os.environ.items()
@@ -57,6 +61,7 @@ def server(tmp_path):  # type: ignore[no-untyped-def]
         LOCAL_TUI_SECRET=TUI,
         DEVELOPMENT_MODE="true",
         ALLOWED_USERS="1",
+        ENABLE_SOUL_MEMORY="false",
     )
     log = open(tmp_path / "server.log", "w")
     proc = subprocess.Popen(
@@ -162,4 +167,4 @@ def test_notify_pin_twice_and_ask_approved_end_to_end(server) -> None:  # type: 
     assert token, "ask card never reached the inbox"
     _req(port, "/internal/callback", token=TUI, body={"data": f"confirm:{token}:y"})
     th.join(10)
-    assert out["r"] == {"approved": True}
+    assert out["r"] == {"approved": True, "timed_out": False}

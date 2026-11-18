@@ -103,23 +103,25 @@ Scope (this user belongs to a family):
 # Appended ONLY for agents with their own repo (dv-32fe: the profiles of
 # config/taskpump/boards.json plus devops). Owner decision 31.10.26: per-task
 # project decisions live in the repo's docs/DECISIONS.md or the task card;
-# memory keeps a pointer, so they stop crowding the injected facts. Content
+# dv-3e28 (14.11.26): a card decision goes onto the card, off the prompt. Content
 # stays the FULL statement: the writer checks the ref against the repo and
 # keeps an unverified decision as a flagged full fact, never a bare pointer.
 PROJECT_DECISION_INSTRUCTIONS = """\
 
 Project decisions (this agent has its own repo):
 - A per-task product or project decision (a feature's behaviour, a design
-  choice, a limit, a rollout, usually tied to a task id such as gb-1ab3) is
-  "conversation_result" EVEN WHEN THE OWNER STATED IT. Put where it is
-  recorded in "source_ref": "docs/DECISIONS.md", or the card id (e.g.
-  "gb-1ab3") when it lives only on the card.
+  choice, a limit, a rollout for one task such as gb-1ab3) is
+  "conversation_result" EVEN WHEN THE OWNER STATED IT. Put the card id in
+  "source_ref" (e.g. "gb-1ab3"), or "docs/DECISIONS.md" when it is recorded
+  there. A card decision is added to that card as a comment and is not
+  injected into the prompt; recall() still finds it.
 - For these, "content" is the FULL decision statement with its task id and
-  reason, not a one-line summary: memory injects only a one-line pointer, and
-  the full text is what recall() returns.
-- "user_fact" stays for the owner's preferences, working rules and decisions
-  that cut across tasks (how to talk to them, how to work, what never to do).
-  When unsure whether a decision is per-task, keep it a "user_fact"."""
+  reason, not a one-line summary.
+- "user_fact" stays for what cuts across tasks: the owner's preferences,
+  working rules, priorities, lessons, root causes and findings about how the
+  system behaves. A rule or lesson that names a card id only as an example
+  is a "user_fact" with no card in "source_ref". When unsure whether a
+  decision is per-task, keep it a "user_fact"."""
 
 
 EVALUATOR_PROMPT = """You maintain an agent's long-term memory.

@@ -15,9 +15,12 @@ from ..state import Board, Card, Outcome, card_digest, tail
 from . import review
 from .common import changed_files, commit, read_tests_json, stopped
 
-# the last RED gate run (failing ids + log tail), for the rerun's prompt;
-# removed on green
-RED_FILE = "build-red.md"
+# dv-65aa: an id picked inside a branch collides with one taken on master
+FOLLOWUPS_LINE = (
+    "Follow-up cards: never write `.deviz/tasks/` files; list them in "
+    '`.pump/followups.json` as `[{"title": "...", "body": "..."}]`; pump2 files '
+    "them when this card lands.\n"
+)
 
 
 def prompt(board: Board, card: Card, wt: Path) -> str:
@@ -32,12 +35,6 @@ def prompt(board: Board, card: Card, wt: Path) -> str:
             "\nA previous build was merged into the integration branch and the "
             "board tests went RED. Fix that; the end of the merge log:\n"
             f"```\n{tail(log.read_text(), 60)}\n```\n"
-        )
-    red = wt / ".pump" / RED_FILE
-    if red.exists():
-        again += (
-            "\nYour previous build left the tests in tests.json RED. Fix the "
-            "code (not the tests); the gate's result:\n" + red.read_text()
         )
     if not (wt / ".pump" / "tests.json").exists():
         return _docs_prompt(card, wt, plan, again)
@@ -71,7 +68,7 @@ the core command when you have touched shared code.
 
 When done write `.pump/build.md`: what changed, 5-15 lines. No commits, no git
 writes: the pipeline commits your work itself.
-"""
+{FOLLOWUPS_LINE}"""
 
 
 def _docs_prompt(card: Card, wt: Path, plan: str, again: str) -> str:
@@ -100,7 +97,7 @@ Do not change code. If a criterion needs a code change, say so in
 
 When done write `.pump/build.md`: what changed, 5-15 lines. No commits, no git
 writes: the pipeline commits your work itself.
-"""
+{FOLLOWUPS_LINE}"""
 
 
 # finish runs inside the pump2 tick (TimeoutStartSec=300). A gate run past this
@@ -115,7 +112,7 @@ def finish(board: Board, card: Card, wt: Path) -> Outcome:
     files, err = read_tests_json(wt)
     if err or not files:
         return stopped(f"build: {err or 'tests.json lists no files'}")
-    # a mergefix may delete a listed file that the integration branch removed:
+    # a resolve may delete a listed file that the integration branch removed:
     # judge the files that still exist
     listed = files
     gone = [f for f in files if not (wt / f).exists()]
@@ -128,11 +125,34 @@ def finish(board: Board, card: Card, wt: Path) -> Outcome:
         return stopped(f"build edited test files: {touched}")
     if not changed:
         return stopped("build changed nothing")
+    warnings, red = gate(board, wt, files, changed)
+    if red:
+        return stopped(red)
+    sha, err = commit(wt, f"{card.id}: build")
+    if err:
+        return stopped(f"build: {err}")
+    notes = wt / ".pump" / "build.md"
+    body = notes.read_text().rstrip() if notes.exists() else "(build.md not written)"
+    return Outcome(
+        "review",
+        f"build: {len(changed)} file(s) changed, committed {sha}\n"
+        f"tests: {warnings[0]}\n"
+        + (f"not run, gone from the branch: {', '.join(gone)}\n" if gone else "")
+        + "".join(w + "\n" for w in warnings[1:])
+        + body,
+    )
+
+
+def gate(
+    board: Board, wt: Path, files: list[str], changed: list[str]
+) -> tuple[list[str], str]:
+    """The build gate (build and resolve): the tests in tests.json under the
+    memory cap. Returns ([result line, warnings...], "") or ([], why red)."""
     # New files are untracked until the commit below: a test that reads
-    # `git ls-files` (the export whitelist, dv-a3d1) would not see them and go
+    # `git ls-files` (the export whitelist) would not see them and go
     # red. Intent-to-add lists them in the index without staging content.
     # A deleted path (git rm'd: gone from index and disk) makes `git add -N`
-    # fail with "pathspec did not match" (dv-92ee); `git add -A` in commit()
+    # fail with "pathspec did not match"; `git add -A` in commit()
     # stages the deletion anyway. A failure here never blocks a green build.
     warnings: list[str] = []
     present = [f for f in changed if (wt / f).exists()]
@@ -157,7 +177,7 @@ def finish(board: Board, card: Card, wt: Path) -> Outcome:
     log = wt / ".pump" / "build-tests.log"
     rc, out, full = run_tests(board, wt, cmd, log, timeout=GATE_TIMEOUT)
     if rc == TIMEOUT_RC:
-        return stopped(
+        return [], (
             f"build: the tests in tests.json ran past {GATE_TIMEOUT} s, the "
             f"limit for a run inside the pump2 tick; not judged\n"
             f"command: {shlex.join(full)}\n```\n{tail(out)}\n```"
@@ -166,36 +186,14 @@ def finish(board: Board, card: Card, wt: Path) -> Outcome:
         ln for ln in out.splitlines() if ln.strip() and not ln.startswith("testrun:")
     ]
     result = lines[-1] if lines else "(no output)"
-    red_file = wt / ".pump" / RED_FILE
     if rc:
         ids = failed_ids(out)
         listing = ("failing tests:\n" + "\n".join(ids) + "\n") if ids else ""
-        red_file.write_text(f"{listing}```\n{tail(out, 60)}\n```\n")
-        msg = (
+        return [], (
             f"build: the tests in tests.json are RED\n{listing}"
-            f"command: {shlex.join(full)}\nexit code: {rc}\n```\n{tail(out)}\n```"
+            f"command: {shlex.join(full)}\nexit code: {rc}\n```\n{tail(out, 60)}\n```"
         )
-        n = int(card.pump2.get("build_red") or 0)
-        if n < 1:  # one fix round: the rerun sees the failing list
-            return Outcome(
-                "build", msg + "\nrerunning build once", {"build_red": n + 1}
-            )
-        return stopped(msg + "\nsecond red: stopped for the owner")
-    red_file.unlink(missing_ok=True)
-    sha, err = commit(wt, f"{card.id}: build")
-    if err:
-        return stopped(f"build: {err}")
-    notes = wt / ".pump" / "build.md"
-    body = notes.read_text().rstrip() if notes.exists() else "(build.md not written)"
-    return Outcome(
-        "review",
-        f"build: {len(changed)} file(s) changed, committed {sha}\n"
-        f"tests: {result}\n"
-        + (f"not run, gone from the branch: {', '.join(gone)}\n" if gone else "")
-        + "".join(w + "\n" for w in warnings)
-        + body,
-        {"build_red": None},
-    )
+    return [result, *warnings], ""
 
 
 def _finish_docs(card: Card, wt: Path) -> Outcome:
@@ -212,5 +210,4 @@ def _finish_docs(card: Card, wt: Path) -> Outcome:
         "review",
         f"build: {len(changed)} file(s) changed, committed {sha}\n"
         "tests: none (docs-only plan)\n" + body,
-        {"build_red": None},
     )

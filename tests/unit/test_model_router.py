@@ -198,19 +198,18 @@ def test_call_request_carries_images_and_defaults_to_empty():
     assert _request(images=("a.png", "b.png")).images == ("a.png", "b.png")
 
 
-async def test_claude_plain_call_with_images_fails_loudly_and_is_recorded(
+async def test_claude_plain_call_with_a_bad_image_fails_loudly_and_is_recorded(
     db, monkeypatch, tmp_path
 ):
-    """Silently dropping the images would let a critic judge renders it never
-    saw: the Claude adapter refuses, before it starts the CLI."""
+    """Claude takes images (dv-a5aa), but a missing one is never dropped
+    silently: the adapter refuses before it starts the CLI."""
     from src.model_router import claude_plain
 
     def no_client(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("the CLI must not start for an image call")
 
     monkeypatch.setattr(claude_plain, "ClaudeSDKClient", no_client)
-    image = tmp_path / "shot.png"
-    image.write_bytes(b"\x89PNG")
+    image = tmp_path / "shot.png"  # never written
     router = _router(db, plain_callers={"claude": claude_plain.ClaudePlainCaller()})
 
     with pytest.raises(ModelCallError, match="(?i)image"):

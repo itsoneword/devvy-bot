@@ -1,14 +1,15 @@
 """Pump v2 state: boards, cards, the one ``pump2:`` frontmatter key, comments.
 
-A card is a ``.deviz/tasks/<id>.md`` file. This module changes only the
-``pump2:`` block of its frontmatter and appends ``### @pump2`` comment
-sections to the body; every other byte stays as it was. No database.
+A card is a ``<cards dir>/<id>.md`` file (``Board.tasks``). This module changes only the
+``pump2:`` block of its frontmatter and appends ``### @<install>/pump2``
+comment sections to the body; every other byte stays as it was. No database.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -17,12 +18,14 @@ from typing import Any
 
 import yaml
 
+from src.utils.boards import default_tasks_dir, tasks_dir
+
 from .criteria import KINDS, SIZES, TOUCHES
 
 KEY = "pump2"
 WORKTREES = ".pump-worktrees"
-STAGES = ("analyze", "tests", "build", "review", "merge", "mergefix", "done", "stopped")
-# the stages a board's `pipeline` may list by name (mergefix is merge's fallback)
+STAGES = ("analyze", "tests", "build", "review", "merge", "resolve", "done", "stopped")
+# the stages a board's `pipeline` may list by name (resolve takes every stop)
 BUILTIN_PIPELINE = ("analyze", "tests", "build", "review", "merge")
 RESERVED = frozenset(STAGES) | {"waiting_user"}
 _CUSTOM_NAME = re.compile(r"[a-z0-9]+")
@@ -38,7 +41,7 @@ WHEN_VALUES: dict[str, tuple[str, ...]] = {
 
 @dataclass(frozen=True)
 class StageSpec:
-    """A board's custom stage (dv-3b99): a prompt job whose ``.pump/<report>``
+    """A board's custom stage: a prompt job whose ``.pump/<report>``
     carries a review-style verdict; ``return`` sends the card to ``return_to``."""
 
     stage: str
@@ -52,6 +55,23 @@ class StageSpec:
 
 PipelineEntry = str | StageSpec
 RUN_STAGES = STAGES[:-2]  # the stages a card can stop in (and restart at)
+# keys of a stopped run that a restart drops (`pump2 start`, resolve's
+# `rerun analyze`): its job, retry and fix-round counters; `jobs` and
+# `returns` stay (the card's cost guards)
+RESTART_CLEARS = (
+    "job",
+    "job_of",
+    "attempt",
+    "retry",
+    "format_retry",
+    "resolves",
+    "resolve_from",
+    "stop_head",
+    "resolve_head",
+    "moved",
+    "tests_red",
+    "stopped_at",
+)
 
 
 @dataclass
@@ -79,6 +99,22 @@ class Board:
     pipeline: list[PipelineEntry] = field(default_factory=list)
     # the closed list of card labels a stage's `when.labels` may name
     stage_labels: list[str] = field(default_factory=list)
+    # intake.github: the board's GitHub repo "OWNER/NAME" for the
+    # issue tools and the status sweep; "" = off. close_issue: the sweep also
+    # closes the issue after its status comment.
+    intake_github: str = ""
+    close_issue: bool = False
+    # the cards dir: boards.json `cards_dir`, else <repo>/.deviz/tasks
+    tasks: Path = Path()
+
+    def __post_init__(self) -> None:
+        if self.tasks == Path():
+            self.tasks = default_tasks_dir(self.repo)
+
+    @property
+    def moved(self) -> bool:
+        """The cards live outside the project repo (the boards repo)."""
+        return self.tasks != default_tasks_dir(self.repo)
 
     def custom(self, stage: str) -> StageSpec | None:
         for e in self.pipeline:
@@ -105,6 +141,7 @@ HOME_BOARD = "devvy"
 
 
 def _board(b: dict[str, Any], name: str, repo: Path) -> Board:
+    gh, close = _intake(b.get("intake"), name)
     return Board(
         name=name,
         repo=repo,
@@ -122,7 +159,33 @@ def _board(b: dict[str, Any], name: str, repo: Path) -> Board:
             b.get("pipeline"), name, repo, _stage_labels(b.get("stage_labels"), name)
         ),
         stage_labels=_stage_labels(b.get("stage_labels"), name),
+        intake_github=gh,
+        close_issue=close,
+        tasks=tasks_dir(b, repo),
     )
+
+
+GITHUB_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+")
+
+
+def _intake(raw: object, board: str) -> tuple[str, bool]:
+    """(intake.github slug or "", close_issue). A block without ``github``
+    (the old argv contract) is off; a ``github`` value that is not
+    OWNER/NAME is a load error naming the board."""
+    if not isinstance(raw, dict) or "github" not in raw:
+        return "", False
+    slug = raw.get("github")
+    if not isinstance(slug, str) or not GITHUB_SLUG.fullmatch(slug):
+        raise ValueError(
+            f"board {board!r}: intake.github must be OWNER/NAME, got {slug!r}"
+        )
+    close = raw.get("close_issue", False)
+    if not isinstance(close, bool):
+        raise ValueError(
+            f"board {board!r}: intake.close_issue must be true or false, "
+            f"got {close!r}"
+        )
+    return slug, close
 
 
 def _stage_labels(raw: object, board: str) -> list[str]:
@@ -140,7 +203,7 @@ def _pipeline(
     raw: object, board: str, repo: Path, labels: list[str]
 ) -> list[PipelineEntry]:
     """The board's `pipeline`, checked at load; any broken rule is a loud
-    ValueError naming the board and the entry (dv-3b99)."""
+    ValueError naming the board and the entry."""
     if raw is None:
         return []
 
@@ -361,12 +424,12 @@ def read_card(path: Path) -> Card:
 def list_cards(board: Board) -> tuple[list[Card], list[tuple[Path, str]]]:
     """(cards, [(file, one-line error)] for the files that did not parse,
     or the one tasks dir when it is missing)."""
-    d = board.repo / ".deviz" / "tasks"
+    d = board.tasks
     cards: list[Card] = []
     bad: list[tuple[Path, str]] = []
     if not d.is_dir():
         # a board without its tasks dir: say so, not an empty status
-        hint = f"missing .deviz/tasks/ -- run `mkdir -p {d}` (pump2 doctor)"
+        hint = f"missing cards dir {d} -- run `mkdir -p {d}` (pump2 doctor)"
         return cards, [(d, hint)]
     for p in sorted(d.glob("*.md")):
         try:
@@ -377,7 +440,7 @@ def list_cards(board: Board) -> tuple[list[Card], list[tuple[Path, str]]]:
 
 
 def find_card(board: Board, card_id: str) -> Card:
-    p = board.repo / ".deviz" / "tasks" / f"{card_id}.md"
+    p = board.tasks / f"{card_id}.md"
     if not p.exists():
         raise FileNotFoundError(f"no card {card_id} in {p.parent}")
     return read_card(p)
@@ -443,11 +506,50 @@ def set_keys(path: Path, **keys: str) -> None:
     _write_atomic(path, "\n".join(lines))
 
 
-def add_comment(path: Path, text: str) -> None:
-    """Append ``### @pump2 — <time>`` + text at the end; earlier text is untouched."""
+def write_comment(path: Path, text: str, profile: str) -> None:
+    """The one comment writer: append ``### @<install>/<profile> — <time>`` +
+    text at the end; earlier text is untouched. ``profile`` is fixed by the
+    calling code (pump2, owner, the turn's profile), the install part comes
+    from the identity."""
+    from .identity import author
+
     cur = path.read_text()
     sep = "" if cur.endswith("\n\n") else ("\n" if cur.endswith("\n") else "\n\n")
-    path.write_text(f"{cur}{sep}### @pump2 — {now_iso()}\n{text.rstrip()}\n")
+    path.write_text(f"{cur}{sep}{comment_header(author(profile))}\n{text.rstrip()}\n")
+
+
+def comment_header(who: str, when: str | None = None) -> str:
+    return f"### @{who} — {when or now_iso()}"
+
+
+# `### @pump2 — t`, `### @devvybot-vps/owner — t`, `### @devops merge — t`
+COMMENT_HEAD = re.compile(r"^### @(\S+?)(?: [^\n—]*)? — (\S+).*$", re.M)
+_ANY_HEAD = re.compile(r"^### @(\S+)", re.M)
+
+
+def split_author(who: str) -> tuple[str, str]:
+    """(install, profile) of an author; a legacy bare name = ("", name)."""
+    inst, sep, prof = who.partition("/")
+    return (inst, prof) if sep else ("", who)
+
+
+def parse_comment_header(line: str) -> tuple[str, str, str] | None:
+    """(install, profile, time) of a comment header line, legacy or new;
+    None when ``line`` is not one."""
+    m = COMMENT_HEAD.match(line)
+    if not m:
+        return None
+    return (*split_author(m.group(1)), m.group(2))
+
+
+def comment_profile(head_author: str) -> str:
+    """The profile part of a header's ``@<author>``."""
+    return split_author(head_author)[1]
+
+
+def add_comment(path: Path, text: str) -> None:
+    """A pump2 comment: ``### @<install>/pump2 — <time>`` + text."""
+    write_comment(path, text, "pump2")
 
 
 def enter_pump2(path: Path, why: str) -> None:
@@ -455,6 +557,90 @@ def enter_pump2(path: Path, why: str) -> None:
     tick's pickup of a hand-moved in_progress card share this one write."""
     set_pump2(path, stage="analyze", attempt=0)
     add_comment(path, why)
+
+
+# every key of a card's `pump2:` block the current code writes; a card in
+# flight holding any other key was left by older code (dv-b8bb folded three
+# per-case paths into resolve) and the tick moves it to resolve without it.
+# A new key goes here, or the tick drops it.
+PUMP2_KEYS = frozenset(
+    {
+        "stage", "job", "job_of", "branch", "attempt", "since", "jobs",
+        "size", "kind", "touches", "criteria_sha", "round", "returns",
+        "format_retry", "tests_red", "retry", "rethink", "stopped_at",
+        "green", "merged", "moved", "killed", "stray", "labels_warned",
+        "wt_kept", "resolves", "resolve_from", "resolve_head", "stop_head",
+        "test_edits",
+    }
+)  # fmt: skip
+RESOLVE_MAX = 2  # resolves per card, one budget for all stages (dv-b8bb)
+STOP_FILE = "stop.md"  # the stop reason the resolve stage reads
+# dv-f707: the head of analyze's question stop. The board's agent triages the
+# questions in resolve first; that triage does not spend RESOLVE_MAX (the
+# question round, `round`, bounds it: a second round is the counted stop).
+QUESTION_STOP = "analyze: questions for the board's agent"
+
+
+def _git(wt: Path, *a: str) -> str | None:
+    r = subprocess.run(["git", *a], cwd=wt, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def resolve_history(body: str) -> str:
+    """The card's earlier resolve decisions, quoted, for the owner."""
+    heads = list(COMMENT_HEAD.finditer(body))
+    picks = []
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(body)
+        text = body[m.end() : end].strip()
+        if comment_profile(m.group(1)) == "pump2" and text.startswith("resolve: "):
+            picks.append(text)
+    quoted = ["\n".join("> " + ln for ln in p.splitlines()) for p in picks]
+    return "\n\nresolve history:\n" + "\n\n".join(quoted) if quoted else ""
+
+
+def stop(
+    board: Board, path: Path, comment: str, direct: bool = False, **keys: Any
+) -> str:
+    """Every stop of a card (dv-b8bb): to stage resolve while it has resolves
+    left (the reason in .pump/stop.md), else, or ``direct`` (config, not the
+    card) or a stop of resolve itself, stopped for the owner with the resolve
+    history. Writes the one comment; returns the stage set."""
+    card = read_card(path)
+    at = str(card.pump2.get("stage") or "")
+    n = int(card.pump2.get("resolves") or 0)
+    wt = worktree_path(board, card.id)
+    triage = at == "analyze" and comment.startswith(QUESTION_STOP)
+    if (
+        not direct
+        and (n < RESOLVE_MAX or triage)
+        and at != "resolve"
+        and (wt / ".pump").is_dir()
+    ):
+        (wt / ".pump" / STOP_FILE).write_text(f"stopped in: {at}\n\n{comment}\n")
+        head = _git(wt, "rev-parse", "HEAD")  # landed by hand if it lands
+        own = _git(wt, "merge-base", "--is-ancestor", str(head), board.branch) is None
+        set_pump2(
+            path,
+            stage="resolve",
+            job=None,
+            resolves=n if triage else n + 1,
+            resolve_from=at,
+            stop_head=head if own else None,
+            resolve_head=head,  # resolve diffs from here (own commits too)
+            **keys,
+        )
+        cnt = "question triage, not counted" if triage else f"{n + 1} of {RESOLVE_MAX}"
+        add_comment(path, f"{comment.rstrip()}\nto resolve ({cnt})")
+        return "resolve"
+    if (wt / ".git").exists() and _git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD"):
+        _git(wt, "merge", "--abort")  # a merge left open never leaks on
+    if at == "resolve":
+        keys.setdefault("stopped_at", card.pump2.get("resolve_from"))
+    set_pump2(path, stage="stopped", job=None, **keys)
+    tail_ = "" if direct else "\nstopped for the owner" + resolve_history(card.body)
+    add_comment(path, comment.rstrip() + tail_)
+    return "stopped"
 
 
 def _when(v: Any) -> datetime | None:
@@ -477,8 +663,8 @@ def hold_reason(card: Card, board: Board, now: datetime | None = None) -> str:
     for dep in deps:
         status = None
         for p in (
-            board.repo / ".deviz/tasks" / f"{dep}.md",
-            board.repo / ".deviz/tasks/archive" / f"{dep}.md",
+            board.tasks / f"{dep}.md",
+            board.tasks / "archive" / f"{dep}.md",
         ):
             if p.exists():
                 status = read_card(p).fm.get("status")
@@ -516,16 +702,15 @@ def set_status(path: Path, value: str) -> None:
 
 
 def add_owner_answer(path: Path, text: str) -> None:
-    """Append ``### @owner — <time>`` and the owner's words, verbatim."""
-    cur = path.read_text()
-    sep = "" if cur.endswith("\n\n") else ("\n" if cur.endswith("\n") else "\n\n")
-    path.write_text(f"{cur}{sep}### @owner — {now_iso()}\n{text}\n")
+    """``### @<install>/owner — <time>`` and the owner's words, verbatim."""
+    write_comment(path, text, "owner")
 
 
-_COMMENT = re.compile(r"^### @(\S+)", re.M)
-# machine comment authors: pump2 and the old pump (off since 2026-11-06, whose
-# comments are most of a long card's bytes); the last machine comment is kept
-MACHINE = ("### @pump2", "### @taskpump")
+_COMMENT = _ANY_HEAD
+# machine comment authors (profile part): pump2 and the old pump (off since
+# 2026-11-06, whose comments are most of a long card's bytes); the last
+# machine comment is kept
+MACHINE = ("pump2", "taskpump")
 _COMMENTS_HEAD = re.compile(r"^## Comments\s*$", re.M)
 
 
@@ -547,7 +732,11 @@ def card_digest(card: Card) -> str:
     starts = [c.start() for c in _COMMENT.finditer(rest)]
     pre = rest[: starts[0]] if starts else rest
     secs = [rest[a:b] for a, b in zip(starts, starts[1:] + [len(rest)])]
-    machine = [i for i, s in enumerate(secs) if s.startswith(MACHINE)]
+    machine = [
+        i
+        for i, s in enumerate(secs)
+        if (m := _ANY_HEAD.match(s)) and comment_profile(m.group(1)) in MACHINE
+    ]
     drop = set(machine[:-1])
     kept = [s for i, s in enumerate(secs) if i not in drop]
     note = f"\n(card file: {card.path}"

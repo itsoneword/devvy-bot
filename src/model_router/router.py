@@ -26,6 +26,7 @@ import structlog
 from . import json_contract, llm_decide
 from .claude_plain import ClaudePlainCaller
 from .codex_plain import CodexPlainCaller
+from .flux_plain import FluxPlainCaller
 from .harness import HarnessVersions
 from .openrouter_plain import OpenRouterPlainCaller
 from .routes import CallRoute, CallRoutes
@@ -34,6 +35,7 @@ from .turn_cost import Settlement, when_settled
 from .types import (
     CLAUDE_HARNESS,
     CODEX_HARNESS,
+    FLUX_HARNESS,
     OPENROUTER_HARNESS,
     PLAIN_PURPOSES,
     PURPOSES,
@@ -64,6 +66,7 @@ _PROVIDERS = {
     CLAUDE_HARNESS: "anthropic",
     CODEX_HARNESS: "openai",
     OPENROUTER_HARNESS: "openrouter",
+    FLUX_HARNESS: "flux",
     TYPESAFE_HARNESS: "typesafe",
 }
 
@@ -88,6 +91,7 @@ class ModelRouter:
                 CLAUDE_HARNESS: ClaudePlainCaller(),
                 CODEX_HARNESS: CodexPlainCaller(),
                 OPENROUTER_HARNESS: OpenRouterPlainCaller(),
+                FLUX_HARNESS: FluxPlainCaller(),
             }
         )
         self._recorder = recorder
@@ -420,7 +424,7 @@ class ModelRouter:
             profile: Optional[str] = None
             if self._profile_resolver is not None and working_dir is not None:
                 profile = self._profile_resolver(Path(working_dir))
-            return await self._recorder.record(
+            row_id = await self._recorder.record(
                 ModelCall(
                     purpose=purpose,
                     kind=kind,
@@ -444,6 +448,8 @@ class ModelRouter:
                     cost_source=cost_source,
                 )
             )
+            # A remote recorder answers took-it / lost-it, not a row id.
+            return None if isinstance(row_id, bool) else row_id
         except Exception as exc:
             logger.warning(
                 "model call not recorded",

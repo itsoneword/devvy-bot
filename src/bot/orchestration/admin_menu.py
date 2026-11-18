@@ -245,7 +245,7 @@ def build_calls(
     from ...model_router.routes import FOLLOW_BACKEND, RouteRow
     from ...model_router.types import PLAIN_PURPOSES
 
-    lines = ["🔧 Внутренние вызовы (config/models.yaml purposes, только просмотр)"]
+    lines = ["🔧 Внутренние вызовы · models.yaml"]
     if routes is None:
         lines.append(f"⚠ Файл не читается: {error}.")
     else:

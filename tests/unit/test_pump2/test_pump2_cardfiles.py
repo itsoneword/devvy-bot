@@ -8,7 +8,7 @@ from pathlib import Path
 
 from src.pump2.merge import dirty_overlap
 
-from .test_pump2_mergefix import (  # noqa: F401
+from .test_pump2_merge_resolve import (  # noqa: F401
     CID,
     TASKS,
     Rig,
@@ -48,7 +48,7 @@ def test_dirty_card_file_does_not_block_ff(repo: Path, tmp_path: Path) -> None:
 
     rig = Rig(repo, tmp_path, agent)
     assert rig.run() == "done"
-    assert rig.mergefix_prompts == [] and rig.runs == 1
+    assert rig.prompts == [] and rig.runs == 1
     assert (repo / OTHER).read_bytes() == live.encode()
     assert (repo / "b.txt").exists()
 
@@ -89,7 +89,7 @@ def test_card_file_conflict_resolves_to_integration_version(
 
     rig = Rig(repo, tmp_path, agent)
     assert rig.run() == "done"
-    assert rig.mergefix_prompts == [] and rig.runs == 1
+    assert rig.prompts == [] and rig.runs == 1
     assert (repo / OTHER).read_text() == BASE + "main side\n"
     assert (repo / "b.txt").exists()
 
@@ -98,9 +98,9 @@ def test_card_and_code_conflict_hands_over_only_code(
     repo: Path, tmp_path: Path
 ) -> None:
     card_conflict(repo, extra=True)
-    rig = Rig(repo, tmp_path, resolver("mod.py", "retest", "x = 4\n"))
+    rig = Rig(repo, tmp_path, resolver("mod.py", "continue merge", "x = 4\n"))
     assert rig.run() == "done"
-    assert len(rig.mergefix_prompts) == 1
+    assert len(rig.prompts) == 1
     assert "mod.py" in rig.facts[0] and "dv-0002.md" not in rig.facts[0]
     assert (repo / OTHER).read_text() == BASE + "main side\n"
     assert (repo / "mod.py").read_text() == "x = 4\n"

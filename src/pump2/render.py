@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .state import Board, Card, _when, list_cards, worktree_path
+from . import identity
+from .state import (
+    Board,
+    Card,
+    _when,
+    comment_profile,
+    list_cards,
+    worktree_path,
+)
 
 LOGS = ("merge.log",)  # stage logs: job-<stage>.log, then merge.log
 
@@ -27,13 +36,14 @@ def minutes(card: Card, now: datetime) -> str:
     if not card.pump2.get("job"):
         return "-"
     since = _when(card.pump2.get("since"))
-    return f"{int((now - since).total_seconds() // 60)}m" if since else "?"
+    return f"{(now - since) // timedelta(minutes=1)}m" if since else "?"
 
 
 def status_lines(
     boards: dict[str, Board], only: str | None = None, now: datetime | None = None
 ) -> list[str]:
     now = now or datetime.now(UTC)
+    ours = ours_check(boards)
     rows = []
     for board in boards.values():
         if only and board.name != only:
@@ -41,7 +51,7 @@ def status_lines(
         cards, bad = list_cards(board)
         rows += [f"{board.name}:{p.name}  ERROR  {err}" for p, err in bad]
         for c in cards:
-            if not c.pump2.get("stage"):
+            if not c.pump2.get("stage") or not ours(c.fm.get("assignee")):
                 continue
             held = c.fm.get("status")
             mark = f" [{held}]" if held and held != "in_progress" else ""
@@ -53,22 +63,77 @@ def status_lines(
     return rows
 
 
+# --- other installs' cards: shown apart, read-only
+
+CLOSED = ("done", "cancelled", "canceled", "archived")
+THEIRS_HEAD = "Theirs (other installs, read-only)"
+
+
+def ours_check(boards: dict[str, Board]) -> Callable[[object], bool]:
+    """``identity.is_ours`` with this install's identity, the served boards'
+    profiles counted as local."""
+    return identity.ours_check(extra={b.profile for b in boards.values()})
+
+
+def theirs(
+    boards: dict[str, Board], only: str | None = None
+) -> list[tuple[Board, Card]]:
+    """Open cards assigned to another install, board order."""
+    ours = ours_check(boards)
+    out = []
+    for board in boards.values():
+        if only and board.name != only:
+            continue
+        out += [
+            (board, c)
+            for c in list_cards(board)[0]
+            if c.fm.get("status") not in CLOSED and not ours(c.fm.get("assignee"))
+        ]
+    return out
+
+
+def theirs_row(card: Card, title: str = "") -> str:
+    """``id title — assignee, status``."""
+    title = title or _title(card)
+    return (
+        f"{card.id} {title} — {identity.owner_of(card.fm)}, "
+        f"{card.fm.get('status') or '?'}"
+    )
+
+
+def theirs_lines(boards: dict[str, Board], only: str | None = None) -> list[str]:
+    """The status block: a heading and one row per card; [] when none."""
+    rows = [f"{b.name}:{theirs_row(c)}" for b, c in theirs(boards, only)]
+    return ["", THEIRS_HEAD, *rows] if rows else []
+
+
 # --- the bot's JSON views: the record shapes of taskpump's
 # `status --json` / `pending --json`, so /menu Pump and the chat tools read
 # both pumps the same way.
 
 ASK_HEAD = "analyze: questions for the owner"
-_COMMENT = re.compile(r"^### @(\S+) — .*$", re.M)
+# the resolve stage's one question (an `owner` verdict, dv-b8bb)
+RESOLVE_HEAD = "resolve: owner"
+ASK_HEADS = (ASK_HEAD, RESOLVE_HEAD)
+# dv-f707: the board agent's answers to analysis questions (a resolve of a
+# question stop), one comment by the board's profile; the pin lists them
+DECIDED_HEAD = "decided for you (reversible: say if you want it otherwise)"
+_COMMENT = re.compile(r"^### @(\S+) — .*$", re.M)  # group 1: the author
 _QUESTION = re.compile(r"^\s*\**(\d+)[.)]\**\s+(.+?)\s*$")
 
 
 def _held_cards(boards: dict[str, Board], only: str | None) -> list[tuple[Board, Card]]:
     out = []
+    ours = ours_check(boards)
     for board in boards.values():
         if only and board.name != only:
             continue
         cards, _bad = list_cards(board)
-        out += [(board, c) for c in cards if c.pump2.get("stage")]
+        out += [
+            (board, c)
+            for c in cards
+            if c.pump2.get("stage") and ours(c.fm.get("assignee"))
+        ]
     return out
 
 
@@ -77,19 +142,36 @@ def _title(card: Card) -> str:
 
 
 def question_block(card: Card) -> str:
-    """The last ``### @pump2`` comment that asks the owner; '' if none."""
+    """The last pump2 comment (``### @<install>/pump2`` or legacy ``@pump2``) that asks the owner; '' if none."""
     heads = list(_COMMENT.finditer(card.body))
     block = ""
     for i, m in enumerate(heads):
         end = heads[i + 1].start() if i + 1 < len(heads) else len(card.body)
         text = card.body[m.end() : end].strip()
-        if m.group(1) == "pump2" and text.startswith(ASK_HEAD):
+        if comment_profile(m.group(1)) == "pump2" and text.startswith(ASK_HEADS):
             block = text
     return block
 
 
-def questions_of(block: str) -> list[dict[str, Any]]:
-    """{num, text, default} per numbered line; pump2 has no defaults."""
+def decided_block(card: Card) -> tuple[str, str]:
+    """(profile, numbered lines) of the card's last ``DECIDED_HEAD`` comment;
+    ('', '') if none."""
+    heads = list(_COMMENT.finditer(card.body))
+    found = ("", "")
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(card.body)
+        text = card.body[m.end() : end].strip()
+        if text.startswith(DECIDED_HEAD):
+            rest = text[len(DECIDED_HEAD) :].strip()
+            found = (comment_profile(m.group(1)), rest)
+    return found
+
+
+def questions_of(block: str | Card) -> list[dict[str, Any]]:
+    """{num, text, default} per numbered line of a question block (or of a
+    card's, ``question_block``); pump2 has no defaults."""
+    if isinstance(block, Card):
+        block = question_block(block)
     return [
         {"num": m.group(1), "text": m.group(2), "default": None}
         for ln in block.splitlines()
@@ -174,7 +256,7 @@ def status_rows(
         elif c.pump2.get("job"):
             since = _when(c.pump2.get("since"))
             if since:
-                hours = round((now - since).total_seconds() / 3600, 1)
+                hours = round((now - since) / timedelta(hours=1), 1)
             group, icon, pump, why = "running", "▶", "running", f"pump2 {stage}"
         else:
             group, icon, pump, why = "queued", "⏳", "queued", f"pump2 {stage}"
@@ -190,6 +272,22 @@ def status_rows(
                 "why": why,
                 "act": "",
                 "hours": hours,
+                "first": False,
+            }
+        )
+    for board, c in theirs(boards, only):
+        rows.append(
+            {
+                "id": f"{board.name}:{c.id}",
+                "title": _title(c),
+                "board": board.name,
+                "pump": "theirs",
+                "status": c.fm.get("status"),
+                "group": "theirs",
+                "icon": "👥",
+                "why": f"assigned to {identity.owner_of(c.fm)}",
+                "act": "",
+                "hours": None,
                 "first": False,
             }
         )

@@ -1,4 +1,4 @@
-"""Per-card criteria (dv-d5aa): the one place for the plan's criterion and
+"""Per-card criteria: the one place for the plan's criterion and
 question format, the frozen ``criteria_sha``, review remark gating, the
 shared return budget and the closing summary comment. analyze, tests,
 review and merge import it; do not parse these formats anywhere else.
@@ -161,7 +161,7 @@ def criteria_sha(plan_text: str) -> str:
 
 
 def frozen(pump2: dict[str, Any]) -> bool:
-    """A card planned in the dv-d5aa format; older cards keep the old rules."""
+    """A card planned in the criteria format; older cards keep the old rules."""
     return bool(pump2.get("criteria_sha"))
 
 
@@ -224,19 +224,30 @@ def judge(body: str, crit: list[Criterion]) -> tuple[list[Remark], list[Remark],
     return blocking, advice, tail
 
 
-# ---- scores (dv-3b99) --------------------------------------------------------
-_SCORE = re.compile(r"^\s*(?:[-*]\s+)?(C\d+)\s*:\s*(\d+)\s*(?:\|.*)?$")
+# ---- scores --------------------------------------------------------
+_SCORE = re.compile(r"^\s*(?:[-*]\s+)?(C\d+)\s*:\s*(\d+)\s*(?:\|(.*))?$")
+# dv-925f: stored text caps (a runaway report must not bloat the table).
+EVIDENCE_CAP = 2000
+REMARKS_CAP = 8000
+# Remarks texts that mean "no remarks" and are not stored.
+_NO_REMARKS = {"", "none", "-", "—", "n/a", "нет"}
+
+
+def parse_evidence(text: str) -> list[tuple[str, int, str | None]]:
+    """``parse_scores`` with the evidence after ``|`` (None when absent)."""
+    out: list[tuple[str, int, str | None]] = []
+    for ln in sections(text).get("Scores", "").split("\n"):
+        m = _SCORE.match(ln)
+        if m and 1 <= int(m.group(2)) <= 10:
+            ev = (m.group(3) or "").strip()[:EVIDENCE_CAP] or None
+            out.append((m.group(1), int(m.group(2)), ev))
+    return out
 
 
 def parse_scores(text: str) -> list[tuple[str, int]]:
     """The ``## Scores`` lines of a report (``C1: 8 | evidence``), score
     1-10; a line that does not parse or is out of range is left out."""
-    out: list[tuple[str, int]] = []
-    for ln in sections(text).get("Scores", "").split("\n"):
-        m = _SCORE.match(ln)
-        if m and 1 <= int(m.group(2)) <= 10:
-            out.append((m.group(1), int(m.group(2))))
-    return out
+    return [(c, n) for c, n, _ in parse_evidence(text)]
 
 
 def scores_warning(text: str, got: list[tuple[str, int]]) -> str:
@@ -259,20 +270,31 @@ def scores_db() -> Path:
 
 
 def record_scores(
-    board: str, card_id: str, stage: str, pump2: dict[str, Any], text: str
+    board: str,
+    card_id: str,
+    stage: str,
+    pump2: dict[str, Any],
+    text: str,
+    remarks: str = "",
 ) -> str:
-    """Store a report's ``## Scores`` (one ``stage_score`` row per criterion)
-    and return the comment's warning line ('' when none). Never raises."""
-    from src.storage.reactions import record_stage_scores_sync
+    """Store a report's ``## Scores`` (one ``stage_score`` row per criterion,
+    the evidence in ``comment``) and, when ``remarks`` is a real text, one
+    row criterion ``remarks`` (score NULL, comment = the text); return the
+    comment's warning line ('' when none). Never raises."""
+    from src.storage.reactions import StageRow, record_stage_scores_sync
 
-    got = parse_scores(text)
-    warn = scores_warning(text, got)
+    got = parse_evidence(text)
+    warn = scores_warning(text, [(c, n) for c, n, _ in got])
+    rows: list[StageRow] = list(got)
+    rem = remarks.strip()
+    if rem.lower().strip(" .`*") not in _NO_REMARKS:
+        rows.append(("remarks", None, rem[:REMARKS_CAP]))
     err = record_stage_scores_sync(
         scores_db(),
         board=board,
         card_id=card_id,
         stage=stage,
-        scores=got,
+        scores=rows,
         size=pump2.get("size"),
         kind=pump2.get("kind"),
     )
@@ -323,7 +345,7 @@ def summary(wt: Path, outcome: str, advice: list[str] | None = None) -> str:
         else:
             not_done.append(ln)
     if not crit:
-        not_done.append("- (plan has no Cn criteria: pre-dv-d5aa format)")
+        not_done.append("- (plan has no Cn criteria: older plan format)")
     if files:
         done.append("- tests: " + ", ".join(files))
     if advice is None:

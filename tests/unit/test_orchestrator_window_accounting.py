@@ -86,6 +86,21 @@ class _Eval:
         return self._result
 
 
+async def _drain_background(timeout: float = 5.0) -> None:
+    """Wait for the fire-and-forget evaluator task to finish.
+
+    account_turn_and_maybe_eval schedules evaluator.run() + the checkpoint
+    write with asyncio.create_task and keeps no handle; a fixed sleep raced
+    the DB I/O under a loaded core run (dv-158d merge flake).
+    """
+    import asyncio
+
+    me = asyncio.current_task()
+    pending = [t for t in asyncio.all_tasks() if t is not me and not t.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=timeout)
+
+
 async def _account(
     window_repo,
     evaluator,
@@ -282,7 +297,6 @@ async def test_failed_eval_does_not_advance_checkpoint(window_repo):
     gone even though nothing downstream ever surfaced an error to them. The
     cursor must only advance once evaluator.run() actually reports success.
     """
-    import asyncio
 
     ev = _Eval(result=False)  # simulates the ARG_MAX crash / any failure
     await _account(
@@ -300,7 +314,7 @@ async def test_failed_eval_does_not_advance_checkpoint(window_repo):
     # mark_evaluator_run does real DB I/O with multiple internal await
     # points; a bare sleep(0) only yields once, which isn't always enough
     # to drain the background task fully.
-    await asyncio.sleep(0.05)
+    await _drain_background()
     assert len(ev.calls) == 1  # the failing run did happen
     after_failure = await window_repo.get_or_create(13, "/p")
     assert after_failure.last_checkpoint_message_id == 0  # cursor stayed put
@@ -320,7 +334,7 @@ async def test_failed_eval_does_not_advance_checkpoint(window_repo):
         agent_id="coach",
         force_eval=True,
     )
-    await asyncio.sleep(0.05)
+    await _drain_background()
     assert len(ev2.calls) == 1
 
     final = await window_repo.get_or_create(13, "/p")
@@ -337,7 +351,6 @@ async def test_no_double_extraction_when_turn_also_rolls_window(window_repo):
     updated" pings for one turn. refresh_window() owns the extraction in this
     case because its facts feed the next window's continuity seed.
     """
-    import asyncio
 
     ev = _Eval()
     await _account(
@@ -351,7 +364,7 @@ async def test_no_double_extraction_when_turn_also_rolls_window(window_repo):
         conversation_text="convo",
         max_message_id=42,
     )
-    await asyncio.sleep(0.05)
+    await _drain_background()
     assert ev.calls == [], "checkpoint eval must defer to the rotation eval"
 
     state = await window_repo.get_or_create(9, "/p")
@@ -360,7 +373,6 @@ async def test_no_double_extraction_when_turn_also_rolls_window(window_repo):
 
 async def test_checkpoint_eval_still_runs_without_rotation(window_repo):
     """The skip above must not suppress ordinary checkpoint extraction."""
-    import asyncio
 
     ev = _Eval()
     await _account(
@@ -374,5 +386,5 @@ async def test_checkpoint_eval_still_runs_without_rotation(window_repo):
         conversation_text="convo",
         max_message_id=43,
     )
-    await asyncio.sleep(0.05)
+    await _drain_background()
     assert len(ev.calls) == 1

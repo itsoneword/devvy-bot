@@ -29,7 +29,15 @@ _JSON_TYPES: Dict[type, str] = {
     float: "number",
     int: "integer",
     bool: "boolean",
+    # A ``list`` param is a list of strings (dv-be37 job_start allow_dirs).
+    list: "array",
 }
+
+
+def _prop(t: type) -> Dict[str, Any]:
+    if t is list:
+        return {"type": "array", "items": {"type": "string"}}
+    return {"type": _JSON_TYPES[t]}
 
 
 def tool_schema(props: Dict[str, type], *required: str) -> Dict[str, Any]:
@@ -47,6 +55,6 @@ def tool_schema(props: Dict[str, type], *required: str) -> Dict[str, Any]:
         raise ValueError(f"required names undeclared params: {sorted(unknown)}")
     return {
         "type": "object",
-        "properties": {k: {"type": _JSON_TYPES[v]} for k, v in props.items()},
+        "properties": {k: _prop(v) for k, v in props.items()},
         "required": list(required),
     }

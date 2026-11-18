@@ -768,7 +768,7 @@ class CodexCliIntegration:
                 env[IMAGE_ROOTS_ENV] = image_roots_env(
                     self.config.approved_directory,
                     working_directory,
-                    getattr(self._profile_for(working_directory), "extra_dirs", ())
+                    getattr(self._profile_for(working_directory), "image_dirs", ())
                     or (),
                 )
             args = [str(a) for a in (cfg.get("args") or [])]

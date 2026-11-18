@@ -44,6 +44,10 @@ class _FakeProfile:
     slug: str = "gymbro"
     sandbox: bool = True
 
+    @property
+    def image_dirs(self) -> Tuple[Path, ...]:
+        return self.extra_dirs
+
 
 class _FakeRegistry:
     def __init__(self, profiles: List[_FakeProfile]) -> None:

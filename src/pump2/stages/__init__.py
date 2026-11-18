@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..state import Board
-from . import analyze, build, mergefix, review, tests
+from . import analyze, build, resolve, review, tests
 from .custom import CustomStage
 
 MODULES: dict[str, Any] = {
@@ -14,13 +14,13 @@ MODULES: dict[str, Any] = {
     "tests": tests,
     "build": build,
     "review": review,
-    "mergefix": mergefix,
+    "resolve": resolve,
 }
 
 
 def module_for(board: Board, stage: str) -> Any:
     """The built-in module of ``stage``, else the board's custom stage of that
-    name (dv-3b99), else None (merge, done, ... : not a model stage)."""
+    name, else None (merge, done, ... : not a model stage)."""
     if stage in MODULES:
         return MODULES[stage]
     spec = board.custom(stage)

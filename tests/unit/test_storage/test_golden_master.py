@@ -681,9 +681,20 @@ async def _deviz_board_section(tmp_path: Path) -> tuple:
     (same mechanism as the ``tmp_path`` redaction) so the random ids never
     make the golden file non-reproducible.
     """
+    import json
+
+    from src.pump2 import identity
     from src.storage.deviz_board import DevizBoard
 
-    board = DevizBoard(tmp_path / "tasks")
+    # Pin the install identity (dv-33c8): add_task stamps
+    # `<me>/<profile>`, which must not come from this machine's boards.json.
+    boards = tmp_path / "boards.json"
+    boards.write_text(json.dumps({"me": "devvybot-vps", "boards": []}))
+    with identity.using(boards):
+        return await _deviz_board_ops(DevizBoard(tmp_path / "tasks"))
+
+
+async def _deviz_board_ops(board: Any) -> tuple:
     out: Dict[str, Any] = {}
 
     from datetime import UTC, datetime

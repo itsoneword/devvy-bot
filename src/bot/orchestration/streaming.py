@@ -10,17 +10,18 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import structlog
-from telegram import InputMediaPhoto, Update
+from telegram import Update
 
 from ...claude.sdk_integration import StreamUpdate
 from ..utils.draft_streamer import DraftStreamer
 from ..utils.ephemeral_updater import EphemeralUpdater
 from ..utils.image_extractor import (
     ImageAttachment,
-    attachment_from_tool_call,
+    attachments_for_tool_call,
     is_send_file_call,
     should_send_as_photo,
 )
+from ..utils.photo_send import send_document, send_photos, undelivered_note
 from .base import OrchestratorBase
 from .formatting import _condense, _redact_secrets, _tool_icon, _truncate
 
@@ -194,9 +195,11 @@ class StreamingMixin(OrchestratorBase):
                 for tc in update_obj.tool_calls:
                     if is_send_file_call(tc):
                         file_path = (tc.get("input") or {}).get("file_path", "")
-                        img = attachment_from_tool_call(tc, approved_directory)
-                        if img:
-                            mcp_images.append(img)
+                        imgs = attachments_for_tool_call(
+                            tc, approved_directory, pending=True
+                        )
+                        if imgs:
+                            mcp_images.extend(imgs)
                         else:
                             logger.warning(
                                 "send_image_to_user path failed validation "
@@ -318,62 +321,40 @@ class StreamingMixin(OrchestratorBase):
         )
         caption_sent = False
 
-        # Send raster photos as a single album (Telegram groups 2-10 items)
+        # Raster photos as one album (Telegram groups 2-10 items), retried one
+        # by one on a timeout; what never arrives is said in the chat.
+        message = update.message
+        assert message is not None  # a reply always has its message
+        kw: Dict[str, Any] = {"reply_to_message_id": reply_to_message_id}
+        if getattr(message, "is_topic_message", False):
+            kw["message_thread_id"] = message.message_thread_id
         if photos:
-            try:
-                if len(photos) == 1:
-                    with open(photos[0].path, "rb") as f:
-                        await update.message.reply_photo(
-                            photo=f,
-                            reply_to_message_id=reply_to_message_id,
-                            caption=caption if use_caption else None,
-                            parse_mode=caption_parse_mode if use_caption else None,
-                        )
-                    caption_sent = use_caption
-                else:
-                    media = []
-                    file_handles = []
-                    for idx, img in enumerate(photos[:10]):
-                        fh = open(img.path, "rb")  # noqa: SIM115
-                        file_handles.append(fh)
-                        media.append(
-                            InputMediaPhoto(
-                                media=fh,
-                                caption=caption if use_caption and idx == 0 else None,
-                                parse_mode=(
-                                    caption_parse_mode
-                                    if use_caption and idx == 0
-                                    else None
-                                ),
-                            )
-                        )
-                    try:
-                        await update.message.chat.send_media_group(
-                            media=media,
-                            reply_to_message_id=reply_to_message_id,
-                        )
-                        caption_sent = use_caption
-                    finally:
-                        for fh in file_handles:
-                            fh.close()
-            except Exception as e:
-                logger.warning("Failed to send photo album", error=str(e))
+            result = await send_photos(
+                message.get_bot(),
+                message.chat_id,
+                [img.path for img in photos],
+                caption=caption if use_caption else None,
+                parse_mode=caption_parse_mode if use_caption else None,
+                **kw,
+            )
+            caption_sent = result.caption_sent
+            if result.failed:
+                try:
+                    await message.reply_text(undelivered_note(result.failed))
+                except Exception as e:
+                    logger.warning("Undelivered-photos note failed", error=str(e))
 
         # Send SVGs / large files as documents (one by one — can't mix in album)
+        undelivered = []
         for img in documents:
+            ok = await send_document(message.get_bot(), message.chat_id, img.path, **kw)
+            if not ok:
+                undelivered.append(img.path)
+            await asyncio.sleep(0.5)
+        if undelivered:
             try:
-                with open(img.path, "rb") as f:
-                    await update.message.reply_document(
-                        document=f,
-                        filename=img.path.name,
-                        reply_to_message_id=reply_to_message_id,
-                    )
-                await asyncio.sleep(0.5)
+                await message.reply_text(undelivered_note(undelivered))
             except Exception as e:
-                logger.warning(
-                    "Failed to send document image",
-                    path=str(img.path),
-                    error=str(e),
-                )
+                logger.warning("Undelivered-documents note failed", error=str(e))
 
         return caption_sent

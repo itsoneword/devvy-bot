@@ -25,7 +25,7 @@ def test_pickup_sets_analyze_comments_and_launches(
     out = f.tick(b, tmp_path)
     c = find_card(b, "dv-0002")
     assert c.pump2["stage"] == "analyze" and c.pump2["attempt"] == 0
-    assert "### @pump2" in c.body and "picked up from in_progress" in c.body
+    assert "/pump2 — " in c.body and "picked up from in_progress" in c.body
     assert "t:dv-0002 picked up from in_progress" in out
     assert [x[0] for x in f.launched] == ["dv-0002"]
     assert f.launched[0][1] == "analyze"

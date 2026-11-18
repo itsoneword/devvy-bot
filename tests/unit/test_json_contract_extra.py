@@ -175,7 +175,7 @@ async def test_openrouter_no_endpoints_for_parameters_is_resent(monkeypatch):
 
     from src.model_router import openrouter_plain
 
-    monkeypatch.setattr(openrouter_plain, "openrouter_key", lambda: "sk")
+    monkeypatch.setattr(openrouter_plain, "openrouter_key", lambda key_ref=None: "sk")
     bodies = []
     answers = [
         (
